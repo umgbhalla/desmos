@@ -2,10 +2,17 @@
 
 A coding agent that owns its harness.
 
-The model lives in a persistent Python kernel. It does not call a closed tool
-schema. It emits XML syscalls. Five tags are frozen. Everything else — new
-tools, tool descriptions, system notes — it writes itself, and the next turn
-sees the change.
+You put data in the kernel. You write a prompt. You call `step`. The model
+peeks at variables by name. It does not get their contents stuffed into the
+chat.
+
+```python
+doc = open("paper.txt").read()
+step("what's in doc? don't dump it")
+```
+
+Five XML tags are frozen. Everything else — new tools, descriptions, system
+notes — the model writes itself, and the next turn sees the change.
 
 ```
 <python>          exec, names persist
@@ -15,24 +22,24 @@ sees the change.
 <tool>            rewrite a tool description
 ```
 
-The live prompt is the ABI plus the current catalog plus the agent's notes.
-That is the inverted harness: the creature edits the thing that governs it.
+## IPython
 
-## Run
+```bash
+uv pip install -e ".[kernel]"
+python -m desmos console          # IPython with step and world bound
+python -m desmos kernel           # install a Jupyter kernelspec named Desmos
+```
+
+Ordinary cells stay Python. `step("...")` is the agent.
+
+## Headless
 
 `ANTHROPIC_API_KEY` comes from the environment. Never commit it.
 
 ```bash
 python3 inverted.py --check
-
-export ANTHROPIC_API_KEY=...
 python3 inverted.py "add a --json flag to inverted.py --check"
 ```
 
-State lands in `.desmos/harness.json` (gitignored): grown tools, their source,
-rewritten descriptions, system notes. Traces go under `runs/` (also gitignored).
+State lands in `.desmos/harness.json` (gitignored). Traces go under `runs/`.
 
-## Docs
-
-- [docs/inverted-rlm.html](docs/inverted-rlm.html) — kernel as organism
-- [docs/kernel-agent.html](docs/kernel-agent.html) — earlier sketch
