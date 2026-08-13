@@ -55,6 +55,9 @@ drop a note.
 <tool name="tag" doc="description"/>
 rewrite a tool's description, including builtins. The catalog is the prompt.
 
+Names listed under ns are kernel variables. Refer to them by name. Peek with
+<python>. Their contents are not in this prompt.
+
 Grow whatever you need. Fix a description when it is wrong. When the task is
 done, speak without XML."""
 
@@ -75,6 +78,26 @@ class Tool:
     frozen: bool = False
 
 
+HIDDEN_NS = frozenset(
+    {
+        "In",
+        "Out",
+        "get_ipython",
+        "exit",
+        "quit",
+        "open",
+        "step",
+        "world",
+        "handle",
+        "__builtins__",
+        "_ih",
+        "_oh",
+        "_dh",
+        "_sh",
+    }
+)
+
+
 @dataclass
 class World:
     ns: dict[str, Any] = field(default_factory=dict)
@@ -83,6 +106,9 @@ class World:
     log: list[dict[str, Any]] = field(default_factory=list)
     cwd: Path = field(default_factory=lambda: Path.cwd())
     state_path: Path | None = None
+    shell: Any = None
+    model: str = "claude-opus-5"
+    complete_fn: Callable[..., dict[str, Any]] | None = None
 
 
 def scan(text: str) -> list[Block]:
@@ -115,11 +141,12 @@ def _clip(text: str, cap: int = RESULT_CAP) -> str:
     return text[: cap - 24] + f"\n…[{len(text) - cap + 24} chars clipped]"
 
 
-def _run_python(body: str, ns: dict[str, Any]) -> str:
+def _run_python(body: str, world: World) -> str:
     src = body.strip()
     if not src:
         return "(empty)"
     buf = io.StringIO()
+    ns = world.ns
     try:
         tree = ast.parse(src)
         with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
@@ -213,7 +240,7 @@ def _tool_doc(world: World, name: str, doc: str) -> str:
 
 def dispatch(world: World, block: Block) -> str:
     if block.tag == "python":
-        return _run_python(block.body, world.ns)
+        return _run_python(block.body, world)
     if block.tag == "bash":
         return _run_bash(block.body, world.cwd)
     if block.tag == "register":
@@ -237,9 +264,46 @@ def dispatch(world: World, block: Block) -> str:
         return traceback.format_exc()
 
 
+def _skip_name(name: str) -> bool:
+    if name in HIDDEN_NS or name.startswith("_"):
+        return True
+    return False
+
+
 def ns_names(world: World) -> list[str]:
-    skip = {"__builtins__", "handle"}
-    return sorted(k for k in world.ns if k not in skip and not k.startswith("_"))
+    import inspect
+
+    names = []
+    for k, v in world.ns.items():
+        if _skip_name(k):
+            continue
+        if inspect.ismodule(v):
+            continue
+        names.append(k)
+    return sorted(names)
+
+
+def _shape_of(value: Any) -> str:
+    if isinstance(value, str):
+        return f"str, {len(value)} chars"
+    if isinstance(value, (bytes, bytearray)):
+        return f"{type(value).__name__}, {len(value)} bytes"
+    if isinstance(value, (list, tuple, set, dict)):
+        return f"{type(value).__name__}, len={len(value)}"
+    shape = getattr(value, "shape", None)
+    if shape is not None:
+        return f"{type(value).__name__} shape={shape}"
+    return type(value).__name__
+
+
+def ns_index(world: World) -> str:
+    names = ns_names(world)
+    if not names:
+        return "ns: (empty)"
+    lines = ["ns:"]
+    for name in names:
+        lines.append(f"  {name}: {_shape_of(world.ns.get(name))}")
+    return "\n".join(lines)
 
 
 def catalog(world: World) -> str:
@@ -260,12 +324,11 @@ def system_prompt(world: World) -> str:
 
 
 def header(world: World, task: str) -> str:
-    names = ns_names(world)
     return "\n".join(
         [
-            f"task: {task}",
             f"cwd: {world.cwd}",
-            f"ns: {', '.join(names) if names else '(empty)'}",
+            ns_index(world),
+            f"prompt: {task}",
         ]
     )
 
@@ -336,7 +399,7 @@ def load(world: World) -> None:
 def complete(model: str, system: str, messages: list[dict[str, str]], max_tokens: int) -> dict[str, Any]:
     key = os.environ.get("ANTHROPIC_API_KEY")
     if not key:
-        raise SystemExit("ANTHROPIC_API_KEY is not set")
+        raise RuntimeError("ANTHROPIC_API_KEY is not set")
     payload = {
         "model": model,
         "max_tokens": max_tokens,
@@ -358,7 +421,7 @@ def complete(model: str, system: str, messages: list[dict[str, str]], max_tokens
             return json.loads(resp.read().decode())
     except urllib.error.HTTPError as e:
         body = e.read().decode()
-        raise SystemExit(f"Anthropic HTTP {e.code}: {body[:2000]}") from e
+        raise RuntimeError(f"Anthropic HTTP {e.code}: {body[:2000]}") from e
 
 
 def text_of(resp: dict[str, Any]) -> str:
@@ -378,8 +441,9 @@ def format_results(results: list[tuple[Block, str]]) -> str:
     return "\n\n".join(chunks)
 
 
-def step(world: World, model: str, messages: list[dict[str, str]], max_tokens: int) -> tuple[str, list[tuple[Block, str]], bool]:
-    resp = complete(model, system_prompt(world), messages, max_tokens)
+def turn(world: World, messages: list[dict[str, str]], max_tokens: int) -> tuple[str, list[tuple[Block, str]], bool]:
+    fn = world.complete_fn or complete
+    resp = fn(world.model, system_prompt(world), messages, max_tokens)
     speech = text_of(resp)
     world.log.append(
         {
@@ -394,11 +458,82 @@ def step(world: World, model: str, messages: list[dict[str, str]], max_tokens: i
     return speech, results, not blocks
 
 
-def new_world(cwd: Path, state_path: Path | None = None) -> World:
+def run_turns(
+    world: World,
+    prompt: str,
+    *,
+    max_turns: int = 32,
+    max_tokens: int = 8192,
+    quiet: bool = False,
+) -> str:
+    messages: list[dict[str, str]] = [{"role": "user", "content": header(world, prompt) + "\n\n" + prompt}]
+    last = ""
+    for n in range(1, max_turns + 1):
+        if not quiet:
+            print(f"\n===== turn {n} =====")
+        speech, results, done = turn(world, messages, max_tokens)
+        last = speech
+        if not quiet:
+            print(speech)
+        last_results = format_results(results) if results else ""
+        if last_results and not quiet:
+            print("\n--- results ---")
+            print(last_results)
+        if done:
+            return speech
+        messages.append({"role": "assistant", "content": speech})
+        messages.append(
+            {
+                "role": "user",
+                "content": header(world, prompt) + "\n\nsyscall results:\n" + _clip(last_results, 6000),
+            }
+        )
+    if not quiet:
+        print(f"\n[hit max_turns={max_turns}]")
+    return last
+
+
+def new_world(
+    cwd: Path,
+    state_path: Path | None = None,
+    *,
+    ns: dict[str, Any] | None = None,
+) -> World:
     world = World(cwd=cwd, state_path=state_path)
-    world.ns["CWD"] = str(cwd)
+    if ns is not None:
+        world.ns = ns
+    world.ns.setdefault("CWD", str(cwd))
     seed_builtins(world)
     load(world)
+    return world
+
+
+def bind_step(world: World) -> Callable[..., str]:
+    def step(prompt: str, *, max_turns: int = 32, max_tokens: int = 8192) -> str:
+        if not isinstance(prompt, str) or not prompt.strip():
+            raise TypeError("step(prompt) needs a non-empty string")
+        return run_turns(world, prompt, max_turns=max_turns, max_tokens=max_tokens)
+
+    world.ns["step"] = step
+    world.ns["world"] = world
+    return step
+
+
+def attach(shell: Any = None, *, cwd: str | Path | None = None, model: str | None = None) -> World:
+    if shell is None:
+        try:
+            from IPython import get_ipython
+        except ImportError as exc:
+            raise RuntimeError("IPython is not installed") from exc
+        shell = get_ipython()
+    if shell is None:
+        raise RuntimeError("no IPython shell — use python -m desmos console")
+    path = Path(cwd or Path.cwd()).resolve()
+    world = new_world(path, ns=shell.user_ns)
+    world.shell = shell
+    if model:
+        world.model = model
+    bind_step(world)
     return world
 
 
@@ -408,52 +543,17 @@ def run(args: argparse.Namespace) -> int:
     world = new_world(cwd)
     run_dir = Path(args.out)
     run_dir.mkdir(parents=True, exist_ok=True)
-    task = args.task
-    messages: list[dict[str, str]] = [{"role": "user", "content": header(world, task) + "\n\n" + task}]
-
-    print(f"model={args.model} max_turns={args.max_turns} cwd={cwd}")
+    world.model = args.model
+    print(f"model={world.model} max_turns={args.max_turns} cwd={cwd}")
     print(system_prompt(world))
     print("--------------")
-
-    for turn in range(1, args.max_turns + 1):
-        print(f"\n===== turn {turn} =====")
-        speech, results, done = step(world, args.model, messages, args.max_tokens)
-        print(speech)
-        last_results = format_results(results) if results else ""
-        if last_results:
-            print("\n--- results ---")
-            print(last_results)
-
-        record = {
-            "turn": turn,
-            "speech": speech,
-            "results": [{"tag": b.tag, "attrs": b.attrs, "body": b.body, "result": r} for b, r in results],
-            "ns": ns_names(world),
-            "tools": {n: t.doc for n, t in world.tools.items()},
-            "notes": world.notes,
-        }
-        (run_dir / f"turn-{turn:02d}.json").write_text(json.dumps(record, indent=2), encoding="utf-8")
-
-        if done:
-            print(f"\n[done on turn {turn}]")
-            break
-
-        messages.append({"role": "assistant", "content": speech})
-        messages.append(
-            {
-                "role": "user",
-                "content": header(world, task) + "\n\nsyscall results:\n" + _clip(last_results, 6000),
-            }
-        )
-    else:
-        print(f"\n[hit max_turns={args.max_turns}]")
-
+    run_turns(world, args.task, max_turns=args.max_turns, max_tokens=args.max_tokens)
     summary = {
-        "task": task,
+        "task": args.task,
         "ns": ns_names(world),
         "tools": {n: t.doc for n, t in world.tools.items()},
         "notes": world.notes,
-        "turns": len(list(run_dir.glob("turn-*.json"))),
+        "turns": len(world.log),
         "usage": [e.get("usage") for e in world.log],
     }
     (run_dir / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
@@ -498,6 +598,40 @@ def _self_check() -> None:
 
         assert "deleted" in dispatch(world2, Block("system", "", {"name": "style", "delete": "1"}))
         assert "style" not in world2.notes
+
+        seen: list[str] = []
+
+        def fake_complete(model, system, messages, max_tokens):
+            blob = json.dumps(messages)
+            seen.append(blob)
+            assert "hello world" not in blob
+            if any("syscall results" in (m.get("content") or "") for m in messages):
+                return {"content": [{"type": "text", "text": "11"}], "usage": {}}
+            return {"content": [{"type": "text", "text": "<python>len(doc)</python>"}], "usage": {}}
+
+        ns = {"doc": "hello world"}
+        w3 = new_world(cwd, state_path=cwd / "harness2.json", ns=ns)
+        w3.complete_fn = fake_complete
+        bind_step(w3)
+        out = w3.ns["step"]("how long is doc?")
+        assert ns["doc"] == "hello world"
+        assert out.strip() == "11"
+        assert seen and "hello world" not in seen[0]
+        assert "doc: str, 11 chars" in header(w3, "how long is doc?")
+
+        try:
+            from IPython.core.interactiveshell import InteractiveShell
+        except ImportError:
+            print("self-check ok (no IPython)")
+            return
+        shell = InteractiveShell.instance()
+        shell.user_ns["doc"] = "hello world"
+        w4 = attach(shell, cwd=cwd)
+        w4.state_path = cwd / "harness3.json"
+        w4.complete_fn = fake_complete
+        assert callable(shell.user_ns["step"])
+        assert "doc" in ns_names(w4)
+        assert dispatch(w4, Block("python", "len(doc)", {})) == "11"
 
     print("self-check ok")
 

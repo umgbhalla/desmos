@@ -1,0 +1,23 @@
+[project]
+name = "desmos"
+version = "0.1.0"
+description = "Inverted coding harness: data in the kernel, user calls step(prompt)"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.optional-dependencies]
+kernel = ["ipython>=8", "ipykernel"]
+
+[project.scripts]
+desmos = "desmos.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = ["inverted"]
+
+[tool.setuptools.packages.find]
+include = ["desmos*"]
