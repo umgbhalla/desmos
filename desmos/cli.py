@@ -57,15 +57,15 @@ def cmd_kernel(_args: argparse.Namespace) -> int:
 
 def cmd_check(_args: argparse.Namespace) -> int:
     _on_path()
-    from inverted import _self_check
+    from desmos.check import self_check
 
-    _self_check()
+    self_check()
     return 0
 
 
 def cmd_run(args: argparse.Namespace) -> int:
     _on_path()
-    from inverted import run
+    from desmos.loop import run
 
     return run(args)
 

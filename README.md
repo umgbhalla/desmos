@@ -35,6 +35,10 @@ python -m desmos kernel           # install a Jupyter kernelspec named Desmos
 Ordinary cells stay Python. `step("...")` is the agent. Syscall results
 append as user-role `<result>` blocks on the same transcript (Pi-style).
 `<evolve>` / `<rollback>` snapshot grown state as numbered generations.
+`<edit path="file">old\\n---\\nnew</edit>` is the Prime-style unique replace.
+
+After editing the SDK itself: `reload_sdk()` reimports `desmos.*` and rebinds
+`step` without restarting IPython.
 
 ## Headless
 

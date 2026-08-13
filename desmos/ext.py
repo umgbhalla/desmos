@@ -7,7 +7,7 @@ from inverted import attach
 
 def load_ipython_extension(ip) -> None:
     attach(ip)
-    print('desmos ready — bind data, then step("prompt")')
+    print('desmos ready — bind data, then step("prompt"). reload() / reload_sdk() if you get stuck.')
 
 
 def unload_ipython_extension(ip) -> None:

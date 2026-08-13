@@ -1,5 +1,6 @@
-"""Desmos: inverted coding harness. Data in the kernel, user calls step(prompt)."""
+"""Desmos SDK. Data in the kernel, user calls step(prompt)."""
 
-from inverted import attach, bind_step, new_world, run_turns
+from desmos.loop import attach, bind_step, new_world, reload, reload_sdk, run_turns
+from desmos.types import World
 
-__all__ = ["attach", "bind_step", "new_world", "run_turns"]
+__all__ = ["World", "attach", "bind_step", "new_world", "reload", "reload_sdk", "run_turns"]

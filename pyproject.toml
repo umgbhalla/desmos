@@ -23,4 +23,4 @@ py-modules = ["inverted"]
 include = ["desmos*"]
 
 [tool.setuptools.package-data]
-desmos = ["skills/**/SKILL.md"]
+desmos = ["skills/**/*"]
