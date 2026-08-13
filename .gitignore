@@ -10,6 +10,9 @@ id_ed25519
 .desmos/
 runs/
 
+# vendored clones — analysis only, never committed
+vendor/
+
 # tooling caches
 .mypy_cache/
 .pytest_cache/
