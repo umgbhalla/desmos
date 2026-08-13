@@ -28,6 +28,7 @@ def save(world: World) -> None:
         "prior": world.prior[-PRIOR_KEEP:],
         "generation": world.generation,
         "gen_reason": world.gen_reason,
+        "thinking": world.thinking,
         "messages": world.messages[-80:],
     }
     path.write_text(json.dumps(data, indent=2), encoding="utf-8")
@@ -75,13 +76,14 @@ def load(world: World) -> None:
         world.generation = data["generation"]
     if isinstance(data.get("gen_reason"), str) and data["gen_reason"]:
         world.gen_reason = data["gen_reason"]
+    if isinstance(data.get("thinking"), str) and data["thinking"].strip():
+        world.thinking = data["thinking"].strip()
     raw_msgs = data.get("messages")
     if isinstance(raw_msgs, list):
         world.messages = []
         for item in raw_msgs[-80:]:
-            if (
-                isinstance(item, dict)
-                and item.get("role") in {"user", "assistant"}
-                and isinstance(item.get("content"), str)
-            ):
-                world.messages.append({"role": item["role"], "content": item["content"]})
+            if not isinstance(item, dict) or item.get("role") not in {"user", "assistant"}:
+                continue
+            content = item.get("content")
+            if isinstance(content, str) or isinstance(content, list):
+                world.messages.append({"role": item["role"], "content": content})

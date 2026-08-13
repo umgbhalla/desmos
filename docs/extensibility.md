@@ -7,8 +7,11 @@ harness Prime Agent is built on) and Prime's Python-backed skills.
 
 | Pi / Prime | desmos |
 |---|---|
-| Frozen base system prompt | `ABI` in `inverted.py` |
+| Frozen base system prompt | `ABI` in `desmos/const.py` (system block 1) |
+| Live catalog + `# runtime` | `desmos/catalog.py` (system block 2) |
 | Skills: name+description in prompt | `<available_skills>` in the live catalog |
+| Mid-turn rediscover | `<reload/>` |
+| Live-reload the SDK | `<reload_sdk/>` |
 | Full `SKILL.md` on demand via read/ipython | `<skill name="…"/>` |
 | Python skill imported in the kernel | `ns[import_name] = module`, optional XML tag |
 | Extensions `export default (pi) =>` | `def load(api):` |

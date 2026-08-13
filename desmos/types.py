@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
-from desmos.const import DEFAULT_MODEL
+from desmos.const import DEFAULT_MODEL, DEFAULT_THINKING
 
 
 @dataclass
@@ -33,6 +33,7 @@ class World:
     state_path: Path | None = None
     shell: Any = None
     model: str = field(default_factory=lambda: DEFAULT_MODEL)
+    thinking: str = field(default_factory=lambda: DEFAULT_THINKING)
     complete_fn: Callable[..., dict[str, Any]] | None = None
     prior: list[dict[str, str]] = field(default_factory=list)
     skills: list[Any] = field(default_factory=list)

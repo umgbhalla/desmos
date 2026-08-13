@@ -37,4 +37,6 @@ my-skill/
 
 Export `handle(body, **attrs)` to also become an XML tag `<my_skill>`, or `run(...)` to call from Python as `my_skill.run(...)`.
 
-Place project skills under `.desmos/skills/`. Reload by starting a new console (or `step` after restart).
+Place project skills under `.desmos/skills/`. Then emit `<reload/>` — no
+console restart. The next `complete()` (or a same-turn `<skill name="…"/>`
+after `<reload/>`) sees it.

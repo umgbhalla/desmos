@@ -60,6 +60,14 @@ def dispatch(world: World, block: Block) -> str:
         if skill is None:
             return f"unknown skill {name!r}"
         return load_skill_body(skill)
+    if block.tag == "reload":
+        from desmos.loop import reload
+
+        return reload(world)
+    if block.tag == "reload_sdk":
+        from desmos.loop import reload_sdk
+
+        return reload_sdk(world)
     if block.tag == "evolve":
         return evolve(world, (block.body or block.attrs.get("reason") or "").strip() or "unspecified")
     if block.tag == "rollback":
@@ -71,7 +79,8 @@ def dispatch(world: World, block: Block) -> str:
         return rollback(world, n)
     tool = world.tools.get(block.tag)
     if tool is None or tool.handler is None:
-        return f"unknown tag <{block.tag}> — register it first"
+        known = ", ".join(sorted(world.tools) or sorted(FROZEN))
+        return f"unknown tag <{block.tag}> — not a syscall. Known: {known}. Speak without XML when done."
     try:
         return clip(str(tool.handler(block.body, **block.attrs)))
     except TypeError:

@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from desmos.catalog import header, ns_names, system_prompt
-from desmos.complete import complete, text_of
+from desmos.complete import assistant_content, complete, text_of, thinking_text
 from desmos.const import FROZEN, PRIOR_KEEP
 from desmos.dispatch import dispatch
 from desmos.generations import ensure_gen1, evolve, rollback
@@ -30,16 +30,28 @@ def format_result_message(results: list[tuple[Block, str]]) -> str:
     return "\n\n".join(parts)
 
 
+_BUILTIN_DOCS = (
+    ("python", "exec Python in the persistent kernel"),
+    ("bash", "run a shell command in cwd"),
+    ("edit", "replace one occurrence: path= and body old\\n---\\nnew"),
+    ("register", "install a tag: name= and doc=, body is def handle"),
+    ("system", "write or delete a system note (name=, optional delete=1)"),
+    ("tool", "rewrite a tool description: name= and doc="),
+    ("skill", "load full SKILL.md: name="),
+    ("reload", "rediscover skills and extensions now"),
+    ("reload_sdk", "reimport desmos.* and rebind step; next complete() uses the new ABI"),
+    ("evolve", "snapshot grown state as the next generation"),
+    ("rollback", "restore generation n="),
+)
+
+
 def seed_builtins(world: World) -> None:
-    world.tools["python"] = Tool("python", "exec Python in the persistent kernel", frozen=True)
-    world.tools["bash"] = Tool("bash", "run a shell command in cwd", frozen=True)
-    world.tools["edit"] = Tool("edit", 'replace one occurrence: path= and body old\\n---\\nnew', frozen=True)
-    world.tools["register"] = Tool("register", "install a tag: name= and doc=, body is def handle", frozen=True)
-    world.tools["system"] = Tool("system", "write or delete a system note (name=, optional delete=1)", frozen=True)
-    world.tools["tool"] = Tool("tool", "rewrite a tool description: name= and doc=", frozen=True)
-    world.tools["skill"] = Tool("skill", "load full SKILL.md: name=", frozen=True)
-    world.tools["evolve"] = Tool("evolve", "snapshot grown state as the next generation", frozen=True)
-    world.tools["rollback"] = Tool("rollback", "restore generation n=", frozen=True)
+    for name, doc in _BUILTIN_DOCS:
+        existing = world.tools.get(name)
+        if existing is None:
+            world.tools[name] = Tool(name, doc, frozen=True)
+        else:
+            existing.frozen = True
 
 
 def install_resources(world: World) -> None:
@@ -67,22 +79,34 @@ def reload(world: World) -> str:
     return f"reloaded {len(world.skills)} skills, {len(world.tools)} tools"
 
 
-def turn(world: World, messages: list[dict[str, str]], max_tokens: int) -> tuple[str, list[tuple[Block, str]], bool]:
+def turn(
+    world: World, messages: list[dict[str, Any]], max_tokens: int
+) -> tuple[str, list[tuple[Block, str]], bool, list[dict[str, Any]]]:
     install_resources(world)
-    fn = world.complete_fn or complete
-    resp = fn(world.model, system_prompt(world), messages, max_tokens)
+    if world.complete_fn:
+        resp = world.complete_fn(world.model, system_prompt(world), messages, max_tokens)
+    else:
+        resp = complete(
+            world.model,
+            system_prompt(world),
+            messages,
+            max_tokens,
+            thinking=world.thinking,
+        )
     speech = text_of(resp)
+    assistant = assistant_content(resp)
     world.log.append(
         {
             "ts": datetime.now(timezone.utc).isoformat(),
             "usage": resp.get("usage") or {},
             "stop": resp.get("stop_reason"),
             "text": speech,
+            "thinking": thinking_text(assistant),
         }
     )
     blocks = scan(speech)
     results = [(b, dispatch(world, b)) for b in blocks]
-    return speech, results, not blocks
+    return speech, results, not blocks, assistant
 
 
 def run_turns(
@@ -98,15 +122,20 @@ def run_turns(
     for n in range(1, max_turns + 1):
         if not quiet:
             print(f"\n===== turn {n} =====")
-        speech, results, done = turn(world, world.messages, max_tokens)
+        speech, results, done, assistant = turn(world, world.messages, max_tokens)
         last = speech
+        thoughts = thinking_text(assistant)
+        if thoughts and not quiet:
+            print("--- thinking ---")
+            print(thoughts)
+            print("--------------")
         if not quiet:
             print(speech)
         last_results = format_results(results) if results else ""
         if last_results and not quiet:
             print("\n--- results ---")
             print(last_results)
-        world.messages.append({"role": "assistant", "content": speech})
+        world.messages.append({"role": "assistant", "content": assistant})
         if done:
             world.prior.append({"prompt": prompt, "speech": speech})
             world.prior = world.prior[-PRIOR_KEEP:]
@@ -145,16 +174,30 @@ def bind_step(world: World) -> Callable[..., str]:
     world.ns["world"] = world
     world.ns["reload"] = lambda: reload(world)
     world.ns["reload_sdk"] = lambda: reload_sdk(world)
+    world.ns["reset"] = lambda: reset_transcript(world)
     world.ns["evolve"] = lambda reason="": evolve(world, str(reason))
     world.ns["rollback"] = lambda n=1: rollback(world, int(n))
     return step
 
 
+def reset_transcript(world: World) -> str:
+    """Drop the append-only chat so a poisoned turn cannot train the next one."""
+    n = len(world.messages)
+    world.messages.clear()
+    world.prior.clear()
+    save(world)
+    return f"transcript cleared ({n} messages)"
+
+
 def reload_sdk(world: World | None = None) -> str:
-    """Reimport desmos.* then rebind. Safe to call from the kernel after editing the SDK."""
+    """Reimport desmos.* then rebind. Safe from the kernel or <reload_sdk/> after editing the SDK."""
     import importlib
     import sys
 
+    importlib.invalidate_caches()
+    for name in list(sys.modules):
+        if name == "edit" or name.startswith("desmos_skill_"):
+            del sys.modules[name]
     order = [
         "desmos.const",
         "desmos.types",
@@ -169,6 +212,10 @@ def reload_sdk(world: World | None = None) -> str:
         "desmos.skills",
         "desmos.extensions",
         "desmos.loop",
+        "desmos.ext",
+        "desmos.cli",
+        "desmos",
+        "inverted",
     ]
     reloaded = []
     for name in order:
@@ -178,10 +225,11 @@ def reload_sdk(world: World | None = None) -> str:
         importlib.reload(mod)
         reloaded.append(name)
     if world is not None:
-        # re-bind against the new loop/catalog functions
         from desmos.loop import bind_step as _bind
         from desmos.loop import reload as _reload
+        from desmos.loop import seed_builtins as _seed
 
+        _seed(world)
         _reload(world)
         _bind(world)
     return "sdk reloaded: " + ", ".join(reloaded)
@@ -215,7 +263,7 @@ def run(args: Any) -> int:
     run_dir = Path(args.out)
     run_dir.mkdir(parents=True, exist_ok=True)
     world.model = args.model
-    print(f"model={world.model} max_turns={args.max_turns} cwd={cwd}")
+    print(f"model={world.model} thinking={world.thinking} max_turns={args.max_turns} cwd={cwd}")
     print(system_prompt(world))
     print("--------------")
     run_turns(world, args.task, max_turns=args.max_turns, max_tokens=args.max_tokens)

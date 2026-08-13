@@ -6,6 +6,26 @@ import urllib.error
 import urllib.request
 from typing import Any
 
+INTERLEAVED_BETA = "interleaved-thinking-2025-05-14"
+ADAPTIVE_MARKERS = (
+    "opus-5",
+    "opus-4-6",
+    "opus-4-7",
+    "opus-4-8",
+    "sonnet-4-6",
+    "sonnet-5",
+    "fable-5",
+    "mythos",
+)
+BUDGETS = {
+    "minimal": 1024,
+    "low": 2048,
+    "medium": 4096,
+    "high": 8192,
+    "xhigh": 16384,
+    "max": 16384,
+}
+
 
 def split_system(system: str) -> tuple[str, str]:
     marker = "\n\n# tools"
@@ -15,8 +35,113 @@ def split_system(system: str) -> tuple[str, str]:
     return system, ""
 
 
-def cached_payload(model: str, system: str, messages: list[dict[str, Any]], max_tokens: int) -> dict[str, Any]:
-    """Pi/Anthropic: cache ABI, cache catalog, cache last *user* only."""
+def adaptive_model(model: str) -> bool:
+    name = model.lower()
+    return any(token in name for token in ADAPTIVE_MARKERS)
+
+
+def thinking_level(value: str | None) -> str:
+    raw = (value or "low").strip().lower()
+    if raw in {"off", "none", "0", "false"}:
+        return "off"
+    if raw in {"minimal", "low", "medium", "high", "xhigh", "max"}:
+        return raw
+    return "low"
+
+
+def apply_thinking(payload: dict[str, Any], model: str, level: str | None) -> list[str]:
+    """Mutate payload. Return extra anthropic-beta tokens (Pi/tau)."""
+    mode = thinking_level(level)
+    if mode == "off":
+        return []
+    if adaptive_model(model):
+        # Opus 5 / 4.6+: adaptive thinking already interleaves. No beta header.
+        effort = "max" if mode in {"xhigh", "max"} else mode
+        if effort == "minimal":
+            effort = "low"
+        payload["thinking"] = {"type": "adaptive", "display": "summarized"}
+        payload["output_config"] = {"effort": effort}
+        return []
+    budget = BUDGETS.get(mode, 2048)
+    if int(payload.get("max_tokens") or 0) <= budget:
+        payload["max_tokens"] = budget + 1024
+    payload["thinking"] = {"type": "enabled", "budget_tokens": budget}
+    return [INTERLEAVED_BETA]
+
+
+def wire_content(content: Any) -> list[dict[str, Any]]:
+    """Replay assistant blocks the way Pi convertMessages / tau _anthropic_message do."""
+    if isinstance(content, str):
+        return [{"type": "text", "text": content}] if content else []
+    if not isinstance(content, list):
+        return []
+    blocks: list[dict[str, Any]] = []
+    for raw in content:
+        if not isinstance(raw, dict):
+            continue
+        kind = raw.get("type")
+        if kind == "thinking":
+            text = raw.get("thinking") or ""
+            signature = raw.get("signature") or ""
+            if raw.get("redacted") and (raw.get("data") or signature):
+                blocks.append({"type": "redacted_thinking", "data": raw.get("data") or signature})
+                continue
+            if not signature:
+                if text.strip():
+                    blocks.append({"type": "text", "text": text})
+                continue
+            blocks.append({"type": "thinking", "thinking": text, "signature": signature})
+        elif kind == "redacted_thinking":
+            data = raw.get("data") or ""
+            if data:
+                blocks.append({"type": "redacted_thinking", "data": data})
+        elif kind == "text":
+            text = raw.get("text") or ""
+            if text:
+                blocks.append({"type": "text", "text": text})
+    return blocks
+
+
+def assistant_content(resp: dict[str, Any]) -> list[dict[str, Any]]:
+    """Keep thinking / redacted_thinking / text. Drop everything else."""
+    blocks: list[dict[str, Any]] = []
+    for raw in resp.get("content") or []:
+        if not isinstance(raw, dict):
+            continue
+        kind = raw.get("type")
+        if kind == "thinking":
+            item = {"type": "thinking", "thinking": raw.get("thinking") or ""}
+            if raw.get("signature"):
+                item["signature"] = raw["signature"]
+            blocks.append(item)
+        elif kind == "redacted_thinking":
+            blocks.append({"type": "redacted_thinking", "data": raw.get("data") or ""})
+        elif kind == "text":
+            text = raw.get("text") or ""
+            if text:
+                blocks.append({"type": "text", "text": text})
+    return blocks or [{"type": "text", "text": ""}]
+
+
+def thinking_text(blocks: list[dict[str, Any]]) -> str:
+    parts = []
+    for block in blocks:
+        if block.get("type") == "thinking" and (block.get("thinking") or "").strip():
+            parts.append(block["thinking"])
+        elif block.get("type") == "redacted_thinking":
+            parts.append("[redacted thinking]")
+    return "\n".join(parts)
+
+
+def cached_payload(
+    model: str,
+    system: str,
+    messages: list[dict[str, Any]],
+    max_tokens: int,
+    *,
+    thinking: str | None = "low",
+) -> dict[str, Any]:
+    """Pi/Anthropic: cache ABI, cache catalog, cache last *user* only. Replay thinking."""
     cache = {"type": "ephemeral"}
     abi, catalog_text = split_system(system)
     sys_blocks: list[dict[str, Any]] = [{"type": "text", "text": abi, "cache_control": cache}]
@@ -24,36 +149,63 @@ def cached_payload(model: str, system: str, messages: list[dict[str, Any]], max_
         sys_blocks.append({"type": "text", "text": catalog_text, "cache_control": cache})
     msgs: list[dict[str, Any]] = []
     for m in messages:
-        content = m["content"]
-        if isinstance(content, str):
-            blocks = [{"type": "text", "text": content}]
+        role = m.get("role")
+        if role == "assistant":
+            blocks = wire_content(m.get("content"))
+        elif isinstance(m.get("content"), str):
+            blocks = [{"type": "text", "text": m["content"]}] if m["content"] else []
+        elif isinstance(m.get("content"), list):
+            blocks = []
+            for raw in m["content"]:
+                if isinstance(raw, dict):
+                    block = {k: v for k, v in raw.items() if k != "cache_control"}
+                    blocks.append(block)
+                elif isinstance(raw, str) and raw:
+                    blocks.append({"type": "text", "text": raw})
         else:
-            blocks = [dict(b) for b in content]
-            for b in blocks:
-                b.pop("cache_control", None)
+            blocks = []
         if not blocks:
             continue
-        msgs.append({"role": m["role"], "content": blocks})
+        msgs.append({"role": role, "content": blocks})
     for m in reversed(msgs):
         if m["role"] == "user" and m["content"]:
             m["content"][-1]["cache_control"] = dict(cache)
             break
-    return {"model": model, "max_tokens": max_tokens, "system": sys_blocks, "messages": msgs}
+    payload: dict[str, Any] = {
+        "model": model,
+        "max_tokens": max_tokens,
+        "system": sys_blocks,
+        "messages": msgs,
+    }
+    payload["_betas"] = apply_thinking(payload, model, thinking)
+    return payload
 
 
-def complete(model: str, system: str, messages: list[dict[str, Any]], max_tokens: int) -> dict[str, Any]:
+def complete(
+    model: str,
+    system: str,
+    messages: list[dict[str, Any]],
+    max_tokens: int,
+    *,
+    thinking: str | None = "low",
+) -> dict[str, Any]:
     key = os.environ.get("ANTHROPIC_API_KEY")
     if not key:
         raise RuntimeError("ANTHROPIC_API_KEY is not set")
-    payload = cached_payload(model, system, messages, max_tokens)
+    payload = cached_payload(model, system, messages, max_tokens, thinking=thinking)
+    betas = payload.pop("_betas", [])
+    log_payload(payload, betas)
+    headers = {
+        "x-api-key": key,
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json",
+    }
+    if betas:
+        headers["anthropic-beta"] = ",".join(betas)
     req = urllib.request.Request(
         "https://api.anthropic.com/v1/messages",
         data=json.dumps(payload).encode(),
-        headers={
-            "x-api-key": key,
-            "anthropic-version": "2023-06-01",
-            "content-type": "application/json",
-        },
+        headers=headers,
         method="POST",
     )
     try:
@@ -62,6 +214,80 @@ def complete(model: str, system: str, messages: list[dict[str, Any]], max_tokens
     except urllib.error.HTTPError as e:
         body = e.read().decode()
         raise RuntimeError(f"Anthropic HTTP {e.code}: {body[:2000]}") from e
+
+
+TRAJECTORY_DIR = os.environ.get("DESMOS_TRAJECTORY", ".desmos/trajectory")
+LAST: dict[str, Any] = {}
+
+
+def log_payload(payload: dict[str, Any], betas: list[str]) -> str:
+    """Persist the exact outgoing POST body so a reload can be verified."""
+    import hashlib
+    import time
+
+    record: dict[str, Any] = {
+        "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "betas": betas,
+        "payload": payload,
+    }
+    sysblocks = payload.get("system") or []
+    record["system_digest"] = [
+        {
+            "chars": len(b.get("text") or ""),
+            "sha1": hashlib.sha1((b.get("text") or "").encode()).hexdigest()[:12],
+            "cached": "cache_control" in b,
+            "head": (b.get("text") or "")[:60],
+        }
+        for b in sysblocks
+    ]
+    record["n_messages"] = len(payload.get("messages") or [])
+    LAST.clear()
+    LAST.update(record)
+    try:
+        os.makedirs(TRAJECTORY_DIR, exist_ok=True)
+        n = len([f for f in os.listdir(TRAJECTORY_DIR) if f.endswith(".json")]) + 1
+        path = os.path.join(TRAJECTORY_DIR, f"{n:04d}.json")
+        with open(path, "w") as fh:
+            json.dump(record, fh, indent=2)
+        return path
+    except OSError:
+        return ""
+
+
+def trajectory(n: int = 1) -> list[dict[str, Any]]:
+    """Digests of the last n logged payloads, newest last."""
+    if not os.path.isdir(TRAJECTORY_DIR):
+        return []
+    files = sorted(f for f in os.listdir(TRAJECTORY_DIR) if f.endswith(".json"))
+    out = []
+    for f in files[-n:]:
+        with open(os.path.join(TRAJECTORY_DIR, f)) as fh:
+            rec = json.load(fh)
+        out.append(
+            {
+                "file": f,
+                "ts": rec.get("ts"),
+                "n_messages": rec.get("n_messages"),
+                "system": rec.get("system_digest"),
+            }
+        )
+    return out
+
+
+def payload_diff() -> dict[str, Any]:
+    """Did the system prompt actually change between the last two calls?"""
+    recs = trajectory(2)
+    if len(recs) < 2:
+        return {"changed": None, "reason": "need 2 logged calls"}
+    before = [b["sha1"] for b in recs[0]["system"]]
+    after = [b["sha1"] for b in recs[1]["system"]]
+    return {
+        "changed": before != after,
+        "before": before,
+        "after": after,
+        "chars_before": [x["chars"] for x in recs[0]["system"]],
+        "chars_after": [x["chars"] for x in recs[1]["system"]],
+    }
 
 
 def text_of(resp: dict[str, Any]) -> str:

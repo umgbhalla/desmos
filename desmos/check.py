@@ -4,9 +4,10 @@ from pathlib import Path
 
 from desmos.dispatch import dispatch
 from desmos.generations import evolve, gen_dir, rollback
-from desmos.loop import attach, bind_step, new_world, reload
+from desmos.loop import attach, bind_step, new_world
 from desmos.catalog import header, ns_names, system_prompt
 from desmos.scan import scan
+from desmos.complete import INTERLEAVED_BETA
 from desmos.types import Block
 
 
@@ -16,8 +17,62 @@ def self_check() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         cwd = Path(tmp)
         world = new_world(cwd, state_path=cwd / "harness.json")
-        assert "cwd:" in system_prompt(world)
-        assert "reload" in system_prompt(world)
+        from desmos.complete import cached_payload
+        from desmos.const import ABI
+
+        prompt = system_prompt(world)
+        assert "cwd:" in prompt
+        assert "reload_sdk" in prompt
+        assert "sdk:" in prompt
+        assert "thinking:" in prompt
+        assert "<edit" in ABI
+        assert "<reload_sdk" in ABI
+        assert "XML tags are syscalls" in ABI
+        assert "Look around first" in ABI
+        assert world.thinking == "low"
+
+        payload = cached_payload(
+            "claude-opus-5",
+            ABI + "\n\n# tools\n<python> exec",
+            [{"role": "user", "content": "hi"}],
+            8192,
+            thinking="low",
+        )
+        assert payload["thinking"] == {"type": "adaptive", "display": "summarized"}
+        assert payload["output_config"] == {"effort": "low"}
+        assert payload["_betas"] == []
+        replay = cached_payload(
+            "claude-opus-5",
+            ABI + "\n\n# tools\nx",
+            [
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "thinking", "thinking": "plan", "signature": "sig"},
+                        {"type": "redacted_thinking", "data": "opaque"},
+                        {"type": "text", "text": "hi"},
+                    ],
+                },
+                {"role": "user", "content": "ok"},
+            ],
+            8192,
+            thinking="low",
+        )
+        kinds = [b["type"] for b in replay["messages"][0]["content"]]
+        assert kinds == ["thinking", "redacted_thinking", "text"]
+        assert replay["messages"][0]["content"][1]["data"] == "opaque"
+        budget = cached_payload(
+            "claude-sonnet-4-5",
+            ABI + "\n\n# tools\nx",
+            [{"role": "user", "content": "hi"}],
+            8192,
+            thinking="low",
+        )
+        assert budget["thinking"]["type"] == "enabled"
+        assert budget["thinking"]["budget_tokens"] == 2048
+        assert INTERLEAVED_BETA in budget["_betas"]
+        assert "reload" in world.tools and world.tools["reload"].frozen
+        assert "reload_sdk" in world.tools and world.tools["reload_sdk"].frozen
         assert any(s.name == "skill-creator" for s in world.skills)
         assert "skill-creator" in dispatch(world, Block("skill", "", {"name": "skill-creator"}))
         assert any(s.name == "edit" for s in world.skills) or "edit" in world.tools
@@ -48,11 +103,22 @@ def self_check() -> None:
             "---\nname: later\ndescription: appeared after start\n---\n# later\nok\n",
             encoding="utf-8",
         )
-        reload(world)
+        assert not any(s.name == "later" for s in world.skills)
+        assert "reloaded" in dispatch(world, Block("reload", "", {}))
         assert any(s.name == "later" for s in world.skills)
+        assert dispatch(world, Block("skill", "", {"name": "later"})).endswith("ok\n")
+
+        sdk_out = dispatch(world, Block("reload_sdk", "", {}))
+        assert "sdk reloaded" in sdk_out
+        assert "reload_sdk" in world.tools
 
         blocks = scan('<python>x = 1+1</python>\n<bash>echo hi</bash>')
         assert [b.tag for b in blocks] == ["python", "bash"]
+        lone = scan("<usage/>\n<reload/>\n<reload_sdk/>\n<rollback n=\"1\"/>\n<skill name=\"ping\"/>")
+        assert [b.tag for b in lone] == ["usage", "reload", "reload_sdk", "rollback", "skill"]
+        assert lone[0].body == ""
+        assert lone[3].attrs == {"n": "1"}
+        assert lone[4].attrs == {"name": "ping"}
         assert dispatch(world, blocks[0]) == "ok"
         assert world.ns["x"] == 2
         assert dispatch(world, blocks[1]).strip() == "hi"
@@ -86,6 +152,24 @@ def self_check() -> None:
         assert out.strip() == "11"
         assert w3.messages[2]["content"].startswith("<result")
         assert "prompt:" not in w3.messages[2]["content"]
+        def fake_usage(_model, _system, messages, _max_tokens):
+            if any("<result" in (m.get("content") or "") for m in messages):
+                return {"content": [{"type": "text", "text": "hello"}], "usage": {}}
+            return {"content": [{"type": "text", "text": "<usage/>"}], "usage": {}}
+
+        w_usage = new_world(cwd, state_path=cwd / "harness-usage.json", ns={})
+        dispatch(
+            w_usage,
+            Block("register", "def handle(body, **a):\n    return 'tokens:0'\n", {"name": "usage", "doc": "stats"}),
+        )
+        w_usage.complete_fn = fake_usage
+        bind_step(w_usage)
+        spoken = w_usage.ns["step"]("hi there")
+        assert spoken.strip() == "hello"
+        assert "tokens:0" in w_usage.messages[2]["content"]
+        assert "transcript cleared" in w_usage.ns["reset"]()
+        assert w_usage.messages == []
+
         ev = evolve(w3, "after ping")
         assert "generation 2" in ev
         assert (gen_dir(w3) / "0001.json").is_file()
@@ -106,6 +190,7 @@ def self_check() -> None:
         w4.complete_fn = fake_complete
         assert callable(shell.user_ns["step"])
         assert callable(shell.user_ns.get("reload_sdk"))
+        assert callable(shell.user_ns.get("reset"))
         assert "doc" in ns_names(w4)
         assert dispatch(w4, Block("python", "len(doc)", {})) == "11"
 

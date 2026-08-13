@@ -176,7 +176,8 @@ def bind_python_skill(ns: dict[str, Any], skill: Skill) -> Any | None:
     entry = _python_entry(skill.file_path.parent, skill.import_name)
     if entry is None:
         return None
-    spec = importlib.util.spec_from_file_location(skill.import_name, entry)
+    mod_name = f"desmos_skill_{skill.import_name}"
+    spec = importlib.util.spec_from_file_location(mod_name, entry)
     if spec is None or spec.loader is None:
         return None
     module = importlib.util.module_from_spec(spec)

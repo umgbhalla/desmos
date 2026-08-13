@@ -64,9 +64,11 @@ do work
 
 ### What may not grow
 
-`scan`, `turn` / `step`, `complete`, exec policy, budget, the five/six
-frozen tags. If the agent can rewrite the loop, it eats itself. Prime
-froze the base prompt for the same reason.
+`scan`, `turn` / `step`, `complete`, exec policy, budget, the frozen tags.
+The agent *can* edit `desmos/*.py` and `<reload_sdk/>` — that is a species
+fork applied live, not growth. Prefer a skill. If the agent rewrites the
+loop casually, it eats itself. Prime froze the base prompt for the same
+reason.
 
 ### Why this is difficult
 
@@ -78,8 +80,9 @@ Descriptions must be trigger conditions ("Use when…"), not slogans.
 Unused skills should be disable-able.
 
 **3. Reload is the missing physics.** Writing `SKILL.md` during a turn
-does nothing if `new_world()` already ran. Growth requires rediscovery
-*before the next complete()*. Without that, self-growth is a story.
+does nothing until rediscovery. `<reload/>` does that mid-turn; every
+`turn()` also rediscovers before `complete()`. Without that, self-growth
+is a story.
 
 **4. Refine is a different creature.** The working agent is a bad editor
 of its own soul while it is failing. A second, narrow pass (or a human
@@ -99,7 +102,9 @@ lists.
 - Each `turn()` rediscovers skills and extensions before `complete()`.
 - `<skill name>` loads the file. Python `handle`/`run` binds into `ns`
   and may become a tag.
-- `reload()` is also a user-callable in the kernel.
+- `<reload/>` / `reload()` rediscover mid-turn (after writing a skill).
+- `<reload_sdk/>` / `reload_sdk()` reimports the SDK and rebinds `step`.
+  New ABI applies on the next `complete()`. Heap, notes, messages stay.
 - Artifacts live on disk (`.desmos/skills`, `.desmos/harness.json`).
   The prompt only holds the index.
 
@@ -122,4 +127,6 @@ throws the list away would miss everything; we do not do that.
 
 Gen 1 is the starting snapshot of grown state (notes, registered tools,
 docs). `<evolve>why</evolve>` writes gen N+1. `<rollback n="1"/>` restores.
-Editing `inverted.py` is a fork of the species, not a generation.
+Editing `desmos/*.py` is a fork of the species, not a generation. Apply
+it live with `<reload_sdk/>`. Snapshot first with `<evolve>` if you want
+a way back.

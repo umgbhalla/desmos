@@ -10,6 +10,13 @@ id_ed25519
 .desmos/
 runs/
 
+# tooling caches
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+*.log
+
 # python
 __pycache__/
 *.py[cod]

@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-from inverted import attach
+from desmos.loop import attach
 
 
 def load_ipython_extension(ip) -> None:
     attach(ip)
-    print('desmos ready — bind data, then step("prompt"). reload() / reload_sdk() if you get stuck.')
+    print('desmos ready — bind data, then step("prompt"). reload_sdk() / reset() if a turn goes dead.')
 
 
 def unload_ipython_extension(ip) -> None:

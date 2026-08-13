@@ -9,7 +9,17 @@ from pathlib import Path
 
 from desmos.check import self_check
 from desmos.const import DEFAULT_MODEL
-from desmos.loop import run
+from desmos.loop import attach, bind_step, new_world, reload, reload_sdk, run, run_turns
+
+__all__ = [
+    "attach",
+    "bind_step",
+    "new_world",
+    "reload",
+    "reload_sdk",
+    "run",
+    "run_turns",
+]
 
 
 def main() -> int:

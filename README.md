@@ -12,15 +12,22 @@ step("what's in doc? don't dump it")
 step("ok, now list the functions it defines")
 ```
 
-Five XML tags are frozen. Everything else — new tools, descriptions, system
-notes — the model writes itself, and the next turn sees the change.
+Frozen XML tags are the brainstem. Everything else — new tools, descriptions,
+system notes, skills — the model writes itself from inside the kernel. The
+next `complete()` sees the change. No restart.
 
 ```
 <python>          exec, names persist
 <bash>            shell in cwd
+<edit>            unique replace (old --- new)
 <register>        grow a new tag
-<system>          write / delete a system note
+<system>          write / delete a catalog note
 <tool>            rewrite a tool description
+<skill>           load a full SKILL.md
+<reload>          rediscover skills/extensions now
+<reload_sdk>      reimport desmos.* and rebind step
+<evolve>          snapshot grown state
+<rollback>        restore generation n=
 ```
 
 ## IPython
@@ -37,13 +44,17 @@ append as user-role `<result>` blocks on the same transcript (Pi-style).
 `<evolve>` / `<rollback>` snapshot grown state as numbered generations.
 `<edit path="file">old\\n---\\nnew</edit>` is the Prime-style unique replace.
 
-After editing the SDK itself: `reload_sdk()` reimports `desmos.*` and rebinds
-`step` without restarting IPython.
+The agent updates itself: write a skill or a note, then `<reload/>`. After
+editing the SDK: `<reload_sdk/>` (or `reload_sdk()` in a cell) reimports
+`desmos.*` and rebinds `step` without restarting IPython. New ABI/loop apply
+on the next `complete()`.
 
 ## Headless
 
 `ANTHROPIC_API_KEY` comes from the environment. Never commit it.
 `DESMOS_MODEL` overrides the default (`claude-opus-5`).
+`DESMOS_THINKING` is the effort floor (`low` by default). Opus 5 uses adaptive
+thinking; older Claude 4 models use a token budget plus interleaved thinking.
 
 ```bash
 python -m desmos check
