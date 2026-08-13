@@ -6,7 +6,8 @@
 id_rsa
 id_ed25519
 
-# experiment output (may contain model traces)
+# local harness state and traces
+.desmos/
 runs/
 
 # python
