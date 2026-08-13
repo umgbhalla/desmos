@@ -27,7 +27,7 @@ from typing import Any, Callable
 
 TAG_OPEN = re.compile(r"<([A-Za-z_][\w.-]*)((?:\s+[^>]*?)?)>", re.S)
 ATTR = re.compile(r'([A-Za-z_][\w.-]*)\s*=\s*"([^"]*)"')
-FROZEN = frozenset({"python", "bash", "register", "system", "tool"})
+FROZEN = frozenset({"python", "bash", "register", "system", "tool", "skill"})
 RESULT_CAP = 8000
 BASH_TIMEOUT = 60
 PRIOR_KEEP = 8
@@ -56,6 +56,10 @@ drop a note.
 
 <tool name="tag" doc="description"/>
 rewrite a tool's description, including builtins. The catalog is the prompt.
+
+<skill name="name"/>
+load the full SKILL.md for a cataloged skill. Only names and descriptions sit
+in the prompt until you load one.
 
 Names listed under ns are kernel variables. Refer to them by name. Peek with
 <python>. Their contents are not in this prompt.
@@ -112,6 +116,8 @@ class World:
     model: str = field(default_factory=lambda: DEFAULT_MODEL)
     complete_fn: Callable[..., dict[str, Any]] | None = None
     prior: list[dict[str, str]] = field(default_factory=list)
+    skills: list[Any] = field(default_factory=list)
+    hooks: dict[str, list[Callable[..., Any]]] = field(default_factory=dict)
 
 
 def scan(text: str) -> list[Block]:
@@ -242,6 +248,10 @@ def _tool_doc(world: World, name: str, doc: str) -> str:
 
 
 def dispatch(world: World, block: Block) -> str:
+    for hook in world.hooks.get("before_dispatch", []):
+        verdict = hook(world, block)
+        if isinstance(verdict, str):
+            return verdict
     if block.tag == "python":
         return _run_python(block.body, world)
     if block.tag == "bash":
@@ -253,6 +263,14 @@ def dispatch(world: World, block: Block) -> str:
         return _system(world, block.body, block.attrs.get("name", ""), delete)
     if block.tag == "tool":
         return _tool_doc(world, block.attrs.get("name", ""), block.attrs.get("doc", "") or block.body)
+    if block.tag == "skill":
+        from desmos.skills import load_skill_body
+
+        name = (block.attrs.get("name") or block.body).strip()
+        skill = next((s for s in world.skills if s.name == name), None)
+        if skill is None:
+            return f"unknown skill {name!r}"
+        return load_skill_body(skill)
     tool = world.tools.get(block.tag)
     if tool is None or tool.handler is None:
         return f"unknown tag <{block.tag}> — register it first"
@@ -319,6 +337,12 @@ def catalog(world: World) -> str:
         lines.append("# your notes")
         for key, note in world.notes.items():
             lines.append(f"[{key}]\n{note}")
+    if world.skills:
+        from desmos.skills import format_skills_for_prompt
+
+        block = format_skills_for_prompt(world.skills)
+        if block:
+            lines.append(block)
     return "\n".join(lines)
 
 
@@ -343,6 +367,7 @@ def seed_builtins(world: World) -> None:
     world.tools["register"] = Tool("register", 'install a tag: name= and doc=, body is def handle(body, **attrs)', frozen=True)
     world.tools["system"] = Tool("system", "write or delete a system note (name=, optional delete=1)", frozen=True)
     world.tools["tool"] = Tool("tool", "rewrite a tool description: name= and doc=", frozen=True)
+    world.tools["skill"] = Tool("skill", "load full SKILL.md: name=", frozen=True)
 
 
 def state_file(world: World) -> Path:
@@ -521,8 +546,28 @@ def new_world(
         world.ns = ns
     world.ns.setdefault("CWD", str(cwd))
     seed_builtins(world)
+    _install_resources(world)
     load(world)
     return world
+
+
+def _install_resources(world: World) -> None:
+    from desmos.extensions import load_extensions
+    from desmos.skills import bind_python_skill, discover_skills
+
+    world.skills = discover_skills(world.cwd)
+    for skill in world.skills:
+        fn = bind_python_skill(world.ns, skill)
+        if callable(fn) and skill.import_name and skill.import_name not in FROZEN:
+            world.tools.setdefault(
+                skill.import_name,
+                Tool(name=skill.import_name, doc=skill.description or f"skill {skill.name}", handler=fn),
+            )
+    api = load_extensions(world.cwd)
+    world.hooks = api.hooks
+    for name, doc, handler in api.tools:
+        if name not in FROZEN:
+            world.tools[name] = Tool(name=name, doc=doc, handler=handler)
 
 
 def bind_step(world: World) -> Callable[..., str]:
@@ -585,6 +630,19 @@ def _self_check() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         cwd = Path(tmp)
         world = new_world(cwd, state_path=cwd / "harness.json")
+        assert any(s.name == "skill-creator" for s in world.skills)
+        assert "skill-creator" in dispatch(world, Block("skill", "", {"name": "skill-creator"}))
+
+        ping = cwd / ".desmos" / "skills" / "ping"
+        ping.mkdir(parents=True)
+        (ping / "SKILL.md").write_text(
+            "---\nname: ping\ndescription: reply pong\n---\n# ping\nbody\n",
+            encoding="utf-8",
+        )
+        (ping / "skill.py").write_text("def handle(body, **a):\n    return 'pong:' + body\n", encoding="utf-8")
+        world = new_world(cwd, state_path=cwd / "harness.json")
+        assert dispatch(world, Block("skill", "", {"name": "ping"})).endswith("body\n")
+        assert dispatch(world, Block("ping", "hi", {})) == "pong:hi"
 
         blocks = scan('<python>x = 1+1</python>\n<bash>echo hi</bash>')
         assert [b.tag for b in blocks] == ["python", "bash"]

@@ -49,3 +49,29 @@ python inverted.py "task"
 
 State lands in `.desmos/harness.json` (gitignored): grown tools, notes, prior
 steps. Traces go under `runs/`.
+
+## Skills and extensions (Pi / Prime grain)
+
+Same shape as [earendil-works/pi](https://github.com/earendil-works/pi) and Prime
+Agent. The base ABI stays frozen. Capability is discovered, not baked in.
+
+**Skills** — Agent Skills `SKILL.md`. Catalog is name + description only.
+`<skill name="…"/>` loads the full file. Python-backed skills (a `handle`/`run`
+module) are imported into the kernel.
+
+```
+~/.desmos/skills/<name>/SKILL.md
+.desmos/skills/<name>/SKILL.md
+~/.agents/skills/          # shared with other harnesses
+.agents/skills/
+```
+
+**Extensions** — `load(api)` Python files. They can `api.register_tool` or
+`api.on("before_dispatch", …)`.
+
+```
+~/.desmos/extensions/*.py
+.desmos/extensions/*.py
+```
+
+See [docs/extensibility.md](docs/extensibility.md).
