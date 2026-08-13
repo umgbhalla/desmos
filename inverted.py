@@ -30,6 +30,8 @@ ATTR = re.compile(r'([A-Za-z_][\w.-]*)\s*=\s*"([^"]*)"')
 FROZEN = frozenset({"python", "bash", "register", "system", "tool"})
 RESULT_CAP = 8000
 BASH_TIMEOUT = 60
+PRIOR_KEEP = 8
+DEFAULT_MODEL = os.environ.get("DESMOS_MODEL") or "claude-opus-5"
 
 ABI = """You are a coding agent in a persistent Python kernel, working in the user's cwd.
 Text is speech. XML tags are syscalls.
@@ -107,8 +109,9 @@ class World:
     cwd: Path = field(default_factory=lambda: Path.cwd())
     state_path: Path | None = None
     shell: Any = None
-    model: str = "claude-opus-5"
+    model: str = field(default_factory=lambda: DEFAULT_MODEL)
     complete_fn: Callable[..., dict[str, Any]] | None = None
+    prior: list[dict[str, str]] = field(default_factory=list)
 
 
 def scan(text: str) -> list[Block]:
@@ -324,13 +327,14 @@ def system_prompt(world: World) -> str:
 
 
 def header(world: World, task: str) -> str:
-    return "\n".join(
-        [
-            f"cwd: {world.cwd}",
-            ns_index(world),
-            f"prompt: {task}",
-        ]
-    )
+    lines = [f"cwd: {world.cwd}", ns_index(world)]
+    if world.prior:
+        lines.append("prior steps:")
+        for i, item in enumerate(world.prior[-PRIOR_KEEP:], 1):
+            lines.append(f"  {i}. user: {_clip(item['prompt'], 240)}")
+            lines.append(f"     you: {_clip(item['speech'], 400)}")
+    lines.append(f"prompt: {task}")
+    return "\n".join(lines)
 
 
 def seed_builtins(world: World) -> None:
@@ -358,6 +362,7 @@ def save(world: World) -> None:
             if not tool.frozen
         },
         "docs": {name: tool.doc for name, tool in world.tools.items() if tool.frozen},
+        "prior": world.prior[-PRIOR_KEEP:],
     }
     path.write_text(json.dumps(data, indent=2), encoding="utf-8")
 
@@ -394,6 +399,12 @@ def load(world: World) -> None:
             except Exception:
                 continue
             world.tools[name] = Tool(name=name, doc=doc, source=source, handler=fn)
+    raw_prior = data.get("prior")
+    if isinstance(raw_prior, list):
+        world.prior = []
+        for item in raw_prior[-PRIOR_KEEP:]:
+            if isinstance(item, dict) and isinstance(item.get("prompt"), str) and isinstance(item.get("speech"), str):
+                world.prior.append({"prompt": item["prompt"], "speech": item["speech"]})
 
 
 def complete(model: str, system: str, messages: list[dict[str, str]], max_tokens: int) -> dict[str, Any]:
@@ -480,6 +491,9 @@ def run_turns(
             print("\n--- results ---")
             print(last_results)
         if done:
+            world.prior.append({"prompt": prompt, "speech": speech})
+            world.prior = world.prior[-PRIOR_KEEP:]
+            save(world)
             return speech
         messages.append({"role": "assistant", "content": speech})
         messages.append(
@@ -490,6 +504,9 @@ def run_turns(
         )
     if not quiet:
         print(f"\n[hit max_turns={max_turns}]")
+    world.prior.append({"prompt": prompt, "speech": last})
+    world.prior = world.prior[-PRIOR_KEEP:]
+    save(world)
     return last
 
 
@@ -618,6 +635,9 @@ def _self_check() -> None:
         assert out.strip() == "11"
         assert seen and "hello world" not in seen[0]
         assert "doc: str, 11 chars" in header(w3, "how long is doc?")
+        assert w3.prior and w3.prior[-1]["prompt"] == "how long is doc?"
+        w3.ns["step"]("say hi")
+        assert "how long is doc?" in header(w3, "say hi")
 
         try:
             from IPython.core.interactiveshell import InteractiveShell

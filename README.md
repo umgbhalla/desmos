@@ -4,11 +4,12 @@ A coding agent that owns its harness.
 
 You put data in the kernel. You write a prompt. You call `step`. The model
 peeks at variables by name. It does not get their contents stuffed into the
-chat.
+chat. Sequential `step` calls see prior prompts and answers.
 
 ```python
 doc = open("paper.txt").read()
 step("what's in doc? don't dump it")
+step("ok, now list the functions it defines")
 ```
 
 Five XML tags are frozen. Everything else — new tools, descriptions, system
@@ -25,7 +26,8 @@ notes — the model writes itself, and the next turn sees the change.
 ## IPython
 
 ```bash
-uv pip install -e ".[kernel]"
+uv venv && uv pip install -e ".[kernel]"
+source .venv/bin/activate
 python -m desmos console          # IPython with step and world bound
 python -m desmos kernel           # install a Jupyter kernelspec named Desmos
 ```
@@ -35,11 +37,15 @@ Ordinary cells stay Python. `step("...")` is the agent.
 ## Headless
 
 `ANTHROPIC_API_KEY` comes from the environment. Never commit it.
+`DESMOS_MODEL` overrides the default (`claude-opus-5`).
 
 ```bash
-python3 inverted.py --check
-python3 inverted.py "add a --json flag to inverted.py --check"
+python -m desmos check
+python -m desmos run "add a --json flag to inverted.py --check"
+# or
+python inverted.py --check
+python inverted.py "task"
 ```
 
-State lands in `.desmos/harness.json` (gitignored). Traces go under `runs/`.
-
+State lands in `.desmos/harness.json` (gitignored): grown tools, notes, prior
+steps. Traces go under `runs/`.
