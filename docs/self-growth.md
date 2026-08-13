@@ -103,4 +103,23 @@ lists.
 - Artifacts live on disk (`.desmos/skills`, `.desmos/harness.json`).
   The prompt only holds the index.
 
-That is the whole design. Everything else is temptation.
+## Trajectory (Pi / Anthropic)
+
+The chat is append-only. Tool results expand on the **user** side as
+`<result>` only — never a restated task. `step()` appends a new user
+utterance onto the same `world.messages`.
+
+Cache breakpoints copy earendil-works/pi:
+
+1. frozen ABI (system block 1)
+2. live catalog (system block 2)
+3. last **user** / result block — never assistant
+
+Catalog changes miss breakpoint 2; ABI can still hit. A new `step()` that
+throws the list away would miss everything; we do not do that.
+
+## Generations
+
+Gen 1 is the starting snapshot of grown state (notes, registered tools,
+docs). `<evolve>why</evolve>` writes gen N+1. `<rollback n="1"/>` restores.
+Editing `inverted.py` is a fork of the species, not a generation.

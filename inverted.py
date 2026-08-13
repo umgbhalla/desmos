@@ -27,7 +27,7 @@ from typing import Any, Callable
 
 TAG_OPEN = re.compile(r"<([A-Za-z_][\w.-]*)((?:\s+[^>]*?)?)>", re.S)
 ATTR = re.compile(r'([A-Za-z_][\w.-]*)\s*=\s*"([^"]*)"')
-FROZEN = frozenset({"python", "bash", "register", "system", "tool", "skill"})
+FROZEN = frozenset({"python", "bash", "register", "system", "tool", "skill", "evolve", "rollback"})
 RESULT_CAP = 8000
 BASH_TIMEOUT = 60
 PRIOR_KEEP = 8
@@ -60,6 +60,13 @@ rewrite a tool's description, including builtins. The catalog is the prompt.
 <skill name="name"/>
 load the full SKILL.md for a cataloged skill. Only names and descriptions sit
 in the prompt until you load one.
+
+<evolve>why</evolve>
+snapshot grown state as the next generation. Frozen ABI does not change.
+<rollback n="1"/>
+restore that generation.
+
+<system> without name writes the note named "note".
 
 Names listed under ns are kernel variables. Refer to them by name. Peek with
 <python>. Their contents are not in this prompt.
@@ -95,6 +102,8 @@ HIDDEN_NS = frozenset(
         "step",
         "world",
         "reload",
+        "evolve",
+        "rollback",
         "handle",
         "__builtins__",
         "_ih",
@@ -119,6 +128,9 @@ class World:
     prior: list[dict[str, str]] = field(default_factory=list)
     skills: list[Any] = field(default_factory=list)
     hooks: dict[str, list[Callable[..., Any]]] = field(default_factory=dict)
+    messages: list[dict[str, Any]] = field(default_factory=list)
+    generation: int = 1
+    gen_reason: str = "gen-1"
 
 
 def scan(text: str) -> list[Block]:
@@ -228,7 +240,7 @@ def _register(world: World, body: str, name: str, doc: str) -> str:
 
 def _system(world: World, body: str, name: str, delete: bool) -> str:
     if not name:
-        return "system failed: name required"
+        name = "note"
     if delete:
         existed = world.notes.pop(name, None)
         save(world)
@@ -272,6 +284,15 @@ def dispatch(world: World, block: Block) -> str:
         if skill is None:
             return f"unknown skill {name!r}"
         return load_skill_body(skill)
+    if block.tag == "evolve":
+        return evolve(world, (block.body or block.attrs.get("reason") or "").strip() or "unspecified")
+    if block.tag == "rollback":
+        raw = block.attrs.get("n") or block.body.strip() or "1"
+        try:
+            n = int(raw)
+        except ValueError:
+            return f"rollback failed: bad n {raw!r}"
+        return rollback(world, n)
     tool = world.tools.get(block.tag)
     if tool is None or tool.handler is None:
         return f"unknown tag <{block.tag}> — register it first"
@@ -352,7 +373,7 @@ def system_prompt(world: World) -> str:
 
 
 def header(world: World, task: str) -> str:
-    lines = [f"cwd: {world.cwd}", ns_index(world)]
+    lines = [f"generation: {world.generation} ({world.gen_reason})", f"cwd: {world.cwd}", ns_index(world)]
     if world.prior:
         lines.append("prior steps:")
         for i, item in enumerate(world.prior[-PRIOR_KEEP:], 1):
@@ -369,6 +390,8 @@ def seed_builtins(world: World) -> None:
     world.tools["system"] = Tool("system", "write or delete a system note (name=, optional delete=1)", frozen=True)
     world.tools["tool"] = Tool("tool", "rewrite a tool description: name= and doc=", frozen=True)
     world.tools["skill"] = Tool("skill", "load full SKILL.md: name=", frozen=True)
+    world.tools["evolve"] = Tool("evolve", "snapshot grown state as the next generation; body is the reason", frozen=True)
+    world.tools["rollback"] = Tool("rollback", "restore generation n=", frozen=True)
 
 
 def state_file(world: World) -> Path:
@@ -389,6 +412,9 @@ def save(world: World) -> None:
         },
         "docs": {name: tool.doc for name, tool in world.tools.items() if tool.frozen},
         "prior": world.prior[-PRIOR_KEEP:],
+        "generation": world.generation,
+        "gen_reason": world.gen_reason,
+        "messages": world.messages[-80:],
     }
     path.write_text(json.dumps(data, indent=2), encoding="utf-8")
 
@@ -431,18 +457,63 @@ def load(world: World) -> None:
         for item in raw_prior[-PRIOR_KEEP:]:
             if isinstance(item, dict) and isinstance(item.get("prompt"), str) and isinstance(item.get("speech"), str):
                 world.prior.append({"prompt": item["prompt"], "speech": item["speech"]})
+    if isinstance(data.get("generation"), int) and data["generation"] > 0:
+        world.generation = data["generation"]
+    if isinstance(data.get("gen_reason"), str) and data["gen_reason"]:
+        world.gen_reason = data["gen_reason"]
+    raw_msgs = data.get("messages")
+    if isinstance(raw_msgs, list):
+        world.messages = []
+        for item in raw_msgs[-80:]:
+            if isinstance(item, dict) and item.get("role") in {"user", "assistant"} and isinstance(item.get("content"), str):
+                world.messages.append({"role": item["role"], "content": item["content"]})
 
 
-def complete(model: str, system: str, messages: list[dict[str, str]], max_tokens: int) -> dict[str, Any]:
+def _split_system(system: str) -> tuple[str, str]:
+    marker = "\n\n# tools"
+    if marker in system:
+        i = system.index(marker)
+        return system[:i], system[i + 2 :]
+    return system, ""
+
+
+def _cached_payload(model: str, system: str, messages: list[dict[str, Any]], max_tokens: int) -> dict[str, Any]:
+    """Pi/Anthropic breakpoints: cached ABI, cached catalog, cached last *user*."""
+    cache = {"type": "ephemeral"}
+    abi, catalog_text = _split_system(system)
+    sys_blocks: list[dict[str, Any]] = [{"type": "text", "text": abi, "cache_control": cache}]
+    if catalog_text.strip():
+        sys_blocks.append({"type": "text", "text": catalog_text, "cache_control": cache})
+    msgs: list[dict[str, Any]] = []
+    for m in messages:
+        content = m["content"]
+        if isinstance(content, str):
+            blocks = [{"type": "text", "text": content}]
+        else:
+            blocks = [dict(b) for b in content]
+            for b in blocks:
+                b.pop("cache_control", None)
+        if not blocks:
+            continue
+        msgs.append({"role": m["role"], "content": blocks})
+    # Pi: only stamp the last *user* (tool-result) message, never assistant.
+    for m in reversed(msgs):
+        if m["role"] == "user" and m["content"]:
+            m["content"][-1]["cache_control"] = dict(cache)
+            break
+    return {
+        "model": model,
+        "max_tokens": max_tokens,
+        "system": sys_blocks,
+        "messages": msgs,
+    }
+
+
+def complete(model: str, system: str, messages: list[dict[str, Any]], max_tokens: int) -> dict[str, Any]:
     key = os.environ.get("ANTHROPIC_API_KEY")
     if not key:
         raise RuntimeError("ANTHROPIC_API_KEY is not set")
-    payload = {
-        "model": model,
-        "max_tokens": max_tokens,
-        "system": system,
-        "messages": messages,
-    }
+    payload = _cached_payload(model, system, messages, max_tokens)
     req = urllib.request.Request(
         "https://api.anthropic.com/v1/messages",
         data=json.dumps(payload).encode(),
@@ -478,6 +549,109 @@ def format_results(results: list[tuple[Block, str]]) -> str:
     return "\n\n".join(chunks)
 
 
+def format_result_message(results: list[tuple[Block, str]]) -> str:
+    """User-role expansion: results only, no restated header/task."""
+    parts = []
+    for b, r in results:
+        parts.append(f'<result tag="{b.tag}">{_clip(r, 6000)}</result>')
+    return "\n\n".join(parts)
+
+
+def _grown_snapshot(world: World) -> dict[str, Any]:
+    return {
+        "generation": world.generation,
+        "reason": world.gen_reason,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "notes": world.notes,
+        "tools": {
+            name: {"doc": tool.doc, "source": tool.source}
+            for name, tool in world.tools.items()
+            if not tool.frozen
+        },
+        "docs": {name: tool.doc for name, tool in world.tools.items() if tool.frozen},
+        "prior": world.prior[-PRIOR_KEEP:],
+    }
+
+
+def _gen_dir(world: World) -> Path:
+    return state_file(world).parent / "generations"
+
+
+def _write_generation(world: World) -> Path:
+    path = _gen_dir(world) / f"{world.generation:04d}.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(_grown_snapshot(world), indent=2), encoding="utf-8")
+    return path
+
+
+def _apply_snapshot(world: World, data: dict[str, Any]) -> None:
+    notes = data.get("notes")
+    world.notes = {str(k): str(v) for k, v in notes.items() if isinstance(v, str)} if isinstance(notes, dict) else {}
+    docs = data.get("docs")
+    if isinstance(docs, dict):
+        for name, doc in docs.items():
+            if name in world.tools and isinstance(doc, str) and doc.strip():
+                world.tools[name].doc = doc
+    grown_names = set()
+    tools = data.get("tools")
+    if isinstance(tools, dict):
+        for name, spec in tools.items():
+            if name in FROZEN or not isinstance(spec, dict):
+                continue
+            source = spec.get("source")
+            doc = spec.get("doc") or f"user tag <{name}>"
+            if not isinstance(source, str) or not isinstance(doc, str):
+                continue
+            try:
+                fn = _callable_from_source(world, source, name)
+            except Exception:
+                continue
+            world.tools[name] = Tool(name=name, doc=doc, source=source, handler=fn)
+            grown_names.add(name)
+    for name in list(world.tools):
+        if not world.tools[name].frozen and name not in grown_names:
+            del world.tools[name]
+    raw_prior = data.get("prior")
+    world.prior = []
+    if isinstance(raw_prior, list):
+        for item in raw_prior[-PRIOR_KEEP:]:
+            if isinstance(item, dict) and isinstance(item.get("prompt"), str) and isinstance(item.get("speech"), str):
+                world.prior.append({"prompt": item["prompt"], "speech": item["speech"]})
+
+
+def evolve(world: World, reason: str = "") -> str:
+    world.generation += 1
+    world.gen_reason = reason or f"gen-{world.generation}"
+    _write_generation(world)
+    save(world)
+    return f"generation {world.generation}: {world.gen_reason}"
+
+
+def rollback(world: World, n: int) -> str:
+    path = _gen_dir(world) / f"{n:04d}.json"
+    if not path.is_file():
+        return f"rollback failed: no generation {n}"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        return f"rollback failed: {exc}"
+    if not isinstance(data, dict):
+        return "rollback failed: bad snapshot"
+    _apply_snapshot(world, data)
+    world.generation = n
+    world.gen_reason = str(data.get("reason") or f"gen-{n}")
+    save(world)
+    return f"rolled back to generation {n}"
+
+
+def _ensure_gen1(world: World) -> None:
+    path = _gen_dir(world) / "0001.json"
+    if not path.is_file():
+        world.generation = 1
+        world.gen_reason = world.gen_reason or "gen-1"
+        _write_generation(world)
+
+
 def turn(world: World, messages: list[dict[str, str]], max_tokens: int) -> tuple[str, list[tuple[Block, str]], bool]:
     _install_resources(world)
     fn = world.complete_fn or complete
@@ -504,12 +678,12 @@ def run_turns(
     max_tokens: int = 8192,
     quiet: bool = False,
 ) -> str:
-    messages: list[dict[str, str]] = [{"role": "user", "content": header(world, prompt) + "\n\n" + prompt}]
+    world.messages.append({"role": "user", "content": header(world, prompt) + "\n\n" + prompt})
     last = ""
     for n in range(1, max_turns + 1):
         if not quiet:
             print(f"\n===== turn {n} =====")
-        speech, results, done = turn(world, messages, max_tokens)
+        speech, results, done = turn(world, world.messages, max_tokens)
         last = speech
         if not quiet:
             print(speech)
@@ -517,18 +691,13 @@ def run_turns(
         if last_results and not quiet:
             print("\n--- results ---")
             print(last_results)
+        world.messages.append({"role": "assistant", "content": speech})
         if done:
             world.prior.append({"prompt": prompt, "speech": speech})
             world.prior = world.prior[-PRIOR_KEEP:]
             save(world)
             return speech
-        messages.append({"role": "assistant", "content": speech})
-        messages.append(
-            {
-                "role": "user",
-                "content": header(world, prompt) + "\n\nsyscall results:\n" + _clip(last_results, 6000),
-            }
-        )
+        world.messages.append({"role": "user", "content": format_result_message(results)})
     if not quiet:
         print(f"\n[hit max_turns={max_turns}]")
     world.prior.append({"prompt": prompt, "speech": last})
@@ -550,6 +719,7 @@ def new_world(
     seed_builtins(world)
     _install_resources(world)
     load(world)
+    _ensure_gen1(world)
     return world
 
 
@@ -587,6 +757,8 @@ def bind_step(world: World) -> Callable[..., str]:
     world.ns["step"] = step
     world.ns["world"] = world
     world.ns["reload"] = lambda: reload(world)
+    world.ns["evolve"] = lambda reason="": evolve(world, str(reason))
+    world.ns["rollback"] = lambda n=1: rollback(world, int(n))
     return step
 
 
@@ -699,7 +871,7 @@ def _self_check() -> None:
             blob = json.dumps(messages)
             seen.append(blob)
             assert "hello world" not in blob
-            if any("syscall results" in (m.get("content") or "") for m in messages):
+            if any("<result" in (m.get("content") or "") for m in messages):
                 return {"content": [{"type": "text", "text": "11"}], "usage": {}}
             return {"content": [{"type": "text", "text": "<python>len(doc)</python>"}], "usage": {}}
 
@@ -713,8 +885,21 @@ def _self_check() -> None:
         assert seen and "hello world" not in seen[0]
         assert "doc: str, 11 chars" in header(w3, "how long is doc?")
         assert w3.prior and w3.prior[-1]["prompt"] == "how long is doc?"
+        roles = [m["role"] for m in w3.messages]
+        assert roles[:4] == ["user", "assistant", "user", "assistant"]
+        assert w3.messages[2]["content"].startswith("<result")
+        assert "prompt:" not in w3.messages[2]["content"]
         w3.ns["step"]("say hi")
-        assert "how long is doc?" in header(w3, "say hi")
+        assert w3.messages[-2]["role"] == "user"
+        assert "say hi" in w3.messages[-2]["content"]
+        assert any(m["content"].startswith("<result") for m in w3.messages if m["role"] == "user")
+        ev = evolve(w3, "after ping")
+        assert "generation 2" in ev
+        assert (_gen_dir(w3) / "0001.json").is_file()
+        assert "wrote" in dispatch(w3, Block("system", "usage line", {}))
+        assert w3.notes["note"] == "usage line"
+        assert "generation 1" in rollback(w3, 1)
+        assert "note" not in w3.notes
 
         try:
             from IPython.core.interactiveshell import InteractiveShell
