@@ -94,6 +94,7 @@ HIDDEN_NS = frozenset(
         "open",
         "step",
         "world",
+        "reload",
         "handle",
         "__builtins__",
         "_ih",
@@ -478,6 +479,7 @@ def format_results(results: list[tuple[Block, str]]) -> str:
 
 
 def turn(world: World, messages: list[dict[str, str]], max_tokens: int) -> tuple[str, list[tuple[Block, str]], bool]:
+    _install_resources(world)
     fn = world.complete_fn or complete
     resp = fn(world.model, system_prompt(world), messages, max_tokens)
     speech = text_of(resp)
@@ -559,15 +561,21 @@ def _install_resources(world: World) -> None:
     for skill in world.skills:
         fn = bind_python_skill(world.ns, skill)
         if callable(fn) and skill.import_name and skill.import_name not in FROZEN:
-            world.tools.setdefault(
-                skill.import_name,
-                Tool(name=skill.import_name, doc=skill.description or f"skill {skill.name}", handler=fn),
+            world.tools[skill.import_name] = Tool(
+                name=skill.import_name,
+                doc=skill.description or f"skill {skill.name}",
+                handler=fn,
             )
     api = load_extensions(world.cwd)
     world.hooks = api.hooks
     for name, doc, handler in api.tools:
         if name not in FROZEN:
             world.tools[name] = Tool(name=name, doc=doc, handler=handler)
+
+
+def reload(world: World) -> str:
+    _install_resources(world)
+    return f"reloaded {len(world.skills)} skills, {len(world.tools)} tools"
 
 
 def bind_step(world: World) -> Callable[..., str]:
@@ -578,6 +586,7 @@ def bind_step(world: World) -> Callable[..., str]:
 
     world.ns["step"] = step
     world.ns["world"] = world
+    world.ns["reload"] = lambda: reload(world)
     return step
 
 
@@ -643,6 +652,16 @@ def _self_check() -> None:
         world = new_world(cwd, state_path=cwd / "harness.json")
         assert dispatch(world, Block("skill", "", {"name": "ping"})).endswith("body\n")
         assert dispatch(world, Block("ping", "hi", {})) == "pong:hi"
+
+        grown = cwd / ".desmos" / "skills" / "later"
+        grown.mkdir(parents=True)
+        (grown / "SKILL.md").write_text(
+            "---\nname: later\ndescription: appeared after start\n---\n# later\nok\n",
+            encoding="utf-8",
+        )
+        reload(world)
+        assert any(s.name == "later" for s in world.skills)
+        assert "appeared after start" in dispatch(world, Block("skill", "", {"name": "later"}))
 
         blocks = scan('<python>x = 1+1</python>\n<bash>echo hi</bash>')
         assert [b.tag for b in blocks] == ["python", "bash"]
