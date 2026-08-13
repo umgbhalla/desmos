@@ -1,0 +1,23 @@
+# secrets — never commit
+.env
+.env.*
+!.env.example
+*.pem
+id_rsa
+id_ed25519
+
+# experiment output (may contain model traces)
+runs/
+
+# python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+dist/
+build/
+
+.DS_Store
+.idea/
+.vscode/

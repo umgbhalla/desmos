@@ -1,0 +1,264 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Kernel-resident agent</title>
+  <style>
+    :root {
+      --bg: #0c0e11;
+      --bg2: #13171c;
+      --bg3: #1a2027;
+      --line: #2a333d;
+      --text: #e8edf2;
+      --muted: #8b969f;
+      --dim: #5c6770;
+      --ipy: #f37626;
+      --xml: #6cb6ff;
+      --heap: #3ecf8e;
+      --frozen: #ff6b6b;
+      --proj: #c9a227;
+      --ok: #7ee787;
+    }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; padding: 0; background: var(--bg); color: var(--text); }
+    body {
+      font: 15px/1.45 "IBM Plex Sans", "Segoe UI", system-ui, sans-serif;
+      letter-spacing: 0.01em;
+    }
+    .wrap { max-width: 980px; margin: 0 auto; padding: 28px 18px 64px; }
+    h1 { font-size: 22px; font-weight: 620; margin: 0 0 6px; letter-spacing: -0.02em; }
+    .lede { color: var(--muted); margin: 0 0 28px; max-width: 62ch; }
+    h2 {
+      font-size: 11px; font-weight: 650; letter-spacing: 0.14em;
+      text-transform: uppercase; color: var(--dim); margin: 36px 0 12px;
+      border-top: 1px solid var(--line); padding-top: 22px;
+    }
+    h2:first-of-type { border-top: 0; padding-top: 0; margin-top: 8px; }
+    .cols { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+    .card {
+      background: var(--bg2); border: 1px solid var(--line);
+      border-radius: 10px; padding: 14px 14px 12px;
+    }
+    .card h3 { margin: 0 0 10px; font-size: 13px; font-weight: 650; }
+    .tag {
+      display: inline-block; font: 10px/1 "IBM Plex Mono", ui-monospace, monospace;
+      letter-spacing: 0.08em; text-transform: uppercase; padding: 3px 6px;
+      border-radius: 4px; margin-bottom: 8px;
+    }
+    .old { color: var(--frozen); background: #2a1515; }
+    .neu { color: var(--heap); background: #10261c; }
+    ol.flow, ul.bits { margin: 0; padding: 0 0 0 18px; color: var(--muted); }
+    ol.flow li, ul.bits li { margin: 0 0 6px; }
+    code, .mono { font-family: "IBM Plex Mono", ui-monospace, Menlo, monospace; }
+    .mono { font-size: 12.5px; line-height: 1.45; }
+    .stack { display: flex; flex-direction: column; gap: 6px; }
+    .layer {
+      display: grid; grid-template-columns: 132px 1fr 92px;
+      gap: 10px; align-items: center;
+      border: 1px solid var(--line); border-radius: 8px;
+      padding: 10px 12px; background: var(--bg2);
+    }
+    .layer b { font-size: 13px; }
+    .layer span { color: var(--muted); font-size: 13px; }
+    .own { font: 10px/1 "IBM Plex Mono", ui-monospace, monospace; letter-spacing: 0.08em; text-transform: uppercase; text-align: right; }
+    .c-frozen { border-left: 3px solid var(--frozen); }
+    .c-harness { border-left: 3px solid var(--ipy); }
+    .c-heap { border-left: 3px solid var(--heap); }
+    .c-world { border-left: 3px solid var(--xml); }
+    .c-proj { border-left: 3px solid var(--proj); }
+    .own-f { color: var(--frozen); }
+    .own-a { color: var(--ipy); }
+    .own-s { color: var(--heap); }
+    .own-e { color: var(--proj); }
+    .turn {
+      display: grid; grid-template-columns: 28px 1fr;
+      gap: 0 12px;
+    }
+    .turn .n {
+      width: 28px; height: 28px; border-radius: 50%;
+      background: var(--bg3); border: 1px solid var(--line);
+      display: flex; align-items: center; justify-content: center;
+      font: 11px/1 "IBM Plex Mono", ui-monospace, monospace; color: var(--ipy);
+    }
+    .turn .row { padding-bottom: 14px; position: relative; }
+    .turn .row:not(:last-child)::before {
+      content: ""; position: absolute; left: -26px; top: 28px; bottom: 0;
+      width: 1px; background: var(--line);
+    }
+    .turn .row strong { display: block; font-size: 13.5px; margin-bottom: 3px; }
+    .turn .row p { margin: 0; color: var(--muted); font-size: 13.5px; }
+    pre {
+      margin: 10px 0 0; background: #0a0c0e; border: 1px solid var(--line);
+      border-radius: 8px; padding: 12px 14px; overflow-x: auto;
+      color: #d5dde4; font-size: 12px; line-height: 1.5;
+    }
+    .k { color: var(--ipy); }
+    .x { color: var(--xml); }
+    .c { color: var(--dim); }
+    .g { color: var(--heap); }
+    .y { color: var(--proj); }
+    .callout {
+      background: #16120c; border: 1px solid #3a3018; border-radius: 10px;
+      padding: 14px 16px; color: #e6d7a8; margin-top: 8px;
+    }
+    .callout b { color: var(--proj); }
+    .grid3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 12px; }
+    .fail { border-top: 2px solid #3a2222; }
+    .ok { border-top: 2px solid #1b3a2a; }
+    @media (max-width: 720px) {
+      .cols, .grid3 { grid-template-columns: 1fr; }
+      .layer { grid-template-columns: 1fr; gap: 4px; }
+      .own { text-align: left; }
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>The kernel is the harness. The prompt is just the ABI.</h1>
+    <p class="lede">
+      One function lives in an IPython heap. It does not RPC tools.
+      It emits a tiny XML dialect. Parsers for that dialect are objects
+      in the same heap — so the agent can grow its own appendages.
+    </p>
+
+    <h2>The inversion</h2>
+    <div class="cols">
+      <div class="card">
+        <span class="tag old">normal 2026 agent</span>
+        <h3>Harness owns the creature</h3>
+        <ul class="bits">
+          <li>Fat system prompt + closed tool schema</li>
+          <li>State = <span class="mono">messages[]</span></li>
+          <li>Tools are invisible Python outside the model</li>
+          <li>Skills are markdown stuffed into context</li>
+          <li>Compaction is a special phase the host runs</li>
+        </ul>
+      </div>
+      <div class="card">
+        <span class="tag neu">this</span>
+        <h3>Creature lives in the image</h3>
+        <ul class="bits">
+          <li>~25-line ABI, open tag set</li>
+          <li>State = kernel heap + world</li>
+          <li>Transcript is a log, not the source of truth</li>
+          <li>Appendages are real callables</li>
+          <li>What the model sees is a query over the heap</li>
+        </ul>
+      </div>
+    </div>
+
+    <h2>State of the system — who owns what</h2>
+    <div class="stack">
+      <div class="layer c-frozen">
+        <b>frozen core</b>
+        <span>scan · step · exec policy · register()</span>
+        <div class="own own-f">not writable</div>
+      </div>
+      <div class="layer c-harness">
+        <b>harness surface</b>
+        <span>handlers{} · view() · pins · stop rule</span>
+        <div class="own own-a">agent writes</div>
+      </div>
+      <div class="layer c-heap">
+        <b>heap</b>
+        <span>objects · In/Out · appendage fns · agent() itself</span>
+        <div class="own own-s">shared w/ human</div>
+      </div>
+      <div class="layer c-world">
+        <b>world</b>
+        <span>cwd · files · subprocesses · network</span>
+        <div class="own own-s">via bash/python</div>
+      </div>
+      <div class="layer c-proj">
+        <b>projection</b>
+        <span>ephemeral prompt: ABI + tag index + pins + tail</span>
+        <div class="own own-e">rebuilt / turn</div>
+      </div>
+    </div>
+    <p class="lede" style="margin:12px 0 0">
+      The hard part is not XML. The hard part is <b style="color:var(--proj);font-weight:600">view()</b>:
+      unbounded heap → bounded window. If the agent can rewrite view(), it governs what it is allowed to remember.
+    </p>
+
+    <h2>One inference step</h2>
+    <div class="turn">
+      <div class="n">1</div>
+      <div class="row">
+        <strong>project</strong>
+        <p><span class="mono">view()</span> builds the prompt from ABI + live tag index + pins + last N cells. Not the whole <span class="mono">In[]</span>.</p>
+      </div>
+      <div class="n">2</div>
+      <div class="row">
+        <strong>complete</strong>
+        <p>Speech is text. Syscalls are XML blocks. No native tool-calling schema.</p>
+      </div>
+      <div class="n">3</div>
+      <div class="row">
+        <strong>scan</strong>
+        <p>Fence-aware lexer, not a real XML parser. Payloads can contain <span class="mono">&lt;/python&gt;</span>.</p>
+      </div>
+      <div class="n">4</div>
+      <div class="row">
+        <strong>dispatch</strong>
+        <p>Builtins locked. Unknown tag → <span class="mono">handlers[tag](body, **attrs)</span>. Result lands in the heap and the log.</p>
+      </div>
+      <div class="n">5</div>
+      <div class="row">
+        <strong>stop or recurse</strong>
+        <p>No tags / <span class="mono">&lt;done/&gt;</span> → speak. Else frozen <span class="mono">step()</span> loops. Agent does not rewrite the loop.</p>
+      </div>
+    </div>
+
+    <h2>How an appendage is born</h2>
+<pre><span class="c"># agent emits this, python builtin runs it</span>
+<span class="x">&lt;python&gt;</span>
+<span class="k">def</span> <span class="g">handle_grep</span>(body, path=<span class="y">"."</span>, **_):
+    <span class="k">return</span> bash(<span class="y">f"rg -n -- {body!r} {path}"</span>)
+
+register(<span class="y">"grep"</span>, handle_grep, doc=<span class="y">"search files"</span>)
+<span class="x">&lt;/python&gt;</span>
+
+<span class="c"># later turns, view() advertises it, agent just uses it</span>
+<span class="x">&lt;grep path="src"&gt;</span>def agent(<span class="x">&lt;/grep&gt;</span></pre>
+
+    <div class="callout">
+      <b>Minimal prompt is an index, not a manual.</b>
+      Static text is the ABI (~25 lines). Every turn also injects
+      <span class="mono">tags: python, bash, register, pin, grep?</span>
+      and the pin names. Capability grows in the heap; the prompt stays a table of contents.
+    </div>
+
+    <h2>Freeze this, or the creature eats itself</h2>
+    <div class="grid3">
+      <div class="card ok">
+        <h3>Let it write</h3>
+        <ul class="bits">
+          <li>new tags</li>
+          <li><span class="mono">view()</span></li>
+          <li>pins / notes</li>
+          <li>stop hints</li>
+        </ul>
+      </div>
+      <div class="card fail">
+        <h3>Do not let it write</h3>
+        <ul class="bits">
+          <li>the scanner</li>
+          <li><span class="mono">step()</span> itself</li>
+          <li>python / bash / register</li>
+          <li>exec policy</li>
+        </ul>
+      </div>
+      <div class="card">
+        <h3>Will still bite you</h3>
+        <ul class="bits">
+          <li>empty ABI wastes turns reinventing grep</li>
+          <li>view() dumps too much or forgets tags</li>
+          <li>handlers rot across a long session</li>
+          <li>kernel python is full user RCE</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+</body>
+</html>
