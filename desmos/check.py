@@ -33,6 +33,52 @@ def _fake_id_token(*, plan: str, account: str, ttl: int = 3600) -> str:
     return f"{head}.{body}.sig-not-checked"
 
 
+def _check_vendor_patch() -> None:
+    """Every patch in patches/ is applied to vendor/grok-build, at the pin.
+
+    Silent by design when there is no clone: vendor/ is gitignored and a
+    checkout that never ran scripts/vendor-setup.sh has nothing to verify.
+    What it will not tolerate is a clone that exists and disagrees with the
+    tracked patches -- that is the state where `--grok` builds and runs the
+    wrong agent.
+    """
+    import re
+    import subprocess
+
+    root = Path(__file__).resolve().parent.parent
+    vendor = root / "vendor" / "grok-build"
+    setup = root / "scripts" / "vendor-setup.sh"
+    patches = sorted((root / "patches").glob("*.patch"))
+    if not patches or not setup.exists():
+        return
+
+    pin = re.search(r"^REV=([0-9a-f]{40})$", setup.read_text(), re.M)
+    assert pin, "scripts/vendor-setup.sh lost its REV pin"
+
+    if not (vendor / ".git").is_dir():
+        return
+
+    head = subprocess.run(
+        ["git", "-C", str(vendor), "rev-parse", "HEAD"],
+        capture_output=True, text=True, check=False,
+    ).stdout.strip()
+    assert head == pin.group(1), (
+        f"vendor/grok-build is at {head[:12]}, scripts/vendor-setup.sh pins "
+        f"{pin.group(1)[:12]} -- rebase patches/ and bump REV, or re-run the script"
+    )
+
+    for p in patches:
+        # --reverse --check succeeds exactly when the patch is already applied.
+        applied = subprocess.run(
+            ["git", "-C", str(vendor), "apply", "--reverse", "--check", str(p)],
+            capture_output=True, check=False,
+        )
+        assert applied.returncode == 0, (
+            f"{p.name} is not applied to vendor/grok-build -- run "
+            f"scripts/vendor-setup.sh, or refresh the patch if you edited vendor by hand"
+        )
+
+
 def self_check() -> None:
     import tempfile
 
@@ -1498,6 +1544,13 @@ def self_check() -> None:
             _oai.complete = real_oai_complete
             if old_key is not None:
                 os.environ["ANTHROPIC_API_KEY"] = old_key
+
+        # The vendor patch is the one piece of this harness that can go missing
+        # without a compile error: vendor/ is gitignored, so a clone that skips
+        # scripts/vendor-setup.sh gets a pager with no DESMOS_ACP branch and
+        # `--grok` quietly runs grok's own agent instead of ours. Nothing else
+        # notices, so check the two halves stay in step here.
+        _check_vendor_patch()
 
         try:
             from IPython.core.interactiveshell import InteractiveShell
