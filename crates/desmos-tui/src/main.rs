@@ -4775,6 +4775,58 @@ fn in_code(spans: &[(usize, usize)], i: usize) -> bool {
     spans.iter().any(|&(a, z)| i >= a && i < z)
 }
 
+/// Strip whole syscalls from prose -- markers *and* bodies.
+///
+/// `strip_xml` deletes angle-bracket markers one at a time and keeps whatever
+/// sits between them, so a one-line call leaves its command behind as if
+/// someone had said it. The command is not prose; it belongs to the calls pane,
+/// which already renders it as a card.
+///
+/// Structure decides, not a list of names: an opener with a matching closer is
+/// a syscall whatever it is called, which means a tag registered later needs no
+/// change here. A bare mention with no closer is left alone, so naming a tool
+/// mid-sentence still reads.
+fn strip_syscalls(text: &str) -> String {
+    let spans = code_spans(text);
+    let mut out = String::new();
+    let mut i = 0usize;
+    while i < text.len() {
+        let Some(rel) = text[i..].find('<') else { break };
+        let start = i + rel;
+        out.push_str(&text[i..start]);
+        if in_code(&spans, start) {
+            out.push('<');
+            i = start + 1;
+            continue;
+        }
+        let Some(gt) = text[start..].find('>') else {
+            out.push_str(&text[start..]);
+            return out;
+        };
+        let open_end = start + gt + 1;
+        let inner = &text[start + 1..open_end - 1];
+        // Name runs to the first space, and a self-closing marker has no body.
+        let name = inner
+            .trim_end_matches('/')
+            .split_whitespace()
+            .next()
+            .unwrap_or("");
+        let selfclose = inner.trim_end().ends_with('/');
+        if name.is_empty() || selfclose || name.starts_with('/') {
+            i = open_end;
+            continue;
+        }
+        // A matching closer makes this a call: drop the body with it.
+        let close = format!("</{name}>");
+        match text[open_end..].find(&close) {
+            Some(rel_end) => i = open_end + rel_end + close.len(),
+            None => i = open_end,
+        }
+    }
+    out.push_str(&text[i..]);
+    out
+}
+
 fn strip_xml(text: &str) -> String {
     let spans = code_spans(text);
     let mut out = String::new();
