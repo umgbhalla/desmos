@@ -4949,7 +4949,15 @@ fn spoken_prefix(text: &str) -> String {
             }
         }
     }
-    strip_syscalls(&text[..cut])
+    // A call that opens the turn leaves the prose behind it beginning with the
+    // newlines that separated the two. Those survive as an empty first line,
+    // and the timestamp overlay always lands on the first content line -- so
+    // the stamp ends up alone on a blank row, one row above the sentence it
+    // belongs to, and a one-line reply costs four rows instead of one.
+    // Leading whitespace is never information here, and trimming it is stable
+    // under streaming: once consumed it stays consumed, so the prefix check in
+    // flush_speech still holds.
+    strip_syscalls(&text[..cut]).trim_start().to_string()
 }
 
 /// A trailing `<` is only worth withholding if it could open a tag: `<`
@@ -5737,6 +5745,45 @@ mod tests {
         let mut term = Terminal::new(backend).unwrap();
         term.draw(|f| draw(f, app)).unwrap();
         buffer_text(&term)
+    }
+
+
+    /// Prose after a syscall must not push its own timestamp onto a blank row.
+    ///
+    /// The stream is `<bash>…</bash>\n\nI'll wait.`, and stripping the call
+    /// leaves the newlines. grok overlays the stamp on a block's *first*
+    /// content line, so an empty first line orphans the stamp one row above
+    /// the sentence -- four rows for one line of prose, which is what the
+    /// story actually looked like.
+    #[test]
+    fn a_reply_after_a_call_starts_on_its_first_row() {
+        assert_eq!(spoken_prefix("<bash>ls</bash>\n\nI'll wait."), "I'll wait.");
+
+        let mut app = App::new();
+        app.ready = true;
+        handle_event(&mut app, json!({"ev": "turn", "text": "go"}));
+        for i in 0..3 {
+            handle_event(&mut app, json!({"ev": "speech", "delta": true,
+                "text": format!("<bash>ls</bash>\n\nWaiting on {i}.")}));
+            handle_event(&mut app, json!({"ev": "result", "tag": "bash", "text": "ok"}));
+        }
+        let text = paint(&mut app, 90, 40);
+        let first = row_of(&text, "Waiting on 0.").expect("prose on screen");
+        let stamp = text
+            .lines()
+            .position(|l| l.contains("AM") || l.contains("PM"))
+            .unwrap_or(first);
+        assert_eq!(
+            stamp, first,
+            "the stamp belongs on the sentence's own row:\n{text}"
+        );
+        // Three one-line replies, three rows of prose, and the gaps between.
+        let last = row_of(&text, "Waiting on 2.").expect("last reply on screen");
+        assert!(
+            last - first <= 4,
+            "three one-line replies must not span {} rows:\n{text}",
+            last - first + 1
+        );
     }
 
     /// A streaming thought is body, and nothing but body.
