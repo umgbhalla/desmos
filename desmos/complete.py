@@ -137,13 +137,21 @@ def assistant_content(resp: dict[str, Any]) -> list[dict[str, Any]]:
             item = {"type": "thinking", "thinking": raw.get("thinking") or ""}
             if raw.get("signature"):
                 item["signature"] = raw["signature"]
+            # A provider's own item, kept whole so the next request can replay
+            # it verbatim. OpenAI reasoning is encrypted and id-bearing: rebuild
+            # it from the summary and the model loses the thought.
+            if isinstance(raw.get("openai"), dict):
+                item["openai"] = raw["openai"]
             blocks.append(item)
         elif kind == "redacted_thinking":
             blocks.append({"type": "redacted_thinking", "data": raw.get("data") or ""})
         elif kind == "text":
             text = raw.get("text") or ""
             if text:
-                blocks.append({"type": "text", "text": text})
+                item = {"type": "text", "text": text}
+                if isinstance(raw.get("openai"), dict):
+                    item["openai"] = raw["openai"]
+                blocks.append(item)
     return blocks or [{"type": "text", "text": ""}]
 
 
@@ -401,6 +409,20 @@ def complete(
     on_event: Callable[[dict[str, Any]], None] | None = None,
     should_stop: Callable[[], bool] | None = None,
 ) -> dict[str, Any]:
+    from desmos.openai import is_openai
+
+    if is_openai(model):
+        from desmos import openai as openai_provider
+
+        return openai_provider.complete(
+            model,
+            system,
+            messages,
+            max_tokens,
+            thinking=thinking,
+            on_event=on_event,
+            should_stop=should_stop,
+        )
     key = os.environ.get("ANTHROPIC_API_KEY")
     if not key:
         raise RuntimeError("ANTHROPIC_API_KEY is not set")

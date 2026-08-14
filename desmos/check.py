@@ -925,6 +925,154 @@ def self_check() -> None:
         finally:
             _auth.LOCAL_PORT = real_port
 
+
+
+        # --- device login: the poll loop, driven with no network and no sleeping ---
+        calls: list = []
+        replies = [
+            (403, {"error": {"code": "deviceauth_authorization_pending"}}),
+            (429, {"error": {"code": "slow_down"}}),
+            (200, {"authorization_code": "dev-code", "code_verifier": "dev-verifier"}),
+        ]
+        real_post, real_sleep = _auth._post_json, _auth._sleep
+        try:
+            _auth._post_json = lambda url, body, timeout=30: (calls.append((url, body)), replies.pop(0))[1]
+            _auth._sleep = lambda s: calls.append(("slept", s))
+            dev = _auth.DeviceCode("dev-1", "ABCD-EFGH", interval=5)
+            got = _auth.poll_device_login(dev)
+            assert got == {"code": "dev-code", "verifier": "dev-verifier"}, got
+            slept = [s for tag, s in calls if tag == "slept"]
+            assert slept == [5, 7], slept  # slow_down actually backs the poll off
+            assert all(url == _auth.DEVICE_TOKEN_URL for url, _ in calls if url != "slept")
+
+            replies[:] = [(400, {"error": {"code": "expired_token"}})]
+            calls.clear()
+            try:
+                _auth.poll_device_login(_auth.DeviceCode("dev-2", "X", interval=1))
+                raise AssertionError("expected NeedsAuth on a hard device error")
+            except _auth.NeedsAuth as e:
+                assert "expired_token" in str(e), e
+        finally:
+            _auth._post_json, _auth._sleep = real_post, real_sleep
+
+        # start_device_login must reject a malformed response instead of polling forever
+        try:
+            _auth._post_json = lambda *a, **kw: (200, {"user_code": "X"})
+            try:
+                _auth.start_device_login()
+                raise AssertionError("expected NeedsAuth on a malformed device code")
+            except _auth.NeedsAuth:
+                pass
+        finally:
+            _auth._post_json = real_post
+
+        # --- openai provider: replay, streaming, usage, and the dispatch seam ---
+        from desmos import openai as _oai
+        from desmos.complete import assistant_content as _ac
+
+        assert _oai.is_openai("gpt-5.6-sol") and not _oai.is_openai("claude-opus-5")
+        assert _oai.effort_of("xhigh") == "xhigh" and _oai.effort_of("off") == "none"
+        assert set(_oai.EFFORTS) == {"low", "high", "xhigh"}
+        assert "gpt-5.6-sol" in _oai.MODELS and "gpt-5.6-luna" in _oai.MODELS
+
+        reasoning_item = {
+            "id": "rs_1",
+            "type": "reasoning",
+            "summary": [{"type": "summary_text", "text": "weighing it"}],
+            "encrypted_content": "ENC-OPAQUE",
+        }
+        msg_item = {
+            "id": "msg_1",
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "done"}],
+        }
+        events = [
+            {"type": "response.created", "response": {"id": "resp_1"}},
+            {"type": "response.output_item.added", "item": {"type": "reasoning", "id": "rs_1"}},
+            {"type": "response.reasoning_summary_text.delta", "delta": "weigh"},
+            {"type": "response.reasoning_summary_text.delta", "delta": "ing it"},
+            {"type": "response.output_item.done", "item": reasoning_item},
+            {"type": "response.output_text.delta", "delta": "do"},
+            {"type": "response.output_text.delta", "delta": "ne"},
+            {"type": "response.output_item.done", "item": msg_item},
+            {
+                "type": "response.completed",
+                "response": {
+                    "id": "resp_1",
+                    "status": "completed",
+                    "output": [reasoning_item, msg_item],
+                    "usage": {
+                        "input_tokens": 1000,
+                        "input_tokens_details": {"cached_tokens": 900},
+                        "output_tokens": 40,
+                        "output_tokens_details": {"reasoning_tokens": 25},
+                    },
+                },
+            },
+        ]
+        sse = []
+        for ev in events:
+            sse.append("event: " + ev["type"])
+            sse.append("data: " + json.dumps(ev))
+            sse.append("")
+        seen = []
+        resp_oai = _oai.read_sse(iter(sse), "gpt-5.6-sol", on_event=seen.append)
+        assert "".join(e["text"] for e in seen if e["kind"] == "thinking_delta") == "weighing it"
+        assert "".join(e["text"] for e in seen if e["kind"] == "text_delta") == "done"
+        assert text_of(resp_oai) == "done"
+        u = resp_oai["usage"]
+        assert u["cache_read_input_tokens"] == 900 and u["input_tokens"] == 100, u
+        assert u["output_tokens"] == 40 and u["reasoning_tokens"] == 25
+
+        kept_oai = _ac(resp_oai)
+        assert kept_oai[0]["openai"]["encrypted_content"] == "ENC-OPAQUE", kept_oai[0]
+        assert kept_oai[0]["thinking"] == "weighing it"
+
+        # replayed verbatim, not rebuilt: the encrypted item goes back as-is
+        back = _oai.to_input([{"role": "user", "content": "hi"}, {"role": "assistant", "content": kept_oai}])
+        assert back[0]["content"][0]["type"] == "input_text"
+        assert reasoning_item in back, back
+        assert msg_item in back, back
+        # ...and a foreign thought (no provider item) degrades to speech, not a crash
+        foreign = _oai.to_input([{"role": "assistant", "content": [{"type": "thinking", "thinking": "x"}]}])
+        assert foreign[0]["content"][0]["text"] == "x"
+
+        body = _oai.payload_for("gpt-5.6-sol", "SYS", [{"role": "user", "content": "hi"}], 4096,
+                                thinking="xhigh", compact_threshold=250000, cache_key="k1")
+        assert body["instructions"] == "SYS" and body["store"] is False
+        assert body["reasoning"] == {"effort": "xhigh", "summary": "auto"}
+        assert body["include"] == ["reasoning.encrypted_content"]
+        assert body["context_management"] == [{"type": "compaction", "compact_threshold": 250000}]
+        assert not any(i.get("role") == "system" for i in body["input"])
+
+        url_oauth, h_oauth = _oai.headers_for(_auth.Credential(provider="openai", kind="oauth",
+                                                               token="t", account_id="acct-1"))
+        assert url_oauth == _oai.CHATGPT_URL and h_oauth["chatgpt-account-id"] == "acct-1"
+        assert h_oauth["originator"] and h_oauth["Authorization"] == "Bearer t"
+        url_key, h_key = _oai.headers_for(_auth.Credential(provider="openai", kind="env", token="sk-x"))
+        assert url_key == _oai.API_URL and "chatgpt-account-id" not in h_key
+
+        # the dispatch seam: a gpt model must never reach the Anthropic call site
+        import desmos.complete as _cmp
+
+        routed = {}
+        real_oai_complete = _oai.complete
+        def _routed_complete(*a, **kw):
+            routed["hit"] = (a[0], kw.get("thinking"))
+            return resp_oai
+
+        _oai.complete = _routed_complete
+        old_key = os.environ.pop("ANTHROPIC_API_KEY", None)
+        try:
+            out = _cmp.complete("gpt-5.6-luna", "SYS", [{"role": "user", "content": "hi"}], 4096, thinking="high")
+            assert routed["hit"] == ("gpt-5.6-luna", "high"), routed
+            assert text_of(out) == "done"
+        finally:
+            _oai.complete = real_oai_complete
+            if old_key is not None:
+                os.environ["ANTHROPIC_API_KEY"] = old_key
+
         try:
             from IPython.core.interactiveshell import InteractiveShell
         except ImportError:

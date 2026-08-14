@@ -317,6 +317,9 @@ def start_device_login() -> DeviceCode:
     return DeviceCode(str(body["device_auth_id"]), str(body["user_code"]), max(1, interval))
 
 
+_sleep = time.sleep  # named so a test can drive the poll loop without waiting
+
+
 def poll_device_login(device: DeviceCode, *, on_wait: Callable[[int], None] | None = None) -> dict[str, str]:
     """Block until the browser half finishes. Returns the authorization code."""
     deadline = time.time() + device.expires_in
@@ -341,7 +344,7 @@ def poll_device_login(device: DeviceCode, *, on_wait: Callable[[int], None] | No
             raise NeedsAuth(f"device auth failed ({code}): {str(body)[:300]}")
         if on_wait is not None:
             on_wait(wait)
-        time.sleep(wait)
+        _sleep(wait)
     raise NeedsAuth("device login timed out")
 
 
@@ -465,21 +468,23 @@ def login_openai(*, notify: Callable[[str], None] = print, method: str = "browse
     """Sign in and leave a usable credential on disk.
 
     method="browser" is the whole cycle -- consent page, localhost callback,
-    code exchange -- and falls back to the device code if this machine has no
-    browser to open. method="device" skips straight to the code.
+    code exchange. method="device" skips straight to a code the user types on
+    another machine. method="auto" tries the browser and drops to the device
+    code if this box has no browser, no display, or no socket to bind.
     """
-    if method == "browser":
+    tokens_out: dict[str, Any] | None = None
+    if method in {"browser", "auto"}:
         try:
             tokens_out = browser_login(notify=notify)
-        except NeedsAuth:
-            raise
-        except Exception as e:  # no display, no webbrowser, no socket
+        except Exception as e:
+            if method == "browser":
+                raise
             notify(f"browser login unavailable ({e}); falling back to a device code")
-            method = "device"
-    if method != "browser":
+    if tokens_out is None:
         device = start_device_login()
-        notify(f"open {device.verify_url} and enter code {device.user_code}")
-        got = poll_device_login(device)
+        url = f"{device.verify_url}?user_code={urllib.parse.quote(device.user_code)}"
+        notify(f"code {device.user_code}\nopen {url}")
+        got = poll_device_login(device, on_wait=lambda _s: None)
         tokens_out = exchange_code(got["code"], got["verifier"])
     access = tokens_out.get("access_token")
     if not access:

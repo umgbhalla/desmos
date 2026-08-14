@@ -327,7 +327,7 @@ def cmd_auth(args: argparse.Namespace) -> int:
             return 2
         cred = auth.login_openai(
             notify=lambda msg: print(msg, flush=True),
-            method="device" if args.device else "browser",
+            method="device" if args.device else "auto",
         )
         print(f"logged in: {cred.masked()} plan={cred.plan or '?'}")
         return 0
