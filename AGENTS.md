@@ -76,6 +76,38 @@ The pulldown walker is gone. Do not put it back.
 
 `python -m desmos check` is the floor, not theater. If you change scan, dispatch, cache, persist, isolation, edit, or ACP, extend the check with a real repro, then run it. Do not add an assert that only passes on the happy fixture you just wrote.
 
+### Never assert that a string exists
+
+`assert "batching:" in prompt` is not a test. It asserts that a sentence you
+just wrote is still the sentence you wrote. It fails the moment someone
+rewords a line that is working perfectly, and it passes while the behaviour it
+was supposedly guarding is completely broken. It tests the author's memory,
+not the program. Ninety of these were deleted from `check.py` in one commit
+and nothing was lost, because they had never once caught anything.
+
+Do not write a check that:
+
+- greps the system prompt, the ABI, or the catalog for wording
+- asserts a doc line, a comment, a help string, or a log message is present
+- asserts a constant still equals the literal it was defined as
+- exists so that a diff "has a test in it"
+
+Write the check that fails when the program is wrong. It runs the thing, and
+it asserts on what came back:
+
+- `run_bash("sleep 20 & echo x", timeout=3)` returns in under 8 seconds —
+  that one caught a 20-second hang nobody knew about
+- a truncated SSE stream raises instead of parsing as a finished answer
+- a foreign `signature` never reaches the wire, so a provider switch cannot
+  400
+- `cd /etc` in one `<shell>` call is still `/etc` in the next
+
+The distinction is not "does it involve a string". Asserting a secret was
+redacted out of a result, or that a syscall's output round-tripped into the
+transcript, is behaviour that happens to be spelled with characters. The test
+is whether the assertion can fail for a reason that matters. If the only way
+to break it is to edit prose, delete it.
+
 ## Git
 
 Stage explicit paths. Never `git add -A`. Do not sweep someone else's in-progress TUI/ACP into a commit about tags. Do not commit `.desmos/`, keys, or `vendor/`.

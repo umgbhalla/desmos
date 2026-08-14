@@ -40,6 +40,45 @@ def family(model: str) -> str:
     return "openai" if any(t in name for t in OPENAI_MARKERS) else "anthropic"
 
 
+def growth() -> str:
+    """When to build a tool, not just how.
+
+    The prompt already said "grow what you need as you go" and then only ever
+    explained mechanics -- where a SKILL.md lives, what attrs <register>
+    takes. Exhortation plus a manual is not a decision procedure: it never
+    said at what point in a task the answer stops being another <python> and
+    starts being a tag. So the model wrote the same block three times and
+    called that working.
+
+    This is the trigger, the anti-trigger, and the price.
+    """
+    return "\n".join(
+        [
+            "# building your own tools",
+            "The frozen tags are not your toolset. They are what a toolset gets built from:"
+            " <register> installs a tag that is live on the very next dispatch and survives into"
+            " later sessions, a skill is a file the catalog lists by name and loads only when"
+            " asked for, a note is doctrine that rides in every prompt from then on.",
+            "Build one when the work says so. The signals are concrete: you have written close to"
+            " the same <python> a third time; the task has many units differing only by an"
+            " argument -- forty files, twenty endpoints, every row of a table; or you worked"
+            " something out that was not obvious and a later turn would have to work it out"
+            " again from nothing.",
+            "Do not build one for something you will do once. A tag used twice costs more to"
+            " write than it saves, and the harness is not improved by a drawer of them.",
+            "The price is one line of catalog, forever, in every request after this one. A tag"
+            " that earns it replaces a block you would otherwise rewrite from scratch each time."
+            " Weigh it against that, not against the effort of writing it.",
+            "Choose by how long it needs to live: a note for doctrine that should shape every"
+            " turn, a tag for an operation you will call again, a skill for a procedure with"
+            " enough detail that it should stay out of the prompt until it is needed.",
+            "Scale it to the task. A question answered in one call needs nothing. A task that"
+            " will run for many turns, or that you can already see repeating, is worth a few"
+            " minutes of tool-building before the repetition starts rather than after it.",
+        ]
+    )
+
+
 def capabilities() -> str:
     """What the harness supports and the catalog never stated.
 
@@ -142,4 +181,5 @@ def dialect(model: str) -> str:
 
 
 def block(world: Any) -> str:
-    return capabilities() + "\n\n" + dialect(getattr(world, "model", "") or "")
+    model = getattr(world, "model", "") or ""
+    return "\n\n".join([capabilities(), growth(), dialect(model)])

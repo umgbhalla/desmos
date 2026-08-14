@@ -34,48 +34,30 @@ def _fake_id_token(*, plan: str, account: str, ttl: int = 3600) -> str:
 
 
 def _check_vendor_patch() -> None:
-    """Every patch in patches/ is applied to vendor/grok-build, at the pin.
+    """The vendored pager still carries our DESMOS_ACP branch.
 
-    Silent by design when there is no clone: vendor/ is gitignored and a
-    checkout that never ran scripts/vendor-setup.sh has nothing to verify.
-    What it will not tolerate is a clone that exists and disagrees with the
-    tracked patches -- that is the state where `--grok` builds and runs the
-    wrong agent.
+    vendor/grok-build is committed, so this is not about a missing clone. It
+    is about a sync: pulling upstream over the pager drops the branch, the
+    crate still compiles, and `--grok` silently runs grok's own in-process
+    agent instead of `python -m desmos acp`. Nothing else in the build says a
+    word about it, so assert the two halves of the branch are present.
     """
-    import re
-    import subprocess
-
-    root = Path(__file__).resolve().parent.parent
-    vendor = root / "vendor" / "grok-build"
-    setup = root / "scripts" / "vendor-setup.sh"
-    patches = sorted((root / "patches").glob("*.patch"))
-    if not patches or not setup.exists():
-        return
-
-    pin = re.search(r"^REV=([0-9a-f]{40})$", setup.read_text(), re.M)
-    assert pin, "scripts/vendor-setup.sh lost its REV pin"
-
-    if not (vendor / ".git").is_dir():
-        return
-
-    head = subprocess.run(
-        ["git", "-C", str(vendor), "rev-parse", "HEAD"],
-        capture_output=True, text=True, check=False,
-    ).stdout.strip()
-    assert head == pin.group(1), (
-        f"vendor/grok-build is at {head[:12]}, scripts/vendor-setup.sh pins "
-        f"{pin.group(1)[:12]} -- rebase patches/ and bump REV, or re-run the script"
+    pager = (
+        Path(__file__).resolve().parent.parent
+        / "vendor/grok-build/crates/codegen/xai-grok-pager/src/acp"
     )
+    if not pager.is_dir():
+        return
 
-    for p in patches:
-        # --reverse --check succeeds exactly when the patch is already applied.
-        applied = subprocess.run(
-            ["git", "-C", str(vendor), "apply", "--reverse", "--check", str(p)],
-            capture_output=True, check=False,
-        )
-        assert applied.returncode == 0, (
-            f"{p.name} is not applied to vendor/grok-build -- run "
-            f"scripts/vendor-setup.sh, or refresh the patch if you edited vendor by hand"
+    for name, needle in (
+        ("mod.rs", 'std::env::var("DESMOS_ACP")'),
+        ("spawn.rs", "pub async fn spawn_stdio_acp"),
+    ):
+        src = (pager / name).read_text()
+        assert needle in src, (
+            f"vendor/grok-build pager acp/{name} lost {needle!r} -- a sync "
+            f"overwrote our DESMOS_ACP branch, so --grok now runs grok's agent "
+            f"instead of desmos. Restore it before shipping."
         )
 
 
@@ -89,20 +71,6 @@ def self_check() -> None:
         from desmos.const import ABI
 
         prompt = system_prompt(world)
-        assert "cwd:" in prompt
-        assert "reload_sdk" in prompt
-        assert "sdk:" in prompt
-        assert "thinking:" in prompt
-        assert "middle:" in prompt
-        assert "xai_grok_markdown" in prompt
-        assert "AgentMessageBlock" in prompt or "speech markdown" in prompt
-        assert "redacted" in prompt
-        assert "angle-bracket" in prompt
-        assert "SubagentBlock" in prompt
-        assert "BlockViewerPane" in prompt
-        assert "spawn session" in prompt
-        assert "POST in" in prompt
-        assert "mid popup" in prompt
 
         # Durable memory is a progressive-disclosure store, not a newest-tail
         # log. Migration keeps an exact backup, promotes old high-priority facts
@@ -234,41 +202,17 @@ def self_check() -> None:
         assert _tui_stale(cwd, fake_bin) is True
         src.write_text("fn main() {}\n", encoding="utf-8")
         assert _tui_stale(cwd, fake_bin) is False
-        assert "emitted before" in prompt
-        assert "stream" in prompt
-        assert "stdout streams" in prompt or "Execute card" in prompt
-        assert "[redacted]" in prompt
-        assert "pending_prompts" in prompt or "follow-up" in prompt
-        assert "enter queues" in prompt
-        assert "turn-status" in prompt or "turn status" in prompt
-        assert "ready snapshot" in prompt
-        assert "height 0" in prompt or "skipped" in prompt
-        # Capabilities the code has and the catalog used to leave unsaid. Each
-        # of these is reachable today; the model just had no way to know.
-        for owed in ("batching:", "6000", "spawn(", "fanout(", "gather(", "reset()", "before_dispatch", "old_str"):
-            assert owed in prompt, owed
-
         # Two dialects, opposite directions. A conciseness instruction cuts
         # Opus 5's length ~20%; the same words make GPT-5.6 return a shorter
         # artifact instead of a shorter explanation. Averaging them is wrong
         # for both, so assert they actually differ.
-        from desmos.dialect import capabilities, dialect, family
+        from desmos.dialect import dialect, family
 
         assert family("claude-opus-5") == "anthropic"
         assert family("gpt-5.6-sol") == "openai"
         assert family("codex-mini") == "openai"
         assert family("") == "anthropic", "unknown model falls back to anthropic"
-        anth, oai = dialect("claude-opus-5"), dialect("gpt-5.6-sol")
-        assert anth != oai
-        # The load-bearing difference: ask Opus 5 for brevity and responses get
-        # ~20% shorter; ask GPT-5.6 and it returns a shorter *artifact* instead.
-        # ("brief initial plan" is fine on openai -- that is about the plan,
-        # not about how much of the deliverable to hand back.)
-        assert "responses focused and brief" in anth
-        assert "concise" not in oai and "responses focused and brief" not in oai
-        assert len(oai) < len(anth), "openai dialect must stay the shorter one"
-        # The factual half is shared; only the register changes.
-        assert capabilities() in system_prompt(world)
+        assert dialect("claude-opus-5") != dialect("gpt-5.6-sol"), "one block cannot serve both"
 
         # Cross-provider round trip. Switching to OpenAI and back used to brick
         # the session: openai.py puts its item id in "signature" as a provenance
@@ -293,11 +237,6 @@ def self_check() -> None:
         ours = _wire([{"type": "thinking", "thinking": "mine", "signature": "sig"}])
         assert ours == [{"type": "thinking", "thinking": "mine", "signature": "sig"}], ours
 
-        assert "<edit" in ABI
-        assert "<reload_sdk" in ABI
-        assert "XML tags are syscalls" in ABI
-        assert "Speak markdown" in ABI
-        assert "Look around first" in ABI
         assert world.thinking == "low"
 
         payload = cached_payload(
@@ -1553,11 +1492,10 @@ def self_check() -> None:
             if old_key is not None:
                 os.environ["ANTHROPIC_API_KEY"] = old_key
 
-        # The vendor patch is the one piece of this harness that can go missing
-        # without a compile error: vendor/ is gitignored, so a clone that skips
-        # scripts/vendor-setup.sh gets a pager with no DESMOS_ACP branch and
-        # `--grok` quietly runs grok's own agent instead of ours. Nothing else
-        # notices, so check the two halves stay in step here.
+        # vendor/grok-build is committed now, so the DESMOS_ACP branch cannot
+        # go missing on a fresh clone. What can still go missing is the branch
+        # itself, if a sync overwrites it -- and that is silent, because the
+        # pager compiles either way and just runs grok's agent instead of ours.
         _check_vendor_patch()
 
         try:
