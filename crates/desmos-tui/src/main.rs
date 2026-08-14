@@ -4340,6 +4340,7 @@ mod tests {
         buffer_text(&term)
     }
 
+
     /// Removed and added rows must be visually distinguishable. grok's gutter
     /// prints a line number, not a -/+ sign, so the distinction is colour --
     /// which means asserting on cell styles, not on the character dump.
@@ -4356,6 +4357,10 @@ mod tests {
                 "text": "Edited notes.md",
             }),
         );
+        // Wire cards land folded, and a folded card shows a preview line, not
+        // the diff. Open it — the colours under test only exist once the hunks
+        // are painted.
+        expand_calls(&mut app);
         let backend = TestBackend::new(130, 24);
         let mut term = Terminal::new(backend).unwrap();
         term.draw(|f| draw(f, &mut app)).unwrap();
