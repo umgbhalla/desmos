@@ -100,6 +100,8 @@ def cmd_tui(args: argparse.Namespace) -> int:
         "--cwd",
         str(Path(args.cwd).resolve()),
     ]
+    if getattr(args, "demo", False):
+        cmd.append("--demo")
     return subprocess.call(cmd, cwd=str(root))
 
 
@@ -130,8 +132,9 @@ def main() -> int:
     b.add_argument("--cwd", default=".")
     b.set_defaults(func=cmd_bridge)
 
-    t = sub.add_parser("tui", help="grok-minimal TUI over the kernel")
+    t = sub.add_parser("tui", help="three-pane TUI: trajectory + calls + input")
     t.add_argument("--cwd", default=".")
+    t.add_argument("--demo", action="store_true", help="seed a fake turn (no API)")
     t.set_defaults(func=cmd_tui)
 
     args = p.parse_args()

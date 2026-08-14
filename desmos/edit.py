@@ -37,6 +37,11 @@ def parse_edit_body(body: str, attrs: dict[str, str]) -> tuple[str, str]:
     text = body.strip("\n")
     if "\n---\n" in text:
         left, right = text.split("\n---\n", 1)
+        if "\n---\n" in right or right.startswith("---\n") or right.rstrip().endswith("\n---"):
+            raise ValueError(
+                "edit body has more than one --- delimiter; the replacement is "
+                "ambiguous. Use old_str=/new_str= attrs, or edit in smaller pieces."
+            )
         return left, right
     return old, new
 

@@ -36,7 +36,8 @@ next `complete()` sees the change. No restart.
 uv venv && uv pip install -e ".[kernel]"
 source .venv/bin/activate
 python -m desmos console          # IPython with step and world bound
-python -m desmos tui              # grok-minimal viewport (needs cargo)
+python -m desmos tui              # trajectory | calls | input  (needs cargo)
+python -m desmos tui --demo       # same layout, no API key
 python -m desmos kernel           # install a Jupyter kernelspec named Desmos
 ```
 

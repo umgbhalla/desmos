@@ -244,6 +244,7 @@ def log_payload(payload: dict[str, Any], betas: list[str]) -> str:
         for b in sysblocks
     ]
     record["n_messages"] = len(payload.get("messages") or [])
+    record["n_chars"] = sum(len(json.dumps(m)) for m in payload.get("messages") or [])
     with _TRAJ_LOCK:
         LAST.clear()
         LAST.update(record)
@@ -256,6 +257,7 @@ def log_payload(payload: dict[str, Any], betas: list[str]) -> str:
             with os.fdopen(fd, "w") as fh:
                 json.dump(record, fh, indent=2)
             os.replace(tmp, dest)
+            prune_trajectory()
         except Exception:
             try:
                 os.unlink(tmp)
@@ -265,6 +267,46 @@ def log_payload(payload: dict[str, Any], betas: list[str]) -> str:
         return dest
     except OSError:
         return ""
+
+
+FULL_KEEP = int(os.environ.get("DESMOS_TRAJ_FULL", "12"))
+MAX_FILES = int(os.environ.get("DESMOS_TRAJ_MAX", "400"))
+
+
+def prune_trajectory(full_keep: int = FULL_KEEP, max_files: int = MAX_FILES) -> dict[str, int]:
+    """Digests are cheap and forever; whole payloads are not.
+
+    Every record embeds the full transcript, so the directory grows
+    quadratically. Strip the payload out of anything older than the newest
+    `full_keep` records, and delete files past `max_files` entirely.
+    """
+    stripped = deleted = 0
+    try:
+        files = sorted(f for f in os.listdir(TRAJECTORY_DIR) if f.endswith(".json"))
+    except OSError:
+        return {"stripped": 0, "deleted": 0}
+    for name in files[:-max_files] if len(files) > max_files else []:
+        try:
+            os.unlink(os.path.join(TRAJECTORY_DIR, name))
+            deleted += 1
+        except OSError:
+            pass
+    files = files[-max_files:]
+    for name in files[:-full_keep] if len(files) > full_keep else []:
+        path = os.path.join(TRAJECTORY_DIR, name)
+        try:
+            with open(path) as fh:
+                rec = json.load(fh)
+            if "payload" not in rec:
+                continue
+            rec.pop("payload", None)
+            rec["payload_stripped"] = True
+            with open(path, "w") as fh:
+                json.dump(rec, fh, indent=2)
+            stripped += 1
+        except (OSError, ValueError):
+            continue
+    return {"stripped": stripped, "deleted": deleted}
 
 
 def trajectory(n: int = 1) -> list[dict[str, Any]]:
