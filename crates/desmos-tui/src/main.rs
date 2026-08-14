@@ -256,7 +256,10 @@ impl Default for PaneLayout {
         Self {
             wire_pct: 38,
             post_h: 12,
-            meter_h: 7,
+            // Three inner rows is everything the meter has to say now that the
+            // sparkline is gone; +2 for the border. Anything taller is dead
+            // space under the context bar.
+            meter_h: 5,
             post_split: 50,
             git_h: 0,
             files_h: 0,
@@ -1179,6 +1182,11 @@ fn grok_appearance() -> AppearanceConfig {
         .and_then(|s| toml::from_str::<RawAppearanceConfig>(&s).ok())
         .map(AppearanceConfig::from)
         .unwrap_or_default();
+    // The pager's Label style writes `Run <desc>` above a `$ <command>` line,
+    // so the command is announced twice and the tool name arrives third. Shell
+    // style drops the verb: the description stands as the title, the command
+    // follows on its own line, the output after that.
+    cfg.scrollback.blocks.execute.header_style = appearance::ExecuteHeaderStyle::Shell;
     cfg.show_timestamps = appearance_cache::load_timestamps();
     cfg.show_timeline = appearance_cache::load_show_timeline();
     cfg.prompt.compact = appearance_cache::load();
@@ -3225,7 +3233,7 @@ fn draw_scrollback(
     let border = if focused {
         accent
     } else {
-        theme.gray_bright
+        theme.bg_base
     };
     // Lay out before drawing the frame: the border title carries the count of
     // rows scrolled off the top, so it has to be known before the block is
@@ -3641,7 +3649,7 @@ fn draw_json_tree(
     focused: bool,
 ) {
     let theme = Theme::current();
-    let border = if focused { accent } else { theme.gray_bright };
+    let border = if focused { accent } else { theme.bg_base };
     // Lay the rows out first: the title reports what scrolled off the top, so
     // the count has to exist before the block is built. Same contract the
     // scrollback panes already follow.
@@ -3703,7 +3711,9 @@ impl Tier {
     fn of(rows: u16) -> Self {
         match rows {
             0..=1 => Self::Line,
-            2..=4 => Self::Dense,
+            // Three rows is the whole meter now, so Full starts there. Dense
+            // is the one-row-short case that has to drop the cost line.
+            2..=2 => Self::Dense,
             _ => Self::Full,
         }
     }
@@ -3956,7 +3966,7 @@ fn draw_git(f: &mut Frame, area: Rect, app: &mut App) {
     let border = if focused {
         theme.accent_skill
     } else {
-        theme.gray_bright
+        theme.bg_base
     };
     let mut title: Vec<Span> = vec![Span::raw(" ")];
     for tab in side::GitTab::ALL {
@@ -4048,7 +4058,7 @@ fn draw_files(f: &mut Frame, area: Rect, app: &mut App) {
     let border = if focused {
         theme.accent_assistant
     } else {
-        theme.gray_bright
+        theme.bg_base
     };
     let title = format!(" {} ", app.files.title());
     let block = Block::default()
@@ -4112,7 +4122,7 @@ fn draw_meta(f: &mut Frame, area: Rect, meter: &CacheMeter, focused: bool) {
     let border = if focused {
         theme.accent_tool
     } else {
-        theme.gray_bright
+        theme.bg_base
     };
     let block = Block::default()
         .borders(Borders::ALL)
@@ -4201,17 +4211,6 @@ fn draw_meta(f: &mut Frame, area: Rect, meter: &CacheMeter, focused: bool) {
             theme.text_primary,
         )
     };
-    let trend_row = || {
-        let spark_w = inner.width.saturating_sub(16) as usize;
-        Line::from(vec![
-            label("trend "),
-            Span::styled(
-                sparkline(&meter.ctx_hist, spark_w),
-                Style::default().fg(theme.accent_tool),
-            ),
-            label(&format!("  {}% hit", meter.hit_total())),
-        ])
-    };
     let money_row = || {
         Line::from(vec![
             Span::styled(
@@ -4231,7 +4230,9 @@ fn draw_meta(f: &mut Frame, area: Rect, meter: &CacheMeter, focused: bool) {
     let mut lines = match Tier::of(inner.height) {
         Tier::Line => vec![ctx_row()],
         Tier::Dense => vec![ctx_row(), cache_row(), money_row()],
-        Tier::Full => vec![ctx_row(), cache_row(), trend_row(), money_row()],
+        // The sparkline was the one row nobody read: a hit-rate trend restates
+        // what the cache row already says, in less precise form.
+        Tier::Full => vec![ctx_row(), cache_row(), money_row()],
     };
     lines.truncate(inner.height as usize);
     f.render_widget(Paragraph::new(lines), inner);
@@ -4263,7 +4264,7 @@ fn draw_queue(f: &mut Frame, area: Rect, app: &App) {
     let border = if focused {
         theme.accent_user
     } else {
-        theme.gray_bright
+        theme.bg_base
     };
     let title = format!(" queue  {} ", app.queue.len());
     let block = Block::default()
@@ -5205,6 +5206,35 @@ mod tests {
         buffer_text(&term)
     }
 
+    /// Only the focused pane draws a visible frame. The border cells stay put
+    /// so the geometry never jumps on Tab -- they are painted in the pane
+    /// background instead, which is the difference this asserts.
+    #[test]
+    fn an_unfocused_pane_has_no_visible_border() {
+        let theme = Theme::current();
+        let mut app = App::new();
+        app.ready = true;
+        app.focus = Focus::Story;
+        let backend = TestBackend::new(110, 26);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let buf = term.backend().buffer();
+        // Top-left corner of the story pane (focused) and of the calls pane.
+        let story_corner = buf.cell((0, 0)).unwrap().style().fg.unwrap();
+        let calls_x = (110 * (100 - app.layout.wire_pct) / 100) as u16;
+        let calls_corner = buf.cell((calls_x, 0)).unwrap().style().fg.unwrap();
+        assert_ne!(
+            story_corner, theme.bg_base,
+            "the focused pane must show its frame"
+        );
+        assert_eq!(
+            calls_corner, theme.bg_base,
+            "an unfocused frame must vanish into the background, got {calls_corner:?}"
+        );
+    }
+
+
+
     #[test]
     fn the_story_pane_shows_prose_and_not_commands() {
         // Drives the real event path. Asserts on the painted story, so a
@@ -6046,11 +6076,11 @@ mod tests {
         assert_eq!(Tier::of(0), Tier::Line);
         assert_eq!(Tier::of(1), Tier::Line);
         assert_eq!(Tier::of(2), Tier::Dense);
-        assert_eq!(Tier::of(4), Tier::Dense);
-        assert_eq!(Tier::of(5), Tier::Full);
+        assert_eq!(Tier::of(3), Tier::Full);
         assert_eq!(Tier::of(12), Tier::Full);
-        // The shipped default (meter_h 7, two border rows) must stay Full, or
-        // every user's meter silently changes shape on upgrade.
+        // The default hugs its content: three rows plus two border rows, and
+        // nothing below the context bar going to waste.
+        assert_eq!(PaneLayout::default().meter_h, 5);
         let inner = PaneLayout::default().meter_h - 2;
         assert_eq!(Tier::of(inner), Tier::Full);
     }
@@ -6077,10 +6107,10 @@ mod tests {
         for (rows, wants, drops) in [
             // One inner row answers "how full am I", not "what did it cost".
             (3u16, "ctx", "trend"),
-            // Three rows buy the cache split and the running cost.
+            // Three rows buy the cache split and the running cost. The trend
+            // sparkline is gone at every height: it restated the cache row.
             (5, "saved", "trend"),
-            // Tall enough for the trend -- the only row that shows motion.
-            (9, "trend", ""),
+            (9, "saved", "trend"),
         ] {
             app.layout.meter_h = rows;
             let text = paint(&mut app, 150, 40);
