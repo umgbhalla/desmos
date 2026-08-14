@@ -33,9 +33,12 @@ CAPS: dict[str, tuple[str, ...]] = {
 }
 
 AGENTS: dict[str, dict[str, Any]] = {
-    "general": {"capability": "edit", "max_turns": 12},
-    "explore": {"persona": "researcher", "capability": "read", "max_turns": 10},
-    "review": {"persona": "critic", "capability": "read", "max_turns": 8},
+    # A cap is a deadline, and a child that hits one answers from half a probe
+    # rather than saying it ran out. These are a runaway guard, not a budget:
+    # the real stop is the child deciding it is done.
+    "general": {"capability": "edit", "max_turns": 500},
+    "explore": {"persona": "researcher", "capability": "read", "max_turns": 500},
+    "review": {"persona": "critic", "capability": "read", "max_turns": 300},
 }
 
 
@@ -47,7 +50,7 @@ class EffectiveConfig:
     capability: str = "edit"
     model: str | None = None
     thinking: str | None = None
-    max_turns: int = 12
+    max_turns: int = 500
     cwd: str | None = None
     context: str = "new"  # new | resumed
 
@@ -71,7 +74,7 @@ def resolve(agent: str = "general", **over: Any) -> EffectiveConfig:
         capability=cap,
         model=d.get("model"),
         thinking=d.get("thinking"),
-        max_turns=int(d.get("max_turns", 12)),
+        max_turns=int(d.get("max_turns", 500)),
         cwd=d.get("cwd"),
         context=d.get("context", "new"),
     )
