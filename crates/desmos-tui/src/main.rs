@@ -88,7 +88,6 @@ use xai_grok_pager::input::is_mod_enter;
 use xai_grok_pager::theme::{Theme, ThemeKind, cache as theme_cache};
 use xai_grok_pager::util;
 use xai_grok_pager::views::block_viewer::{BlockViewerPane, ViewerKind};
-use xai_grok_pager::views::progress_bar::progress_bar_spans;
 use xai_grok_pager::views::modal_window::{
     ModalSizing, ModalWindowConfig, ModalWindowOutcome, ModalWindowState, Shortcut,
     handle_modal_key, handle_modal_mouse, render_modal_window,
@@ -692,10 +691,26 @@ struct CacheMeter {
     /// trajectory bar shows what is filling the window instead of one
     /// undifferentiated block. Order: system, user, assistant.
     roles: [u64; 3],
+    /// Context ceiling for the model that answered, so "how full" has a
+    /// denominator. Zero until the first call lands.
+    window: u64,
+    /// Prompt size per call, oldest first. One bar shows where context is;
+    /// this shows where it is heading, which is the part you steer by.
+    ctx_hist: Vec<u64>,
 }
 
 /// List price per million tokens (input, output). Cache reads bill at 0.1x
 /// input, 5m writes at 1.25x, 1h writes at 2x.
+/// Context window per model, in tokens. The wire never reports the ceiling,
+/// so the bar needs one to divide by.
+fn model_window(model: &str) -> u64 {
+    match model {
+        m if m.starts_with("claude-haiku") => 200_000,
+        m if m.starts_with("claude-") => 200_000,
+        _ => 200_000,
+    }
+}
+
 fn model_price(model: &str) -> (f64, f64) {
     match model {
         m if m.starts_with("claude-fable") || m.starts_with("claude-mythos") => (10.0, 50.0),
@@ -710,6 +725,19 @@ impl CacheMeter {
     /// Split the last request by role. Counts serialized characters, not
     /// tokens: the wire never reports per-role tokens, and the bar only needs
     /// proportions. System blocks and anything unlabelled land in slot 0.
+    /// Cache share of this one call's prompt.
+    fn hit(&self) -> u64 {
+        let total = self.read + self.write + self.fresh;
+        if total == 0 { 0 } else { self.read * 100 / total }
+    }
+
+    /// Cache share across the session -- the number that says whether the
+    /// window is actually working, rather than how one call happened to land.
+    fn hit_total(&self) -> u64 {
+        let total = self.read_total + self.write_total + self.fresh_total;
+        if total == 0 { 0 } else { self.read_total * 100 / total }
+    }
+
     fn observe_roles(&mut self, request: &Value) {
         let mut split = [0u64; 3];
         if let Some(sys) = request.get("system") {
@@ -729,6 +757,7 @@ impl CacheMeter {
     }
 
     fn observe(&mut self, usage: &Value, model: &str) {
+        self.window = model_window(model);
         let n = |k: &str| usage.get(k).and_then(Value::as_u64).unwrap_or(0);
         self.read = n("cache_read_input_tokens");
         self.write = n("cache_creation_input_tokens");
@@ -764,6 +793,15 @@ impl CacheMeter {
         self.spent += cost;
         self.saved += saved;
 
+        // Prompt size for this call -- everything the model had to read before
+        // it could answer. Recorded before the cold-call early return below, so
+        // the trend does not silently skip uncached turns.
+        let ctx = self.read + self.write + self.fresh;
+        self.ctx_hist.push(ctx);
+        if self.ctx_hist.len() > 128 {
+            self.ctx_hist.remove(0);
+        }
+
         if self.read == 0 && self.write == 0 {
             return;
         }
@@ -786,20 +824,7 @@ impl CacheMeter {
         (left > 0.0).then_some(left)
     }
 
-    fn hit(&self) -> u64 {
-        let total = self.read + self.write + self.fresh;
-        if total == 0 { 0 } else { self.read * 100 / total }
-    }
 
-    /// Hit rate over every token the session has sent, not just the last call.
-    fn hit_total(&self) -> u64 {
-        let total = self.read_total + self.write_total + self.fresh_total;
-        if total == 0 {
-            0
-        } else {
-            self.read_total * 100 / total
-        }
-    }
 }
 
 impl App {
@@ -3647,6 +3672,119 @@ fn pct(part: u64, total: u64) -> String {
 /// cells to the parts with the biggest fractional loss. Floors can only
 /// undershoot, so the bar fills its width exactly and never overruns it — a
 /// three-part split in one cell paints one cell, not three.
+/// A sparkline over the tail of `vals`. Height is relative to the window's own
+/// peak, not an absolute scale: the question is "is this climbing", and a bar
+/// that is always full answers nothing.
+fn sparkline(vals: &[u64], width: usize) -> String {
+    const TICKS: [char; 8] = ['\u{2581}', '\u{2582}', '\u{2583}', '\u{2584}', '\u{2585}', '\u{2586}', '\u{2587}', '\u{2588}'];
+    if vals.is_empty() || width == 0 {
+        return String::new();
+    }
+    let take = vals.len().min(width);
+    let tail = &vals[vals.len() - take..];
+    let max = tail.iter().copied().max().unwrap_or(0);
+    if max == 0 {
+        return TICKS[0].to_string().repeat(take);
+    }
+    tail.iter()
+        .map(|v| {
+            let i = ((*v as f64 / max as f64) * 7.0).round() as usize;
+            TICKS[i.min(7)]
+        })
+        .collect()
+}
+
+/// One meter row: a filled track with its label and value written *inside* it.
+///
+/// The old layout spent two rows per bar -- the bar, then a legend underneath --
+/// which is why the pane sprawled. Painting the text over the track costs one
+/// row and reads the same, so long as the ink flips to the background colour
+/// where it crosses a filled cell.
+#[allow(clippy::too_many_arguments)]
+fn meter_row(
+    width: u16,
+    label: &str,
+    value: &str,
+    segments: &[(u64, ratatui::style::Color)],
+    ratio: f64,
+    track: ratatui::style::Color,
+    ink_on_fill: ratatui::style::Color,
+    ink_on_track: ratatui::style::Color,
+) -> Line<'static> {
+    let w = width as usize;
+    if w == 0 {
+        return Line::from("");
+    }
+    let filled = ((w as f64) * ratio.clamp(0.0, 1.0)).round() as usize;
+
+    // Paint the track, then hand the filled prefix to the segment allocator so
+    // a role split and a plain fill share one code path.
+    let mut bg: Vec<ratatui::style::Color> = vec![track; w];
+    let total: u64 = segments.iter().map(|(v, _)| *v).sum();
+    if filled > 0 {
+        if total == 0 {
+            let fallback = segments
+                .first()
+                .map(|(_, c)| *c)
+                .unwrap_or(ink_on_track);
+            for cell in bg.iter_mut().take(filled) {
+                *cell = fallback;
+            }
+        } else {
+            let mut at = 0usize;
+            for span in segment_bar_spans(filled as u16, segments, track) {
+                let n = span.content.chars().count();
+                let color = span.style.fg.unwrap_or(track);
+                for cell in bg.iter_mut().skip(at).take(n) {
+                    *cell = color;
+                }
+                at += n;
+            }
+        }
+    }
+
+    // Label hugs the left edge, value the right. If they would collide the
+    // value wins -- a number you cannot read is worse than a missing word.
+    let mut text: Vec<Option<char>> = vec![None; w];
+    let vchars: Vec<char> = value.chars().collect();
+    let vstart = w.saturating_sub(vchars.len());
+    for (i, ch) in vchars.iter().enumerate() {
+        if vstart + i < w {
+            text[vstart + i] = Some(*ch);
+        }
+    }
+    let lchars: Vec<char> = label.chars().collect();
+    if 1 + lchars.len() < vstart {
+        for (i, ch) in lchars.iter().enumerate() {
+            text[1 + i] = Some(*ch);
+        }
+    }
+
+    // Group runs of identical style so a 60-cell row is a handful of spans.
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut run = String::new();
+    let mut run_style: Option<Style> = None;
+    for i in 0..w {
+        let filled_here = bg[i] != track;
+        let ink = if filled_here { ink_on_fill } else { ink_on_track };
+        let style = Style::default().bg(bg[i]).fg(ink);
+        let ch = text[i].unwrap_or(' ');
+        if run_style == Some(style) {
+            run.push(ch);
+        } else {
+            if let Some(st) = run_style {
+                spans.push(Span::styled(std::mem::take(&mut run), st));
+            }
+            run.push(ch);
+            run_style = Some(style);
+        }
+    }
+    if let Some(st) = run_style {
+        spans.push(Span::styled(run, st));
+    }
+    Line::from(spans)
+}
+
 fn segment_bar_spans(
     width: u16,
     parts: &[(u64, ratatui::style::Color)],
@@ -3888,153 +4026,90 @@ fn draw_meta(f: &mut Frame, area: Rect, meter: &CacheMeter, focused: bool) {
         return;
     }
 
-    let ratio = left.unwrap_or(0.0);
-    // Fade with the window: healthy → warm → nearly gone → dim once expired.
-    let (fg, dim) = match ratio {
-        r if r <= 0.0 => (theme.gray_bright, true),
-        r if r < 0.25 => (theme.accent_user, false),
-        r if r < 0.6 => (theme.accent_tool, false),
-        _ => (theme.accent_success, false),
-    };
-    let mut bar_fg = fg;
-    if dim {
-        bar_fg = theme.gray_bright;
-    }
-    let bar = || {
-        Line::from(progress_bar_spans(
-            inner.width,
-            ratio,
-            bar_fg,
-            theme.bg_base,
-        ))
-    };
     let label = |s: &str| Span::styled(s.to_string(), Style::default().fg(theme.text_secondary));
-    let val = |s: String| Span::styled(s, Style::default().fg(theme.text_primary));
-    let hit = |v: u64| Span::styled(format!("{v:>3}%"), Style::default().fg(fg));
 
     // One row, two zones: how long the cache entry has left, and what the
     // last call did with it. They answer the same question — is the window
     // working for me — so they share a row instead of stacking.
-    let split_row = |w: u16| -> Line<'static> {
-        let left = (w / 2).saturating_sub(1);
-        let right = w.saturating_sub(left + 1);
-        let mut spans = progress_bar_spans(left, ratio, bar_fg, theme.bg_base);
-        spans.push(Span::raw(" "));
-        spans.extend(segment_bar_spans(
-            right,
-            &[
-                (meter.write, theme.accent_tool),
-                (meter.read, theme.accent_success),
-            ],
-            theme.bg_base,
-        ));
-        Line::from(spans)
-    };
-    let ttl_text = match secs {
-        Some(sec) => format!("{}:{:02}", sec / 60, sec % 60),
-        None => "cold".into(),
-    };
 
     // Priority order: what a glance needs first, then detail. Whatever the
     // pane cannot fit is dropped from the tail, not clipped mid-thought.
-    let mut lines = match Tier::of(inner.height) {
-        // One row: is the cache warm, and what has this session cost.
-        Tier::Line => vec![Line::from(vec![
-            hit(meter.hit_total()),
-            label("  warm "),
-            val(format!("{}/{}", meter.warm, meter.calls)),
-            label("  spent "),
+    let ctx_used = meter.read + meter.write + meter.fresh;
+    let window = if meter.window == 0 {
+        200_000
+    } else {
+        meter.window
+    };
+    let roles = [
+        (meter.roles[0], theme.accent_skill),
+        (meter.roles[1], theme.accent_user),
+        (meter.roles[2], theme.accent_assistant),
+    ];
+    // How full, and full of what -- one bar answers both. A role split
+    // normalised to 100% looks identical at 8k and at 180k, which is the one
+    // thing worth knowing.
+    let ctx_row = || {
+        meter_row(
+            inner.width,
+            "ctx",
+            &format!("{} / {}", tokens(ctx_used), tokens(window)),
+            &roles,
+            ctx_used as f64 / window as f64,
+            theme.bg_highlight,
+            theme.bg_base,
+            theme.text_primary,
+        )
+    };
+    let rw = meter.read + meter.write;
+    // Read against write on the last call: a write-heavy bar is the call that
+    // paid to fill the cache rather than riding it. The track is always full --
+    // this is a proportion, not a level.
+    let cache_row = || {
+        meter_row(
+            inner.width,
+            "cache",
+            &format!("{}% cached", meter.hit()),
+            &[
+                (meter.read, theme.accent_success),
+                (meter.write, theme.accent_tool),
+            ],
+            if rw == 0 { 0.0 } else { 1.0 },
+            theme.bg_highlight,
+            theme.bg_base,
+            theme.text_primary,
+        )
+    };
+    let trend_row = || {
+        let spark_w = inner.width.saturating_sub(16) as usize;
+        Line::from(vec![
+            label("trend "),
+            Span::styled(
+                sparkline(&meter.ctx_hist, spark_w),
+                Style::default().fg(theme.accent_tool),
+            ),
+            label(&format!("  {}% hit", meter.hit_total())),
+        ])
+    };
+    let money_row = || {
+        Line::from(vec![
             Span::styled(
                 money(meter.spent),
                 Style::default()
                     .fg(theme.accent_user)
                     .add_modifier(Modifier::BOLD),
             ),
-        ])],
-        Tier::Dense => vec![
-            split_row(inner.width),
-            Line::from(vec![
-                hit(meter.hit_total()),
-                label("  warm "),
-                val(format!("{}/{}", meter.warm, meter.calls)),
-                label("  spent "),
-                Span::styled(
-                    money(meter.spent),
-                    Style::default()
-                        .fg(theme.accent_user)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                label("  saved "),
-                Span::styled(money(meter.saved), Style::default().fg(theme.accent_success)),
-            ]),
-        ],
-        Tier::Full => vec![
-            split_row(inner.width),
-            Line::from(vec![
-                label("ttl "),
-                Span::styled(format!("{ttl_text:<5}"), Style::default().fg(fg)),
-                Span::styled(" write ", Style::default().fg(theme.accent_tool)),
-                val(format!("{:<7}", tokens(meter.write))),
-                Span::styled(" read ", Style::default().fg(theme.accent_success)),
-                val(tokens(meter.read)),
-            ]),
-            // What is filling the window this call, by role.
-            Line::from(segment_bar_spans(
-                inner.width,
-                &[
-                    (meter.roles[0], theme.accent_skill),
-                    (meter.roles[1], theme.accent_user),
-                    (meter.roles[2], theme.accent_assistant),
-                ],
-                theme.bg_base,
-            )),
-            Line::from(vec![
-                Span::styled("sys ", Style::default().fg(theme.accent_skill)),
-                val(pct(meter.roles[0], meter.roles.iter().sum())),
-                Span::styled("  usr ", Style::default().fg(theme.accent_user)),
-                val(pct(meter.roles[1], meter.roles.iter().sum())),
-                Span::styled("  ast ", Style::default().fg(theme.accent_assistant)),
-                val(pct(meter.roles[2], meter.roles.iter().sum())),
-            ]),
-            // Session so far.
-            Line::from(vec![
-                label("warm "),
-                Span::styled(
-                    format!("{}/{}", meter.warm, meter.calls),
-                    Style::default().fg(theme.accent_success),
-                ),
-                label("  rate "),
-                hit(meter.hit_total()),
-                label("  spent "),
-                Span::styled(
-                    money(meter.spent),
-                    Style::default()
-                        .fg(theme.accent_user)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                label("  saved "),
-                Span::styled(money(meter.saved), Style::default().fg(theme.accent_success)),
-            ]),
-            // Detail, only if the pane was grown for it.
-            Line::from(vec![
-                label("call  "),
-                hit(meter.hit()),
-                label("  in "),
-                val(format!("{:>5}", tokens(meter.fresh))),
-                label("  gen "),
-                val(format!("{:>5}", tokens(meter.out))),
-            ]),
-            Line::from(vec![
-                label("total "),
-                val(format!(
-                    "read {}  write {}  in {}  gen {}",
-                    tokens(meter.read_total),
-                    tokens(meter.write_total),
-                    tokens(meter.fresh_total),
-                    tokens(meter.out_total)
-                )),
-            ]),
-        ],
+            label(" spent   "),
+            Span::styled(money(meter.saved), Style::default().fg(theme.accent_success)),
+            label(" saved"),
+        ])
+    };
+
+    // Degrade by which question matters most, not by what happens to fit. The
+    // title already carries the TTL, so row one is context, not hit rate.
+    let mut lines = match Tier::of(inner.height) {
+        Tier::Line => vec![ctx_row()],
+        Tier::Dense => vec![ctx_row(), cache_row(), money_row()],
+        Tier::Full => vec![ctx_row(), cache_row(), trend_row(), money_row()],
     };
     lines.truncate(inner.height as usize);
     f.render_widget(Paragraph::new(lines), inner);
@@ -4955,6 +5030,71 @@ mod tests {
         buffer_text(&term)
     }
 
+    #[test]
+    fn a_meter_row_paints_exactly_its_width() {
+        let c = ratatui::style::Color::Red;
+        let t = ratatui::style::Color::Black;
+        for w in [1u16, 12, 40, 77] {
+            for ratio in [0.0f64, 0.13, 0.5, 0.999, 1.0] {
+                let line = meter_row(w, "ctx", "62k / 200k", &[(3, c), (7, c)], ratio, t, t, c);
+                let painted: usize = line
+                    .spans
+                    .iter()
+                    .map(|s| s.content.chars().count())
+                    .sum();
+                assert_eq!(painted, w as usize, "w={w} ratio={ratio}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_meter_row_keeps_the_value_when_the_label_will_not_fit() {
+        let c = ratatui::style::Color::Red;
+        let t = ratatui::style::Color::Black;
+        // Narrow row: the number has to survive, the word can go.
+        let line = meter_row(14, "context", "62k / 200k", &[(1, c)], 0.5, t, t, c);
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.contains("62k / 200k"), "value dropped: {text:?}");
+        assert!(!text.contains("context"), "label should have yielded: {text:?}");
+        // One cell of gutter on the right, so the value never touches the border.
+        assert!(
+            text.ends_with(' '),
+            "value is flush against the edge: {text:?}"
+        );
+    }
+
+    #[test]
+    fn a_sparkline_tracks_its_own_peak() {
+        // Flat input is flat output; a rising series ends higher than it starts.
+        assert_eq!(sparkline(&[5, 5, 5], 8).chars().count(), 3);
+        let rising = sparkline(&[1, 2, 4, 8], 8);
+        let ch: Vec<char> = rising.chars().collect();
+        assert!(ch[3] > ch[0], "not rising: {rising:?}");
+        assert_eq!(sparkline(&[], 8), "");
+        assert_eq!(sparkline(&[0, 0], 8).chars().count(), 2);
+    }
+
+    #[test]
+    fn a_sparkline_shows_only_what_fits() {
+        let vals: Vec<u64> = (0..100).collect();
+        assert_eq!(sparkline(&vals, 10).chars().count(), 10);
+    }
+
+    #[test]
+    fn context_history_records_cold_calls_too() {
+        // The early return for an uncached call must not skip the trend.
+        let mut m = CacheMeter::default();
+        m.observe(
+            &json!({"input_tokens": 900, "cache_read_input_tokens": 0,
+                    "cache_creation_input_tokens": 0, "output_tokens": 10}),
+            "claude-opus-5",
+        );
+        assert_eq!(m.ctx_hist.len(), 1, "cold call missing from trend");
+        assert_eq!(m.ctx_hist[0], 900);
+        assert_eq!(m.window, 200_000, "window never set");
+    }
+
+
 
     #[test]
     fn segment_bar_fills_exactly_and_keeps_small_slices() {
@@ -5572,9 +5712,12 @@ mod tests {
         );
         // Rows the meter can be dragged to, and what has to survive each.
         for (rows, wants, drops) in [
-            (3u16, "spent", "total "),
-            (5, "saved", "total "),
-            (9, "total ", ""),
+            // One inner row answers "how full am I", not "what did it cost".
+            (3u16, "ctx", "trend"),
+            // Three rows buy the cache split and the running cost.
+            (5, "saved", "trend"),
+            // Tall enough for the trend -- the only row that shows motion.
+            (9, "trend", ""),
         ] {
             app.layout.meter_h = rows;
             let text = paint(&mut app, 150, 40);
