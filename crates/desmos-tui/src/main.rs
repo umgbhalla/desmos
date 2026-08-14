@@ -923,6 +923,14 @@ struct App {
     /// Wire cards the reader folded or opened by hand. reflow_wire leaves
     /// these alone; without it the auto-open would fight every keystroke.
     wire_manual: HashSet<EntryId>,
+    /// First card of each call group, in order — one per `complete()` POST.
+    ///
+    /// The pager has turn navigation already, but it derives turns from
+    /// `RenderBlock::UserPrompt` entries and the wire pane has none: its
+    /// groups start at a POST card, which is a `ToolCall::Other`. So the
+    /// boundaries are recorded where they are pushed rather than rebuilt from
+    /// block shape, which would mean matching on the header string.
+    call_groups: Vec<EntryId>,
     post_in_area: Rect,
     post_out_area: Rect,
     queue_area: Rect,
@@ -1224,6 +1232,7 @@ impl App {
             traj_area: Rect::default(),
             call_area: Rect::default(),
             wire_manual: HashSet::new(),
+            call_groups: Vec::new(),
             post_in_area: Rect::default(),
             post_out_area: Rect::default(),
             queue_area: Rect::default(),
@@ -1421,6 +1430,68 @@ impl App {
         wire_push(&mut self.calls, block);
     }
 
+    /// Push a card that opens a new call group. Every `complete()` POST starts
+    /// one; the syscalls it produced land after it and belong to it.
+    fn call_push_group(&mut self, block: RenderBlock) {
+        let id = wire_push(&mut self.calls, block);
+        self.call_groups.push(id);
+    }
+
+    /// `(current, total)` group position, 1-based, for the wire pane title.
+    ///
+    /// "Current" follows the selection when there is one so `[`/`]` can be
+    /// watched moving, and otherwise reports the newest group, which is what
+    /// the tail the reader is staring at actually belongs to.
+    fn call_group_pos(&self) -> Option<(usize, usize)> {
+        let total = self.call_groups.len();
+        if total == 0 {
+            return None;
+        }
+        // Groups are pushed in entry order, so the group a card belongs to is
+        // the last boundary at or above it.
+        let cur = match self.calls.selected() {
+            Some(sel) => self
+                .call_groups
+                .iter()
+                .filter_map(|id| self.calls.index_of_id(*id))
+                .filter(|start| *start <= sel)
+                .count()
+                .max(1),
+            None => total,
+        };
+        Some((cur, total))
+    }
+
+    /// Move the wire selection to the first card of the previous/next group.
+    ///
+    /// Returns false when there is nowhere to go, so the caller can leave the
+    /// selection alone rather than snapping to an end.
+    fn select_call_group(&mut self, forward: bool) -> bool {
+        let mut starts: Vec<usize> = self
+            .call_groups
+            .iter()
+            .filter_map(|id| self.calls.index_of_id(*id))
+            .collect();
+        starts.sort_unstable();
+        starts.dedup();
+        if starts.is_empty() {
+            return false;
+        }
+        let sel = self.calls.selected();
+        let target = match sel {
+            None if forward => starts.first().copied(),
+            None => starts.last().copied(),
+            Some(cur) if forward => starts.iter().copied().find(|s| *s > cur),
+            Some(cur) => starts.iter().rev().copied().find(|s| *s < cur),
+        };
+        let Some(target) = target else {
+            return false;
+        };
+        self.calls.set_selected(Some(target));
+        self.calls.scroll_to_entry_top(target);
+        true
+    }
+
     fn focused_scroll(&mut self) -> &mut ScrollbackState {
         match self.focus {
             Focus::Calls => self.calls_scroll(),
@@ -1582,7 +1653,20 @@ fn seed_demo(app: &mut App) {
          to live in a note, a skill, or a named object the index still lists. \
          A paragraph this long must wrap across more than one row. WRAPEND",
     ));
-    app.call_push(wire_complete(
+    // One edit, in both panes, so --demo shows the story card folded next to
+    // the wire card it was built from.
+    let demo_edit = json!({
+        "ev": "result",
+        "tag": "edit",
+        "attrs": {"path": "desmos/loop.py"},
+        "body": "    if n < max_turns:\n---\n    if n <= max_turns:",
+        "text": "ok",
+    });
+    if let Some(card) = story_edit_card(&demo_edit) {
+        let id = app.story.push_block(card);
+        set_wire_mode(&mut app.story, id, DisplayMode::Collapsed);
+    }
+    app.call_push_group(wire_complete(
         "user",
         1,
         "claude-opus-5",
@@ -1591,6 +1675,7 @@ fn seed_demo(app: &mut App) {
         1,
         1,
     ));
+    app.call_push(result_block(&demo_edit));
     app.call_push(wire_syscall(
         "python",
         "sorted(k for k in world.ns if not k.startswith('_'))",
@@ -1603,7 +1688,7 @@ fn seed_demo(app: &mut App) {
         &json!({}),
         "0001.json 0002.json 0003.json 0004.json",
     ));
-    app.call_push(wire_complete(
+    app.call_push_group(wire_complete(
         "llm",
         2,
         "claude-opus-5",
@@ -1616,7 +1701,7 @@ fn seed_demo(app: &mut App) {
         1,
         0,
     ));
-    app.call_push(wire_complete(
+    app.call_push_group(wire_complete(
         "user",
         3,
         "claude-opus-5",
@@ -2102,9 +2187,17 @@ fn handle_event(app: &mut App, ev: Value) {
             let phase = ev.get("phase").and_then(Value::as_str).unwrap_or("done");
             if phase != "start" && phase != "delta" {
                 let tag = ev.get("tag").and_then(Value::as_str).unwrap_or("?");
-                let target = call_target(tag, &ev);
-                app.stream.run.call(tag, target);
-                app.stream.run.sync(&mut app.story);
+                // An edit reports itself in the story as a card, so counting it
+                // in the work sentence too would say the same thing twice —
+                // `edit x3` above three cards that name the files.
+                if let Some(card) = story_edit_card(&ev) {
+                    let id = app.story.push_block(card);
+                    set_wire_mode(&mut app.story, id, DisplayMode::Collapsed);
+                } else {
+                    let target = call_target(tag, &ev);
+                    app.stream.run.call(tag, target);
+                    app.stream.run.sync(&mut app.story);
+                }
             }
             apply_result(&mut app.calls, &mut app.exec, &ev);
         }
@@ -2137,7 +2230,7 @@ fn handle_event(app: &mut App, ev: Value) {
             }
             let thoughts = ev.get("thoughts").and_then(Value::as_u64).unwrap_or(0);
             let redacted = ev.get("redacted").and_then(Value::as_u64).unwrap_or(0);
-            app.call_push(wire_complete(
+            app.call_push_group(wire_complete(
                 origin, n, model, thinking, &usage, thoughts, redacted,
             ));
             let empty = json!({});
@@ -2620,6 +2713,14 @@ fn handle_key(
                     app.focused_scroll().toggle_fold_selected();
                 }
             }
+            // Group step. Arrows already mean fold in this pane, so walking
+            // whole POST groups gets its own pair rather than overloading them.
+            KeyCode::Char('[') if app.focus == Focus::Calls => {
+                app.select_call_group(false);
+            }
+            KeyCode::Char(']') if app.focus == Focus::Calls => {
+                app.select_call_group(true);
+            }
             KeyCode::Char('r') => app.focused_scroll().toggle_raw_selected(),
             KeyCode::PageUp => app.focused_scroll().page_up(),
             KeyCode::PageDown => app.focused_scroll().page_down(),
@@ -2768,7 +2869,7 @@ fn start_step(
         app.status = "running".into();
         b.send(&json!({"op": "step", "text": line}))?;
     } else {
-        app.call_push(wire_complete("user", 0, "demo", "", &json!({}), 0, 0));
+        app.call_push_group(wire_complete("user", 0, "demo", "", &json!({}), 0, 0));
     }
     Ok(())
 }
@@ -2853,6 +2954,8 @@ fn submit_prompt(mut bridge: Option<&mut Bridge>, app: &mut App) -> io::Result<b
         }
         app.story.clear();
         app.calls.clear();
+        app.call_groups.clear();
+        app.wire_manual.clear();
         app.post_in.clear();
         app.post_out.clear();
         app.post_req = json!({});
@@ -4026,13 +4129,17 @@ fn draw(f: &mut Frame, app: &mut App) {
             app.mouse,
             &app.story_text,
         );
+        let calls_title = match app.call_group_pos() {
+            Some((cur, total)) => format!("calls  #{cur}/{total}"),
+            None => "calls".to_string(),
+        };
         draw_scrollback(
             f,
             panes[1],
             &mut app.calls,
             &mut app.calls_scratch,
             &mut app.calls_sel,
-            "calls",
+            &calls_title,
             theme.accent_tool,
             app.focus == Focus::Calls,
             app.mouse,
@@ -4756,6 +4863,9 @@ fn key_rows(app: &App) -> Vec<(&'static str, String)> {
             rows.push(("↑ ↓", "move".into()));
             rows.push(("← →", "fold".into()));
             rows.push(("⏎", "open".into()));
+            if app.focus == Focus::Calls && !app.call_groups.is_empty() {
+                rows.push(("[ ]", "group".into()));
+            }
             rows.push(("r", "raw".into()));
             rows.push(("i", "input".into()));
         }
@@ -5590,6 +5700,30 @@ fn wire_compacted(n: u64, kept: u64, summary: &str) -> RenderBlock {
     ))
 }
 
+/// The story's copy of an `<edit>` result, or `None` for any other syscall.
+///
+/// The story is otherwise a whitelist of narrative kinds and syscalls are the
+/// wire pane's job — but an edit is the one call whose result *is* the
+/// narrative. "It changed these four lines" is the sentence the prose is
+/// about, and a work-run row reading `edit x3` cannot carry it. The card is
+/// pushed collapsed, so a turn that rewrites twenty files costs twenty header
+/// rows and not twenty diffs; `l` opens one, Enter zooms it into the viewer.
+///
+/// This is the same block the wire pane gets, built a second time rather than
+/// shared: the two panes fold independently, and a card that opened in the
+/// story because the reader pressed `l` must not also open on the wire.
+fn story_edit_card(ev: &Value) -> Option<RenderBlock> {
+    if ev.get("tag").and_then(Value::as_str)? != "edit" {
+        return None;
+    }
+    match result_block(ev) {
+        block @ RenderBlock::ToolCall(ToolCallBlock::Edit(_)) => Some(block),
+        // A malformed edit body falls through wire_syscall's `edit` arm as
+        // something else; the story has no use for that shape.
+        _ => None,
+    }
+}
+
 /// Wire card for one XML syscall: the body that ran, then the result.
 fn wire_syscall(tag: &str, body: &str, attrs: &Value, result: &str) -> RenderBlock {
     match tag {
@@ -6197,6 +6331,283 @@ mod tests {
         assert!(row.contains("bash \u{00d7}2"), "calls not compressed: {row}");
         assert!(row.contains("thought"), "thinking not folded in: {row}");
         assert!(!row.contains("cargo build"), "a command body leaked: {row}");
+    }
+
+    /// The two panes as the reader actually sees them: a folded edit card in
+    /// the story that opens into readable before/after rows, and a wire title
+    /// that says which group the cursor is in.
+    #[test]
+    fn the_demo_paints_a_folded_edit_and_a_group_counter() {
+        let mut app = App::new();
+        seed_demo(&mut app);
+
+        let folded = paint(&mut app, 120, 40);
+        // Folded, the card names the file by basename; opened, by full path.
+        assert!(
+            folded.contains("Edit loop.py"),
+            "no story edit card: {folded}"
+        );
+        assert!(
+            !folded.contains("if n <= max_turns"),
+            "the card arrived open and spilled its diff into the story: {folded}"
+        );
+        assert!(
+            folded.contains("calls  #3/3"),
+            "the wire title lost its group counter: {folded}"
+        );
+
+        let id = app.story.entry(story_edits(&app)[0]).unwrap().id;
+        set_wire_mode(&mut app.story, id, DisplayMode::Expanded);
+        let open = paint(&mut app, 120, 40);
+        assert!(
+            open.contains("if n < max_turns:") && open.contains("if n <= max_turns:"),
+            "opening the card did not show both sides of the diff: {open}"
+        );
+    }
+
+    /// Two POSTs, each with syscalls under it. `]` walks forward to the next
+    /// group head, `[` back, and neither wraps past the ends.
+    #[test]
+    fn brackets_step_the_wire_through_post_groups() {
+        let mut app = App::new();
+        handle_event(&mut app, json!({"ev": "turn", "text": "go"}));
+        for n in 1..=3u64 {
+            handle_event(&mut app, json!({"ev": "complete", "n": n, "origin": "llm"}));
+            handle_event(
+                &mut app,
+                json!({"ev": "result", "tag": "bash", "body": "cargo test", "text": "ok"}),
+            );
+        }
+        let _ = paint(&mut app, 120, 34);
+        assert_eq!(app.call_groups.len(), 3, "one group per POST");
+
+        let starts: Vec<usize> = app
+            .call_groups
+            .iter()
+            .filter_map(|id| app.calls.index_of_id(*id))
+            .collect();
+
+        // A painted pane already has a cursor, so clear it to reach the
+        // no-selection path: forward from nowhere lands on the first group.
+        app.calls.set_selected(None);
+        assert!(app.select_call_group(true));
+        assert_eq!(app.calls.selected(), Some(starts[0]));
+        assert!(app.select_call_group(true));
+        assert_eq!(app.calls.selected(), Some(starts[1]));
+        assert!(app.select_call_group(true));
+        assert_eq!(app.calls.selected(), Some(starts[2]));
+        // Past the last group there is nowhere to go, and the selection holds.
+        assert!(!app.select_call_group(true), "forward wrapped off the end");
+        assert_eq!(app.calls.selected(), Some(starts[2]));
+
+        assert!(app.select_call_group(false));
+        assert_eq!(app.calls.selected(), Some(starts[1]));
+        assert!(app.select_call_group(false));
+        assert_eq!(app.calls.selected(), Some(starts[0]));
+        assert!(!app.select_call_group(false), "back wrapped off the start");
+        assert_eq!(app.calls.selected(), Some(starts[0]));
+    }
+
+    /// `[`/`]` step from a card in the middle of a group to that group's
+    /// neighbours, not to the card's own neighbours.
+    #[test]
+    fn a_group_step_jumps_from_mid_group_to_the_next_head() {
+        let mut app = App::new();
+        handle_event(&mut app, json!({"ev": "turn", "text": "go"}));
+        for n in 1..=2u64 {
+            handle_event(&mut app, json!({"ev": "complete", "n": n, "origin": "llm"}));
+            for _ in 0..3 {
+                handle_event(
+                    &mut app,
+                    json!({"ev": "result", "tag": "bash", "body": "x", "text": "ok"}),
+                );
+            }
+        }
+        let _ = paint(&mut app, 120, 34);
+        let starts: Vec<usize> = app
+            .call_groups
+            .iter()
+            .filter_map(|id| app.calls.index_of_id(*id))
+            .collect();
+
+        // Land inside group 1, two cards past its head.
+        app.calls.set_selected(Some(starts[0] + 2));
+        assert!(app.select_call_group(true));
+        assert_eq!(
+            app.calls.selected(),
+            Some(starts[1]),
+            "a group step behaved like a plain cursor move",
+        );
+    }
+
+    /// The title reports which group the cursor is in, so the step is visible.
+    #[test]
+    fn the_wire_title_counts_groups() {
+        let mut app = App::new();
+        assert_eq!(app.call_group_pos(), None, "no POSTs, no counter");
+
+        handle_event(&mut app, json!({"ev": "turn", "text": "go"}));
+        for n in 1..=3u64 {
+            handle_event(&mut app, json!({"ev": "complete", "n": n, "origin": "llm"}));
+        }
+        let _ = paint(&mut app, 120, 34);
+        // Nothing selected: the counter names the newest group, which is the
+        // one the tail belongs to.
+        assert_eq!(app.call_group_pos(), Some((3, 3)));
+
+        app.select_call_group(false);
+        app.select_call_group(false);
+        assert_eq!(app.call_group_pos(), Some((1, 3)), "counter did not follow");
+    }
+
+    /// `/reset` clears the wire, so the group index has to go with it or the
+    /// stale ids leave the counter claiming groups that are gone.
+    #[test]
+    fn reset_drops_the_group_index() {
+        let mut app = App::new();
+        handle_event(&mut app, json!({"ev": "turn", "text": "go"}));
+        handle_event(&mut app, json!({"ev": "complete", "n": 1, "origin": "llm"}));
+        assert_eq!(app.call_groups.len(), 1);
+
+        app.prompt = PromptBuf::new();
+        for c in "/reset".chars() {
+            app.prompt.insert_char(c);
+        }
+        let _ = submit_prompt(None, &mut app);
+        assert!(app.call_groups.is_empty(), "group index survived /reset");
+        assert_eq!(app.call_group_pos(), None);
+    }
+
+    fn edit_ev(path: &str, old: &str, new: &str, result: &str) -> Value {
+        json!({
+            "ev": "result",
+            "tag": "edit",
+            "attrs": {"path": path},
+            "body": format!("{old}\n---\n{new}"),
+            "text": result,
+        })
+    }
+
+    fn story_edits(app: &App) -> Vec<usize> {
+        (0..app.story.len())
+            .filter(|i| {
+                matches!(
+                    app.story.entry(*i).map(|e| &e.block),
+                    Some(RenderBlock::ToolCall(ToolCallBlock::Edit(_)))
+                )
+            })
+            .collect()
+    }
+
+    /// An edit lands in the story as its own card, folded, the moment the
+    /// result arrives -- not at the end of the turn and not only on the wire.
+    #[test]
+    fn an_edit_shows_up_in_the_story_folded_and_live() {
+        let mut app = App::new();
+        handle_event(&mut app, json!({"ev": "turn", "text": "go"}));
+        handle_event(
+            &mut app,
+            edit_ev("desmos/loop.py", "if n < max_turns:", "if n <= max_turns:", "ok"),
+        );
+
+        let edits = story_edits(&app);
+        assert_eq!(edits.len(), 1, "the edit did not reach the story");
+        let entry = app.story.entry(edits[0]).unwrap();
+        assert_eq!(
+            entry.display_mode,
+            DisplayMode::Collapsed,
+            "a story edit card must arrive folded, or a wide refactor buries the prose",
+        );
+        // Live: it is there before the turn ends.
+        assert!(!app.running, "sanity: no complete() was sent");
+
+        // And the wire pane still has its own copy -- the story card is a
+        // second block, not a move.
+        let wire = (0..app.calls.len())
+            .filter(|i| {
+                matches!(
+                    app.calls.entry(*i).map(|e| &e.block),
+                    Some(RenderBlock::ToolCall(ToolCallBlock::Edit(_)))
+                )
+            })
+            .count();
+        assert_eq!(wire, 1, "the edit left the wire pane");
+    }
+
+    /// Folding is per-pane. Opening the story card must not open the wire one:
+    /// they are two blocks, and the reader opened exactly one of them.
+    #[test]
+    fn opening_a_story_edit_leaves_the_wire_card_folded() {
+        let mut app = App::new();
+        handle_event(&mut app, json!({"ev": "turn", "text": "go"}));
+        handle_event(&mut app, edit_ev("f.rs", "old", "new", "ok"));
+
+        let sid = app.story.entry(story_edits(&app)[0]).unwrap().id;
+        set_wire_mode(&mut app.story, sid, DisplayMode::Expanded);
+
+        let wire_edit = (0..app.calls.len())
+            .find(|i| {
+                matches!(
+                    app.calls.entry(*i).map(|e| &e.block),
+                    Some(RenderBlock::ToolCall(ToolCallBlock::Edit(_)))
+                )
+            })
+            .expect("wire edit card");
+        assert_eq!(
+            app.calls.entry(wire_edit).unwrap().display_mode,
+            DisplayMode::Collapsed,
+            "opening the story card reached across into the wire pane",
+        );
+    }
+
+    /// Edits carry themselves now, so they must drop out of the work sentence.
+    /// `edit x3` stacked above three cards that name the files is the same
+    /// fact printed twice.
+    #[test]
+    fn edits_do_not_also_count_toward_the_work_row() {
+        let mut app = App::new();
+        handle_event(&mut app, json!({"ev": "turn", "text": "go"}));
+        for f in ["a.rs", "b.rs", "c.rs"] {
+            handle_event(&mut app, edit_ev(f, "old", "new", "ok"));
+        }
+        let row = (0..app.story.len()).find_map(|i| match app.story.entry(i).map(|e| &e.block) {
+            Some(RenderBlock::System(b)) => Some(b.text.clone()),
+            _ => None,
+        });
+        assert!(
+            row.is_none(),
+            "three edits produced a work row as well as three cards: {row:?}"
+        );
+        assert_eq!(story_edits(&app).len(), 3, "one card per edit");
+
+        // A non-edit call still earns a row, and the row still ignores edits.
+        for _ in 0..2 {
+            handle_event(
+                &mut app,
+                json!({"ev": "result", "tag": "bash", "body": "cargo test", "text": "ok"}),
+            );
+        }
+        let row = (0..app.story.len())
+            .find_map(|i| match app.story.entry(i).map(|e| &e.block) {
+                Some(RenderBlock::System(b)) => Some(b.text.clone()),
+                _ => None,
+            })
+            .expect("two bash calls are a run");
+        assert!(row.contains("bash"), "row lost the real calls: {row}");
+        assert!(!row.contains("edit"), "edits leaked back into the row: {row}");
+    }
+
+    /// A failed edit is still the narrative -- it is the turn's whole point
+    /// when it happens -- so it gets a card too, carrying the error.
+    #[test]
+    fn a_failed_edit_still_reaches_the_story() {
+        let mut app = App::new();
+        handle_event(&mut app, json!({"ev": "turn", "text": "go"}));
+        handle_event(
+            &mut app,
+            edit_ev("f.rs", "missing", "new", "no match for old_string"),
+        );
+        assert_eq!(story_edits(&app).len(), 1, "a failed edit vanished");
     }
 
     /// One call is not a run. A row for a lone grep is worse than silence.

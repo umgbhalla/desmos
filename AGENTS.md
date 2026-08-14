@@ -65,7 +65,11 @@ The pulldown walker is gone. Do not put it back.
 - Default TUI is `python -m desmos tui` → `crates/desmos-tui` hosting grok-build `ScrollbackState` / `ScrollbackPane`. Story = UserPrompt / Thinking / AgentMessage. Calls = ToolCall. Tab/j/k/h/l, click select, double-click fold. Needs `vendor/grok-build`. Do not flatten blocks to an `out` label.
 - `--grok` attaches grok-build's pager (`--minimal --no-leader`) with `python -m desmos acp` on stdio. ACP is NDJSON JSON-RPC 2.0, not Content-Length.
 - `vendor/grok-build` is a gitignored analysis clone. Do not commit it. Do not vendor a half-copy of one crate and call that "using grok-build."
+- Our changes to vendored crates live in `patches/`, applied by `scripts/vendor-setup.sh` (pinned rev in that script). Never leave a vendor edit only in the working tree — it is gitignored, so it dies on the next clone with no compile error. Re-run the script after any vendor pull, and refresh the patch (`git -C vendor/grok-build diff > patches/NNNN-*.patch`) after any vendor edit.
+- A vendored crate is only ownable in `crates/` if every vendored consumer names it `{ workspace = true }` — our root `[workspace.dependencies]` then redirects it (this is how `xai-grok-markdown` works). Crates reached by a hard `path = "../..."` (`xai-grok-pager-diff`, `-render`, `xai-grok-paths`) cannot be redirected, and their types cross the pager API, so a local copy will not typecheck.
 - Do not hide syscalls from the human. The right pane exists so the wire is visible.
+- `<edit>` is the one syscall that also gets a story card, folded, pushed the moment the result lands (`story_edit_card`). It is the narrative, not just wire traffic. Edits are therefore excluded from the work-run sentence — do not add them back, that prints `edit ×3` above three cards naming the files. Every other tag stays wire-only.
+- Call groups in the wire pane are one per `complete()` POST, recorded at push time in `App::call_groups` (`call_push_group`). The pager's own turn navigation keys off `RenderBlock::UserPrompt`, which the wire pane never has, so do not reach for `next_turn`/`prev_turn` there. `[`/`]` step groups; arrows stay fold.
 - Do not leak API keys into the TUI, logs, trajectory files, commits, or screenshots.
 
 ## Checks

@@ -1,0 +1,306 @@
+diff --git a/crates/codegen/xai-grok-pager/Cargo.toml b/crates/codegen/xai-grok-pager/Cargo.toml
+index db32aa6..3c63385 100644
+--- a/crates/codegen/xai-grok-pager/Cargo.toml
++++ b/crates/codegen/xai-grok-pager/Cargo.toml
+@@ -69,6 +69,7 @@ tokio = { workspace = true, features = [
+     "signal",
+     "io-util",
+     "io-std",
++    "process",
+ ] }
+ tokio-util = { workspace = true, features = ["compat"] }
+ tracing = { workspace = true }
+diff --git a/crates/codegen/xai-grok-pager/src/acp/mod.rs b/crates/codegen/xai-grok-pager/src/acp/mod.rs
+index cbe5731..1eae1a6 100644
+--- a/crates/codegen/xai-grok-pager/src/acp/mod.rs
++++ b/crates/codegen/xai-grok-pager/src/acp/mod.rs
+@@ -202,10 +202,33 @@ pub async fn connect(cancel: &CancellationToken, flags: ConnectFlags) -> Result<
+ 
+     apply_config_writes(&flags);
+ 
+-    let memory_config = agent_config.memory_config.clone();
+-    let spawned = spawn::spawn_grok_shell(agent_config, cancel, memory_config).await?;
+-    let auth_manager = spawned.auth_manager.clone();
+-    let (tx, rx) = (spawned.channel.tx, spawned.channel.rx);
++    let (tx, rx, spawned_cancel, agent_thread, auth_manager) =
++        if let Ok(cmd) = std::env::var("DESMOS_ACP") {
++            let spawned = spawn::spawn_stdio_acp(&cmd, cancel).await?;
++            // Out-of-process agent: local AuthManager, no refresher (same as leader).
++            let auth_manager = std::sync::Arc::new(xai_grok_shell::auth::AuthManager::new(
++                &xai_grok_shell::util::grok_home::grok_home(),
++                agent_config.grok_com_config.clone(),
++            ));
++            (
++                spawned.channel.tx,
++                spawned.channel.rx,
++                spawned.cancel,
++                Some(spawned.thread_handle),
++                auth_manager,
++            )
++        } else {
++            let memory_config = agent_config.memory_config.clone();
++            let spawned = spawn::spawn_grok_shell(agent_config, cancel, memory_config).await?;
++            let auth_manager = spawned.auth_manager.clone();
++            (
++                spawned.channel.tx,
++                spawned.channel.rx,
++                spawned.cancel,
++                Some(spawned.thread_handle),
++                auth_manager,
++            )
++        };
+ 
+     startup::enter(StartupPhase::AcpInitialize);
+     let (
+@@ -241,8 +264,8 @@ pub async fn connect(cancel: &CancellationToken, flags: ConnectFlags) -> Result<
+         models,
+         is_grok_shell,
+         auth_methods,
+-        cancel: spawned.cancel,
+-        agent_thread: Some(spawned.thread_handle),
++        cancel: spawned_cancel,
++        agent_thread,
+         available_commands,
+         needs_login,
+         login_label,
+diff --git a/crates/codegen/xai-grok-pager/src/acp/spawn.rs b/crates/codegen/xai-grok-pager/src/acp/spawn.rs
+index 0476b14..7519f34 100644
+--- a/crates/codegen/xai-grok-pager/src/acp/spawn.rs
++++ b/crates/codegen/xai-grok-pager/src/acp/spawn.rs
+@@ -1,20 +1,24 @@
+ //! Agent spawning — creates the agent process and ACP channels.
+ //!
+-//! Simplified to only support GrokShell (in-process) mode.
+-//! Subprocess and remote modes can be added later if needed.
++//! Supports in-process GrokShell and an out-of-process NDJSON stdio ACP
++//! agent (`DESMOS_ACP`).
+ 
+ use std::io::IsTerminal;
++use std::process::Stdio;
+ use std::rc::Rc;
+ use std::thread;
+ use std::time::Duration;
+ 
+ use anyhow::Result;
++use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, simplex};
++use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
+ use tokio_util::sync::CancellationToken;
+ use xai_grok_telemetry::startup::{self, StartupPhase};
+ 
++use agent_client_protocol as acp;
+ use xai_acp_lib::{
+     AcpAgentChannel, AcpClientChannel, AcpClientTx, AcpGatewayReceiver, AcpGatewaySender,
+-    acp_channels,
++    LineBufferedRead, acp_channels,
+ };
+ use xai_grok_shell::{
+     agent::{MvpAgent, activity::SESSION_FLUSH_GRACE, config::Config as AgentConfig},
+@@ -242,6 +246,173 @@ pub async fn spawn_grok_shell(
+     })
+ }
+ 
++/// Result of spawning an out-of-process newline-delimited JSON-RPC ACP agent.
++pub struct SpawnedStdioAgent {
++    pub thread_handle: thread::JoinHandle<Result<()>>,
++    pub channel: AcpClientChannel,
++    pub cancel: CancellationToken,
++}
++
++const STDIO_ACP_MAX_BUF: usize = 8 * 1024 * 1024;
++
++/// Spawn `cmd` as a stdio ACP agent (NDJSON on stdin/stdout).
++///
++/// On Unix, `cmd` is parsed by `sh -c` so values like `python -m desmos acp`
++/// work. Stdin/stdout are piped, stderr is inherited, `current_dir` is the
++/// process cwd. The child is killed when `cancel` fires.
++pub async fn spawn_stdio_acp(cmd: &str, cancel: &CancellationToken) -> Result<SpawnedStdioAgent> {
++    startup::enter(StartupPhase::SpawnWorker);
++    tracing::info!(cmd, "spawning stdio ACP agent from DESMOS_ACP");
++
++    let mut child = spawn_stdio_child(cmd)?;
++    let stdin = child
++        .stdin
++        .take()
++        .ok_or_else(|| anyhow::anyhow!("stdio ACP child stdin not piped"))?;
++    let stdout = child
++        .stdout
++        .take()
++        .ok_or_else(|| anyhow::anyhow!("stdio ACP child stdout not piped"))?;
++
++    let (client_channel, agent_channel) = acp_channels();
++    let (incoming_read, incoming_write) = simplex(STDIO_ACP_MAX_BUF);
++    let (outgoing_read, outgoing_write) = simplex(STDIO_ACP_MAX_BUF);
++
++    let bridge_cancel = cancel.child_token();
++    let thread_cancel = bridge_cancel.clone();
++    let thread_handle = thread::Builder::new()
++        .name("pager-stdio-acp".into())
++        .spawn(move || -> Result<()> {
++            let mut builder = tokio::runtime::Builder::new_current_thread();
++            let rt = xai_tty_utils::runtime::apply_blocking_pool(builder.enable_all()).build()?;
++            let local = tokio::task::LocalSet::new();
++            local.block_on(&rt, async move {
++                let cancel_r = thread_cancel.clone();
++                let reader_task = tokio::task::spawn_local(async move {
++                    let mut stdout = BufReader::new(stdout);
++                    let mut incoming_write = incoming_write;
++                    let mut line = String::new();
++                    loop {
++                        line.clear();
++                        tokio::select! {
++                            biased;
++                            _ = cancel_r.cancelled() => break,
++                            result = stdout.read_line(&mut line) => {
++                                match result {
++                                    Ok(0) => break,
++                                    Ok(_) => {
++                                        if incoming_write.write_all(line.as_bytes()).await.is_err() {
++                                            break;
++                                        }
++                                    }
++                                    Err(_) => break,
++                                }
++                            }
++                        }
++                    }
++                });
++
++                let cancel_w = thread_cancel.clone();
++                let writer_task = tokio::task::spawn_local(async move {
++                    let mut reader = BufReader::new(outgoing_read);
++                    let mut stdin = stdin;
++                    let mut line = String::new();
++                    loop {
++                        line.clear();
++                        tokio::select! {
++                            biased;
++                            _ = cancel_w.cancelled() => break,
++                            result = reader.read_line(&mut line) => {
++                                match result {
++                                    Ok(0) => break,
++                                    Ok(_) => {
++                                        let pending = line.trim_end();
++                                        if pending.is_empty() {
++                                            continue;
++                                        }
++                                        if stdin.write_all(pending.as_bytes()).await.is_err()
++                                            || stdin.write_all(b"\n").await.is_err()
++                                            || stdin.flush().await.is_err()
++                                        {
++                                            break;
++                                        }
++                                    }
++                                    Err(_) => break,
++                                }
++                            }
++                        }
++                    }
++                });
++
++                let gw_tx = AcpGatewaySender::new(agent_channel.tx).with_tracing(true);
++                let incoming = LineBufferedRead::spawn_local(incoming_read.compat());
++                let (conn, handle_io) = acp::ClientSideConnection::new(
++                    gw_tx,
++                    outgoing_write.compat_write(),
++                    incoming,
++                    |fut| {
++                        tokio::task::spawn_local(fut);
++                    },
++                );
++                let gw_rx = AcpGatewayReceiver::new(agent_channel.rx, conn).with_tracing(true);
++                tokio::task::spawn_local(handle_io);
++                tokio::task::spawn_local(gw_rx.run());
++                tokio::task::yield_now().await;
++
++                tokio::select! {
++                    biased;
++                    _ = thread_cancel.cancelled() => {
++                        let _ = child.start_kill();
++                        let _ = child.wait().await;
++                    }
++                    status = child.wait() => {
++                        tracing::warn!(?status, "stdio ACP agent exited");
++                        thread_cancel.cancel();
++                    }
++                }
++                reader_task.abort();
++                writer_task.abort();
++                Ok(())
++            })
++        })?;
++
++    Ok(SpawnedStdioAgent {
++        thread_handle,
++        channel: client_channel,
++        cancel: bridge_cancel,
++    })
++}
++
++fn spawn_stdio_child(cmd: &str) -> Result<tokio::process::Child> {
++    let cwd = std::env::current_dir()?;
++    let mut command = stdio_acp_command(cmd);
++    command
++        .stdin(Stdio::piped())
++        .stdout(Stdio::piped())
++        .stderr(Stdio::inherit())
++        .current_dir(&cwd)
++        .kill_on_drop(true);
++    xai_tty_utils::detach_command(&mut command);
++    command
++        .spawn()
++        .map_err(|e| anyhow::anyhow!("failed to spawn DESMOS_ACP command `{cmd}`: {e}"))
++}
++
++fn stdio_acp_command(cmd: &str) -> tokio::process::Command {
++    #[cfg(unix)]
++    {
++        let mut command = tokio::process::Command::new("sh");
++        command.arg("-c").arg(cmd);
++        command
++    }
++    #[cfg(not(unix))]
++    {
++        let mut command = tokio::process::Command::new("cmd");
++        command.arg("/C").arg(cmd);
++        command
++    }
++}
++
+ /// Spawn an agent in a dedicated thread with direct RPC dispatch.
+ ///
+ /// The agent runs on a single-threaded tokio LocalSet runtime.
+@@ -368,6 +539,21 @@ mod tests {
+         );
+     }
+ 
++    #[cfg(unix)]
++    #[test]
++    fn stdio_acp_command_uses_sh_c() {
++        let cmd = stdio_acp_command("python -m desmos acp");
++        assert_eq!(cmd.as_std().get_program(), std::ffi::OsStr::new("sh"));
++        let args: Vec<_> = cmd.as_std().get_args().collect();
++        assert_eq!(
++            args,
++            [
++                std::ffi::OsStr::new("-c"),
++                std::ffi::OsStr::new("python -m desmos acp")
++            ]
++        );
++    }
++
+     #[test]
+     fn panic_payloads_render_as_text() {
+         assert_eq!(
+diff --git a/crates/codegen/xai-grok-pager/src/app/mod.rs b/crates/codegen/xai-grok-pager/src/app/mod.rs
+index 3c80d17..ea881f5 100644
+--- a/crates/codegen/xai-grok-pager/src/app/mod.rs
++++ b/crates/codegen/xai-grok-pager/src/app/mod.rs
+@@ -902,6 +902,8 @@ pub async fn run(
+         set_terminal_title(t);
+     }
+     const CONNECT_UI_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
++    // Stdio ACP (DESMOS_ACP) must use connect() — never the grok leader.
++    let use_leader = use_leader && std::env::var("DESMOS_ACP").is_err();
+     let fallback_flags = use_leader.then(|| connect_flags.clone());
+     let primary_target = if use_leader {
+         crate::acp::AgentKind::Leader

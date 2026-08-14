@@ -47,7 +47,8 @@ python -m desmos kernel           # install a Jupyter kernelspec named Desmos
 Default TUI, left column then right:
 
 ```
-story        the turn: your prompt, thinking, speech as markdown
+story        the turn: your prompt, thinking, speech as markdown,
+             and each <edit> as a folded diff card (→ opens, ⏎ zooms)
 POST in/out  the last complete() request and reply as a folding JSON tree
 queue        follow-ups stacked while a step runs (hidden when empty)
 input        the composer
@@ -63,6 +64,10 @@ keys         what the focused pane's keys do
 `ctrl+b` toggle the git and file panes. Tab cycles panes; in every pane the
 arrows mean the same thing — up/down moves the cursor, left/right drives that
 pane's second axis (fold, tab, directory, order).
+
+In calls, `[` and `]` step whole groups — one group per `complete()` POST,
+holding the syscalls that POST produced. The pane title counts them (`#2/5`).
+Arrows still mean fold, so the group step gets its own pair of keys.
 
 `--grok` launches grok-build's pager-bin (`--minimal --no-leader`) with
 `python -m desmos acp` on stdio.
