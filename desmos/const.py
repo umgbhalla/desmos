@@ -6,6 +6,7 @@ FROZEN = frozenset(
     {
         "python",
         "bash",
+    "shell",
         "edit",
         "register",
         "system",
@@ -40,6 +41,7 @@ this for you.
 
 <python>code</python>
 <bash>command</bash>
+<shell id="main">command</shell>
 <edit path="file">old
 ---
 new</edit>

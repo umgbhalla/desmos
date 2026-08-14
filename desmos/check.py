@@ -867,6 +867,43 @@ def self_check() -> None:
         assert tail == ["user", "assistant", "user"], tail
         assert "<result" in str(w_ord.messages[-1]["content"]), "a stop must not eat results that ran"
 
+        # <bash> is one subprocess per call, so nothing it does survives. The
+        # persistent shell is the other half: state carries, exit codes come
+        # back, and a program that asks a question can be answered -- which is
+        # the case a one-shot subprocess cannot express at all.
+        from desmos.shell import close_all as _close_shells, head_tail, strip_ansi
+
+        w_sh = new_world(cwd, state_path=None, persist=False, ns={})
+        try:
+            def sh(body: str, **attrs: str) -> str:
+                return dispatch(w_sh, Block("shell", body, attrs))
+
+            assert sh("cd /etc && pwd").strip() == "/etc"
+            assert sh("pwd").strip() == "/etc", "a persistent shell keeps its cwd"
+            assert sh("export DZ=kept; echo ok").strip() == "ok"
+            assert sh("echo $DZ").strip() == "kept", "and its environment"
+            assert sh("python3 -c 'import sys;print(sys.stdin.isatty())'").strip() == "True"
+            failed = sh("ls /definitely-not-here")
+            assert "[exit " in failed and "[exit 0]" not in failed, failed
+            # A second session is a second machine as far as state goes.
+            assert sh("pwd", id="other").strip() != "/etc"
+            # The interactive round trip.
+            asked = sh("python3 -c \"n=input('who? ');print('hi '+n)\"")
+            assert "who?" in asked and "still running" in asked, asked
+            assert sh("desmos").strip() == "hi desmos", "the answer reached the waiting program"
+            assert sh("echo recovered").strip() == "recovered", "and the shell came back"
+            assert w_sh.shells, "sessions live on the world"
+        finally:
+            _close_shells(w_sh)
+        assert not w_sh.shells
+
+        # Oversized output keeps both ends: the head says what it was doing,
+        # the tail says how it ended.
+        big = ("a" * 400 + "\n").encode() * 100
+        trimmed = head_tail(big, 600)
+        assert trimmed.startswith("aaa") and "omitted" in trimmed and len(trimmed) < 800
+        assert strip_ansi("\x1b[?2004hx\x1b[0m\r\ny") == "x\ny"
+
         # A traceback is the last thing a failing script prints. Head-clipping
         # a noisy failure returned progress and no error.
         from desmos.scan import clip as _clip

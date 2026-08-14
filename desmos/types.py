@@ -49,3 +49,7 @@ class World:
     # forever. reset() is worse: it clears the list the outer loop is appending
     # to. Neither is worth supporting; both are worth refusing.
     running: bool = False
+    # Named live shells, kept for the life of this process. Not persisted:
+    # a pty cannot be reloaded from JSON, and pretending otherwise would hand
+    # back a session whose cd and exports silently did not survive.
+    shells: dict[str, Any] = field(default_factory=dict)

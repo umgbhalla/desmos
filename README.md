@@ -18,7 +18,8 @@ next `complete()` sees the change. No restart.
 
 ```
 <python>          exec, names persist
-<bash>            shell in cwd
+<bash>            one subprocess in cwd, no state kept
+<shell>           persistent pty: cd/env/venv survive, answers prompts
 <edit>            unique replace (old --- new)
 <register>        grow a new tag
 <system>          write / delete a catalog note
@@ -35,6 +36,7 @@ next `complete()` sees the change. No restart.
 ```bash
 uv venv && uv pip install -e ".[kernel]"
 source .venv/bin/activate
+./scripts/vendor-setup.sh         # clone vendor/grok-build at the pinned rev + apply patches/
 python -m desmos console          # IPython with step and world bound
 python -m desmos tui              # story | calls | input  (needs cargo + vendor/grok-build)
 python -m desmos tui --demo       # same layout, no API key
@@ -64,6 +66,10 @@ pane's second axis (fold, tab, directory, order).
 
 `--grok` launches grok-build's pager-bin (`--minimal --no-leader`) with
 `python -m desmos acp` on stdio.
+
+`vendor/grok-build` is gitignored, but `patches/` is not: `DESMOS_ACP` is our
+patch on the vendored pager, not upstream. Run `scripts/vendor-setup.sh` after
+any vendor pull or the ACP bridge goes missing with no compile error.
 
 Ordinary cells stay Python. `step("...")` is the agent. Syscall results
 append as user-role `<result>` blocks on the same transcript (Pi-style).

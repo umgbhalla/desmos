@@ -42,7 +42,8 @@ def format_result_message(results: list[tuple[Block, str]]) -> str:
 
 _BUILTIN_DOCS = (
     ("python", "exec Python in the persistent kernel"),
-    ("bash", "run a shell command in cwd"),
+    ("bash", "run a shell command in cwd — one subprocess, no state kept"),
+    ("shell", "persistent pty shell: id= names the session, cd/env/venv survive, answers prompts; timeout=, interrupt=1, close=1"),
     ("edit", "replace one occurrence: path= and body old\\n---\\nnew"),
     ("register", "install a tag: name= and doc=, body is def handle"),
     ("system", "write or delete a system note (name=, optional delete=1)"),
