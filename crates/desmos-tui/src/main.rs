@@ -705,9 +705,6 @@ struct CacheMeter {
     /// Context ceiling for the model that answered, so "how full" has a
     /// denominator. Zero until the first call lands.
     window: u64,
-    /// Prompt size per call, oldest first. One bar shows where context is;
-    /// this shows where it is heading, which is the part you steer by.
-    ctx_hist: Vec<u64>,
 }
 
 /// List price per million tokens (input, output). Cache reads bill at 0.1x
@@ -740,13 +737,6 @@ impl CacheMeter {
     fn hit(&self) -> u64 {
         let total = self.read + self.write + self.fresh;
         if total == 0 { 0 } else { self.read * 100 / total }
-    }
-
-    /// Cache share across the session -- the number that says whether the
-    /// window is actually working, rather than how one call happened to land.
-    fn hit_total(&self) -> u64 {
-        let total = self.read_total + self.write_total + self.fresh_total;
-        if total == 0 { 0 } else { self.read_total * 100 / total }
     }
 
     fn observe_roles(&mut self, request: &Value) {
@@ -841,10 +831,6 @@ impl CacheMeter {
         // it could answer. Recorded before the cold-call early return below, so
         // the trend does not silently skip uncached turns.
         let ctx = self.read + self.write + self.fresh;
-        self.ctx_hist.push(ctx);
-        if self.ctx_hist.len() > 128 {
-            self.ctx_hist.remove(0);
-        }
 
         if self.read == 0 && self.write == 0 {
             return;
@@ -3719,45 +3705,6 @@ impl Tier {
     }
 }
 
-/// Whole-percent share, or a dash when there is nothing to divide.
-fn pct(part: u64, total: u64) -> String {
-    if total == 0 {
-        return "  -%".to_string();
-    }
-    format!("{:>3.0}%", part as f64 / total as f64 * 100.0)
-}
-
-/// A bar split into proportional coloured runs. Any nonzero part gets at least
-/// one cell so a small slice never rounds away, and the widest run absorbs the
-/// remainder so the bar fills exactly `width`.
-/// A bar split into coloured runs, one per part, sized by share of the total.
-///
-/// Largest-remainder allocation: floor every share, then hand the leftover
-/// cells to the parts with the biggest fractional loss. Floors can only
-/// undershoot, so the bar fills its width exactly and never overruns it — a
-/// three-part split in one cell paints one cell, not three.
-/// A sparkline over the tail of `vals`. Height is relative to the window's own
-/// peak, not an absolute scale: the question is "is this climbing", and a bar
-/// that is always full answers nothing.
-fn sparkline(vals: &[u64], width: usize) -> String {
-    const TICKS: [char; 8] = ['\u{2581}', '\u{2582}', '\u{2583}', '\u{2584}', '\u{2585}', '\u{2586}', '\u{2587}', '\u{2588}'];
-    if vals.is_empty() || width == 0 {
-        return String::new();
-    }
-    let take = vals.len().min(width);
-    let tail = &vals[vals.len() - take..];
-    let max = tail.iter().copied().max().unwrap_or(0);
-    if max == 0 {
-        return TICKS[0].to_string().repeat(take);
-    }
-    tail.iter()
-        .map(|v| {
-            let i = ((*v as f64 / max as f64) * 7.0).round() as usize;
-            TICKS[i.min(7)]
-        })
-        .collect()
-}
-
 /// One meter row: a filled track with its label and value written *inside* it.
 ///
 /// The old layout spent two rows per bar -- the bar, then a legend underneath --
@@ -3897,61 +3844,6 @@ fn sequence_bar_spans(
         spans.push(Span::styled(run, Style::default().fg(prev)));
     }
     spans
-}
-
-fn segment_bar_spans(
-    width: u16,
-    parts: &[(u64, ratatui::style::Color)],
-    bg: ratatui::style::Color,
-) -> Vec<Span<'static>> {
-    let w = width as usize;
-    if w == 0 {
-        return Vec::new();
-    }
-    let total: u64 = parts.iter().map(|(v, _)| *v).sum();
-    if total == 0 {
-        return vec![Span::styled("\u{2588}".repeat(w), Style::default().fg(bg))];
-    }
-    let exact: Vec<f64> = parts
-        .iter()
-        .map(|(v, _)| *v as f64 / total as f64 * w as f64)
-        .collect();
-    let mut cells: Vec<usize> = exact.iter().map(|e| e.floor() as usize).collect();
-    let used: usize = cells.iter().sum();
-    let mut order: Vec<usize> = (0..parts.len()).collect();
-    order.sort_by(|&a, &b| {
-        let fa = exact[a] - exact[a].floor();
-        let fb = exact[b] - exact[b].floor();
-        fb.partial_cmp(&fa).unwrap_or(std::cmp::Ordering::Equal)
-    });
-    for i in order.into_iter().take(w - used) {
-        cells[i] += 1;
-    }
-    // A slice that exists should be visible: give every non-zero part a cell,
-    // paid for out of the widest one. Only while someone has a cell to spare —
-    // at one cell wide, the majority keeps it and the rest go unpainted.
-    for i in 0..parts.len() {
-        if parts[i].0 == 0 || cells[i] > 0 {
-            continue;
-        }
-        let Some(donor) = cells
-            .iter()
-            .enumerate()
-            .filter(|(_, c)| **c > 1)
-            .max_by_key(|(_, c)| **c)
-            .map(|(j, _)| j)
-        else {
-            break;
-        };
-        cells[donor] -= 1;
-        cells[i] += 1;
-    }
-    parts
-        .iter()
-        .zip(cells)
-        .filter(|(_, c)| *c > 0)
-        .map(|((_, color), c)| Span::styled("\u{2588}".repeat(c), Style::default().fg(*color)))
-        .collect()
 }
 
 /// Git state as a tab strip over rows — druk's sidebar, with the views it
@@ -4526,9 +4418,8 @@ fn spoken_prefix(text: &str) -> String {
     // into the story as prose, and it stays there, because by the time the
     // closer lands the chunk has already been appended to a live block.
     //
-    // This is why the streaming path must use strip_syscalls and not
-    // strip_xml. strip_xml drops the tag markers and keeps what they wrap,
-    // which is right for prose about markup and wrong for a command.
+    // The streaming path must strip bodies, not just markers: dropping the
+    // markers alone is right for prose about markup and wrong for a command.
     let mut cut = text.len();
     let mut i = 0usize;
     while let Some(rel) = text[i..].find('<') {
@@ -4807,10 +4698,9 @@ fn in_code(spans: &[(usize, usize)], i: usize) -> bool {
 
 /// Strip whole syscalls from prose -- markers *and* bodies.
 ///
-/// `strip_xml` deletes angle-bracket markers one at a time and keeps whatever
-/// sits between them, so a one-line call leaves its command behind as if
-/// someone had said it. The command is not prose; it belongs to the calls pane,
-/// which already renders it as a card.
+/// Deleting the markers alone is not enough: it leaves the command behind as
+/// if someone had said it. The command is not prose; it belongs to the calls
+/// pane, which already renders it as a card.
 ///
 /// Structure decides, not a list of names: an opener with a matching closer is
 /// a syscall whatever it is called, which means a tag registered later needs no
@@ -4851,31 +4741,6 @@ fn strip_syscalls(text: &str) -> String {
         match text[open_end..].find(&close) {
             Some(rel_end) => i = open_end + rel_end + close.len(),
             None => i = open_end,
-        }
-    }
-    out.push_str(&text[i..]);
-    out
-}
-
-fn strip_xml(text: &str) -> String {
-    let spans = code_spans(text);
-    let mut out = String::new();
-    let mut i = 0usize;
-    while i < text.len() {
-        let Some(rel) = text[i..].find('<') else { break };
-        let start = i + rel;
-        out.push_str(&text[i..start]);
-        if in_code(&spans, start) {
-            out.push('<');
-            i = start + 1;
-            continue;
-        }
-        match text[start..].find('>') {
-            Some(end) => i = start + end + 1,
-            None => {
-                out.push_str(&text[start..]);
-                i = text.len();
-            }
         }
     }
     out.push_str(&text[i..]);
@@ -5235,6 +5100,19 @@ mod tests {
         buffer_text(&term)
     }
 
+    /// Code spans are protected: markup inside a fence or backticks is the
+    /// reader's subject matter, not a call. This was covered against a stripper
+    /// that no longer exists, so it is re-pinned against the one that runs.
+    #[test]
+    fn markup_inside_code_is_not_a_call() {
+        let fenced = "see\n```html\n<div class=\"x\">hi</div>\n```\ndone";
+        let got = strip_syscalls(fenced);
+        assert!(got.contains("<div class=\"x\">"), "fenced opener stripped: {got}");
+        assert!(got.contains("</div>"), "fenced closer stripped: {got}");
+        let inline = "use `<python>` not <python>x</python>";
+        assert_eq!(strip_syscalls(inline), "use `<python>` not ");
+    }
+
     /// The failure this guards: a command body streamed into the story one
     /// delta at a time, was appended to a live block, and stayed there when
     /// the closer finally arrived. Checking only the final story misses it --
@@ -5365,10 +5243,8 @@ mod tests {
 
     #[test]
     fn a_syscall_leaves_nothing_behind() {
-        // strip_xml kept the command; the story is prose only.
         let one = format!("{}bash{}cd /tmp && cargo test{}bash{}", '<', '>', "</", '>');
         assert_eq!(strip_syscalls(&one).trim(), "", "body survived: {:?}", strip_syscalls(&one));
-        assert_eq!(strip_xml(&one).trim(), "cd /tmp && cargo test", "strip_xml changed behaviour");
     }
 
     #[test]
@@ -5566,73 +5442,6 @@ mod tests {
     }
 
     #[test]
-    fn a_sparkline_tracks_its_own_peak() {
-        // Flat input is flat output; a rising series ends higher than it starts.
-        assert_eq!(sparkline(&[5, 5, 5], 8).chars().count(), 3);
-        let rising = sparkline(&[1, 2, 4, 8], 8);
-        let ch: Vec<char> = rising.chars().collect();
-        assert!(ch[3] > ch[0], "not rising: {rising:?}");
-        assert_eq!(sparkline(&[], 8), "");
-        assert_eq!(sparkline(&[0, 0], 8).chars().count(), 2);
-    }
-
-    #[test]
-    fn a_sparkline_shows_only_what_fits() {
-        let vals: Vec<u64> = (0..100).collect();
-        assert_eq!(sparkline(&vals, 10).chars().count(), 10);
-    }
-
-    #[test]
-    fn context_history_records_cold_calls_too() {
-        // The early return for an uncached call must not skip the trend.
-        let mut m = CacheMeter::default();
-        m.observe(
-            &json!({"input_tokens": 900, "cache_read_input_tokens": 0,
-                    "cache_creation_input_tokens": 0, "output_tokens": 10}),
-            "claude-opus-5",
-        );
-        assert_eq!(m.ctx_hist.len(), 1, "cold call missing from trend");
-        assert_eq!(m.ctx_hist[0], 900);
-        assert_eq!(m.window, 200_000, "window never set");
-    }
-
-
-
-    #[test]
-    fn segment_bar_fills_exactly_and_keeps_small_slices() {
-        let c = ratatui::style::Color::Red;
-        for w in [1u16, 7, 20, 44] {
-            for parts in [
-                vec![(100u64, c), (1, c), (1, c)],
-                vec![(1u64, c), (0, c), (99, c)],
-                vec![(5u64, c), (5, c)],
-            ] {
-                let spans = segment_bar_spans(w, &parts, c);
-                let painted: usize = spans.iter().map(|s| s.content.chars().count()).sum();
-                let sizes: Vec<u64> = parts.iter().map(|p| p.0).collect();
-                assert_eq!(painted, w as usize, "w={w} parts={sizes:?}");
-            }
-        }
-    }
-
-    #[test]
-    fn segment_bar_gives_a_tiny_slice_at_least_one_cell() {
-        let a = ratatui::style::Color::Red;
-        let b = ratatui::style::Color::Blue;
-        // 1 part in 1000 would floor to zero cells at width 20.
-        let spans = segment_bar_spans(20, &[(999, a), (1, b)], a);
-        assert!(spans.len() >= 2, "small slice vanished: {} runs", spans.len());
-    }
-
-    #[test]
-    fn segment_bar_with_no_data_is_all_background() {
-        let c = ratatui::style::Color::Red;
-        let spans = segment_bar_spans(10, &[(0, c), (0, c)], c);
-        let painted: usize = spans.iter().map(|s| s.content.chars().count()).sum();
-        assert_eq!(painted, 10);
-    }
-
-    #[test]
     fn role_split_attributes_system_user_and_assistant() {
         let mut m = CacheMeter::default();
         m.observe_roles(&json!({
@@ -5654,13 +5463,6 @@ mod tests {
         m.observe_roles(&json!({"messages":[{"content":"NOROLE"}]}));
         assert!(m.roles[0] > 0, "unlabelled went nowhere: {:?}", m.roles);
         assert_eq!(m.roles[1..], [0, 0, 0, 0]);
-    }
-
-    #[test]
-    fn pct_is_a_dash_when_there_is_no_total() {
-        assert_eq!(pct(0, 0).trim(), "-%");
-        assert_eq!(pct(1, 4).trim(), "25%");
-        assert_eq!(pct(3, 3).trim(), "100%");
     }
 
     /// A request event carries an empty response. It must not clear the out
@@ -6270,7 +6072,6 @@ mod tests {
         assert!((m.saved - 0.004_5).abs() < 1e-9, "{}", m.saved);
         assert_eq!((m.calls, m.warm), (2, 1));
         assert_eq!(m.read_total, 1000);
-        assert_eq!(m.hit_total(), 1000 * 100 / 3010);
         assert_eq!(m.ttl, Duration::from_secs(300));
     }
 
@@ -6426,8 +6227,8 @@ mod tests {
     }
 
     #[test]
-    fn strip_xml_keeps_markdown_newlines() {
-        let got = strip_xml("## cache\n\n**87%**\n<python>x</python>\nmore");
+    fn stripping_keeps_markdown_structure() {
+        let got = strip_syscalls("## cache\n\n**87%**\n<python>x</python>\nmore");
         assert!(got.contains("## cache"), "{got}");
         assert!(got.contains('\n'), "{got}");
         assert!(!got.contains("<python>"), "{got}");
@@ -6838,20 +6639,6 @@ mod tests {
     fn open_fence_is_never_treated_as_markup() {
         let live = "here:\n```python\nif a < b:\n    print('<hi>')\n";
         assert_eq!(spoken_prefix(live), live);
-    }
-
-    #[test]
-    fn closed_fence_keeps_its_angle_brackets() {
-        let src = "see\n```html\n<div class=\"x\">hi</div>\n```\ndone";
-        let got = strip_xml(src);
-        assert!(got.contains("<div class=\"x\">"), "{got}");
-        assert!(got.contains("</div>"), "{got}");
-    }
-
-    #[test]
-    fn inline_code_keeps_tags_but_prose_still_strips() {
-        let got = strip_xml("use `<python>` not <python>x</python>");
-        assert_eq!(got, "use `<python>` not x");
     }
 
     #[test]
