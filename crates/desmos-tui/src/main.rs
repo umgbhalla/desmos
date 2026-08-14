@@ -659,6 +659,10 @@ struct CacheMeter {
     /// they did cost — the money the cache actually saved this session.
     saved: f64,
     area: Rect,
+    /// Characters of the last request attributable to each role, so the
+    /// trajectory bar shows what is filling the window instead of one
+    /// undifferentiated block. Order: system, user, assistant.
+    roles: [u64; 3],
 }
 
 /// List price per million tokens (input, output). Cache reads bill at 0.1x
@@ -674,6 +678,27 @@ fn model_price(model: &str) -> (f64, f64) {
 }
 
 impl CacheMeter {
+    /// Split the last request by role. Counts serialized characters, not
+    /// tokens: the wire never reports per-role tokens, and the bar only needs
+    /// proportions. System blocks and anything unlabelled land in slot 0.
+    fn observe_roles(&mut self, request: &Value) {
+        let mut split = [0u64; 3];
+        if let Some(sys) = request.get("system") {
+            split[0] += sys.to_string().len() as u64;
+        }
+        if let Some(msgs) = request.get("messages").and_then(Value::as_array) {
+            for m in msgs {
+                let len = m.to_string().len() as u64;
+                match m.get("role").and_then(Value::as_str) {
+                    Some("user") => split[1] += len,
+                    Some("assistant") => split[2] += len,
+                    _ => split[0] += len,
+                }
+            }
+        }
+        self.roles = split;
+    }
+
     fn observe(&mut self, usage: &Value, model: &str) {
         let n = |k: &str| usage.get(k).and_then(Value::as_u64).unwrap_or(0);
         self.read = n("cache_read_input_tokens");
@@ -3467,6 +3492,66 @@ impl Tier {
     }
 }
 
+/// Whole-percent share, or a dash when there is nothing to divide.
+fn pct(part: u64, total: u64) -> String {
+    if total == 0 {
+        return "  -%".to_string();
+    }
+    format!("{:>3.0}%", part as f64 / total as f64 * 100.0)
+}
+
+/// A bar split into proportional coloured runs. Any nonzero part gets at least
+/// one cell so a small slice never rounds away, and the widest run absorbs the
+/// remainder so the bar fills exactly `width`.
+fn segment_bar_spans(width: u16, parts: &[(u64, ratatui::style::Color)], bg: ratatui::style::Color) -> Vec<Span<'static>> {
+    let w = width as usize;
+    if w == 0 {
+        return Vec::new();
+    }
+    let total: u64 = parts.iter().map(|(v, _)| *v).sum();
+    if total == 0 {
+        return vec![Span::styled("\u{2588}".repeat(w), Style::default().fg(bg))];
+    }
+    let mut cells: Vec<usize> = parts
+        .iter()
+        .map(|(v, _)| ((*v as f64 / total as f64) * w as f64).floor() as usize)
+        .collect();
+    for (i, (v, _)) in parts.iter().enumerate() {
+        if *v > 0 && cells[i] == 0 {
+            cells[i] = 1;
+        }
+    }
+    let mut used: usize = cells.iter().sum();
+    while used > w {
+        let Some(i) = cells
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| **c > 1)
+            .max_by_key(|(_, c)| **c)
+            .map(|(i, _)| i)
+        else {
+            break;
+        };
+        cells[i] -= 1;
+        used -= 1;
+    }
+    if used < w
+        && let Some(i) = cells
+            .iter()
+            .enumerate()
+            .max_by_key(|(_, c)| **c)
+            .map(|(i, _)| i)
+    {
+        cells[i] += w - used;
+    }
+    parts
+        .iter()
+        .zip(cells)
+        .filter(|(_, c)| *c > 0)
+        .map(|((_, color), c)| Span::styled("\u{2588}".repeat(c), Style::default().fg(*color)))
+        .collect()
+}
+
 fn draw_meta(f: &mut Frame, area: Rect, meter: &CacheMeter, focused: bool) {
     if area.height == 0 || area.width == 0 {
         return;
@@ -3559,6 +3644,40 @@ fn draw_meta(f: &mut Frame, area: Rect, meter: &CacheMeter, focused: bool) {
         ],
         Tier::Full => vec![
             bar(),
+            // Trajectory split by role: what is actually filling the window.
+            Line::from(segment_bar_spans(
+                inner.width,
+                &[
+                    (meter.roles[0], theme.accent_skill),
+                    (meter.roles[1], theme.accent_user),
+                    (meter.roles[2], theme.accent_assistant),
+                ],
+                theme.bg_base,
+            )),
+            Line::from(vec![
+                Span::styled("sys ", Style::default().fg(theme.accent_skill)),
+                val(pct(meter.roles[0], meter.roles.iter().sum())),
+                Span::styled("  usr ", Style::default().fg(theme.accent_user)),
+                val(pct(meter.roles[1], meter.roles.iter().sum())),
+                Span::styled("  ast ", Style::default().fg(theme.accent_assistant)),
+                val(pct(meter.roles[2], meter.roles.iter().sum())),
+            ]),
+            // Read vs write on the last call: a write-heavy call just paid to
+            // fill the cache rather than riding it.
+            Line::from(segment_bar_spans(
+                inner.width,
+                &[
+                    (meter.read, theme.accent_success),
+                    (meter.write, theme.accent_tool),
+                ],
+                theme.bg_base,
+            )),
+            Line::from(vec![
+                Span::styled("read ", Style::default().fg(theme.accent_success)),
+                val(pct(meter.read, meter.read + meter.write)),
+                Span::styled("  write ", Style::default().fg(theme.accent_tool)),
+                val(pct(meter.write, meter.read + meter.write)),
+            ]),
             // This call.
             Line::from(vec![
                 label("call  "),
