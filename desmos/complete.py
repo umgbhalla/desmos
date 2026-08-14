@@ -300,6 +300,28 @@ def cached_payload(
     return payload
 
 
+RETRY_STREAM_ERROR_TYPES = frozenset(
+    {"overloaded_error", "rate_limit_error", "api_error", "timeout_error"}
+)
+
+
+class AnthropicStreamError(RuntimeError):
+    """An error event delivered inside an HTTP-200 Anthropic SSE stream."""
+
+    def __init__(self, error_type: str, message: str, *, had_output: bool) -> None:
+        super().__init__(f"Anthropic stream error: {message}")
+        self.error_type = error_type
+        self.had_output = had_output
+        self.retryable = error_type in RETRY_STREAM_ERROR_TYPES
+
+
+def _stream_has_output(state: dict[str, Any]) -> bool:
+    # message_start is metadata and emits nothing. content_block_start is the
+    # first event that can create visible TUI state (including redacted thought),
+    # so any block means replay would risk duplication.
+    return bool(state.get("blocks"))
+
+
 def apply_stream_event(
     state: dict[str, Any],
     ev: dict[str, Any],
@@ -314,8 +336,13 @@ def apply_stream_event(
     kind = ev.get("type")
     if kind == "error":
         err = ev.get("error") or {}
+        error_type = str(err.get("type") or "stream_error") if isinstance(err, dict) else "stream_error"
         msg = err.get("message") if isinstance(err, dict) else ev.get("message")
-        raise RuntimeError(f"Anthropic stream error: {msg or ev}")
+        raise AnthropicStreamError(
+            error_type,
+            str(msg or ev),
+            had_output=_stream_has_output(state),
+        )
     if kind == "message_start":
         message = dict(ev.get("message") or {})
         message["content"] = []
@@ -479,6 +506,24 @@ def _retry_after(err: Any, attempt: int) -> float:
     return min(0.5 * (2**attempt), 8.0)
 
 
+def _wait_for_retry(
+    delay: float,
+    reason: str,
+    *,
+    should_stop: Callable[[], bool] | None = None,
+) -> None:
+    """Cancelable backoff shared by HTTP and in-stream retries."""
+    import time
+
+    waited = 0.0
+    while waited < delay:
+        if should_stop is not None and should_stop():
+            raise RuntimeError(f"stopped while retrying after {reason}")
+        step = min(0.25, delay - waited)
+        time.sleep(step)
+        waited += step
+
+
 def _open_with_retry(
     req: Any,
     *,
@@ -504,12 +549,7 @@ def _open_with_retry(
         if on_event is not None:
             on_event({"kind": "retry", "attempt": attempt + 1, "delay": delay, "reason": reason})
         # Sleep in slices so Ctrl+C still lands during a long backoff.
-        waited = 0.0
-        while waited < delay:
-            if should_stop is not None and should_stop():
-                raise RuntimeError(f"stopped while retrying after {reason}")
-            time.sleep(min(0.25, delay - waited))
-            waited += 0.25
+        _wait_for_retry(delay, reason, should_stop=should_stop)
     raise RuntimeError("unreachable")
 
 
@@ -563,16 +603,38 @@ def complete(
         headers=headers,
         method="POST",
     )
-    try:
-        with _open_with_retry(req, on_event=on_event, should_stop=should_stop) as resp:
-            return read_sse(
-                iter_sse_lines(resp),
-                on_event=on_event,
-                should_stop=should_stop,
-            )
-    except urllib.error.HTTPError as e:
-        body = e.read().decode()
-        raise RuntimeError(f"Anthropic HTTP {e.code}: {body[:2000]}") from e
+    for stream_attempt in range(RETRIES):
+        try:
+            with _open_with_retry(req, on_event=on_event, should_stop=should_stop) as resp:
+                return read_sse(
+                    iter_sse_lines(resp),
+                    on_event=on_event,
+                    should_stop=should_stop,
+                )
+        except AnthropicStreamError as exc:
+            final = stream_attempt == RETRIES - 1
+            if not exc.retryable or exc.had_output or final:
+                if exc.had_output and exc.retryable:
+                    raise RuntimeError(
+                        f"{exc}; not retried because partial output was already emitted"
+                    ) from exc
+                raise
+            delay = min(0.5 * (2**stream_attempt), 8.0)
+            reason = f"Anthropic SSE {exc.error_type}"
+            if on_event is not None:
+                on_event(
+                    {
+                        "kind": "retry",
+                        "attempt": stream_attempt + 1,
+                        "delay": delay,
+                        "reason": reason,
+                    }
+                )
+            _wait_for_retry(delay, reason, should_stop=should_stop)
+        except urllib.error.HTTPError as e:
+            body = e.read().decode()
+            raise RuntimeError(f"Anthropic HTTP {e.code}: {body[:2000]}") from e
+    raise RuntimeError("Anthropic stream retry loop exhausted")
 
 
 TRAJECTORY_DIR = os.environ.get("DESMOS_TRAJECTORY", ".desmos/trajectory")
