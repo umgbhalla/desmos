@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import traceback
+from typing import Callable
 
 from desmos.const import FROZEN
 from desmos.edit import apply_edit, parse_edit_body
@@ -33,15 +34,26 @@ def set_tool_doc(world: World, name: str, doc: str) -> str:
     return f"updated <{name}> doc"
 
 
-def dispatch(world: World, block: Block) -> str:
+def dispatch(
+    world: World,
+    block: Block,
+    *,
+    on_chunk: Callable[[str], None] | None = None,
+    should_stop: Callable[[], bool] | None = None,
+) -> str:
     for hook in world.hooks.get("before_dispatch", []):
         verdict = hook(world, block)
         if isinstance(verdict, str):
             return verdict
     if block.tag == "python":
-        return run_python(block.body, world)
+        return run_python(block.body, world, on_chunk=on_chunk)
     if block.tag == "bash":
-        return run_bash(block.body, world.cwd)
+        return run_bash(
+            block.body,
+            world.cwd,
+            on_chunk=on_chunk,
+            should_stop=should_stop,
+        )
     if block.tag == "edit":
         old, new = parse_edit_body(block.body, block.attrs)
         return apply_edit(block.attrs.get("path", ""), old, new, cwd=world.cwd)

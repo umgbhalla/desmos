@@ -149,6 +149,7 @@ def _child_world(cfg: EffectiveConfig, parent: Any):
         "You are a subagent. Finish the task and report. Your final message is "
         "the only thing the parent sees, so put the answer there, not in a syscall."
     )
+    w.complete_fn = getattr(parent, "complete_fn", None)
     return w
 
 
@@ -162,9 +163,22 @@ def _execute(run: Run, parent: Any) -> None:
         w = _child_world(run.cfg, parent)
         if run.cfg.context == "resumed" and run.messages:
             w.messages = list(run.messages)
+        def child_event(ev: dict[str, Any]) -> None:
+            kind = ev.get("ev")
+            if kind == "turn":
+                _emit({"ev": "subagent", "phase": "progress", "id": run.id, "turns": ev.get("n")})
+            payload = {k: v for k, v in ev.items() if k != "ev"}
+            _emit({"ev": "child", "id": run.id, "kind": kind, **payload})
+
         _DEPTH.n = 1
         try:
-            out = run_turns(w, run.task, max_turns=run.cfg.max_turns, quiet=True)
+            out = run_turns(
+                w,
+                run.task,
+                max_turns=run.cfg.max_turns,
+                quiet=True,
+                on_event=child_event,
+            )
         finally:
             _DEPTH.n = 0
         from desmos.scan import scan
@@ -205,6 +219,17 @@ def _execute(run: Run, parent: Any) -> None:
     finally:
         run.ended = time.time()
         _persist(run)
+        _emit(
+            {
+                "ev": "subagent",
+                "phase": run.state,
+                "id": run.id,
+                "secs": run.secs,
+                "turns": run.turns,
+                "result": (run.result or "")[:800],
+                "error": run.error,
+            }
+        )
 
 
 def spawn(task: str, agent: str = "general", *, resume: str | None = None, **over: Any) -> str:
@@ -224,11 +249,39 @@ def spawn(task: str, agent: str = "general", *, resume: str | None = None, **ove
         run.cfg.context = "resumed"
     with _LOCK:
         RUNS[run.id] = run
+    _emit(
+        {
+            "ev": "subagent",
+            "phase": "started",
+            "id": run.id,
+            "agent": cfg.agent,
+            "persona": cfg.persona or "",
+            "task": task,
+            "model": cfg.model or getattr(parent, "model", ""),
+        }
+    )
     _POOL.submit(_execute, run, parent)
     return run.id
 
 
 PARENT: Any = None
+_EMIT: Any = None
+
+
+def set_emitter(fn: Any) -> None:
+    """Bridge/TUI hook. Child threads call this; never send redacted ciphertext."""
+    global _EMIT
+    _EMIT = fn
+
+
+def _emit(ev: dict[str, Any]) -> None:
+    fn = _EMIT
+    if fn is None:
+        return
+    try:
+        fn(ev)
+    except Exception:
+        pass
 
 
 def bind(world: Any) -> str:

@@ -5,7 +5,16 @@ from pathlib import Path
 from typing import Any, Callable
 
 from desmos.catalog import header, ns_names, system_prompt
-from desmos.complete import assistant_content, complete, text_of, thinking_text
+from desmos.complete import (
+    LAST,
+    assistant_content,
+    cached_payload,
+    complete,
+    redact_wire,
+    text_of,
+    thought_blocks,
+    thinking_text,
+)
 from desmos.const import FROZEN, PRIOR_KEEP
 from desmos.dispatch import dispatch
 from desmos.generations import ensure_gen1, evolve, rollback
@@ -80,21 +89,78 @@ def reload(world: World) -> str:
 
 
 def turn(
-    world: World, messages: list[dict[str, Any]], max_tokens: int
+    world: World,
+    messages: list[dict[str, Any]],
+    max_tokens: int,
+    *,
+    n: int = 1,
+    emit: Callable[[dict[str, Any]], None] | None = None,
+    should_stop: Callable[[], bool] | None = None,
 ) -> tuple[str, list[tuple[Block, str]], bool, list[dict[str, Any]]]:
+    def fire(ev: dict[str, Any]) -> None:
+        if emit is not None:
+            emit(ev)
+
+    def stopped() -> bool:
+        return should_stop is not None and should_stop()
+
     install_resources(world)
     if world.ns.get("world") is not world:
         bind_step(world)  # ns lost its handles (cleanup, reload, stale exec globals)
+    system = system_prompt(world)
+    built = cached_payload(
+        world.model, system, messages, max_tokens, thinking=world.thinking
+    )
+    req = {k: v for k, v in built.items() if k != "_betas"}
+    fire(
+        {
+            "ev": "post",
+            "n": n,
+            "origin": "user" if n == 1 else "llm",
+            "model": world.model,
+            "request": redact_wire(req),
+        }
+    )
+    streamed = False
+
+    def on_delta(delta: dict[str, Any]) -> None:
+        nonlocal streamed
+        streamed = True
+        kind = delta.get("kind")
+        if kind == "thinking_delta":
+            fire(
+                {
+                    "ev": "thinking",
+                    "redacted": False,
+                    "text": delta.get("text") or "",
+                    "delta": True,
+                }
+            )
+        elif kind == "thinking":
+            fire(
+                {
+                    "ev": "thinking",
+                    "redacted": bool(delta.get("redacted")),
+                    "text": delta.get("text") or "",
+                    "delta": False,
+                }
+            )
+        elif kind == "text_delta":
+            fire({"ev": "speech", "text": delta.get("text") or "", "delta": True})
+
     if world.complete_fn:
-        resp = world.complete_fn(world.model, system_prompt(world), messages, max_tokens)
+        resp = world.complete_fn(world.model, system, messages, max_tokens)
     else:
         resp = complete(
             world.model,
-            system_prompt(world),
+            system,
             messages,
             max_tokens,
             thinking=world.thinking,
+            on_event=on_delta,
+            should_stop=should_stop,
         )
+        req = dict(LAST.get("payload") or {})
     speech = text_of(resp)
     assistant = assistant_content(resp)
     world.log.append(
@@ -104,11 +170,91 @@ def turn(
             "stop": resp.get("stop_reason"),
             "text": speech,
             "thinking": thinking_text(assistant),
+            "request": redact_wire(req),
+            "response": redact_wire(resp),
         }
     )
+    parts = thought_blocks(assistant)
+    if not streamed:
+        for part in parts:
+            fire(
+                {
+                    "ev": "thinking",
+                    "redacted": part["redacted"],
+                    "text": part["text"],
+                }
+            )
+        fire({"ev": "speech", "text": speech})
+    n_thoughts = sum(1 for p in parts if not p["redacted"])
+    n_redacted = sum(1 for p in parts if p["redacted"])
+    usage = (world.log[-1].get("usage") if world.log else {}) or {}
+    fire(
+        {
+            "ev": "complete",
+            "n": n,
+            "origin": "user" if n == 1 else "llm",
+            "model": world.model,
+            "thinking": world.thinking,
+            "thoughts": n_thoughts,
+            "redacted": n_redacted,
+            "usage": usage,
+            "request": (world.log[-1] or {}).get("request") or {},
+            "response": (world.log[-1] or {}).get("response") or {},
+        }
+    )
+    results: list[tuple[Block, str]] = []
     blocks = scan(speech)
-    results = [(b, dispatch(world, b)) for b in blocks]
+    if not stopped():
+        for b in blocks:
+            if stopped():
+                break
+            fire(
+                {
+                    "ev": "result",
+                    "phase": "start",
+                    "tag": b.tag,
+                    "attrs": dict(b.attrs),
+                    "body": clip(b.body),
+                    "text": "",
+                }
+            )
+
+            def on_chunk(text: str, tag: str = b.tag) -> None:
+                if text:
+                    fire(
+                        {
+                            "ev": "result",
+                            "phase": "delta",
+                            "tag": tag,
+                            "delta": True,
+                            "text": text,
+                        }
+                    )
+
+            r = dispatch(
+                world,
+                b,
+                on_chunk=on_chunk,
+                should_stop=should_stop,
+            )
+            results.append((b, r))
+            fire(
+                {
+                    "ev": "result",
+                    "phase": "done",
+                    "tag": b.tag,
+                    "attrs": dict(b.attrs),
+                    "body": clip(b.body),
+                    "text": clip(r),
+                }
+            )
     return speech, results, not blocks, assistant
+
+
+def _commit_step(world: World, prompt: str, last: str) -> None:
+    world.prior.append({"prompt": prompt, "speech": last})
+    world.prior = world.prior[-PRIOR_KEEP:]
+    save(world)
 
 
 def run_turns(
@@ -119,58 +265,55 @@ def run_turns(
     max_tokens: int = 8192,
     quiet: bool = False,
     on_event: Callable[[dict[str, Any]], None] | None = None,
+    should_stop: Callable[[], bool] | None = None,
 ) -> str:
     def emit(ev: dict[str, Any]) -> None:
         if on_event is not None:
             on_event(ev)
 
+    def stopped() -> bool:
+        return should_stop is not None and should_stop()
+
     world.messages.append({"role": "user", "content": header(world, prompt) + "\n\n" + prompt})
     last = ""
     for n in range(1, max_turns + 1):
+        if stopped():
+            emit({"ev": "stopped", "text": "stopped, saved"})
+            _commit_step(world, prompt, last)
+            return last
         emit({"ev": "turn", "n": n})
         if not quiet:
             print(f"\n===== turn {n} =====")
-        speech, results, done, assistant = turn(world, world.messages, max_tokens)
-        last = speech
-        usage = (world.log[-1].get("usage") if world.log else {}) or {}
-        emit(
-            {
-                "ev": "complete",
-                "n": n,
-                "origin": "user" if n == 1 else "llm",
-                "model": world.model,
-                "thinking": world.thinking,
-                "usage": usage,
-            }
+        speech, results, done, assistant = turn(
+            world,
+            world.messages,
+            max_tokens,
+            n=n,
+            emit=emit,
+            should_stop=should_stop,
         )
+        last = speech
         thoughts = thinking_text(assistant)
-        if thoughts:
-            emit({"ev": "thinking", "text": thoughts})
         if thoughts and not quiet:
             print("--- thinking ---")
             print(thoughts)
             print("--------------")
-        emit({"ev": "speech", "text": speech})
         if not quiet:
             print(speech)
         last_results = format_results(results) if results else ""
-        for b, r in results:
-            emit({"ev": "result", "tag": b.tag, "text": clip(r, 2000)})
         if last_results and not quiet:
             print("\n--- results ---")
             print(last_results)
         world.messages.append({"role": "assistant", "content": assistant})
-        if done:
-            world.prior.append({"prompt": prompt, "speech": speech})
-            world.prior = world.prior[-PRIOR_KEEP:]
-            save(world)
+        if done or stopped():
+            if stopped() and not done:
+                emit({"ev": "stopped", "text": "stopped, saved"})
+            _commit_step(world, prompt, speech)
             return speech
         world.messages.append({"role": "user", "content": format_result_message(results)})
     if not quiet:
         print(f"\n[hit max_turns={max_turns}]")
-    world.prior.append({"prompt": prompt, "speech": last})
-    world.prior = world.prior[-PRIOR_KEEP:]
-    save(world)
+    _commit_step(world, prompt, last)
     return last
 
 

@@ -229,23 +229,52 @@ class AcpServer:
                     "content": {"type": "text", "text": text},
                 })
         elif kind == "result":
-            state["n"] = int(state["n"]) + 1
-            tool_id = f"t{state['n']}"
+            phase = str(ev.get("phase") or "done")
             title = str(ev.get("tag") or "tool")
-            self._update(session_id, prompt_id, {
-                "sessionUpdate": "tool_call",
-                "toolCallId": tool_id,
-                "title": title,
-                "kind": "execute",
-                "status": "pending",
-            })
+            if phase == "start":
+                state["n"] = int(state["n"]) + 1
+                tool_id = f"t{state['n']}"
+                state["tool"] = tool_id
+                self._update(session_id, prompt_id, {
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": tool_id,
+                    "title": title,
+                    "kind": "execute",
+                    "status": "pending",
+                })
+                return
+            tool_id = str(state.get("tool") or "")
+            if not tool_id:
+                state["n"] = int(state["n"]) + 1
+                tool_id = f"t{state['n']}"
+                state["tool"] = tool_id
+                self._update(session_id, prompt_id, {
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": tool_id,
+                    "title": title,
+                    "kind": "execute",
+                    "status": "pending",
+                })
+            text = str(ev.get("text") or "")
+            if phase == "delta":
+                if text:
+                    self._update(session_id, prompt_id, {
+                        "sessionUpdate": "tool_call_update",
+                        "toolCallId": tool_id,
+                        "status": "in_progress",
+                        "content": [{
+                            "type": "content",
+                            "content": {"type": "text", "text": text},
+                        }],
+                    })
+                return
             self._update(session_id, prompt_id, {
                 "sessionUpdate": "tool_call_update",
                 "toolCallId": tool_id,
                 "status": "completed",
                 "content": [{
                     "type": "content",
-                    "content": {"type": "text", "text": str(ev.get("text") or "")},
+                    "content": {"type": "text", "text": text},
                 }],
             })
 

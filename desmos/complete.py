@@ -4,7 +4,7 @@ import json
 import os
 import urllib.error
 import urllib.request
-from typing import Any
+from typing import Any, Callable, Iterable
 
 INTERLEAVED_BETA = "interleaved-thinking-2025-05-14"
 ADAPTIVE_MARKERS = (
@@ -125,12 +125,36 @@ def assistant_content(resp: dict[str, Any]) -> list[dict[str, Any]]:
 
 def thinking_text(blocks: list[dict[str, Any]]) -> str:
     parts = []
-    for block in blocks:
-        if block.get("type") == "thinking" and (block.get("thinking") or "").strip():
-            parts.append(block["thinking"])
-        elif block.get("type") == "redacted_thinking":
-            parts.append("[redacted thinking]")
+    for block in thought_blocks(blocks):
+        parts.append("[redacted thinking]" if block["redacted"] else block["text"])
     return "\n".join(parts)
+
+
+def redact_wire(obj: Any) -> Any:
+    """Copy a POST/response tree for the TUI. Never includes redacted ciphertext or keys."""
+    if isinstance(obj, dict):
+        if obj.get("type") == "redacted_thinking":
+            return {"type": "redacted_thinking", "data": "[redacted]"}
+        return {
+            k: redact_wire(v)
+            for k, v in obj.items()
+            if k not in {"x-api-key", "api_key", "authorization"}
+        }
+    if isinstance(obj, list):
+        return [redact_wire(v) for v in obj]
+    return obj
+
+
+def thought_blocks(blocks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """One entry per wire thinking block. Never includes redacted ciphertext."""
+    out: list[dict[str, Any]] = []
+    for block in blocks:
+        kind = block.get("type")
+        if kind == "thinking" and (block.get("thinking") or "").strip():
+            out.append({"redacted": False, "text": block["thinking"]})
+        elif kind == "redacted_thinking":
+            out.append({"redacted": True, "text": ""})
+    return out
 
 
 def cached_payload(
@@ -181,6 +205,144 @@ def cached_payload(
     return payload
 
 
+def apply_stream_event(
+    state: dict[str, Any],
+    ev: dict[str, Any],
+    on_event: Callable[[dict[str, Any]], None] | None = None,
+) -> None:
+    """Fold one Anthropic SSE event into an assembled message.
+
+    Fires thinking_delta / text_delta / redacted thinking. Never puts
+    redacted ciphertext on on_event. The assembled message keeps wire data
+    so assistant_content can replay it; redact_wire strips it for the TUI.
+    """
+    kind = ev.get("type")
+    if kind == "error":
+        err = ev.get("error") or {}
+        msg = err.get("message") if isinstance(err, dict) else ev.get("message")
+        raise RuntimeError(f"Anthropic stream error: {msg or ev}")
+    if kind == "message_start":
+        message = dict(ev.get("message") or {})
+        message["content"] = []
+        state["message"] = message
+        state["blocks"] = []
+        return
+    if kind == "content_block_start":
+        idx = int(ev.get("index") or 0)
+        block = dict(ev.get("content_block") or {})
+        _pad_blocks(state, idx)
+        state["blocks"][idx] = block
+        if block.get("type") == "redacted_thinking" and on_event is not None:
+            on_event({"kind": "thinking", "redacted": True, "text": ""})
+        return
+    if kind == "content_block_delta":
+        idx = int(ev.get("index") or 0)
+        _pad_blocks(state, idx)
+        block = state["blocks"][idx]
+        delta = ev.get("delta") or {}
+        dtype = delta.get("type")
+        if dtype == "thinking_delta":
+            chunk = delta.get("thinking") or ""
+            block["thinking"] = (block.get("thinking") or "") + chunk
+            if chunk and on_event is not None:
+                on_event({"kind": "thinking_delta", "text": chunk})
+        elif dtype == "text_delta":
+            chunk = delta.get("text") or ""
+            block["text"] = (block.get("text") or "") + chunk
+            if chunk and on_event is not None:
+                on_event({"kind": "text_delta", "text": chunk})
+        elif dtype == "signature_delta":
+            block["signature"] = (block.get("signature") or "") + (delta.get("signature") or "")
+        return
+    if kind == "content_block_stop":
+        return
+    if kind == "message_delta":
+        message = state.setdefault("message", {})
+        delta = ev.get("delta") or {}
+        if "stop_reason" in delta:
+            message["stop_reason"] = delta.get("stop_reason")
+        if "stop_sequence" in delta:
+            message["stop_sequence"] = delta.get("stop_sequence")
+        usage = ev.get("usage") or {}
+        if usage:
+            merged = dict(message.get("usage") or {})
+            merged.update(usage)
+            message["usage"] = merged
+        return
+
+
+def assemble_message(state: dict[str, Any]) -> dict[str, Any]:
+    message = dict(state.get("message") or {})
+    blocks = list(state.get("blocks") or [])
+    message["content"] = blocks or [{"type": "text", "text": ""}]
+    return message
+
+
+def iter_sse_lines(resp: Any) -> Iterable[Any]:
+    """Yield HTTP/SSE lines as they arrive. Never slurp the body.
+
+    HTTPResponse.readline() is the chunk-decoded path. ``for line in resp``
+    can wait for EOF on some urllib wrappers, which is why the TUI painted
+    thinking/speech only after complete() returned.
+    """
+    readline = getattr(resp, "readline", None)
+    if not callable(readline):
+        yield from resp
+        return
+    while True:
+        line = readline()
+        if not line:
+            return
+        yield line
+
+
+def read_sse(
+    lines: Iterable[Any],
+    *,
+    on_event: Callable[[dict[str, Any]], None] | None = None,
+    should_stop: Callable[[], bool] | None = None,
+) -> dict[str, Any]:
+    """Parse an Anthropic event-stream into one assembled message."""
+    state: dict[str, Any] = {"message": {}, "blocks": []}
+    data_parts: list[str] = []
+
+    def flush() -> None:
+        nonlocal data_parts
+        if not data_parts:
+            return
+        raw = "\n".join(data_parts)
+        data_parts = []
+        if raw.strip() in {"", "[DONE]"}:
+            return
+        ev = json.loads(raw)
+        if isinstance(ev, dict):
+            apply_stream_event(state, ev, on_event)
+
+    for line in lines:
+        if should_stop is not None and should_stop():
+            break
+        if isinstance(line, bytes):
+            line = line.decode("utf-8", errors="replace")
+        line = line.rstrip("\r\n")
+        if line == "":
+            flush()
+            continue
+        if line.startswith(":"):
+            continue
+        if line.startswith("event:"):
+            continue
+        if line.startswith("data:"):
+            data_parts.append(line[5:].lstrip())
+    flush()
+    return assemble_message(state)
+
+
+def _pad_blocks(state: dict[str, Any], idx: int) -> None:
+    blocks = state.setdefault("blocks", [])
+    while len(blocks) <= idx:
+        blocks.append({})
+
+
 def complete(
     model: str,
     system: str,
@@ -188,12 +350,15 @@ def complete(
     max_tokens: int,
     *,
     thinking: str | None = "low",
+    on_event: Callable[[dict[str, Any]], None] | None = None,
+    should_stop: Callable[[], bool] | None = None,
 ) -> dict[str, Any]:
     key = os.environ.get("ANTHROPIC_API_KEY")
     if not key:
         raise RuntimeError("ANTHROPIC_API_KEY is not set")
     payload = cached_payload(model, system, messages, max_tokens, thinking=thinking)
     betas = payload.pop("_betas", [])
+    payload["stream"] = True
     log_payload(payload, betas)
     headers = {
         "x-api-key": key,
@@ -210,7 +375,11 @@ def complete(
     )
     try:
         with urllib.request.urlopen(req, timeout=180) as resp:
-            return json.loads(resp.read().decode())
+            return read_sse(
+                iter_sse_lines(resp),
+                on_event=on_event,
+                should_stop=should_stop,
+            )
     except urllib.error.HTTPError as e:
         body = e.read().decode()
         raise RuntimeError(f"Anthropic HTTP {e.code}: {body[:2000]}") from e

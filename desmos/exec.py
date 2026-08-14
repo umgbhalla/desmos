@@ -3,7 +3,9 @@ from __future__ import annotations
 import ast
 import contextlib
 import io
+import select
 import subprocess
+import time
 import traceback
 from pathlib import Path
 from typing import Any, Callable
@@ -12,12 +14,42 @@ from desmos.const import BASH_TIMEOUT, FROZEN
 from desmos.scan import clip
 from desmos.types import Tool, World
 
+OnChunk = Callable[[str], None]
+ShouldStop = Callable[[], bool]
 
-def run_python(body: str, world: World) -> str:
+
+class _ChunkWriter(io.TextIOBase):
+    """Capture stdout/stderr and forward each write to the TUI."""
+
+    def __init__(self, on_chunk: OnChunk | None) -> None:
+        self.buf = io.StringIO()
+        self.on_chunk = on_chunk
+
+    def write(self, s: str) -> int:  # type: ignore[override]
+        if not s:
+            return 0
+        self.buf.write(s)
+        if self.on_chunk is not None:
+            self.on_chunk(s)
+        return len(s)
+
+    def flush(self) -> None:
+        return None
+
+    def getvalue(self) -> str:
+        return self.buf.getvalue()
+
+
+def run_python(
+    body: str,
+    world: World,
+    *,
+    on_chunk: OnChunk | None = None,
+) -> str:
     src = body.strip()
     if not src:
         return "(empty)"
-    buf = io.StringIO()
+    buf = _ChunkWriter(on_chunk)
     ns = world.ns
     try:
         tree = ast.parse(src)
@@ -38,22 +70,68 @@ def run_python(body: str, world: World) -> str:
         return clip((buf.getvalue() + traceback.format_exc()).strip())
 
 
-def run_bash(body: str, cwd: Path) -> str:
+def run_bash(
+    body: str,
+    cwd: Path,
+    *,
+    on_chunk: OnChunk | None = None,
+    should_stop: ShouldStop | None = None,
+    timeout: float | None = None,
+) -> str:
     cmd = body.strip()
     if not cmd:
         return "(empty)"
+    limit = BASH_TIMEOUT if timeout is None else timeout
     try:
-        proc = subprocess.run(
+        proc = subprocess.Popen(
             cmd,
             shell=True,
             cwd=cwd,
-            text=True,
-            capture_output=True,
-            timeout=BASH_TIMEOUT,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            bufsize=0,
         )
-    except subprocess.TimeoutExpired:
-        return f"timeout after {BASH_TIMEOUT}s"
-    out = (proc.stdout or "") + (proc.stderr or "")
+    except OSError as exc:
+        return f"bash failed: {exc}"
+    assert proc.stdout is not None
+    parts: list[bytes] = []
+    deadline = time.monotonic() + limit
+    timed_out = False
+    try:
+        while True:
+            if should_stop is not None and should_stop():
+                proc.kill()
+                break
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                proc.kill()
+                timed_out = True
+                break
+            ready, _, _ = select.select([proc.stdout], [], [], min(0.1, remaining))
+            if ready:
+                chunk = proc.stdout.read(256)
+                if not chunk:
+                    break
+                parts.append(chunk)
+                if on_chunk is not None:
+                    on_chunk(chunk.decode("utf-8", errors="replace"))
+            elif proc.poll() is not None:
+                rest = proc.stdout.read()
+                if rest:
+                    parts.append(rest)
+                    if on_chunk is not None:
+                        on_chunk(rest.decode("utf-8", errors="replace"))
+                break
+        try:
+            proc.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+    finally:
+        proc.stdout.close()
+    out = b"".join(parts).decode("utf-8", errors="replace")
+    if timed_out:
+        return clip(f"timeout after {limit}s\n{out}".strip())
     if proc.returncode:
         return clip(f"exit {proc.returncode}\n{out}".strip())
     return clip(out.strip() or "ok")

@@ -7,7 +7,7 @@ from desmos.generations import evolve, gen_dir, rollback
 from desmos.loop import attach, bind_step, new_world
 from desmos.catalog import header, ns_names, system_prompt
 from desmos.scan import scan
-from desmos.complete import INTERLEAVED_BETA
+from desmos.complete import INTERLEAVED_BETA, text_of
 from desmos.types import Block
 
 
@@ -25,9 +25,89 @@ def self_check() -> None:
         assert "reload_sdk" in prompt
         assert "sdk:" in prompt
         assert "thinking:" in prompt
+        assert "middle:" in prompt
+        assert "xai_grok_markdown" in prompt
+        assert "AgentMessageBlock" in prompt or "speech markdown" in prompt
+        assert "redacted" in prompt
+        assert "angle-bracket" in prompt
+        assert "SubagentBlock" in prompt
+        assert "BlockViewerPane" in prompt
+        assert "spawn session" in prompt
+        assert "POST in" in prompt
+        assert "mid popup" in prompt
+        from desmos.cli import (
+            _repo_root,
+            _tui_binary,
+            _tui_build_cmd,
+            _tui_build_env,
+            _tui_stabilize_fingerprints,
+            _tui_stale,
+            _tui_watch_roots,
+        )
+
+        roots = _tui_watch_roots(cwd)
+        assert any("desmos-tui" in str(p) for p in roots)
+        assert not any("vendor" in str(p) for p in roots)
+        cargo_cmd = _tui_build_cmd("cargo")
+        assert cargo_cmd == ["cargo", "build", "-p", "desmos-tui", "--release"]
+        assert _tui_build_cmd("cargo", release=False) == [
+            "cargo",
+            "build",
+            "-p",
+            "desmos-tui",
+        ]
+        assert "--quiet" not in cargo_cmd
+        launch_env = _tui_build_env({"PATH": "/bin", "HOME": str(cwd)})
+        assert "CARGO_TERM_QUIET" not in launch_env
+        assert "RUSTFLAGS" not in launch_env
+        assert launch_env["RUSTUP_TOOLCHAIN"] == "1.97.1"
+        protoc = Path(launch_env["PROTOC"])
+        assert protoc.is_file() and protoc.is_absolute()
+        for head in _tui_stabilize_fingerprints(_repo_root()):
+            assert head.is_file(), head
+        kept = _tui_build_env({"RUSTFLAGS": "-C debuginfo=1", "CARGO_TERM_QUIET": "true"})
+        assert kept["RUSTFLAGS"] == "-C debuginfo=1"
+        assert "CARGO_TERM_QUIET" not in kept
+        assert "float_literal_f32_fallback" not in kept.get("RUSTFLAGS", "")
+        assert kept["PROTOC"] == str(protoc)
+        crate = cwd / "crates" / "desmos-tui"
+        crate.mkdir(parents=True)
+        src = crate / "main.rs"
+        src.write_text("fn main() {}\n", encoding="utf-8")
+        fake_bin = cwd / "target" / "release" / "desmos-tui"
+        fake_bin.parent.mkdir(parents=True)
+        fake_bin.write_bytes(b"bin")
+        older = src.stat().st_mtime - 30
+        import os as _os
+
+        # No stamp yet: fall back to mtime, so a source newer than the binary
+        # is stale and an older one is adopted (and stamped).
+        _os.utime(fake_bin, (older, older))
+        assert _tui_stale(cwd, fake_bin) is True
+        assert _tui_binary(cwd) is None
+        _os.utime(src, (older - 30, older - 30))
+        assert _tui_stale(cwd, fake_bin) is False
+        assert _tui_binary(cwd) == fake_bin
+        # Stamped now: a touch is not a rebuild, changed bytes are.
+        src.touch()
+        assert _tui_stale(cwd, fake_bin) is False
+        src.write_text("fn main() { let _ = 1; }\n", encoding="utf-8")
+        assert _tui_stale(cwd, fake_bin) is True
+        src.write_text("fn main() {}\n", encoding="utf-8")
+        assert _tui_stale(cwd, fake_bin) is False
+        assert "emitted before" in prompt
+        assert "stream" in prompt
+        assert "stdout streams" in prompt or "Execute card" in prompt
+        assert "[redacted]" in prompt
+        assert "pending_prompts" in prompt or "follow-up" in prompt
+        assert "enter queues" in prompt
+        assert "turn-status" in prompt or "turn status" in prompt
+        assert "ready snapshot" in prompt
+        assert "height 0" in prompt or "skipped" in prompt
         assert "<edit" in ABI
         assert "<reload_sdk" in ABI
         assert "XML tags are syscalls" in ABI
+        assert "Speak markdown" in ABI
         assert "Look around first" in ABI
         assert world.thinking == "low"
 
@@ -174,6 +254,297 @@ def self_check() -> None:
 
         _run(w_usage, "ping", quiet=True, on_event=lambda e: seen.append(str(e.get("ev"))))
         assert "speech" in seen and "result" in seen and "turn" in seen
+        assert "post" in seen
+        assert seen.index("post") < seen.index("complete")
+
+        def thinking_complete(_model, _system, _messages, _max_tokens):
+            return {
+                "content": [
+                    {"type": "thinking", "thinking": "plan", "signature": "sig"},
+                    {"type": "redacted_thinking", "data": "opaque-secret"},
+                    {"type": "text", "text": "hi"},
+                ],
+                "usage": {},
+            }
+
+        w_th = new_world(cwd, state_path=cwd / "harness-think.json", ns={})
+        w_th.complete_fn = thinking_complete
+        evs_th: list[dict] = []
+        _run(w_th, "hi", quiet=True, on_event=lambda e: evs_th.append(e))
+        thinks = [e for e in evs_th if e.get("ev") == "thinking"]
+        assert len(thinks) == 2
+        assert thinks[0].get("redacted") is False and thinks[0].get("text") == "plan"
+        assert thinks[1].get("redacted") is True
+        assert "opaque-secret" not in str(evs_th)
+        complete_ev = next(e for e in evs_th if e.get("ev") == "complete")
+        assert complete_ev.get("thoughts") == 1 and complete_ev.get("redacted") == 1
+        req = complete_ev.get("request") or {}
+        resp = complete_ev.get("response") or {}
+        assert req.get("model") or req.get("messages") is not None
+        assert "opaque-secret" not in str(resp)
+        data = ""
+        for block in (resp.get("content") or []):
+            if isinstance(block, dict) and block.get("type") == "redacted_thinking":
+                data = str(block.get("data") or "")
+        assert data == "[redacted]" or data == ""
+
+        from desmos.complete import apply_stream_event, assemble_message, read_sse
+
+        stream_state: dict = {"message": {}, "blocks": []}
+        stream_deltas: list[dict] = []
+        apply_stream_event(
+            stream_state,
+            {
+                "type": "message_start",
+                "message": {"id": "m", "role": "assistant", "usage": {"input_tokens": 9}},
+            },
+            stream_deltas.append,
+        )
+        apply_stream_event(
+            stream_state,
+            {"type": "content_block_start", "index": 0, "content_block": {"type": "thinking", "thinking": ""}},
+            stream_deltas.append,
+        )
+        apply_stream_event(
+            stream_state,
+            {"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": "ab"}},
+            stream_deltas.append,
+        )
+        apply_stream_event(
+            stream_state,
+            {"type": "content_block_stop", "index": 0},
+            stream_deltas.append,
+        )
+        apply_stream_event(
+            stream_state,
+            {
+                "type": "content_block_start",
+                "index": 1,
+                "content_block": {"type": "redacted_thinking", "data": "opaque-secret"},
+            },
+            stream_deltas.append,
+        )
+        apply_stream_event(
+            stream_state,
+            {"type": "content_block_start", "index": 2, "content_block": {"type": "text", "text": ""}},
+            stream_deltas.append,
+        )
+        apply_stream_event(
+            stream_state,
+            {"type": "content_block_delta", "index": 2, "delta": {"type": "text_delta", "text": "hi"}},
+            stream_deltas.append,
+        )
+        apply_stream_event(
+            stream_state,
+            {
+                "type": "message_delta",
+                "delta": {"stop_reason": "end_turn"},
+                "usage": {"output_tokens": 3},
+            },
+            stream_deltas.append,
+        )
+        streamed = assemble_message(stream_state)
+        assert streamed["content"][0]["thinking"] == "ab"
+        assert streamed["content"][1]["data"] == "opaque-secret"
+        assert streamed["content"][2]["text"] == "hi"
+        assert streamed["stop_reason"] == "end_turn"
+        assert streamed["usage"]["output_tokens"] == 3
+        assert "opaque-secret" not in str(stream_deltas)
+        assert any(d.get("kind") == "thinking_delta" and d.get("text") == "ab" for d in stream_deltas)
+        assert any(d.get("kind") == "thinking" and d.get("redacted") for d in stream_deltas)
+        assert any(d.get("kind") == "text_delta" and d.get("text") == "hi" for d in stream_deltas)
+        sse_msg = read_sse(
+            [
+                "event: message_start",
+                'data: {"type":"message_start","message":{"role":"assistant"}}',
+                "",
+                "event: content_block_start",
+                'data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}',
+                "",
+                "event: content_block_delta",
+                'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"ok"}}',
+                "",
+                "event: message_stop",
+                'data: {"type":"message_stop"}',
+                "",
+            ]
+        )
+        assert text_of(sse_msg) == "ok"
+        halted = {"go": False}
+
+        def on_first_delta(delta: dict) -> None:
+            if delta.get("kind") == "text_delta":
+                halted["go"] = True
+
+        sse_stop = read_sse(
+            [
+                'data: {"type":"message_start","message":{"role":"assistant"}}',
+                "",
+                'data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}',
+                "",
+                'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"one"}}',
+                "",
+                'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"two"}}',
+                "",
+            ],
+            on_event=on_first_delta,
+            should_stop=lambda: halted["go"],
+        )
+        assert "one" in text_of(sse_stop)
+        assert "two" not in text_of(sse_stop)
+
+        from desmos.complete import iter_sse_lines
+        from desmos.exec import run_bash
+
+        import socket
+        import threading
+        import urllib.request
+
+        got_live = threading.Event()
+
+        def _chunk(conn: socket.socket, payload: bytes) -> None:
+            conn.sendall(f"{len(payload):X}\r\n".encode() + payload + b"\r\n")
+
+        def _sse_server(sock: socket.socket) -> None:
+            conn, _ = sock.accept()
+            try:
+                buf = b""
+                while b"\r\n\r\n" not in buf:
+                    more = conn.recv(4096)
+                    if not more:
+                        return
+                    buf += more
+                conn.sendall(
+                    b"HTTP/1.1 200 OK\r\n"
+                    b"Content-Type: text/event-stream\r\n"
+                    b"Transfer-Encoding: chunked\r\n"
+                    b"\r\n"
+                )
+                _chunk(
+                    conn,
+                    b'data: {"type":"message_start","message":{"role":"assistant","usage":{}}}\n\n',
+                )
+                _chunk(
+                    conn,
+                    b'data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}\n\n',
+                )
+                _chunk(
+                    conn,
+                    b'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"LIVE"}}\n\n',
+                )
+                if not got_live.wait(2):
+                    return
+                _chunk(
+                    conn,
+                    b'data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}}\n\n',
+                )
+                conn.sendall(b"0\r\n\r\n")
+            finally:
+                conn.close()
+                sock.close()
+
+        srv = socket.socket()
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind(("127.0.0.1", 0))
+        port = srv.getsockname()[1]
+        srv.listen(1)
+        threading.Thread(target=_sse_server, args=(srv,), daemon=True).start()
+        live_seen: list[str] = []
+
+        def on_live(delta: dict) -> None:
+            if delta.get("kind") == "text_delta" and delta.get("text") == "LIVE":
+                live_seen.append("LIVE")
+                got_live.set()
+
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/", timeout=5) as resp:
+            streamed = read_sse(iter_sse_lines(resp), on_event=on_live)
+        assert live_seen == ["LIVE"], "SSE delta must fire before the server closes"
+        assert text_of(streamed) == "LIVE"
+
+        handshake = cwd / "go"
+        chunks: list[str] = []
+
+        def on_bash(text: str) -> None:
+            chunks.append(text)
+            if "ONE" in "".join(chunks) and not handshake.is_file():
+                handshake.write_text("1", encoding="utf-8")
+
+        bash_out = run_bash(
+            "printf ONE; while [ ! -f go ]; do sleep 0.01; done; printf TWO",
+            cwd,
+            on_chunk=on_bash,
+            timeout=3,
+        )
+        assert "ONE" in bash_out and "TWO" in bash_out
+        assert any("ONE" in c for c in chunks)
+
+        live_order: list[str] = []
+
+        def live_complete(_model, _system, messages, _max_tokens):
+            live_order.append("http")
+            if any("<result" in (m.get("content") or "") for m in messages):
+                return {"content": [{"type": "text", "text": "done"}], "usage": {}}
+            return {
+                "content": [{"type": "text", "text": "<python>1</python>\n<python>2</python>"}],
+                "usage": {},
+            }
+
+        w_live = new_world(cwd, state_path=cwd / "harness-live.json", ns={})
+        w_live.complete_fn = live_complete
+        _run(w_live, "two calls", quiet=True, on_event=lambda e: live_order.append(str(e.get("ev"))))
+        assert live_order.index("post") < live_order.index("http")
+        assert live_order.index("http") < live_order.index("complete")
+        assert live_order.count("result") == 4  # start+done per python tag
+
+        evs_wire: list[dict] = []
+        w_wire = new_world(cwd, state_path=cwd / "harness-wire.json", ns={"doc": "hello world"})
+
+        def wire_complete(_model, _system, messages, _max_tokens):
+            if any("<result" in (m.get("content") or "") for m in messages):
+                return {"content": [{"type": "text", "text": "11"}], "usage": {}}
+            return {"content": [{"type": "text", "text": "<python>len(doc)</python>"}], "usage": {}}
+
+        w_wire.complete_fn = wire_complete
+        _run(w_wire, "how long is doc?", quiet=True, on_event=lambda e: evs_wire.append(e))
+        res = next(
+            e
+            for e in evs_wire
+            if e.get("ev") == "result" and e.get("phase") in {None, "done"}
+        )
+        assert res.get("tag") == "python"
+        assert "len(doc)" in (res.get("body") or "")
+        assert "11" in (res.get("text") or "")
+        assert any(e.get("ev") == "result" and e.get("phase") == "start" for e in evs_wire)
+        stop_flag = {"go": False}
+        calls = {"n": 0}
+
+        def looping_complete(_model, _system, messages, _max_tokens):
+            calls["n"] += 1
+            if any("<result" in (m.get("content") or "") for m in messages):
+                return {"content": [{"type": "text", "text": "more"}], "usage": {}}
+            return {"content": [{"type": "text", "text": "<python>1</python>"}], "usage": {}}
+
+        w_stop = new_world(cwd, state_path=cwd / "harness-stop.json", ns={})
+        w_stop.complete_fn = looping_complete
+        evs: list[str] = []
+
+        def on_stop_ev(e: dict) -> None:
+            evs.append(str(e.get("ev")))
+            if e.get("ev") == "complete":
+                stop_flag["go"] = True
+
+        spoken = _run(
+            w_stop,
+            "keep going",
+            quiet=True,
+            on_event=on_stop_ev,
+            should_stop=lambda: stop_flag["go"],
+        )
+        assert spoken
+        assert "stopped" in evs
+        assert calls["n"] == 1
+        assert (cwd / "harness-stop.json").is_file()
+        assert w_stop.prior and w_stop.prior[-1]["prompt"] == "keep going"
         assert "transcript cleared" in w_usage.ns["reset"]()
         assert w_usage.messages == []
 
@@ -221,6 +592,28 @@ def self_check() -> None:
                 raise AssertionError("child spawn should be blocked")
         finally:
             S._DEPTH.n = 0
+
+        evs_spawn: list[dict] = []
+        S.set_emitter(evs_spawn.append)
+        parent_sp = new_world(cwd, state_path=cwd / "harness-spawn.json")
+
+        def spawn_complete(_model, _system, _messages, _max_tokens):
+            return {"content": [{"type": "text", "text": "child said ok"}], "usage": {}}
+
+        parent_sp.complete_fn = spawn_complete
+        S.bind(parent_sp)
+        rid = S.spawn("reply with ok", agent="explore", parent=parent_sp)
+        briefs = S.wait(rid, timeout=15.0)
+        assert briefs and briefs[0]["state"] == "done", briefs
+        phases = [e.get("phase") for e in evs_spawn if e.get("ev") == "subagent"]
+        assert phases and phases[0] == "started", evs_spawn
+        assert "done" in phases, evs_spawn
+        kids = [e for e in evs_spawn if e.get("ev") == "child"]
+        assert any(e.get("kind") == "speech" for e in kids), kids
+        assert not any(
+            "opaque-secret" in str(e) for e in evs_spawn
+        )
+        S.set_emitter(None)
 
         import threading
 
