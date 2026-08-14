@@ -38,6 +38,7 @@ mod queue;
 
 use std::collections::HashMap;
 use std::io::{self, BufRead, BufReader, Write};
+use std::path::PathBuf;
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, TryRecvError};
 use std::time::{Duration, Instant};
@@ -102,6 +103,7 @@ use queue::QueryQueue;
 enum Focus {
     Story,
     Calls,
+    Meter,
     PostIn,
     PostOut,
     Queue,
@@ -171,7 +173,8 @@ impl Focus {
     fn next(self) -> Self {
         match self {
             Self::Story => Self::Calls,
-            Self::Calls => Self::PostIn,
+            Self::Calls => Self::Meter,
+            Self::Meter => Self::PostIn,
             Self::PostIn => Self::PostOut,
             Self::PostOut => Self::Queue,
             Self::Queue => Self::Input,
@@ -183,28 +186,124 @@ impl Focus {
         match self {
             Self::Story => Self::Input,
             Self::Calls => Self::Story,
-            Self::PostIn => Self::Calls,
+            Self::Meter => Self::Calls,
+            Self::PostIn => Self::Meter,
             Self::PostOut => Self::PostIn,
             Self::Queue => Self::PostOut,
             Self::Input => Self::Queue,
         }
     }
 
-    /// Tab cycle. Queue is not a pane when it has no rows (height 0).
-    fn next_open(self, queue_open: bool) -> Self {
+    /// Tab cycle. A pane collapsed to zero rows is not a pane.
+    fn next_open(self, open: &dyn Fn(Focus) -> bool) -> Self {
         let mut f = self.next();
-        if f == Self::Queue && !queue_open {
+        for _ in 0..6 {
+            if open(f) {
+                break;
+            }
             f = f.next();
         }
         f
     }
 
-    fn prev_open(self, queue_open: bool) -> Self {
+    fn prev_open(self, open: &dyn Fn(Focus) -> bool) -> Self {
         let mut f = self.prev();
-        if f == Self::Queue && !queue_open {
+        for _ in 0..6 {
+            if open(f) {
+                break;
+            }
             f = f.prev();
         }
         f
+    }
+}
+
+/// Pane sizes, adjusted live with `+` / `-` on the focused pane and kept in
+/// `.desmos/tui.json` so a session does not start by re-doing the layout.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct PaneLayout {
+    /// Width of the wire column (calls + meter) as a percent of the top row.
+    wire_pct: u16,
+    /// Rows for the POST in/out split; 0 hides it.
+    post_h: u16,
+    /// Rows for the cache meter; 0 hides it.
+    meter_h: u16,
+}
+
+impl Default for PaneLayout {
+    fn default() -> Self {
+        Self {
+            wire_pct: 38,
+            post_h: 12,
+            meter_h: 7,
+        }
+    }
+}
+
+impl PaneLayout {
+    const MIN_WIRE: u16 = 15;
+    const MAX_WIRE: u16 = 75;
+    const MAX_POST: u16 = 28;
+    const MAX_METER: u16 = 12;
+
+    fn grow(&mut self, focus: Focus, by: i16) {
+        let step = |v: u16, lo: u16, hi: u16| -> u16 {
+            (v as i16 + by).clamp(lo as i16, hi as i16) as u16
+        };
+        match focus {
+            // Story grows by taking width off the wire column, and vice versa.
+            Focus::Story => self.wire_pct = step(self.wire_pct, Self::MIN_WIRE, Self::MAX_WIRE),
+            Focus::Calls => {
+                self.wire_pct = (self.wire_pct as i16 + by)
+                    .clamp(Self::MIN_WIRE as i16, Self::MAX_WIRE as i16)
+                    as u16
+            }
+            Focus::Meter => self.meter_h = step(self.meter_h, 0, Self::MAX_METER),
+            Focus::PostIn | Focus::PostOut => self.post_h = step(self.post_h, 0, Self::MAX_POST),
+            Focus::Queue | Focus::Input => {}
+        }
+    }
+
+    fn path() -> Option<PathBuf> {
+        let cwd = std::env::current_dir().ok()?;
+        Some(cwd.join(".desmos").join("tui.json"))
+    }
+
+    fn load() -> Self {
+        let Some(p) = Self::path() else {
+            return Self::default();
+        };
+        let Ok(raw) = std::fs::read_to_string(p) else {
+            return Self::default();
+        };
+        let Ok(v) = serde_json::from_str::<Value>(&raw) else {
+            return Self::default();
+        };
+        let d = Self::default();
+        let n = |k: &str, fallback: u16| {
+            v.get(k).and_then(Value::as_u64).unwrap_or(fallback as u64) as u16
+        };
+        Self {
+            wire_pct: n("wire_pct", d.wire_pct).clamp(Self::MIN_WIRE, Self::MAX_WIRE),
+            post_h: n("post_h", d.post_h).min(Self::MAX_POST),
+            meter_h: n("meter_h", d.meter_h).min(Self::MAX_METER),
+        }
+    }
+
+    fn save(&self) {
+        let Some(p) = Self::path() else { return };
+        if let Some(dir) = p.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let _ = std::fs::write(
+            p,
+            json!({
+                "wire_pct": self.wire_pct,
+                "post_h": self.post_h,
+                "meter_h": self.meter_h,
+            })
+            .to_string(),
+        );
     }
 }
 
@@ -475,6 +574,7 @@ struct App {
     story_text: TextSel,
     calls_text: TextSel,
     cache: CacheMeter,
+    layout: PaneLayout,
 }
 
 /// Prompt-cache window for the meter under the calls pane.
@@ -646,6 +746,7 @@ impl App {
             story_text: TextSel::default(),
             calls_text: TextSel::default(),
             cache: CacheMeter::default(),
+            layout: PaneLayout::load(),
         };
         app.apply_grok_settings();
         app
@@ -875,7 +976,11 @@ impl App {
         match focus {
             Focus::Story => self.story_scroll().on_activate(),
             Focus::Calls => self.calls_scroll().on_activate(),
-            Focus::PostIn | Focus::PostOut | Focus::Queue | Focus::Input => {}
+            Focus::Meter
+            | Focus::PostIn
+            | Focus::PostOut
+            | Focus::Queue
+            | Focus::Input => {}
         }
     }
 }
@@ -1556,6 +1661,31 @@ fn handle_key(
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
         return on_ctrl_c(bridge.as_deref_mut(), app);
     }
+    // Pane resize runs before every pane-specific branch: the POST trees and
+    // the queue consume their keys and return, so a resize handled later never
+    // reaches them. `+` grows the focused pane, `-` shrinks it, `0` resets.
+    if app.focus != Focus::Input && app.viewer.is_none() && app.post_inspect.is_none() {
+        match key.code {
+            KeyCode::Char('+') | KeyCode::Char('=') => {
+                let by = if app.focus == Focus::Story { -2 } else { 2 };
+                app.layout.grow(app.focus, by);
+                app.layout.save();
+                return Ok(false);
+            }
+            KeyCode::Char('-') | KeyCode::Char('_') => {
+                let by = if app.focus == Focus::Story { 2 } else { -2 };
+                app.layout.grow(app.focus, by);
+                app.layout.save();
+                return Ok(false);
+            }
+            KeyCode::Char('0') => {
+                app.layout = PaneLayout::default();
+                app.layout.save();
+                return Ok(false);
+            }
+            _ => {}
+        }
+    }
     if app.viewer.is_some() {
         if is_inline_paste_key(&key) || is_paste_key(&key) {
             match clipboard_text() {
@@ -1606,15 +1736,15 @@ fn handle_key(
     }
     match key.code {
         KeyCode::Tab if key.modifiers.contains(KeyModifiers::SHIFT) => {
-            app.set_focus(app.focus.prev_open(!app.queue.is_empty()));
+            app.set_focus(app.focus.prev_open(&pane_open(app)));
             return Ok(false);
         }
         KeyCode::BackTab => {
-            app.set_focus(app.focus.prev_open(!app.queue.is_empty()));
+            app.set_focus(app.focus.prev_open(&pane_open(app)));
             return Ok(false);
         }
         KeyCode::Tab => {
-            app.set_focus(app.focus.next_open(!app.queue.is_empty()));
+            app.set_focus(app.focus.next_open(&pane_open(app)));
             return Ok(false);
         }
         KeyCode::Esc => {
@@ -1771,6 +1901,19 @@ fn handle_key(
         _ => {}
     }
     Ok(false)
+}
+
+/// Tab skips panes the layout has collapsed to nothing.
+fn pane_open(app: &App) -> impl Fn(Focus) -> bool + use<> {
+    let queue = !app.queue.is_empty();
+    let post = app.layout.post_h > 0;
+    let meter = app.layout.meter_h > 0;
+    move |f| match f {
+        Focus::Queue => queue,
+        Focus::PostIn | Focus::PostOut => post,
+        Focus::Meter => meter,
+        _ => true,
+    }
 }
 
 fn apply_paste(app: &mut App, text: &str, inline: bool) {
@@ -2921,7 +3064,7 @@ fn draw(f: &mut Frame, app: &mut App) {
         .saturating_sub(input_h)
         .saturating_sub(queue_h)
         .saturating_sub(turn_h);
-    let post_h = (rest / 3).clamp(8, 16);
+    let post_h = app.layout.post_h.min(rest / 3);
     let cols = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -2934,10 +3077,13 @@ fn draw(f: &mut Frame, app: &mut App) {
         .split(f.area());
     let panes = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(62), Constraint::Percentage(38)])
+        .constraints([
+            Constraint::Percentage(100 - app.layout.wire_pct),
+            Constraint::Percentage(app.layout.wire_pct),
+        ])
         .split(cols[0]);
     // Bottom fifth of the wire column is the meter: cache TTL + last POST.
-    let meter_h = (panes[1].height / 5).clamp(7, 9).min(panes[1].height);
+    let meter_h = app.layout.meter_h.min(panes[1].height.saturating_sub(3));
     let wire = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(3), Constraint::Length(meter_h)])
@@ -3041,7 +3187,7 @@ fn draw(f: &mut Frame, app: &mut App) {
         theme.accent_assistant,
         app.focus == Focus::PostOut,
     );
-    draw_cache_meter(f, app.cache.area, &app.cache);
+    draw_cache_meter(f, app.cache.area, &app.cache, app.focus == Focus::Meter);
     draw_queue(f, cols[2], app);
     if show_turn {
         let cancel_hovered = app.mouse.is_some_and(|(c, r)| {
@@ -3117,7 +3263,7 @@ fn draw_json_tree(
 
 /// Cache meter: how much of the prompt-cache TTL is left, fading as it burns
 /// down, plus the token split of the last `complete()`.
-fn draw_cache_meter(f: &mut Frame, area: Rect, meter: &CacheMeter) {
+fn draw_cache_meter(f: &mut Frame, area: Rect, meter: &CacheMeter, focused: bool) {
     if area.height == 0 || area.width == 0 {
         return;
     }
@@ -3129,9 +3275,14 @@ fn draw_cache_meter(f: &mut Frame, area: Rect, meter: &CacheMeter) {
         Some(s) => format!(" cache  {ttl_label}  {}:{:02} left ", s / 60, s % 60),
         None => " cache  cold ".to_string(),
     };
+    let border = if focused {
+        theme.accent_tool
+    } else {
+        theme.gray_bright
+    };
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme.gray_bright))
+        .border_style(Style::default().fg(border))
         .title(Span::styled(
             title,
             Style::default()
@@ -3418,11 +3569,31 @@ fn draw_paste_preview(f: &mut Frame, input: Rect, body: &str, on_chip: bool) {
 }
 
 fn spoken_prefix(text: &str) -> String {
+    let spans = code_spans(text);
     let cut = match text.rfind('<') {
-        Some(i) if !text[i..].contains('>') => &text[..i],
+        Some(i)
+            if !text[i..].contains('>')
+                && !in_code(&spans, i)
+                && looks_like_tag_start(&text[i..]) =>
+        {
+            &text[..i]
+        }
         _ => text,
     };
     strip_xml(cut)
+}
+
+/// A trailing `<` is only worth withholding if it could open a tag: `<`
+/// followed by a letter or `/`. Without this, `if a < b` in streamed prose
+/// stalls the render until some later `>` arrives.
+fn looks_like_tag_start(rest: &str) -> bool {
+    let mut it = rest.chars();
+    it.next();
+    match it.next() {
+        Some('/') => it.next().is_some_and(|c| c.is_ascii_alphabetic()),
+        Some(c) => c.is_ascii_alphabetic(),
+        None => true,
+    }
 }
 
 fn start_thinking(story: &mut ScrollbackState, stream: &mut StreamCursor) {
@@ -3472,17 +3643,26 @@ fn apply_result(calls: &mut ScrollbackState, exec: &mut ExecStream, ev: &Value) 
             let tag = ev.get("tag").and_then(Value::as_str).unwrap_or("?");
             if let Some(id) = exec.id.take() {
                 if let Some(entry) = calls.get_by_id_mut(id) {
-                    if let RenderBlock::ToolCall(ToolCallBlock::Execute(block)) = &mut entry.block {
-                        if block.output.as_ref().is_none_or(|s| s.is_empty()) && !text.is_empty()
-                        {
-                            block.output = Some(text.to_string());
+                    match &mut entry.block {
+                        RenderBlock::ToolCall(ToolCallBlock::Execute(block)) => {
+                            if block.output.as_ref().is_none_or(|s| s.is_empty())
+                                && !text.is_empty()
+                            {
+                                block.output = Some(text.to_string());
+                            }
+                            if looks_failed(tag, text) {
+                                block.set_error(Some(
+                                    text.lines().next().unwrap_or("failed").to_string(),
+                                ));
+                            }
+                            block.finish();
                         }
-                        if looks_failed(tag, text) {
-                            block.set_error(Some(
-                                text.lines().next().unwrap_or("failed").to_string(),
-                            ));
-                        }
-                        block.finish();
+                        // Only python/bash are Execute cards. `edit`, `register`,
+                        // `system`, `skill`, `evolve` and every tag grown with
+                        // <register> render as Other, which has no streaming
+                        // output slot — rebuild the card from the done event so
+                        // the wire pane actually shows what the syscall returned.
+                        other => *other = result_block(ev),
                     }
                 }
                 calls.finish_running(id);
@@ -3544,24 +3724,125 @@ fn apply_speech(story: &mut ScrollbackState, stream: &mut StreamCursor, text: &s
     }
 }
 
-/// Drop XML syscall tags; keep markdown newlines.
-fn strip_xml(text: &str) -> String {
-    let mut out = String::new();
-    let mut rest = text;
-    while let Some(start) = rest.find('<') {
-        out.push_str(&rest[..start]);
-        match rest[start..].find('>') {
-            Some(end) => {
-                rest = &rest[start + end + 1..];
+/// Byte ranges of `text` that are literal code: fenced blocks (fence lines
+/// included) and inline backtick spans. XML stripping must leave these alone,
+/// or `<div>` inside a fenced HTML sample silently vanishes from the story.
+///
+/// An unterminated fence runs to the end of `text`. That is the streaming
+/// case and the whole point: while a code block is still open, everything
+/// after the opening fence is code.
+fn code_spans(text: &str) -> Vec<(usize, usize)> {
+    fn run(s: &str, c: char) -> usize {
+        s.chars().take_while(|&x| x == c).count()
+    }
+
+    let mut spans: Vec<(usize, usize)> = Vec::new();
+    let mut fence: Option<(char, usize, usize)> = None;
+    let mut off = 0usize;
+
+    for line in text.split_inclusive('\n') {
+        let trimmed = line.trim_start();
+        let indent = line.len() - trimmed.len();
+        let first = trimmed.chars().next();
+        let mut fenced_line = false;
+
+        match fence {
+            Some((fc, flen, start)) => {
+                fenced_line = true;
+                let n = run(trimmed, fc);
+                if first == Some(fc) && n >= flen && trimmed[n..].trim().is_empty() {
+                    spans.push((start, off + line.len()));
+                    fence = None;
+                }
             }
             None => {
-                out.push_str(rest);
-                rest = "";
-                break;
+                if indent <= 3 && (first == Some('`') || first == Some('~')) {
+                    let fc = first.unwrap();
+                    let n = run(trimmed, fc);
+                    if n >= 3 {
+                        fence = Some((fc, n, off));
+                        fenced_line = true;
+                    }
+                }
+            }
+        }
+
+        if !fenced_line {
+            inline_code_spans(line, off, &mut spans);
+        }
+        off += line.len();
+    }
+
+    if let Some((_, _, start)) = fence {
+        spans.push((start, text.len()));
+    }
+    spans
+}
+
+/// Backtick-delimited inline spans on one line. An unclosed opener is treated
+/// as code to the end of the line, so a half-streamed `` `<tag` `` is not eaten.
+fn inline_code_spans(line: &str, base: usize, out: &mut Vec<(usize, usize)>) {
+    let b = line.as_bytes();
+    let mut i = 0usize;
+    while i < b.len() {
+        if b[i] != b'`' {
+            i += 1;
+            continue;
+        }
+        let mut n = 0usize;
+        while i + n < b.len() && b[i + n] == b'`' {
+            n += 1;
+        }
+        let start = i;
+        let mut j = i + n;
+        let mut close = None;
+        while j < b.len() {
+            if b[j] == b'`' {
+                let mut m = 0usize;
+                while j + m < b.len() && b[j + m] == b'`' {
+                    m += 1;
+                }
+                if m == n {
+                    close = Some(j + m);
+                    break;
+                }
+                j += m;
+            } else {
+                j += 1;
+            }
+        }
+        let end = close.unwrap_or(b.len());
+        out.push((base + start, base + end));
+        i = end;
+    }
+}
+
+fn in_code(spans: &[(usize, usize)], i: usize) -> bool {
+    spans.iter().any(|&(a, z)| i >= a && i < z)
+}
+
+fn strip_xml(text: &str) -> String {
+    let spans = code_spans(text);
+    let mut out = String::new();
+    let mut i = 0usize;
+    while i < text.len() {
+        let Some(rel) = text[i..].find('<') else { break };
+        let start = i + rel;
+        out.push_str(&text[i..start]);
+        if in_code(&spans, start) {
+            out.push('<');
+            i = start + 1;
+            continue;
+        }
+        match text[start..].find('>') {
+            Some(end) => i = start + end + 1,
+            None => {
+                out.push_str(&text[start..]);
+                i = text.len();
             }
         }
     }
-    out.push_str(rest);
+    out.push_str(&text[i..]);
     out
 }
 
@@ -3636,9 +3917,9 @@ fn wire_syscall(tag: &str, body: &str, attrs: &Value, result: &str) -> RenderBlo
             // there — a bare `<bash>` is not a preview of anything.
             let preview = first_line(&cmd);
             let desc = if preview.is_empty() {
-                format!("<{tag}>")
+                tag.to_string()
             } else {
-                format!("<{tag}>  {preview}")
+                format!("{tag}  {preview}")
             };
             let mut block = ExecuteToolCallBlock::new(cmd)
                 .with_description(desc)
@@ -3670,8 +3951,19 @@ fn wire_syscall(tag: &str, body: &str, attrs: &Value, result: &str) -> RenderBlo
                 (_, true) => body.to_string(),
                 _ => format!("{body}\n\n→ {result}"),
             };
+            let target = attr_summary(attrs);
+            let head = if target.is_empty() {
+                format!("{tag}: {summary}")
+            } else {
+                format!("{tag}: {target}")
+            };
+            let sub = if target.is_empty() {
+                String::new()
+            } else {
+                summary
+            };
             RenderBlock::ToolCall(ToolCallBlock::Other(
-                OtherToolCallBlock::new(format!("syscall: <{tag}>"), summary).with_output(payload),
+                OtherToolCallBlock::new(head, sub).with_output(payload),
             ))
         }
     }
@@ -4563,6 +4855,42 @@ mod tests {
         assert_eq!(spoken_prefix("hello <python"), "hello ");
         assert_eq!(spoken_prefix("hello <python>x</python>!"), "hello x!");
     }
+    #[test]
+    fn a_less_than_in_prose_does_not_stall_the_stream() {
+        assert_eq!(
+            spoken_prefix("loop while a < b and keep going"),
+            "loop while a < b and keep going"
+        );
+    }
+
+    #[test]
+    fn open_fence_is_never_treated_as_markup() {
+        let live = "here:\n```python\nif a < b:\n    print('<hi>')\n";
+        assert_eq!(spoken_prefix(live), live);
+    }
+
+    #[test]
+    fn closed_fence_keeps_its_angle_brackets() {
+        let src = "see\n```html\n<div class=\"x\">hi</div>\n```\ndone";
+        let got = strip_xml(src);
+        assert!(got.contains("<div class=\"x\">"), "{got}");
+        assert!(got.contains("</div>"), "{got}");
+    }
+
+    #[test]
+    fn inline_code_keeps_tags_but_prose_still_strips() {
+        let got = strip_xml("use `<python>` not <python>x</python>");
+        assert_eq!(got, "use `<python>` not x");
+    }
+
+    #[test]
+    fn code_spans_covers_open_fence_to_end() {
+        let src = "a\n```\nb\n";
+        let spans = code_spans(src);
+        assert_eq!(spans.len(), 1, "{spans:?}");
+        assert_eq!(spans[0].1, src.len(), "open fence must run to EOF");
+    }
+
 
     fn first_speech(app: &App) -> Option<usize> {
         (0..app.story.len()).find(|&i| {
