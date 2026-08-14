@@ -1516,10 +1516,11 @@ def self_check() -> None:
         w_sw.complete_fn = recording_complete
         bind_step(w_sw)
 
+        # Neither a real credential nor a write to ~/.desmos is what this proves.
+        stub_path = cwd / "settings-not-written.json"
         real_usable, real_save = _st.usable, _st.save
-        _st.usable = lambda _p: True          # a credential check is not what this proves
-        _st.save = lambda _c: settings_path_stub  # and neither is writing ~/.desmos
-        settings_path_stub = cwd / "settings-not-written.json"
+        _st.usable = lambda _p: True
+        _st.save = lambda _c: stub_path
         try:
             w_sw.ns["step"]("switch to sonnet")
         finally:
