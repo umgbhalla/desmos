@@ -261,8 +261,14 @@ impl Default for PaneLayout {
             // space under the context bar.
             meter_h: 5,
             post_split: 50,
-            git_h: 0,
-            files_h: 0,
+            // Both side panes start open. A pane you have to know about before
+            // you can see it is a pane nobody sees; git state and the file it
+            // points at are the two things a harness turn is about. Kept small
+            // so the calls pane still owns most of the wire column — the
+            // `spare` clamp in draw() squeezes these to nothing before it
+            // takes a row off calls.
+            git_h: 6,
+            files_h: 8,
         }
     }
 }
@@ -659,6 +665,7 @@ struct App {
     files: side::FilePane,
     git_area: Rect,
     files_area: Rect,
+    keys_area: Rect,
     layout: PaneLayout,
 }
 
@@ -912,9 +919,10 @@ impl App {
             calls_text: TextSel::default(),
             cache: CacheMeter::default(),
             git: side::GitPane::new(&std::env::current_dir().unwrap_or_default()),
-            files: side::FilePane::default(),
+            files: side::FilePane::new(&std::env::current_dir().unwrap_or_default()),
             git_area: Rect::default(),
             files_area: Rect::default(),
+            keys_area: Rect::default(),
             layout: PaneLayout::load(),
         };
         app.apply_grok_settings();
@@ -2017,6 +2025,20 @@ fn handle_key(
                 app.set_focus(Focus::Input);
                 return Ok(false);
             }
+            // Esc steps back one pane rather than reaching the quit below it.
+            // These branches used to live in the per-pane handlers further
+            // down, where this match had already returned — so Esc anywhere in
+            // the side column fell through to `focused_scroll`, which maps
+            // every non-Calls focus to the story, found no selection there,
+            // and quit the harness.
+            if app.focus == Focus::Files {
+                app.set_focus(Focus::Git);
+                return Ok(false);
+            }
+            if app.focus == Focus::Git || app.focus == Focus::Meter {
+                app.set_focus(Focus::Input);
+                return Ok(false);
+            }
             let sb = app.focused_scroll();
             if sb.selected().is_some() {
                 sb.clear_selection();
@@ -2078,8 +2100,13 @@ fn handle_key(
         match key.code {
             KeyCode::Char('j') | KeyCode::Down => app.queue.select_next(),
             KeyCode::Char('k') | KeyCode::Up => app.queue.select_prev(),
-            KeyCode::Char('[') => app.queue.move_selected(-1),
-            KeyCode::Char(']') => app.queue.move_selected(1),
+            // The queue's second axis is order, so that is what ←/→ drive.
+            KeyCode::Char('[') | KeyCode::Char('h') | KeyCode::Left => {
+                app.queue.move_selected(-1)
+            }
+            KeyCode::Char(']') | KeyCode::Char('l') | KeyCode::Right => {
+                app.queue.move_selected(1)
+            }
             KeyCode::Char('d') | KeyCode::Backspace | KeyCode::Delete => {
                 app.queue.remove_selected();
                 if app.queue.is_empty() {
@@ -2100,16 +2127,18 @@ fn handle_key(
             KeyCode::Char('k') | KeyCode::Up => app.git.select(-1),
             KeyCode::PageDown => app.git.select(rows as i32),
             KeyCode::PageUp => app.git.select(-(rows as i32)),
-            KeyCode::Char(']') => app.git.next_tab(1),
-            KeyCode::Char('[') => app.git.next_tab(-1),
+            // Git's second axis is the tab strip in its own title bar, so ←/→
+            // move along it. Going *in* is Enter, which lands in the file pane.
+            KeyCode::Char(']') | KeyCode::Right => app.git.next_tab(1),
+            KeyCode::Char('[') | KeyCode::Left => app.git.next_tab(-1),
             KeyCode::Char('r') => app.git.poll(true),
             KeyCode::Char('i') => app.set_focus(Focus::Input),
             KeyCode::Enter | KeyCode::Char('l') => {
                 // Opening a row is what fills the file pane, so open that pane
                 // too rather than loading into something invisible.
                 let path = app.git.selected().and_then(|r| r.path.clone());
-                if path.is_some() {
-                    app.files.show(path.as_deref());
+                if let Some(p) = path {
+                    app.files.open(&p);
                     if app.layout.files_h == 0 {
                         app.layout.files_h = PaneLayout::OPEN_SIDE;
                         app.layout.save();
@@ -2119,21 +2148,34 @@ fn handle_key(
             }
             _ => {}
         }
-        // Walking the list previews as it goes, the way druk's tree does.
+        // Walking the list previews as it goes, the way druk's tree does. A row
+        // that names no file (a branch, a commit) leaves the pane alone.
         let path = app.git.selected().and_then(|r| r.path.clone());
-        app.files.show(path.as_deref());
+        app.files.preview(path.as_deref());
         return Ok(false);
     }
     if app.focus == Focus::Files && !matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
         let rows = app.files_area.height.saturating_sub(2) as usize;
         match key.code {
-            KeyCode::Char('j') | KeyCode::Down => app.files.scroll_by(1, rows),
-            KeyCode::Char('k') | KeyCode::Up => app.files.scroll_by(-1, rows),
-            KeyCode::PageDown => app.files.scroll_by(rows as i32, rows),
-            KeyCode::PageUp => app.files.scroll_by(-(rows as i32), rows),
+            KeyCode::Char('j') | KeyCode::Down => app.files.move_by(1, rows),
+            KeyCode::Char('k') | KeyCode::Up => app.files.move_by(-1, rows),
+            KeyCode::PageDown => app.files.move_by(rows as i32, rows),
+            KeyCode::PageUp => app.files.move_by(-(rows as i32), rows),
+            // Down the tree and back up it. `←` out of a file lands on that
+            // file in its own directory, so `←` `→` is a round trip.
+            KeyCode::Char('l') | KeyCode::Right | KeyCode::Enter => app.files.enter(),
+            KeyCode::Char('h') | KeyCode::Left => app.files.back(),
             KeyCode::Char('i') => app.set_focus(Focus::Input),
-            KeyCode::Esc => app.set_focus(Focus::Git),
             _ => {}
+        }
+        return Ok(false);
+    }
+    // The meter has no cursor and nothing to fold. Without this it fell into
+    // the scrollback branch below, where `focused_scroll` maps every non-Calls
+    // focus to the story — so j/k in the meter silently drove the story pane.
+    if app.focus == Focus::Meter {
+        if key.code == KeyCode::Char('i') {
+            app.set_focus(Focus::Input);
         }
         return Ok(false);
     }
@@ -3418,46 +3460,43 @@ fn draw(f: &mut Frame, app: &mut App) {
     let turn_h = if show_turn { 1 } else { 0 };
 
     let inner_w = f.area().width.saturating_sub(2);
-    let prompt_rows = app.prompt.display_rows(inner_w).clamp(1, 8);
-    let input_h = (1 + 2 + prompt_rows)
-        .min(f.area().height.saturating_sub(14 + turn_h))
-        .max(4);
+    // Roomy by default. An empty composer still opens three rows: this is where
+    // a prompt gets drafted, not a one-line readline.
+    let prompt_rows = app.prompt.display_rows(inner_w).clamp(3, 10);
     let queue_h = app.queue.display_height();
-    let rest = f.area()
-        .height
-        .saturating_sub(input_h)
-        .saturating_sub(queue_h)
-        .saturating_sub(turn_h);
-    let post_h = app.layout.post_h.min(rest / 3);
-    // The body is split left/right first, so the wire column runs the full
-    // height down to the queue. The POST tree sits under the story column
-    // only -- it used to span both, which capped the call stack at a third of
-    // the screen and silently scrolled older cards away.
-    let cols = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Min(6),
-            Constraint::Length(queue_h),
-            Constraint::Length(turn_h),
-            Constraint::Length(input_h),
-        ])
-        .split(f.area());
+    let input_h = (3 + prompt_rows)
+        .min(f.area().height.saturating_sub(10 + turn_h + queue_h))
+        .max(6);
+    // Columns first, and both run the full height. The composer belongs to the
+    // story column -- it is where you type *about* the story -- and the wire
+    // column spends the same band on a key legend, so the two columns end on
+    // the same row. A full-width bar cutting across both is what this replaced.
     let body = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
             Constraint::Percentage(100 - app.layout.wire_pct),
             Constraint::Percentage(app.layout.wire_pct),
         ])
-        .split(cols[0]);
-    let post_h = post_h.min(body[0].height.saturating_sub(3));
+        .split(f.area());
+    let bottom_h = queue_h + turn_h + input_h;
+    let post_h = app
+        .layout
+        .post_h
+        .min(body[0].height.saturating_sub(bottom_h + 3));
     let left = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(3), Constraint::Length(post_h)])
+        .constraints([
+            Constraint::Min(3),
+            Constraint::Length(post_h),
+            Constraint::Length(queue_h),
+            Constraint::Length(turn_h),
+            Constraint::Length(input_h),
+        ])
         .split(body[0]);
-    // The wire column stacks: calls, the meta pane, then the two side panes —
-    // git and the file it points at. Both side panes start closed, so this is
-    // the same column it was until someone opens one.
-    let spare = body[1].height.saturating_sub(3);
+    // The wire column stacks: calls, the meta pane, the two side panes — git
+    // and the file it points at — then the key legend, which takes exactly the
+    // band the composer takes opposite it.
+    let spare = body[1].height.saturating_sub(bottom_h + 3);
     let meter_h = app.layout.meter_h.min(spare);
     let git_h = app.layout.git_h.min(spare.saturating_sub(meter_h));
     let files_h = app
@@ -3471,12 +3510,14 @@ fn draw(f: &mut Frame, app: &mut App) {
             Constraint::Length(meter_h),
             Constraint::Length(git_h),
             Constraint::Length(files_h),
+            Constraint::Length(bottom_h),
         ])
         .split(body[1]);
     let panes = [left[0], wire[0]];
     app.cache.area = wire[1];
     app.git_area = wire[2];
     app.files_area = wire[3];
+    app.keys_area = wire[4];
     let posts = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
@@ -3486,9 +3527,9 @@ fn draw(f: &mut Frame, app: &mut App) {
     app.call_area = panes[1];
     app.post_in_area = posts[0];
     app.post_out_area = posts[1];
-    app.queue_area = cols[1];
-    app.turn_status_area = cols[2];
-    app.input_area = cols[3];
+    app.queue_area = left[2];
+    app.turn_status_area = left[3];
+    app.input_area = left[4];
 
     let viewing = app.viewing.clone();
     let child_ok = viewing
@@ -3580,14 +3621,14 @@ fn draw(f: &mut Frame, app: &mut App) {
     draw_meta(f, app.cache.area, &app.cache, app.focus == Focus::Meter);
     draw_git(f, app.git_area, app);
     draw_files(f, app.files_area, app);
-    draw_queue(f, cols[1], app);
+    draw_queue(f, app.queue_area, app);
     if show_turn {
         let cancel_hovered = app.mouse.is_some_and(|(c, r)| {
             app.turn_cancel.is_some_and(|a| hit(a, c, r))
         });
         let out = turn_status::render_turn_status(
             f.buffer_mut(),
-            cols[2],
+            app.turn_status_area,
             TurnStatusArgs {
                 state: &agent_st,
                 activity: &activity,
@@ -3617,7 +3658,8 @@ fn draw(f: &mut Frame, app: &mut App) {
     } else {
         app.turn_cancel = None;
     }
-    draw_input(f, cols[3], app);
+    draw_keys(f, app.keys_area, app);
+    draw_input(f, app.input_area, app);
     if app.post_inspect.is_some() {
         draw_post_inspect(f, app);
     }
@@ -3979,23 +4021,52 @@ fn draw_files(f: &mut Frame, area: Rect, app: &mut App) {
         return;
     }
     let width = inner.width as usize;
-    let lines: Vec<Line> = app
-        .files
-        .lines
-        .iter()
-        .enumerate()
-        .skip(app.files.scroll)
-        .take(inner.height as usize)
-        .map(|(i, text)| {
-            let n = format!("{:>4} ", i + 1);
-            let room = width.saturating_sub(n.len());
-            let body: String = text.chars().take(room).collect();
-            Line::from(vec![
-                Span::styled(n, Style::default().fg(theme.gray_bright)),
-                Span::styled(body, Style::default().fg(theme.text_primary)),
-            ])
-        })
-        .collect();
+    // Two states, one pane: a directory listing, or the file opened out of it.
+    // The title says which — `src/` against `side.rs`.
+    let lines: Vec<Line> = if app.files.in_file() {
+        app.files
+            .lines
+            .iter()
+            .enumerate()
+            .skip(app.files.scroll)
+            .take(inner.height as usize)
+            .map(|(i, text)| {
+                let n = format!("{:>4} ", i + 1);
+                let room = width.saturating_sub(n.len());
+                let body: String = text.chars().take(room).collect();
+                Line::from(vec![
+                    Span::styled(n, Style::default().fg(theme.gray_bright)),
+                    Span::styled(body, Style::default().fg(theme.text_primary)),
+                ])
+            })
+            .collect()
+    } else {
+        app.files
+            .entries
+            .iter()
+            .enumerate()
+            .skip(app.files.scroll)
+            .take(inner.height as usize)
+            .map(|(i, row)| {
+                let name = if row.is_dir && row.name != ".." {
+                    format!("{}/", row.name)
+                } else {
+                    row.name.clone()
+                };
+                let style = if row.is_dir {
+                    Style::default().fg(theme.accent_skill)
+                } else {
+                    Style::default().fg(theme.text_primary)
+                };
+                let body: String = name.chars().take(width).collect();
+                let mut line = Line::from(Span::styled(body, style));
+                if focused && i == app.files.sel {
+                    line = line.style(Style::default().bg(theme.bg_highlight));
+                }
+                line
+            })
+            .collect()
+    };
     f.render_widget(Paragraph::new(lines), inner);
 }
 
@@ -4180,96 +4251,178 @@ fn draw_queue(f: &mut Frame, area: Rect, app: &App) {
     );
 }
 
-/// Shortcuts for the pane that has focus, most useful first. A key that does
-/// nothing where you are standing is noise, and the bar has no room for noise.
-fn focus_hints(app: &App, enter_hint: &str) -> Vec<String> {
-    let mut hints: Vec<String> = Vec::new();
+/// A key and the verb it fires, for the pane that has focus.
+///
+/// Two columns rather than one sentence: a cap and a verb are different kinds
+/// of thing, and `j/k move   h/l fold   enter/ctrl-f open` makes the eye do
+/// the separating. Caps use the glyph the keyboard prints where one exists,
+/// so a modifier reads as a modifier instead of a hyphenated word.
+fn key_rows(app: &App) -> Vec<(&'static str, String)> {
+    let mut rows: Vec<(&'static str, String)> = Vec::new();
     match app.focus {
         Focus::Input => {
-            let send = enter_hint.trim();
-            if !send.is_empty() {
-                hints.push(send.to_string());
+            let composer = !app.prompt.to_send().trim().is_empty();
+            let send = if app.running && composer {
+                Some("queues")
+            } else if app.running && !app.queue.is_empty() {
+                Some("send now")
+            } else if app.running {
+                None
+            } else {
+                Some("send")
+            };
+            if let Some(verb) = send {
+                rows.push(("⏎", verb.into()));
             }
-            hints.push("shift-enter newline".into());
-            hints.push("tab panes".into());
+            rows.push(("⇧⏎", "newline".into()));
         }
         Focus::Story | Focus::Calls => {
-            hints.push("j/k move".into());
-            hints.push("h/l fold".into());
-            hints.push("enter/ctrl-f open".into());
-            hints.push("r raw".into());
-            hints.push("i input".into());
+            rows.push(("j k", "move".into()));
+            rows.push(("h l", "fold".into()));
+            rows.push(("⏎", "open".into()));
+            rows.push(("r", "raw".into()));
+            rows.push(("i", "input".into()));
         }
         Focus::Meter => {
-            hints.push("+/- rows".into());
-            hints.push("ctrl-←/→ width".into());
-            hints.push("i input".into());
+            rows.push(("+ -", "rows".into()));
+            rows.push(("^← →", "width".into()));
+            rows.push(("i", "input".into()));
         }
         Focus::Git => {
-            hints.push("j/k move".into());
-            hints.push("[/] tab".into());
-            hints.push("enter open".into());
-            hints.push("r refresh".into());
-            hints.push("+/- rows".into());
-            hints.push("i input".into());
+            rows.push(("j k", "move".into()));
+            rows.push(("[ ]", "tab".into()));
+            rows.push(("⏎", "open".into()));
+            rows.push(("r", "refresh".into()));
+            rows.push(("+ -", "rows".into()));
+            rows.push(("i", "input".into()));
         }
         Focus::Files => {
-            hints.push("j/k scroll".into());
-            hints.push("+/- rows".into());
-            hints.push("i input".into());
+            rows.push(("j k", "scroll".into()));
+            rows.push(("+ -", "rows".into()));
+            rows.push(("i", "input".into()));
         }
         Focus::PostIn | Focus::PostOut => {
-            hints.push("j/k move".into());
-            hints.push("h/l fold".into());
-            hints.push("e inspect".into());
-            hints.push("+/- rows".into());
-            hints.push("ctrl-←/→ split".into());
-            hints.push("i input".into());
+            rows.push(("j k", "move".into()));
+            rows.push(("h l", "fold".into()));
+            rows.push(("e", "inspect".into()));
+            rows.push(("+ -", "rows".into()));
+            rows.push(("^← →", "split".into()));
+            rows.push(("i", "input".into()));
         }
         Focus::Queue => {
-            hints.push("j/k select".into());
-            hints.push("[/] reorder".into());
-            hints.push("d drop".into());
-            hints.push("enter send now".into());
-            hints.push("i input".into());
+            rows.push(("j k", "select".into()));
+            rows.push(("[ ]", "reorder".into()));
+            rows.push(("d", "drop".into()));
+            rows.push(("⏎", "send now".into()));
+            rows.push(("i", "input".into()));
         }
+    }
+    rows.push(("⇥", "panes".into()));
+    if app.focus != Focus::Input && !rows.iter().any(|(c, _)| *c == "+ -") {
+        rows.push(("+ -", "resize".into()));
     }
     if app.focus != Focus::Input {
-        // A pane that already says what `+` does there does not also need the
-        // generic line — the bar is short and the tail gets cut first.
-        if !hints.iter().any(|h| h.starts_with("+/-")) {
-            hints.push("+/- resize".into());
-        }
-        hints.push("0 reset".into());
-        hints.push("tab panes".into());
-        if app.viewing.is_some() {
-            hints.push("esc parent".into());
-        }
+        rows.push(("0", "reset".into()));
     }
-    hints
+    if app.viewing.is_some() {
+        rows.push(("␛", "parent".into()));
+    }
+    rows
 }
 
-/// Drop hints from the tail until the bar fits. The identity half (model,
-/// effort, generation, status) always wins the space it needs.
-fn fit_status(head: &str, hints: &[String], width: usize) -> String {
-    let head_w = UnicodeWidthStr::width(head);
-    for take in (0..=hints.len()).rev() {
-        let tail = hints[..take].join("   ");
-        if head_w + UnicodeWidthStr::width(tail.as_str()) <= width {
-            return format!("{head}{tail}");
-        }
+/// The key legend, in the band the composer occupies in the other column.
+///
+/// It titles itself with the focused pane, because the rows change with focus
+/// and a legend that silently re-writes itself is a legend you stop trusting.
+fn draw_keys(f: &mut Frame, area: Rect, app: &App) {
+    if area.height < 4 || area.width < 10 {
+        return;
     }
-    head.to_string()
+    // Inset exactly like the composer opposite it, so the two cards float on
+    // the same rows instead of one sitting a row proud of the other.
+    let area = Rect {
+        x: area.x.saturating_add(1),
+        y: area.y.saturating_add(1),
+        width: area.width.saturating_sub(2),
+        height: area.height.saturating_sub(1),
+    };
+    let theme = Theme::current();
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme.bg_base))
+        .title(Span::styled(
+            format!(" keys  {} ", focus_name(app.focus)),
+            Style::default().fg(theme.text_secondary),
+        ))
+        .style(Style::default().bg(theme.bg_base).fg(theme.text_primary));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+    let rows = key_rows(app);
+    let cap_w = rows
+        .iter()
+        .map(|(c, _)| UnicodeWidthStr::width(*c))
+        .max()
+        .unwrap_or(0);
+    let lines: Vec<Line> = rows
+        .iter()
+        .take(inner.height as usize)
+        .map(|(cap, verb)| {
+            let pad = cap_w.saturating_sub(UnicodeWidthStr::width(*cap));
+            Line::from(vec![
+                Span::raw(" ".repeat(pad + 1)),
+                Span::styled(
+                    *cap,
+                    Style::default()
+                        .fg(theme.accent_user)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw("  "),
+                Span::styled(verb.clone(), Style::default().fg(theme.text_secondary)),
+            ])
+        })
+        .collect();
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
+/// What to call the focused pane in the legend title.
+fn focus_name(focus: Focus) -> &'static str {
+    match focus {
+        Focus::Input => "input",
+        Focus::Story => "story",
+        Focus::Calls => "calls",
+        Focus::Meter => "meta",
+        Focus::Git => "git",
+        Focus::Files => "files",
+        Focus::PostIn => "POST in",
+        Focus::PostOut => "POST out",
+        Focus::Queue => "queue",
+    }
 }
 
 fn draw_input(f: &mut Frame, area: Rect, app: &mut App) {
-    let session = app
+    let theme = Theme::current();
+    // Float the box: a blank row above it and a cell of gutter each side, so it
+    // reads as a card laid over the story column rather than one more pane
+    // stacked in the frame.
+    let card = Rect {
+        x: area.x.saturating_add(1),
+        y: area.y.saturating_add(1),
+        width: area.width.saturating_sub(2),
+        height: area.height.saturating_sub(1),
+    };
+    // Identity lives on the box's own bottom edge now. It used to be a line of
+    // running text above the box, competing with the shortcuts for one row and
+    // losing the tail of both.
+    let identity = app
         .viewing
         .as_deref()
-        .map(|id| format!("session {id}  esc=parent"))
+        .map(|id| format!(" session {id} "))
         .unwrap_or_else(|| {
             format!(
-                "{}  think:{}  gen {}",
+                " {}  think:{}  gen {} ",
                 if app.model.is_empty() {
                     "—"
                 } else {
@@ -4287,41 +4440,6 @@ fn draw_input(f: &mut Frame, area: Rect, app: &mut App) {
                 },
             )
         });
-    let multiline = if app.prompt.is_multiline() {
-        "multiline  "
-    } else {
-        ""
-    };
-    let composer = !app.prompt.to_send().trim().is_empty();
-    let enter_hint = if app.running && composer {
-        "enter queues   "
-    } else if app.running && !app.queue.is_empty() {
-        "enter send now   "
-    } else if app.running {
-        ""
-    } else {
-        "enter send   "
-    };
-    let head = format!(
-        " desmos  {session}  {}  {}   {multiline}",
-        Theme::current_kind().display_name(),
-        app.status,
-    );
-    let hints = focus_hints(app, enter_hint);
-    let width = area.width as usize;
-    let status = fit_status(&head, &hints, width);
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Min(2)])
-        .split(area);
-    let theme = Theme::current();
-    f.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            status,
-            Style::default().fg(theme.text_secondary).bg(theme.bg_base),
-        ))),
-        chunks[0],
-    );
     let prefix = " ❯ ";
     let focused = app.focus == Focus::Input;
     let border = if focused {
@@ -4340,10 +4458,26 @@ fn draw_input(f: &mut Frame, area: Rect, app: &mut App) {
             },
             Style::default().fg(theme.accent_success),
         ));
-    let inner = block.inner(chunks[1]);
+    let block = block
+        .title_bottom(
+            Line::from(Span::styled(
+                identity,
+                Style::default().fg(theme.text_secondary),
+            ))
+            .left_aligned(),
+        )
+        .title_bottom(
+            Line::from(Span::styled(
+                format!(" {} ", Theme::current_kind().display_name()),
+                Style::default().fg(theme.text_secondary),
+            ))
+            .right_aligned(),
+        )
+        .style(Style::default().bg(theme.bg_base));
+    let inner = block.inner(card);
     app.input_inner = inner;
     let lay = app.prompt.layout(prefix, inner.width);
-    f.render_widget(block, chunks[1]);
+    f.render_widget(block, card);
     if inner.width > 0 && inner.height > 0 {
         f.render_widget(
             Paragraph::new(lay.lines.clone()).style(Style::default().fg(theme.text_primary)),
@@ -5100,6 +5234,36 @@ mod tests {
         buffer_text(&term)
     }
 
+    /// The composer belongs to the story column, and the legend takes the same
+    /// band opposite it. Asserted on the rects the layout hands out, because a
+    /// full-width bar and a column-width card paint the same words -- only the
+    /// geometry tells them apart.
+    #[test]
+    fn the_composer_sits_under_the_story_column_only() {
+        let mut app = App::new();
+        let text = paint(&mut app, 140, 34);
+        assert_eq!(app.input_area.x, app.traj_area.x, "composer left edge");
+        assert_eq!(app.input_area.width, app.traj_area.width, "composer width");
+        assert!(
+            app.input_area.width + 20 < 140,
+            "composer still spans the frame: {:?}",
+            app.input_area
+        );
+        assert_eq!(app.keys_area.x, app.call_area.x, "legend sits in the wire column");
+        assert_eq!(
+            app.keys_area.y + app.keys_area.height,
+            app.input_area.y + app.input_area.height,
+            "columns must end on the same row"
+        );
+        assert!(app.keys_area.height >= 5, "legend band too thin: {:?}", app.keys_area);
+        // The bar this replaced ran the full width and lost its tail.
+        assert!(
+            !text.contains("shift-enter newline"),
+            "the old chrome sentence is still being painted:\n{text}"
+        );
+        assert!(text.contains("keys"), "legend pane missing:\n{text}");
+    }
+
     /// Code spans are protected: markup inside a fence or backticks is the
     /// reader's subject matter, not a call. This was covered against a stripper
     /// that no longer exists, so it is re-pinned against the one that runs.
@@ -5549,7 +5713,7 @@ mod tests {
                 "text": "Edited notes.md",
             }),
         );
-        let text = paint(&mut app, 130, 24);
+        let text = paint(&mut app, 130, 34);
         assert!(text.contains("notes.md"), "path missing:\n{text}");
         assert!(text.contains("UNIQUEOLD"), "removed side missing:\n{text}");
         assert!(text.contains("UNIQUENEW"), "added side missing:\n{text}");
@@ -5769,7 +5933,9 @@ mod tests {
         app.story_push(RenderBlock::agent_message(
             "PARAONE first paragraph stays its own block.\n\nPARATWO second paragraph after a blank line.",
         ));
-        let text = paint(&mut app, 80, 24);
+        // 34 rows, not 24: the composer opens roomy and the legend band is
+        // reserved opposite it, so a short terminal scrolls the story.
+        let text = paint(&mut app, 80, 34);
         let a = row_of(&text, "LINEA").expect(&text);
         let b = row_of(&text, "LINEB").expect(&text);
         assert!(b > a, "user hard-newline stayed on one row:\n{text}");
@@ -6250,7 +6416,7 @@ mod tests {
             app.input_area
         );
         let expected_x = app.input_area.x
-            + 1
+            + 2 // floating gutter, then the box's own border
             + UnicodeWidthStr::width(" ❯ ") as u16
             + UnicodeWidthStr::width("hi") as u16;
         assert_eq!(pos.x, expected_x, "caret not at end of prompt");
@@ -6924,10 +7090,13 @@ mod tests {
         app.status = "running".into();
         app.prompt.insert_str("follow up later");
         let text = paint(&mut app, 160, 30);
+        // The legend prints the cap and the verb in separate columns, so the
+        // old sentence "enter queues" no longer exists as a substring.
         assert!(
-            text.contains("enter queues"),
-            "typed follow-up while running must say enter queues:\n{text}"
+            text.contains("queues"),
+            "legend must say a typed follow-up queues:\n{text}"
         );
+        assert!(text.contains('⏎'), "legend must show the enter cap:\n{text}");
     }
 
     #[test]

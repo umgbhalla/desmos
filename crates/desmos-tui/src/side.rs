@@ -248,9 +248,28 @@ fn read_repo(cwd: &Path) -> GitSnap {
     snap
 }
 
-/// The file under the git pane's cursor, read once and scrolled locally.
+/// One row of a directory listing.
+pub struct DirRow {
+    pub name: String,
+    pub is_dir: bool,
+}
+
+/// The file view, which is also the filesystem view — the two are one pane with
+/// two states, and `←` / `→` move between them. Opening a file from git jumps
+/// straight to the content state; `←` drops back to the listing for that file's
+/// own directory, with the cursor on the file you just left. `←` again walks up
+/// a level. That is the whole navigation model: down is `→`, up is `←`.
+///
+/// The listing is not a tree. A tree pane six rows tall shows you a spine and
+/// no leaves; one directory at a time shows you the directory.
 #[derive(Default)]
 pub struct FilePane {
+    /// The directory being listed, and the one `←` returns to from a file.
+    pub dir: PathBuf,
+    pub entries: Vec<DirRow>,
+    /// Cursor into `entries`. Only meaningful while `path` is None.
+    pub sel: usize,
+    /// The open file, or None while listing `dir`.
     pub path: Option<PathBuf>,
     pub lines: Vec<String>,
     pub scroll: usize,
@@ -261,43 +280,146 @@ pub struct FilePane {
 /// TUI freezes on a lockfile.
 const MAX_BYTES: u64 = 512 * 1024;
 const MAX_LINES: usize = 4000;
+/// Directories with more entries than this exist (node_modules, a build dir).
+/// The pane still opens; it just stops reading past what anyone will scroll.
+const MAX_ENTRIES: usize = 2000;
+/// The row that walks up a level. Kept as a real row so `→` and `←` agree, and
+/// so the way out is visible rather than something you have to already know.
+const PARENT: &str = "..";
 
 impl FilePane {
-    /// Load `path` unless it is already loaded. Returns true when it changed.
-    pub fn show(&mut self, path: Option<&Path>) -> bool {
-        let same = match (&self.path, path) {
-            (Some(a), Some(b)) => a == b,
-            (None, None) => true,
-            _ => false,
+    pub fn new(cwd: &Path) -> Self {
+        let mut pane = Self {
+            dir: cwd.to_path_buf(),
+            ..Default::default()
         };
-        if same {
-            return false;
+        pane.read_dir();
+        pane
+    }
+
+    /// True while the pane is showing a file rather than a directory.
+    pub fn in_file(&self) -> bool {
+        self.path.is_some()
+    }
+
+    fn read_dir(&mut self) {
+        self.entries.clear();
+        self.note = None;
+        self.sel = 0;
+        self.scroll = 0;
+        let mut rows: Vec<DirRow> = match std::fs::read_dir(&self.dir) {
+            Ok(it) => it
+                .filter_map(Result::ok)
+                .take(MAX_ENTRIES)
+                .map(|e| DirRow {
+                    is_dir: e.file_type().is_ok_and(|t| t.is_dir()),
+                    name: e.file_name().to_string_lossy().into_owned(),
+                })
+                .collect(),
+            Err(e) => {
+                self.note = Some(e.to_string());
+                return;
+            }
+        };
+        rows.sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then_with(|| a.name.cmp(&b.name)));
+        if self.dir.parent().is_some() {
+            rows.insert(
+                0,
+                DirRow {
+                    name: PARENT.into(),
+                    is_dir: true,
+                },
+            );
         }
+        self.entries = rows;
+    }
+
+    fn select_name(&mut self, name: Option<&str>) {
+        let Some(name) = name else { return };
+        if let Some(i) = self.entries.iter().position(|r| r.name == name) {
+            self.sel = i;
+        }
+    }
+
+    /// `→`: descend. Into a directory, or into a file's contents. Already
+    /// inside a file, there is nowhere further down to go.
+    pub fn enter(&mut self) {
+        if self.in_file() {
+            return;
+        }
+        let Some(row) = self.entries.get(self.sel) else {
+            return;
+        };
+        if row.name == PARENT {
+            self.back();
+            return;
+        }
+        let target = self.dir.join(&row.name);
+        if row.is_dir {
+            self.dir = target;
+            self.read_dir();
+        } else {
+            self.open(&target);
+        }
+    }
+
+    /// `←`: back out one level. From a file, to the directory holding it, with
+    /// the cursor on that file. From a directory, to its parent, with the
+    /// cursor on the directory you left — so `←` `→` is a round trip, not a
+    /// reset to the top of the list.
+    pub fn back(&mut self) {
+        if let Some(p) = self.path.take() {
+            self.lines.clear();
+            if let Some(parent) = p.parent() {
+                self.dir = parent.to_path_buf();
+            }
+            self.read_dir();
+            self.select_name(p.file_name().map(|n| n.to_string_lossy()).as_deref());
+            return;
+        }
+        let Some(parent) = self.dir.parent().map(Path::to_path_buf) else {
+            return;
+        };
+        let leaving = self
+            .dir
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned());
+        self.dir = parent;
+        self.read_dir();
+        self.select_name(leaving.as_deref());
+    }
+
+    /// Read `path` into the content state. Public so the git pane can hand a
+    /// row's file straight over without walking there.
+    pub fn open(&mut self, path: &Path) {
         self.scroll = 0;
         self.note = None;
         self.lines.clear();
-        self.path = path.map(Path::to_path_buf);
-        let Some(p) = path else { return true };
-        match std::fs::metadata(p) {
+        self.path = Some(path.to_path_buf());
+        match std::fs::metadata(path) {
             Ok(m) if m.is_dir() => {
-                self.note = Some("directory".into());
-                return true;
+                // A directory reached through `open` is a listing, not a note
+                // saying the word "directory" at you.
+                self.path = None;
+                self.dir = path.to_path_buf();
+                self.read_dir();
+                return;
             }
             Ok(m) if m.len() > MAX_BYTES => {
                 self.note = Some(format!("{} KB — too big to preview", m.len() / 1024));
-                return true;
+                return;
             }
             Err(e) => {
                 self.note = Some(e.to_string());
-                return true;
+                return;
             }
             _ => {}
         }
-        match std::fs::read(p) {
+        match std::fs::read(path) {
             Ok(bytes) => {
                 if bytes.contains(&0) {
                     self.note = Some("binary".into());
-                    return true;
+                    return;
                 }
                 self.lines = String::from_utf8_lossy(&bytes)
                     .lines()
@@ -307,7 +429,38 @@ impl FilePane {
             }
             Err(e) => self.note = Some(e.to_string()),
         }
+    }
+
+    /// The git cursor moved. A row naming a file opens it; a row naming none —
+    /// a branch, a commit — leaves the pane alone, so walking the branches tab
+    /// does not blank the file you were reading.
+    pub fn preview(&mut self, path: Option<&Path>) -> bool {
+        let Some(p) = path else { return false };
+        if self.path.as_deref() == Some(p) {
+            return false;
+        }
+        self.open(p);
         true
+    }
+
+    /// `↑` / `↓`, whichever state the pane is in: the cursor in a listing, the
+    /// viewport in a file.
+    pub fn move_by(&mut self, by: i32, height: usize) {
+        if self.in_file() {
+            self.scroll_by(by, height);
+            return;
+        }
+        let len = self.entries.len();
+        if len == 0 {
+            return;
+        }
+        self.sel = (self.sel as i32 + by).clamp(0, len as i32 - 1) as usize;
+        if self.sel < self.scroll {
+            self.scroll = self.sel;
+        } else if height > 0 && self.sel >= self.scroll + height {
+            self.scroll = self.sel + 1 - height;
+        }
+        self.scroll = self.scroll.min(len.saturating_sub(height.max(1)));
     }
 
     pub fn scroll_by(&mut self, by: i32, height: usize) {
@@ -321,7 +474,11 @@ impl FilePane {
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_else(|| p.display().to_string()),
-            None => "file".into(),
+            None => self
+                .dir
+                .file_name()
+                .map(|n| format!("{}/", n.to_string_lossy()))
+                .unwrap_or_else(|| self.dir.display().to_string()),
         }
     }
 }
@@ -402,17 +559,69 @@ mod tests {
         let text = dir.join("t.txt");
         std::fs::write(&text, "one\ntwo\n").unwrap();
 
-        let mut f = FilePane::default();
-        assert!(f.show(Some(&bin)));
+        let mut f = FilePane::new(&dir);
+        assert!(f.preview(Some(&bin)));
         assert_eq!(f.note.as_deref(), Some("binary"));
         assert!(f.lines.is_empty());
 
-        assert!(f.show(Some(&text)));
+        assert!(f.preview(Some(&text)));
         assert_eq!(f.lines, vec!["one", "two"]);
         assert!(f.note.is_none());
-        assert!(!f.show(Some(&text)), "the same path is not re-read");
+        assert!(!f.preview(Some(&text)), "the same path is not re-read");
 
-        assert!(f.show(Some(&dir)));
-        assert_eq!(f.note.as_deref(), Some("directory"));
+        // A row that names no file leaves the open file alone rather than
+        // blanking the pane.
+        assert!(!f.preview(None));
+        assert_eq!(f.lines, vec!["one", "two"]);
+
+        // A directory handed to `open` becomes a listing, not a note.
+        f.open(&dir);
+        assert!(!f.in_file());
+        assert_eq!(f.dir, dir);
+    }
+
+    #[test]
+    fn arrows_walk_down_into_a_file_and_back_out_to_where_it_sat() {
+        let root = std::env::temp_dir().join("desmos-side-walk");
+        let _ = std::fs::remove_dir_all(&root);
+        let sub = root.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join("a.txt"), "hello\n").unwrap();
+
+        let mut f = FilePane::new(&root);
+        // `..` sorts first, then directories, then files.
+        assert_eq!(f.entries[0].name, "..");
+        assert_eq!(f.entries[1].name, "sub");
+
+        f.move_by(1, 10);
+        f.enter();
+        assert_eq!(f.dir, sub, "→ on a directory descends");
+        assert!(!f.in_file());
+
+        f.select_name(Some("a.txt"));
+        f.enter();
+        assert!(f.in_file(), "→ on a file opens it");
+        assert_eq!(f.lines, vec!["hello"]);
+
+        f.back();
+        assert!(!f.in_file(), "← leaves the file");
+        assert_eq!(f.dir, sub);
+        assert_eq!(
+            f.entries[f.sel].name, "a.txt",
+            "← lands on the file you left, not the top of the list"
+        );
+
+        f.back();
+        assert_eq!(f.dir, root, "← again walks up a level");
+        assert_eq!(
+            f.entries[f.sel].name, "sub",
+            "← lands on the directory you left"
+        );
+
+        // `→` on the `..` row is the same move as `←`.
+        f.sel = 0;
+        let up = f.dir.parent().unwrap().to_path_buf();
+        f.enter();
+        assert_eq!(f.dir, up);
     }
 }
