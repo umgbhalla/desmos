@@ -519,6 +519,7 @@ impl StreamCursor {
                     _ => None,
                 });
                 self.run.thought(id, ms);
+                self.run.sync(story);
             }
         }
     }
@@ -647,6 +648,9 @@ struct WorkRun {
     thoughts: Vec<EntryId>,
     /// HEAD when the run's first call landed, to spot a commit at the seam.
     head_at_start: Option<String>,
+    /// The row itself, once the run has earned one. Rewritten in place as the
+    /// run grows, so it never moves and never stacks.
+    row: Option<EntryId>,
 }
 
 /// Below this a run is not worth a row: the collapsed thought already says
@@ -677,11 +681,15 @@ impl WorkRun {
             .count()
     }
 
-    /// Replace the run's thought blocks with a single sentence. Called at the
-    /// seam, just before prose starts, so the row lands above the answer.
-    fn fold(&mut self, story: &mut ScrollbackState) {
+    /// Rewrite the row for the run so far. Called after every segment, so the
+    /// reader watches the work accumulate instead of staring at a stack of
+    /// collapsed thoughts until the answer arrives.
+    ///
+    /// The row is written in place: one entry per run, updated, never a second
+    /// row and never a jump to the bottom. It appears only once the run has
+    /// earned it, which is also when the thoughts it summarises are removed.
+    fn sync(&mut self, story: &mut ScrollbackState) {
         if self.calls() < RUN_MIN_CALLS {
-            self.reset();
             return;
         }
         let mut line = work_sentence(&self.segs);
@@ -692,7 +700,23 @@ impl WorkRun {
         for id in self.thoughts.drain(..) {
             story.remove_entry(id);
         }
-        story.push_block(RenderBlock::system(line));
+        let live = self.row.filter(|id| story.get_by_id(*id).is_some());
+        match live {
+            Some(id) => {
+                if let Some(entry) = story.get_by_id_mut(id) {
+                    entry.block = RenderBlock::system(line);
+                }
+                story.mark_structurally_dirty(id);
+                story.mark_height_dirty(id);
+            }
+            None => self.row = Some(story.push_block(RenderBlock::system(line))),
+        }
+    }
+
+    /// Close the run at the seam, just before prose starts. The last sync
+    /// catches the final call and whatever git says about it.
+    fn fold(&mut self, story: &mut ScrollbackState) {
+        self.sync(story);
         self.reset();
     }
 
@@ -700,6 +724,7 @@ impl WorkRun {
         self.segs.clear();
         self.thoughts.clear();
         self.head_at_start = None;
+        self.row = None;
     }
 }
 
@@ -2007,6 +2032,7 @@ fn handle_event(app: &mut App, ev: Value) {
                 let tag = ev.get("tag").and_then(Value::as_str).unwrap_or("?");
                 let target = call_target(tag, &ev);
                 app.stream.run.call(tag, target);
+                app.stream.run.sync(&mut app.story);
             }
             apply_result(&mut app.calls, &mut app.exec, &ev);
         }
@@ -5631,6 +5657,39 @@ mod tests {
     /// Driven through handle_event, because the row is only worth anything if
     /// the real event path builds it. The thoughts must be gone: two rows
     /// saying the same thing is what this replaced.
+    /// The row is live: it appears while the run is happening, not when the
+    /// answer starts. Watching a stack of collapsed thoughts and nothing else
+    /// for a minute is exactly the silence the row exists to fill.
+    #[test]
+    fn the_work_row_appears_before_the_answer_does() {
+        let mut app = App::new();
+        handle_event(&mut app, json!({"ev": "turn", "text": "go"}));
+        let row = |app: &App| {
+            (0..app.story.len()).find_map(|i| match app.story.entry(i).map(|e| &e.block) {
+                Some(RenderBlock::System(b)) => Some(b.text.clone()),
+                _ => None,
+            })
+        };
+        handle_event(&mut app, json!({"ev": "thinking", "delta": true, "text": "planning\n"}));
+        handle_event(&mut app, json!({"ev": "result", "tag": "bash", "body": "cargo build", "text": "ok"}));
+        assert!(row(&app).is_none(), "one call is not a run: {:?}", row(&app));
+
+        handle_event(&mut app, json!({"ev": "thinking", "delta": true, "text": "reading\n"}));
+        handle_event(&mut app, json!({"ev": "result", "tag": "bash", "body": "cargo test", "text": "ok"}));
+        let mid = row(&app).expect("the row must exist mid-run, before any speech");
+        assert!(mid.contains("bash"), "mid-run row says nothing about the work: {mid}");
+
+        // A third call rewrites the same row rather than stacking a second.
+        handle_event(&mut app, json!({"ev": "result", "tag": "read", "body": "main.rs", "text": "ok"}));
+        let rows = (0..app.story.len())
+            .filter(|i| matches!(app.story.entry(*i).map(|e| &e.block), Some(RenderBlock::System(_))))
+            .count();
+        assert_eq!(rows, 1, "the run must own exactly one row");
+        let grown = row(&app).unwrap();
+        assert!(grown.contains("read"), "the row did not grow with the run: {grown}");
+        assert_ne!(mid, grown, "the row must be rewritten, not frozen at its first shape");
+    }
+
     #[test]
     fn invisible_work_folds_into_one_row_above_the_prose() {
         let mut app = App::new();
