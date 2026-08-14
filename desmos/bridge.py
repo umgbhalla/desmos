@@ -154,9 +154,28 @@ def serve(cwd: Path) -> int:
                 if not _settings.usable(choice.provider):
                     _emit({"ev": "error", "text": f"{choice.provider} has no usable credential"})
                     continue
+                was = _settings.provider_of(str(world.model or ""))
                 world.model, world.thinking = choice.model, choice.effort
                 _settings.save(choice)
                 _emit(_snapshot(world))
+                if was and was != choice.provider:
+                    # wire_content fences blocks across providers: the other
+                    # provider's thinking and its signatures cannot be replayed,
+                    # so they are dropped from every later request. That is a
+                    # real change to what the model can see, and silence about
+                    # it reads as the harness losing reasoning for no reason.
+                    _emit(
+                        {
+                            "ev": "notice",
+                            "text": (
+                                f"provider switched {was} → {choice.provider}. "
+                                f"Speech and syscall results replay in full, but "
+                                f"{was} thinking blocks cannot cross providers and are "
+                                f"dropped from later requests — the new model reads the "
+                                f"conversation without the old model's reasoning."
+                            ),
+                        }
+                    )
             elif op == "picker":
                 from desmos.settings import picker
 

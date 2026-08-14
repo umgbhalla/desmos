@@ -1356,6 +1356,14 @@ def self_check() -> None:
             saved = json.loads((cwd / "settings.json").read_text())
             assert saved == {"provider": "openai", "model": "gpt-5.6-luna", "effort": "xhigh"}, saved
 
+            # Crossing providers drops the other provider's thinking blocks from
+            # every later request. That is a real loss of context, so the bridge
+            # says so instead of letting it look like a glitch.
+            fence = json.loads(proc.stdout.readline())
+            assert fence["ev"] == "notice", fence
+            assert "anthropic" in fence["text"] and "openai" in fence["text"], fence
+            assert "thinking" in fence["text"], fence
+
             proc.stdin.write(json.dumps({"op": "model", "model": "gpt-9-nope"}) + "\n")
             proc.stdin.flush()
             bad = json.loads(proc.stdout.readline())

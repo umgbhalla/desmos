@@ -828,6 +828,10 @@ struct ChildSess {
     exec: ExecStream,
     story_text: TextSel,
     calls_text: TextSel,
+    /// Group heads for this child's wire, same contract as `App::call_groups`.
+    /// A child runs its own POSTs, so it needs its own index — sharing the
+    /// parent's would step the cursor to entries that are not in this pane.
+    call_groups: Vec<EntryId>,
 }
 
 /// Grok text selection for one scrollback (drag, persist, double-click word).
@@ -976,6 +980,12 @@ struct CacheMeter {
     spent: f64,
     /// Billing is a subscription, not per token: show list price, not a bill.
     plan: bool,
+    /// True when the provider hands out a client-declared ephemeral cache with
+    /// a TTL we can count down. Anthropic does; OpenAI's Responses cache is the
+    /// endpoint's own, with no window we are told about — so counting one down
+    /// invented a deadline, and calling it "cold" five minutes later claimed a
+    /// cache had expired when nothing had said so.
+    ephemeral: bool,
     /// What the cached reads would have cost at full input price, minus what
     /// they did cost — the money the cache actually saved this session.
     saved: f64,
@@ -1296,6 +1306,7 @@ impl App {
                     exec: ExecStream::default(),
                     story_text: TextSel::default(),
                     calls_text: TextSel::default(),
+                    call_groups: Vec::new(),
                 },
             );
         }
@@ -1418,6 +1429,27 @@ impl App {
         &mut self.calls
     }
 
+    /// The wire pane on screen and its group index together, parent or child.
+    /// Group navigation needs both halves of the same session or it steps the
+    /// cursor to entries that live in the other one.
+    fn calls_and_groups(&mut self) -> (&mut ScrollbackState, &mut Vec<EntryId>) {
+        if let Some(id) = self.viewing.clone() {
+            if let Some(c) = self.children.get_mut(&id) {
+                return (&mut c.calls, &mut c.call_groups);
+            }
+        }
+        (&mut self.calls, &mut self.call_groups)
+    }
+
+    fn calls_and_groups_ref(&self) -> (&ScrollbackState, &[EntryId]) {
+        if let Some(id) = self.viewing.as_ref() {
+            if let Some(c) = self.children.get(id) {
+                return (&c.calls, &c.call_groups);
+            }
+        }
+        (&self.calls, &self.call_groups)
+    }
+
     fn story_push(&mut self, block: RenderBlock) {
         // follow_mode is already true on a fresh state; prepare_layout pins
         // the viewport. goto_bottom() before the first layout has
@@ -1443,17 +1475,17 @@ impl App {
     /// watched moving, and otherwise reports the newest group, which is what
     /// the tail the reader is staring at actually belongs to.
     fn call_group_pos(&self) -> Option<(usize, usize)> {
-        let total = self.call_groups.len();
+        let (calls, groups) = self.calls_and_groups_ref();
+        let total = groups.len();
         if total == 0 {
             return None;
         }
         // Groups are pushed in entry order, so the group a card belongs to is
         // the last boundary at or above it.
-        let cur = match self.calls.selected() {
-            Some(sel) => self
-                .call_groups
+        let cur = match calls.selected() {
+            Some(sel) => groups
                 .iter()
-                .filter_map(|id| self.calls.index_of_id(*id))
+                .filter_map(|id| calls.index_of_id(*id))
                 .filter(|start| *start <= sel)
                 .count()
                 .max(1),
@@ -1467,18 +1499,17 @@ impl App {
     /// Returns false when there is nowhere to go, so the caller can leave the
     /// selection alone rather than snapping to an end.
     fn select_call_group(&mut self, forward: bool) -> bool {
-        let mut starts: Vec<usize> = self
-            .call_groups
+        let (calls, groups) = self.calls_and_groups();
+        let mut starts: Vec<usize> = groups
             .iter()
-            .filter_map(|id| self.calls.index_of_id(*id))
+            .filter_map(|id| calls.index_of_id(*id))
             .collect();
         starts.sort_unstable();
         starts.dedup();
         if starts.is_empty() {
             return false;
         }
-        let sel = self.calls.selected();
-        let target = match sel {
+        let target = match calls.selected() {
             None if forward => starts.first().copied(),
             None => starts.last().copied(),
             Some(cur) if forward => starts.iter().copied().find(|s| *s > cur),
@@ -1487,8 +1518,8 @@ impl App {
         let Some(target) = target else {
             return false;
         };
-        self.calls.set_selected(Some(target));
-        self.calls.scroll_to_entry_top(target);
+        calls.set_selected(Some(target));
+        calls.scroll_to_entry_top(target);
         true
     }
 
@@ -1579,7 +1610,24 @@ fn grok_appearance() -> AppearanceConfig {
     cfg.scrollback.blocks.thinking.header = false;
     cfg.show_timestamps = appearance_cache::load_timestamps();
     cfg.show_timeline = appearance_cache::load_show_timeline();
-    cfg.prompt.compact = appearance_cache::load();
+    // Density. Grok's defaults are tuned for one full-width chat column; this
+    // is two columns plus four stacked side panes, so every default pad is
+    // paid several times over. Compact is the default here, not a small-screen
+    // fallback: it zeroes the outer vertical pad and clamps the horizontal pad
+    // to one cell. A pager.toml that asks for compact cannot un-ask.
+    cfg.prompt.compact = true;
+    // Two cells of pad on each side of every block, inside a pane that is a
+    // third of the screen. One cell still separates content from the accent
+    // column, which is all the pad was doing.
+    cfg.scrollback.layout.block_pad_left = 1;
+    cfg.scrollback.layout.block_pad_right = 1;
+    // A blank row above and below every user prompt. The prompt already has an
+    // accent column and a background tint; it does not also need two rows of
+    // air, and it is the most frequent block in the story.
+    cfg.scrollback.blocks.prompt.vpad = false;
+    // The turn-status row lives in a one-row band of its own, immediately above
+    // the composer border. Its gap row would come out of the story.
+    cfg.turn_status.gap = false;
     cfg
 }
 
@@ -2110,10 +2158,11 @@ fn handle_child(app: &mut App, ev: &Value) {
             let usage = ev.get("usage").cloned().unwrap_or(json!({}));
             let thoughts = ev.get("thoughts").and_then(Value::as_u64).unwrap_or(0);
             let redacted = ev.get("redacted").and_then(Value::as_u64).unwrap_or(0);
-            wire_push(
+            let head = wire_push(
                 &mut child.calls,
                 wire_complete(origin, n, model, thinking, &usage, thoughts, redacted),
             );
+            child.call_groups.push(head);
             if let (Some(req), Some(resp)) = (ev.get("request"), ev.get("response")) {
                 last_post = Some((n, req.clone(), resp.clone()));
             }
@@ -2147,6 +2196,9 @@ fn handle_event(app: &mut App, ev: Value) {
             app.picker.observe(&ev);
             if let Some(b) = ev.get("billing").and_then(Value::as_str) {
                 app.cache.plan = b == "plan";
+            }
+            if let Some(p) = ev.get("provider").and_then(Value::as_str) {
+                app.cache.ephemeral = p == "anthropic";
             }
             if let Some(s) = ev.get("model").and_then(Value::as_str) {
                 app.model = s.into();
@@ -2205,6 +2257,18 @@ fn handle_event(app: &mut App, ev: Value) {
             let n = ev.get("n").and_then(Value::as_u64).unwrap_or(0);
             let empty = json!({});
             let req = ev.get("request").unwrap_or(&empty);
+            // The body about to go over the wire is the only unarguable answer
+            // to "which model is this". A switch applied mid-step (or from the
+            // kernel, which never sends a snapshot) used to leave the composer
+            // naming the old model until the next user turn.
+            if let Some(m) = req.get("model").and_then(Value::as_str) {
+                if !m.is_empty() && app.model != m {
+                    app.model = m.into();
+                }
+                if app.model_pending.as_ref().is_some_and(|(p, _)| p == m) {
+                    app.model_pending = None;
+                }
+            }
             app.set_last_post(n, req, &empty);
         }
         // The wire pane exists so the human sees what the harness did. A fold
@@ -2215,6 +2279,11 @@ fn handle_event(app: &mut App, ev: Value) {
             let kept = ev.get("kept").and_then(Value::as_u64).unwrap_or(0);
             let summary = ev.get("text").and_then(Value::as_str).unwrap_or("");
             app.call_push(wire_compacted(n, kept, summary));
+            // The card carries the summary, but a fold is not a detail: the
+            // model's memory of this session just changed shape. Say so where
+            // the human is actually reading, and say what it means.
+            app.story_push(RenderBlock::system(&fold_notice(n, kept)));
+            app.status = "context folded".into();
         }
         "complete" => {
             app.stream.finish(&mut app.story);
@@ -2263,6 +2332,14 @@ fn handle_event(app: &mut App, ev: Value) {
             app.turn_started = None;
             app.status = "idle".into();
             app.drain_after = app.send_now && !app.queue.is_empty();
+        }
+        // The harness explaining itself. Not speech (that is the model) and not
+        // an error, so it must not touch running state.
+        "notice" => {
+            let t = ev.get("text").and_then(Value::as_str).unwrap_or("");
+            if !t.is_empty() {
+                app.story_push(RenderBlock::system(t));
+            }
         }
         "error" => {
             app.stream.finish(&mut app.story);
@@ -4014,13 +4091,15 @@ fn draw(f: &mut Frame, app: &mut App) {
     let turn_h = if show_turn { 1 } else { 0 };
 
     let inner_w = f.area().width.saturating_sub(2);
-    // Roomy by default. An empty composer still opens three rows: this is where
-    // a prompt gets drafted, not a one-line readline.
-    let prompt_rows = app.prompt.display_rows(inner_w).clamp(3, 10);
+    // The composer grows with what you type, so an idle one has no reason to
+    // hold three rows open: two rows of border plus a hint row already frame
+    // it. Those two reclaimed rows go to the story, which is the pane that
+    // ever runs out.
+    let prompt_rows = app.prompt.display_rows(inner_w).clamp(2, 10);
     let queue_h = app.queue.display_height();
     let input_h = (3 + prompt_rows)
         .min(f.area().height.saturating_sub(10 + turn_h + queue_h))
-        .max(6);
+        .max(5);
     // Columns first, and both run the full height. The composer belongs to the
     // story column -- it is where you type *about* the story -- and the wire
     // column spends the same band on a key legend, so the two columns end on
@@ -4089,6 +4168,12 @@ fn draw(f: &mut Frame, app: &mut App) {
     let child_ok = viewing
         .as_deref()
         .is_some_and(|id| app.children.contains_key(id));
+    // Computed before the child borrow: call_group_pos already resolves to
+    // whichever session is on screen, so both branches want the same string.
+    let calls_title = match app.call_group_pos() {
+        Some((cur, total)) => format!("calls  #{cur}/{total}"),
+        None => "calls".to_string(),
+    };
     if let (Some(id), true) = (viewing.as_deref(), child_ok) {
         let child = app.children.get_mut(id).expect("checked");
         let title = format!("session {id}");
@@ -4110,7 +4195,7 @@ fn draw(f: &mut Frame, app: &mut App) {
             &mut child.calls,
             &mut child.calls_scratch,
             &mut child.calls_sel,
-            "calls",
+            &calls_title,
             theme.accent_tool,
             app.focus == Focus::Calls,
             app.mouse,
@@ -4129,10 +4214,6 @@ fn draw(f: &mut Frame, app: &mut App) {
             app.mouse,
             &app.story_text,
         );
-        let calls_title = match app.call_group_pos() {
-            Some((cur, total)) => format!("calls  #{cur}/{total}"),
-            None => "calls".to_string(),
-        };
         draw_scrollback(
             f,
             panes[1],
@@ -4644,6 +4725,15 @@ fn draw_meta(f: &mut Frame, area: Rect, meter: &CacheMeter, focused: bool) {
     let secs = left.map(|l| (l * meter.ttl.as_secs_f32()).round() as u64);
     let ttl_label = if meter.ttl.as_secs() >= 3600 { "1h" } else { "5m" };
     let title = match secs {
+        _ if !meter.ephemeral => {
+            // No declared window on this provider. Report what the last call
+            // actually got instead of inventing a deadline for it.
+            if meter.read + meter.write == 0 {
+                " meta  cache ".to_string()
+            } else {
+                format!(" meta  cache {}% ", meter.hit())
+            }
+        }
         Some(s) => format!(" meta  cache {ttl_label} {}:{:02} ", s / 60, s % 60),
         None => " meta  cache cold ".to_string(),
     };
@@ -4863,7 +4953,7 @@ fn key_rows(app: &App) -> Vec<(&'static str, String)> {
             rows.push(("↑ ↓", "move".into()));
             rows.push(("← →", "fold".into()));
             rows.push(("⏎", "open".into()));
-            if app.focus == Focus::Calls && !app.call_groups.is_empty() {
+            if app.focus == Focus::Calls && app.call_group_pos().is_some() {
                 rows.push(("[ ]", "group".into()));
             }
             rows.push(("r", "raw".into()));
@@ -5681,6 +5771,21 @@ fn wire_complete(
     ))
 }
 
+/// Plain-language story row for a fold. The wire card is evidence; this is the
+/// explanation — what happened, what the model now reads, what did not change.
+fn fold_notice(n: u64, kept: u64) -> String {
+    let scope = if kept > 0 {
+        format!("the {kept} most recent messages were kept verbatim")
+    } else {
+        "only the summary was kept".to_string()
+    };
+    format!(
+        "context folded at POST #{n} — the provider replaced the earlier turns with a summary; \
+         {scope}. Nothing above was deleted from this pane; the model just reads the summary \
+         instead of the originals from here on."
+    )
+}
+
 /// Wire card for a server-side fold. The model's memory just got rewritten,
 /// which is the largest thing the harness does to itself in a run — without a
 /// card the only symptom is the context bar dropping for no stated reason.
@@ -6406,6 +6511,78 @@ mod tests {
         assert_eq!(app.calls.selected(), Some(starts[0]));
         assert!(!app.select_call_group(false), "back wrapped off the start");
         assert_eq!(app.calls.selected(), Some(starts[0]));
+    }
+
+    /// A child session runs its own POSTs, so it needs its own group index.
+    /// Stepping inside the child must not reach into the parent's wire, and
+    /// the counter has to follow whichever session is on screen.
+    #[test]
+    fn a_child_session_walks_its_own_groups() {
+        let mut app = App::new();
+        // Parent: two POSTs of its own, to prove the child does not see them.
+        handle_event(&mut app, json!({"ev": "turn", "text": "go"}));
+        for n in 1..=2u64 {
+            handle_event(&mut app, json!({"ev": "complete", "n": n, "origin": "llm"}));
+        }
+        handle_event(
+            &mut app,
+            json!({
+                "ev": "subagent", "phase": "started", "id": "deadbeef",
+                "agent": "explore", "persona": "researcher",
+                "task": "find cache notes", "model": "claude-opus-5",
+            }),
+        );
+        for n in 1..=3u64 {
+            handle_event(
+                &mut app,
+                json!({
+                    "ev": "child", "id": "deadbeef", "kind": "complete",
+                    "n": n, "origin": "llm", "model": "claude-opus-5",
+                    "thinking": "low", "usage": {}, "thoughts": 0, "redacted": 0,
+                }),
+            );
+        }
+
+        assert_eq!(app.call_groups.len(), 2, "parent groups");
+        assert_eq!(
+            app.children["deadbeef"].call_groups.len(),
+            3,
+            "the child's POSTs did not open groups of their own",
+        );
+
+        // Looking at the parent, the counter is the parent's.
+        let _ = paint(&mut app, 120, 34);
+        assert_eq!(app.call_group_pos(), Some((2, 2)));
+
+        // Enter the child: the counter and the step both switch with it.
+        app.viewing = Some("deadbeef".to_string());
+        let _ = paint(&mut app, 120, 34);
+        assert_eq!(
+            app.call_group_pos(),
+            Some((3, 3)),
+            "the counter stayed on the parent inside a child session",
+        );
+
+        let child_starts: Vec<usize> = app.children["deadbeef"]
+            .call_groups
+            .iter()
+            .filter_map(|id| app.children["deadbeef"].calls.index_of_id(*id))
+            .collect();
+        // The parent was painted, so it already carries a cursor. Whatever it
+        // is, a step taken inside the child must leave it exactly there.
+        let parent_sel = app.calls.selected();
+        app.children.get_mut("deadbeef").unwrap().calls.set_selected(None);
+        assert!(app.select_call_group(true));
+        assert_eq!(
+            app.children["deadbeef"].calls.selected(),
+            Some(child_starts[0]),
+            "the step moved something other than the child's wire",
+        );
+        assert_eq!(
+            app.calls.selected(),
+            parent_sel,
+            "stepping inside a child moved the parent's wire cursor",
+        );
     }
 
     /// `[`/`]` step from a card in the middle of a group to that group's
@@ -7791,6 +7968,32 @@ mod tests {
         assert_eq!(slash::verdict("/thinking xhigh", &pick), Verdict::Ready);
     }
 
+    /// The meter counted down a 5-minute clock for OpenAI too, so a session
+    /// that had cached fine read "cache cold" once the Anthropic-shaped TTL
+    /// ran out — a deadline that provider never gave us.
+    #[test]
+    fn only_a_provider_that_declares_a_ttl_gets_a_countdown() {
+        let usage = json!({
+            "input_tokens": 638,
+            "cache_read_input_tokens": 2816,
+            "cache_creation_input_tokens": 0,
+            "output_tokens": 57,
+        });
+        let mut app = App::new();
+        handle_event(&mut app, json!({"ev": "snapshot", "provider": "openai"}));
+        app.cache.observe(&usage, "gpt-5.6-luna");
+        assert!(!app.cache.ephemeral);
+        let painted = paint(&mut app, 130, 40);
+        assert!(painted.contains("cache 81%"), "{painted}");
+        assert!(!painted.contains("cache cold"), "{painted}");
+
+        handle_event(&mut app, json!({"ev": "snapshot", "provider": "anthropic"}));
+        assert!(app.cache.ephemeral, "anthropic does declare one");
+        app.cache.observe(&usage, "claude-opus-5");
+        let painted = paint(&mut app, 130, 40);
+        assert!(painted.contains("cache 5m"), "{painted}");
+    }
+
     #[test]
     fn a_queued_switch_is_labelled_queued_not_current() {
         let mut app = App::new();
@@ -7815,6 +8018,72 @@ mod tests {
     }
 
     #[test]
+    fn density_is_the_default_and_the_story_gets_the_rows() {
+        // The single policy point: every pane's appearance comes from here.
+        let cfg = grok_appearance();
+        assert!(cfg.prompt.compact, "compact is the default, not a fallback");
+        assert_eq!(cfg.scrollback.layout.block_pad_left, 1);
+        assert_eq!(cfg.scrollback.layout.block_pad_right, 1);
+        assert!(!cfg.scrollback.blocks.prompt.vpad, "a prompt does not need two blank rows");
+        assert!(!cfg.turn_status.gap);
+
+        // And it reaches the frame: an idle composer holds five rows, not six,
+        // and the row it gives up goes to the story pane above it.
+        let mut app = App::new();
+        let _ = paint(&mut app, 140, 34);
+        assert_eq!(app.input_area.height, 5, "idle composer: {:?}", app.input_area);
+        assert_eq!(
+            app.traj_area.y + app.traj_area.height + app.layout.post_h,
+            app.input_area.y,
+            "the story column has to absorb the reclaimed row",
+        );
+    }
+
+    #[test]
+    fn the_post_body_promotes_the_model_the_composer_names() {
+        let mut app = App::new();
+        app.model = "claude-opus-5".into();
+        app.running = true;
+        let _ = apply_picker(
+            None,
+            &mut app,
+            picker::PickerAction::Apply { model: "gpt-5.6-sol".into(), effort: "low".into() },
+        );
+        assert!(app.model_pending.is_some());
+        // No snapshot arrives mid-step, but the request does — and the request
+        // is what the model is actually being asked as.
+        handle_event(&mut app, json!({"ev": "post", "n": 3, "request": {"model": "gpt-5.6-sol"}}));
+        assert_eq!(app.model, "gpt-5.6-sol", "the body on the wire is the authority");
+        assert!(app.model_pending.is_none(), "nothing left to queue once it is in a request");
+    }
+
+    #[test]
+    fn a_fold_is_explained_in_the_story_not_only_on_the_wire() {
+        let mut app = App::new();
+        handle_event(
+            &mut app,
+            json!({"ev": "compacted", "n": 7, "kept": 24, "text": "summary of earlier turns"}),
+        );
+        let painted = paint(&mut app, 120, 40);
+        assert!(painted.contains("context folded"), "{painted}");
+        assert!(painted.contains("24"), "kept count is the fact that matters: {painted}");
+        assert_eq!(app.status, "context folded");
+    }
+
+    #[test]
+    fn a_notice_explains_itself_without_ending_the_turn() {
+        let mut app = App::new();
+        app.running = true;
+        handle_event(
+            &mut app,
+            json!({"ev": "notice", "text": "provider switched anthropic to openai."}),
+        );
+        assert!(app.running, "a notice is not a terminator");
+        let painted = paint(&mut app, 120, 40);
+        assert!(painted.contains("provider switched"), "{painted}");
+    }
+
+    #[test]
     fn model_and_dense_are_local_slashes_and_compact_still_answers() {
         for line in ["/model", "/model gpt-5.6-sol", "/dense", "/compact"] {
             assert!(is_local_slash(line), "{line} must not reach the model");
@@ -7829,7 +8098,7 @@ mod tests {
     }
 
     #[test]
-    fn a_fold_lands_on_the_wire_and_never_in_the_story() {
+    fn a_fold_lands_on_the_wire_and_is_explained_in_the_story() {
         let mut app = App::new();
         handle_event(
             &mut app,
@@ -7843,9 +8112,13 @@ mod tests {
         assert!(wire.contains("#7") && wire.contains("12 kept"), "{wire}");
         assert!(wire.contains("folded 40 turns"), "{wire}");
 
-        // `paint` renders both columns, so assert on the scrollback itself
-        // rather than the frame text: the story took no entry at all.
-        assert_eq!(app.story.len(), 0, "a fold is not speech");
+        // The evidence is the card; the story gets exactly one harness row that
+        // says what happened. It must be a System row — a fold is not speech.
+        assert_eq!(app.story.len(), 1, "the fold went unexplained where it is read");
+        assert!(
+            matches!(app.story.entry(0).map(|e| &e.block), Some(RenderBlock::System(_))),
+            "a fold is not speech, but it must be said",
+        );
     }
 
     #[test]

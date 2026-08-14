@@ -23,6 +23,13 @@ class Budget:
             raise ValueError("budget max_retries cannot be negative")
 
 
+# Evidence kinds that assert something was observed at runtime. A child that
+# declares one of these without ever calling a tool is narrating, not working.
+OBSERVABLE_EVIDENCE = frozenset(
+    {"command", "output", "file", "path", "test", "log", "artifact", "diff", "run"}
+)
+
+
 @dataclass(frozen=True)
 class TaskContract:
     objective: str
@@ -35,6 +42,7 @@ class TaskContract:
     write_paths: tuple[str, ...] = ()
     budget: Budget = field(default_factory=Budget)
     dependencies: tuple[str, ...] = ()
+    require_tool_use: bool = True
 
     def __post_init__(self) -> None:
         if not self.objective.strip():
