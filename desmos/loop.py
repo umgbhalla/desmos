@@ -113,7 +113,7 @@ def turn(
     install_resources(world)
     if world.ns.get("world") is not world:
         bind_step(world)  # ns lost its handles (cleanup, reload, stale exec globals)
-    system = system_prompt(world)
+    system = getattr(world, "system_override", "") or system_prompt(world)
     built = cached_payload(
         world.model, system, messages, max_tokens, thinking=world.thinking
     )
@@ -499,6 +499,9 @@ def reload_sdk(world: World | None = None) -> str:
         "desmos.exec",
         "desmos.persist",
         "desmos.memory",
+        "desmos.subagent_contracts",
+        "desmos.subagent_prompt",
+        "desmos.subagent",
         "desmos.generations",
         "desmos.auth",
         "desmos.openai",

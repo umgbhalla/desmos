@@ -55,6 +55,9 @@ class EffectiveConfig:
     max_turns: int = 500
     cwd: str | None = None
     context: str = "new"  # new | resumed
+    # None lets legacy free-text tasks infer whether they claim observations.
+    # Typed contracts carry their own explicit requirement.
+    require_tool_use: bool | None = None
 
 
 def resolve(agent: str = "general", **over: Any) -> EffectiveConfig:
@@ -79,6 +82,11 @@ def resolve(agent: str = "general", **over: Any) -> EffectiveConfig:
         max_turns=int(d.get("max_turns", 500)),
         cwd=d.get("cwd"),
         context=d.get("context", "new"),
+        require_tool_use=(
+            bool(d["require_tool_use"])
+            if d.get("require_tool_use") is not None
+            else None
+        ),
     )
 
 
@@ -102,6 +110,8 @@ class Run:
     started: float = 0.0
     ended: float = 0.0
     retries: int = 0
+    steers: int = 0
+    observed_tools: list[str] = field(default_factory=list)
     run_result: RunResult | None = None
     judgment: Judgment | None = None
     messages: list[dict[str, Any]] = field(default_factory=list)
@@ -124,6 +134,8 @@ class Run:
             "accepted": self.judgment.accepted if self.judgment is not None else None,
             "secs": self.secs,
             "turns": self.turns,
+            "steers": self.steers,
+            "observed_tools": list(self.observed_tools),
             "budget": {
                 "turns": {"used": self.turns, "limit": budget.max_turns if budget else self.cfg.max_turns},
                 "tokens": {"used": _token_total(self.usage), "limit": budget.max_tokens if budget else None},
@@ -131,6 +143,33 @@ class Run:
             },
             "out": (self.result or self.error)[:120],
         }
+
+
+def _legacy_requires_tool(task: str) -> bool:
+    """Whether a free-text task makes claims that require observation."""
+    words = {
+        "analyze",
+        "audit",
+        "check",
+        "debug",
+        "edit",
+        "explore",
+        "find",
+        "fix",
+        "implement",
+        "inspect",
+        "map",
+        "read",
+        "research",
+        "review",
+        "run",
+        "search",
+        "test",
+        "trace",
+        "verify",
+    }
+    normalized = "".join(ch if ch.isalnum() else " " for ch in task.lower())
+    return bool(words & set(normalized.split()))
 
 
 def _token_total(usage: dict[str, int]) -> int:
@@ -194,6 +233,9 @@ def _child_world(cfg: EffectiveConfig, parent: Any, contract: TaskContract | Non
             "The typed task contract is authoritative. Stay inside its tool and path scope. "
             "Return the required JSON result with evidence for every claim and passed check."
         )
+    from desmos.subagent_prompt import child_system_prompt
+
+    w.system_override = child_system_prompt(w, cfg, contract)
     w.complete_fn = getattr(parent, "complete_fn", None)
     return w
 
@@ -253,7 +295,9 @@ def _execute(run: Run, parent: Any) -> None:
                 run.progress = f"completed model turn {ev.get('n') or run.turns}"
                 publish_progress()
             elif kind == "result" and ev.get("phase") == "done":
-                run.progress = f"collected {ev.get('tag') or 'tool'} evidence"
+                tag = str(ev.get("tag") or "tool")
+                run.observed_tools.append(tag)
+                run.progress = f"collected {tag} evidence"
                 publish_progress()
             payload = {k: v for k, v in ev.items() if k != "ev"}
             _emit({"ev": "child", "id": run.id, "kind": kind, **payload})
@@ -275,6 +319,37 @@ def _execute(run: Run, parent: Any) -> None:
             )
         finally:
             _DEPTH.n = 0
+        if run.structured and run.contract is not None:
+            require_tool = run.contract.require_tool_use
+        elif run.cfg.require_tool_use is not None:
+            require_tool = run.cfg.require_tool_use
+        else:
+            require_tool = _legacy_requires_tool(run.task)
+        no_tool_failure = False
+        if require_tool and not run.observed_tools and not budget_stop[0]:
+            remaining = max_turns - len(w.log)
+            run.steers += 1
+            run.stage = "steering"
+            run.progress = "no syscall observed; requiring action"
+            publish_progress()
+            if remaining > 0:
+                _DEPTH.n = 1
+                try:
+                    out = run_turns(
+                        w,
+                        "You finished without using any tool. That result is unevidenced and will "
+                        "be rejected. Use one of your available syscalls now, inspect the task with "
+                        "a real call, read its result, and only then return the complete answer.",
+                        max_turns=remaining,
+                        quiet=True,
+                        on_event=child_event,
+                        should_stop=should_stop,
+                    )
+                finally:
+                    _DEPTH.n = 0
+            if not run.observed_tools:
+                no_tool_failure = True
+
         from desmos.scan import scan
 
         forced_turn_cap = False
@@ -313,6 +388,10 @@ def _execute(run: Run, parent: Any) -> None:
         if budget_stop[0]:
             run.state = "stopped"
             run.stop_reason = budget_stop[0]
+        elif no_tool_failure:
+            run.state = "failed"
+            run.stop_reason = "no_tool_evidence"
+            run.error = "child completed twice without using a syscall"
         elif forced_turn_cap:
             run.state = "stopped"
             run.stop_reason = "turn_budget"
@@ -320,8 +399,12 @@ def _execute(run: Run, parent: Any) -> None:
             run.state = "done"
             run.stop_reason = "completed"
 
-        run.stage = "judging" if run.structured else "completed"
-        run.progress = "validating declared evidence" if run.structured else "child finished"
+        if no_tool_failure:
+            run.stage = "failed"
+            run.progress = run.error
+        else:
+            run.stage = "judging" if run.structured else "completed"
+            run.progress = "validating declared evidence" if run.structured else "child finished"
         if run.structured and run.contract is not None:
             run.run_result = parse_run_result(
                 run.result,
@@ -331,7 +414,11 @@ def _execute(run: Run, parent: Any) -> None:
                 duration=run.secs,
                 retries=run.retries,
             )
-            run.judgment = judge(run.contract, run.run_result)
+            run.judgment = judge(
+                run.contract,
+                run.run_result,
+                tuple(run.observed_tools),
+            )
             if run.run_result.stop_reason == "invalid_result":
                 run.stop_reason = "invalid_result"
             run.stage = "accepted" if run.judgment.accepted else "rejected"

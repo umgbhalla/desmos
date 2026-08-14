@@ -71,6 +71,7 @@ class TaskContract:
             "write_paths": list(self.write_paths),
             "budget": asdict(self.budget),
             "dependencies": list(self.dependencies),
+            "require_tool_use": self.require_tool_use,
         }
         result_shape = {
             "summary": "human-readable summary",
@@ -257,8 +258,15 @@ def parse_run_result(
     )
 
 
-def judge(contract: TaskContract, result: RunResult) -> Judgment:
+def judge(
+    contract: TaskContract,
+    result: RunResult,
+    observed_tools: tuple[str, ...] = (),
+) -> Judgment:
+    """Judge declarations against the parent's observed runtime events."""
     reasons: list[str] = []
+    if contract.require_tool_use and not observed_tools:
+        reasons.append("no tool use observed")
     if result.terminal_state != "done":
         reasons.append(f"terminal state is {result.terminal_state}")
     if result.stop_reason not in {"completed", "end_turn"}:
@@ -277,6 +285,17 @@ def judge(contract: TaskContract, result: RunResult) -> Judgment:
             reasons.append(f"acceptance check failed: {required}")
         elif not check.evidence:
             reasons.append(f"acceptance check lacks evidence: {required}")
+    declared_kinds = {
+        evidence.kind
+        for claim in result.claims
+        for evidence in claim.evidence
+    } | {
+        evidence.kind
+        for check in result.checks
+        for evidence in check.evidence
+    }
+    if declared_kinds & OBSERVABLE_EVIDENCE and not observed_tools:
+        reasons.append("observable evidence was declared but no tool use was observed")
     if contract.required_evidence:
         kinds = {
             evidence.kind
