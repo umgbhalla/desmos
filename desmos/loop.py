@@ -175,6 +175,11 @@ def turn(
             "response": redact_wire(resp),
         }
     )
+    # Durable before anything runs. This used to be appended by the caller
+    # after the dispatch loop, so a crash or a kill during a <bash> lost the
+    # assistant turn that ordered it: the side effect had happened and the
+    # transcript never asked for it.
+    messages.append({"role": "assistant", "content": assistant})
     parts = thought_blocks(assistant)
     if not streamed:
         for part in parts:
@@ -349,14 +354,29 @@ def _run_turns(
         emit({"ev": "turn", "n": n})
         if not quiet:
             print(f"\n===== turn {n} =====")
-        speech, results, done, assistant = turn(
-            world,
-            world.messages,
-            max_tokens,
-            n=n,
-            emit=emit,
-            should_stop=should_stop,
-        )
+        try:
+            speech, results, done, assistant = turn(
+                world,
+                world.messages,
+                max_tokens,
+                n=n,
+                emit=emit,
+                should_stop=should_stop,
+            )
+        except Exception as exc:  # noqa: BLE001
+            # A failure is a value, not an unwind. Letting it propagate left a
+            # user message with no assistant reply -- so the next step appended
+            # a second consecutive user turn -- while run_turns' finally still
+            # emitted "done", telling the TUI the step succeeded next to an
+            # unrelated error line. Write what happened where the model will
+            # read it, say so once, and stop this step.
+            note = f"[turn {n} failed: {type(exc).__name__}: {exc}]"
+            world.messages.append({"role": "assistant", "content": [{"type": "text", "text": note}]})
+            emit({"ev": "error", "n": n, "text": note})
+            if not quiet:
+                print(note)
+            _commit_step(world, prompt, last)
+            return last
         last = speech
         thoughts = thinking_text(assistant)
         if thoughts and not quiet:
@@ -369,11 +389,16 @@ def _run_turns(
         if last_results and not quiet:
             print("\n--- results ---")
             print(last_results)
-        world.messages.append({"role": "assistant", "content": assistant})
+        # Whatever ran, its output goes back. The stop path used to return
+        # before this, so a Ctrl+C landing after the first of three syscalls
+        # threw away the results of the ones that had already finished -- the
+        # model's next context showed its own tags with no outcome and no
+        # marker that they had been executed.
+        if results:
+            world.messages.append({"role": "user", "content": format_result_message(results)})
         if done or stopped():
             _commit_step(world, prompt, speech)
             return speech
-        world.messages.append({"role": "user", "content": format_result_message(results)})
     if not quiet:
         print(f"\n[hit max_turns={max_turns}]")
     _commit_step(world, prompt, last)

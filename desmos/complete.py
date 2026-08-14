@@ -430,6 +430,63 @@ def _pad_blocks(state: dict[str, Any], idx: int) -> None:
         blocks.append({})
 
 
+# Statuses worth trying again. A 400 is a payload bug and will fail forever;
+# 429 and 5xx are the endpoint asking for a moment. Overload is routine, and
+# one of them used to kill a twenty-turn step.
+RETRY_STATUS = frozenset({408, 409, 429, 500, 502, 503, 504, 529})
+RETRIES = 4
+# Honour retry-after, but cap it. Parking for an hour with no cancel point is
+# worse than failing and letting the human decide.
+RETRY_CAP = 30.0
+
+
+def _retry_after(err: Any, attempt: int) -> float:
+    """Seconds to wait: the endpoint's number if it sent one, else backoff."""
+    headers = getattr(err, "headers", None)
+    for field, scale in (("retry-after-ms", 0.001), ("retry-after", 1.0)):
+        raw = headers.get(field) if headers is not None else None
+        if raw:
+            try:
+                return min(float(raw) * scale, RETRY_CAP)
+            except ValueError:
+                pass
+    return min(0.5 * (2**attempt), 8.0)
+
+
+def _open_with_retry(
+    req: Any,
+    *,
+    on_event: Callable[[dict[str, Any]], None] | None = None,
+    should_stop: Callable[[], bool] | None = None,
+) -> Any:
+    """urlopen, retried on the failures that are worth retrying."""
+    import time
+
+    for attempt in range(RETRIES):
+        try:
+            return urllib.request.urlopen(req, timeout=180)
+        except urllib.error.HTTPError as exc:
+            if exc.code not in RETRY_STATUS or attempt == RETRIES - 1:
+                raise
+            delay = _retry_after(exc, attempt)
+            reason = f"HTTP {exc.code}"
+        except urllib.error.URLError as exc:
+            if attempt == RETRIES - 1:
+                raise
+            delay = min(0.5 * (2**attempt), 8.0)
+            reason = str(getattr(exc, "reason", exc))
+        if on_event is not None:
+            on_event({"kind": "retry", "attempt": attempt + 1, "delay": delay, "reason": reason})
+        # Sleep in slices so Ctrl+C still lands during a long backoff.
+        waited = 0.0
+        while waited < delay:
+            if should_stop is not None and should_stop():
+                raise RuntimeError(f"stopped while retrying after {reason}")
+            time.sleep(min(0.25, delay - waited))
+            waited += 0.25
+    raise RuntimeError("unreachable")
+
+
 def complete(
     model: str,
     system: str,
@@ -475,7 +532,7 @@ def complete(
         method="POST",
     )
     try:
-        with urllib.request.urlopen(req, timeout=180) as resp:
+        with _open_with_retry(req, on_event=on_event, should_stop=should_stop) as resp:
             return read_sse(
                 iter_sse_lines(resp),
                 on_event=on_event,

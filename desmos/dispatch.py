@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import traceback
-from typing import Callable
+from inspect import signature
+from typing import Any, Callable
 
 from desmos.const import FROZEN
 from desmos.edit import apply_edit, parse_edit_body
@@ -94,11 +95,29 @@ def dispatch(
         known = ", ".join(sorted(world.tools) or sorted(FROZEN))
         return f"unknown tag <{block.tag}> — not a syscall. Known: {known}. Speak without XML when done."
     try:
-        return clip(str(tool.handler(block.body, **block.attrs)))
-    except TypeError:
-        try:
-            return clip(str(tool.handler(block.body)))
-        except Exception:
-            return traceback.format_exc()
+        return clip(str(_invoke(tool.handler, block.body, block.attrs)))
     except Exception:
         return traceback.format_exc()
+
+
+def _invoke(handler: Callable[..., Any], body: str, attrs: dict[str, str]) -> Any:
+    """Call a handler with attrs if it takes them, plain if it does not.
+
+    This used to be `try handler(body, **attrs) except TypeError: handler(body)`
+    -- an exception used as a feature test. A handler that raised TypeError
+    *itself*, anywhere after its first side effect, was then run a second time:
+    the file written twice, the request sent twice. Ask the signature instead;
+    it answers before anything runs.
+    """
+    if not attrs:
+        return handler(body)
+    try:
+        signature(handler).bind(body, **attrs)
+    except TypeError:
+        # The attrs genuinely do not fit this handler's parameters.
+        return handler(body)
+    except (ValueError, KeyError):
+        # No introspectable signature (a builtin, a C callable). Prefer the
+        # richer call and let a real TypeError surface as the error it is.
+        pass
+    return handler(body, **attrs)

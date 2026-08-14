@@ -745,6 +745,57 @@ def self_check() -> None:
         assert w_re.running is False, "the flag must clear even after a refusal"
         assert w_re.messages, "the outer step still committed its own transcript"
 
+        # Overload is routine and used to kill a whole multi-turn step.
+        from desmos.complete import RETRY_CAP, RETRY_STATUS, _retry_after
+
+        assert {429, 529, 503}.issubset(RETRY_STATUS)
+        assert 400 not in RETRY_STATUS and 401 not in RETRY_STATUS, "a payload bug never heals"
+
+        class _Err:
+            def __init__(self, **h):
+                self.headers = h
+
+        assert _retry_after(_Err(**{"retry-after": "2"}), 0) == 2.0
+        assert _retry_after(_Err(**{"retry-after-ms": "1500"}), 0) == 1.5
+        assert _retry_after(_Err(**{"retry-after": "99999"}), 0) == RETRY_CAP, "an hour is not a wait"
+        assert _retry_after(_Err(**{"retry-after": "junk"}), 0) == 0.5
+        assert _retry_after(_Err(), 3) == 4.0, "backoff when the endpoint says nothing"
+
+        # A turn that raises becomes a value. It used to unwind _run_turns,
+        # leaving a user message with no assistant reply -- so the next step
+        # appended a second consecutive user turn -- while the finally still
+        # emitted "done", reporting success beside an unrelated error line.
+        w_fail = new_world(cwd, state_path=None, persist=False, ns={})
+        w_fail.complete_fn = lambda *_: (_ for _ in ()).throw(RuntimeError("wire died"))
+        fail_evs: list[dict] = []
+        _run(w_fail, "will fail", quiet=True, on_event=fail_evs.append)
+        roles = [m["role"] for m in w_fail.messages]
+        assert roles == ["user", "assistant"], roles
+        assert "wire died" in str(w_fail.messages[-1]["content"]), w_fail.messages[-1]
+        assert any(e.get("ev") == "error" and "wire died" in e.get("text", "") for e in fail_evs)
+        assert w_fail.running is False
+
+        # The assistant turn is durable before its syscalls run, and results
+        # come back even when the step stops mid-batch.
+        w_ord = new_world(cwd, state_path=None, persist=False, ns={})
+        halt = {"go": False}
+        seen_mid: list[list[str]] = []
+
+        def ordering(_m, _s, msgs, _mt):
+            seen_mid.append([m["role"] for m in msgs])
+            return {"content": [{"type": "text", "text": "<python>1+1</python>"}], "usage": {}}
+
+        w_ord.complete_fn = ordering
+
+        def stop_after_first(ev: dict) -> None:
+            if ev.get("ev") == "result" and ev.get("phase") == "done":
+                halt["go"] = True
+
+        _run(w_ord, "batch then stop", quiet=True, on_event=stop_after_first, should_stop=lambda: halt["go"])
+        tail = [m["role"] for m in w_ord.messages]
+        assert tail == ["user", "assistant", "user"], tail
+        assert "<result" in str(w_ord.messages[-1]["content"]), "a stop must not eat results that ran"
+
         # A traceback is the last thing a failing script prints. Head-clipping
         # a noisy failure returned progress and no error.
         from desmos.scan import clip as _clip

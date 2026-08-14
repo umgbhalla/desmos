@@ -2638,16 +2638,26 @@ fn apply_paste(app: &mut App, text: &str, inline: bool) {
     }
 }
 
+/// The command alone, or the command followed by its argument — never a
+/// longer word that merely starts the same way.
+fn is_slash_word(line: &str, cmd: &str) -> bool {
+    line == cmd || line.strip_prefix(cmd).is_some_and(|rest| rest.starts_with(' '))
+}
+
 fn is_local_slash(line: &str) -> bool {
     let t = line.trim();
     t == "/quit"
         || t == "/exit"
         || t == "/timestamps"
         || t == "/compact"
+        || t == "/dense"
         || t == "/reset"
         || t == "/reload"
-        || t.starts_with("/theme")
-        || t.starts_with("/thinking")
+        // A bare prefix match eats real prose: "/modelling the data" is a
+        // prompt, not a command. Require the word to end.
+        || is_slash_word(t, "/theme")
+        || is_slash_word(t, "/thinking")
+        || is_slash_word(t, "/model")
 }
 
 fn send_now(mut bridge: Option<&mut Bridge>, app: &mut App) -> io::Result<bool> {
@@ -2747,11 +2757,31 @@ fn submit_prompt(mut bridge: Option<&mut Bridge>, app: &mut App) -> io::Result<b
             "timestamps off"
         }
         .into();
-    } else if line == "/compact" {
+    } else if line == "/compact" || line == "/dense" {
+        // `/compact` reads like "fold the transcript" and does not — folding is
+        // the server's, on its own trigger, and there is no client verb for it.
+        // This only changes row spacing. `/dense` says that; the old name stays
+        // so muscle memory does not hit an unknown command.
         let on = !appearance_cache::load();
         appearance_cache::set(on);
         app.apply_grok_settings();
-        app.status = if on { "compact on" } else { "compact off" }.into();
+        app.status = if on {
+            "dense rows on (this is spacing, not transcript folding)"
+        } else {
+            "dense rows off"
+        }
+        .into();
+    } else if let Some(rest) = line.strip_prefix("/model") {
+        // The bridge op has always existed; nothing typed to it. The picker is
+        // still the discoverable path -- this is for people who already know
+        // what they want.
+        let want = rest.trim();
+        if want.is_empty() {
+            app.picker.open_for_change();
+        } else if let Some(b) = bridge.as_mut() {
+            b.send(&json!({"op": "model", "model": want, "effort": app.thinking}))?;
+            app.status = format!("model {want}");
+        }
     } else if let Some(level) = line.strip_prefix("/thinking") {
         let level = level.trim();
         if !level.is_empty() {
@@ -7115,6 +7145,23 @@ mod tests {
 
     /// A fold rewrites what the model remembers. It is the harness acting on
     /// itself, not something the model said, so it belongs on the wire.
+    /// The bridge op for switching models existed from the start; nothing
+    /// typed to it, so the picker was the only way in. And `/compact` reads
+    /// like "fold the transcript" while only changing row spacing.
+    #[test]
+    fn model_and_dense_are_local_slashes_and_compact_still_answers() {
+        for line in ["/model", "/model gpt-5.6-sol", "/dense", "/compact"] {
+            assert!(is_local_slash(line), "{line} must not reach the model");
+        }
+        // A prefix match ate real prose. These are prompts, not commands.
+        assert!(!is_local_slash("/modelling the data"));
+        assert!(!is_local_slash("/themes worth trying"));
+        assert!(!is_local_slash("/thinkingcap"));
+        assert!(!is_local_slash("model gpt-5.6-sol"));
+        assert!(is_local_slash("/theme rosepine"));
+        assert!(is_local_slash("/thinking high"));
+    }
+
     #[test]
     fn a_fold_lands_on_the_wire_and_never_in_the_story() {
         let mut app = App::new();
