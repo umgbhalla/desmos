@@ -1,3 +1,292 @@
+# Workspace deps are grok-build's table (paths rewritten to vendor/) so
+# desmos-tui can host ScrollbackPane without forking pager Cargo.toml.
+# vendor/grok-build is gitignored; clone it before `cargo build -p desmos-tui`.
+
+[patch.crates-io]
+async-openai = { git = "https://github.com/our-forks/async-openai.git", rev = "95b52ebdedf42143083cf3d6f0e0be7c84e9c808" }
+
 [workspace]
 resolver = "2"
-members = ["crates/desmos-tui", "crates/ratatui-inline"]
+members = [
+    "crates/desmos-tui",
+    "crates/xai-grok-markdown",
+    "crates/xai-grok-markdown-core",
+]
+exclude = ["crates/ratatui-inline"]
+
+[workspace.package]
+edition = "2024"
+license = "Apache-2.0"
+
+[workspace.dependencies]
+agent-client-protocol = { version = "0.10.4", features = ["unstable"] }
+alacritty_terminal = "0.26.0"
+ansi-to-tui = "7.0.0"
+ansi-width = "0.1"
+anstyle = "1.0"
+anstyle-lossy = "1.1.4"
+anstyle-parse = "0.2"
+anstyle-syntect = "1.0.4"
+anyhow = { version = "1", features = ["backtrace"] }
+arboard = "3.6"
+arc-swap = "1.7"
+assert_matches = "1.5.0"
+async-compression = { version = "0.4.17", default-features = false, features = ["gzip", "zstd", "tokio"] }
+async-lsp = { version = "0.2.3", features = ["tokio", "tracing"] }
+async-openai = { version = "0.33.0", features = ["responses"] }
+async-stream = "0.3"
+async-trait = "0.1"
+axum = { version = "0.8", features = ["macros", "ws"] }
+backon = { version = "1.6" }
+backtrace = "0.3"
+base64 = "0.22"
+blake3 = "1"
+bytes = { version = "1", features = ["serde"] }
+camino = "1.1.10"
+chrono = "0.4"
+clap = { version = "4", features = ["derive", "env"] }
+clap_complete = { version = "4" }
+colored_json = "5"
+core-foundation = "0.10"
+crc32fast = "1.4"
+criterion = "0.6"
+crossbeam = "0.8"
+crossterm = "0.28"
+cryptify = "3.2"
+ctor = "0.4"
+dashmap = "6"
+derive_more = { version = "2", features = ["add", "add_assign", "debug", "deref", "deref_mut", "display", "from", "from_str", "into", "into_iterator", "try_into"] }
+dhat = "0.3"
+dirs = "5.0"
+documented = "0.9"
+dunce = "1"
+educe = "0.6.0"
+encoding_rs = "0.8.35"
+enum_delegate = "0.2"
+env_logger = "0.11"
+eventsource-stream = "0.2"
+fastrace = { version = "0.7" }
+fastrace-opentelemetry = { version = "0.18" }
+fastrace-reqwest = { version = "0.2" }
+fastrace-tonic = { version = "0.1" }
+fastrand = "2"
+filetime = "0.2.25"
+flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }
+fontdb = "0.23"
+fs2 = "0.4"
+futures = "0.3"
+futures-util = "0.3"
+fuzzy-matcher = "0.3.7"
+gcloud-storage = { version = "1.3.0", default-features = false, features = ["auth", "jwt-aws-lc-rs", "external-account"] }
+gethostname = "1"
+gix = { version = "0.83", default-features = false, features = ["sha1"] }
+glob = "0.3"
+globset = "0.4"
+htmd = "0.5.4"
+html-escape = "0.2"
+http = "1"
+http-body-util = "0.1"
+humantime-serde = "1"
+ignore = "0.4"
+image = { version = "0.25.10", default-features = false }
+indexmap = { version = "2", features = ["serde"] }
+indicatif = "0.18"
+infer = "0.19.0"
+insta = "1"
+itertools = "0.14"
+jsonschema = "0.30.0"
+kamadak-exif = "0.5"
+libc = "0.2"
+linkify = "0.10"
+lipsum = "0.9"
+log = { version = "0.4", features = ["kv", "kv_unstable"] }
+md5 = "0.8"
+mermaid-to-svg = { path = "vendor/grok-build/third_party/mermaid-to-svg" }
+minijinja = "2.9"
+mockito = "1"
+moka = "0.12"
+nix = { version = "0.30", features = ["poll", "process", "signal", "sched", "term", "mount", "fs", "ioctl", "mman", "reboot", "user"] }
+notify = "8"
+notify-debouncer-mini = "0.6"
+nucleo = { git = "https://github.com/helix-editor/nucleo.git", rev = "5b74652" }
+num_cpus = "1"
+oauth2 = "5"
+obfstr = "0.4"
+once_cell = "1"
+opentelemetry = "0.32"
+opentelemetry-http = { version = "0.32", features = ["reqwest-blocking"] }
+opentelemetry-otlp = { version = "0.32", features = ["grpc-tonic", "reqwest-blocking-client", "tls-roots"] }
+opentelemetry-proto = { version = "0.32", features = ["gen-tonic"] }
+opentelemetry_sdk = { version = "0.32.1", features = ["spec_unstable_metrics_views"] }
+parking_lot = "0.12.4"
+pbjson-build = "0.9"
+pdf_oxide = { version = "0.3.43", features = ["rendering"] }
+petgraph = { version = "0.6.5", default-features = false, features = ["serde-1", "stable_graph"] }
+portable-pty = "0.9"
+pprof = "0.15"
+pretty_assertions = "1"
+prometheus = { version = "0.14", features = ["process"] }
+prost = "0.14"
+prost-build = "0.14"
+prost-reflect = "0.16"
+pulldown-cmark = "0.13"
+quick-xml = "0.38"
+rand = "0.9"
+ratatui = { version = "0.29" }
+ratatui-core = "0.1"
+rayon = "1"
+rcgen = { version = "0.13", features = ["pem"] }
+reflink-copy = "0.1"
+regex = "1"
+reqwest = { version = "0.12", features = ["rustls-tls", "stream", "json", "multipart", "http2", "blocking", "socks"], default-features = false }
+reqwest-middleware = { version = "0.4.1", features = ["json", "multipart"] }
+resvg = { version = "0.47", default-features = false, features = ["text"] }
+rhai = { version = "1.25", features = ["serde"] }
+ring = "0.17"
+rsa = "0.9"
+runfiles = "0.1"
+rustc-hash = "2"
+rustls = { version = "0.23", features = ["aws-lc-rs"] }
+schemars = "1"
+scraper = "0.23"
+semver = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_path_to_error = "0.1"
+serde_yaml = "0.9"
+serial_test = "3"
+sha1 = "0.10"
+sha2 = { version = "0.10", features = ["force-soft"] }
+shlex = "1"
+signal-hook = "0.3"
+similar = "2.7"
+siphasher = "1"
+smallvec = "1"
+strip-ansi-escapes = "0.2.1"
+strum = { version = "0.27", features = ["derive"] }
+supports-color = "3.0"
+syntect = "5.3"
+tar = "0.4"
+tempfile = "3"
+terminput = "0.3"
+termwiz = { version = "0.23", default-features = false }
+textwrap = "0.16"
+thiserror = "2"
+tikv-jemalloc-ctl = "0.6"
+tikv-jemalloc-sys = "0.6"
+tikv-jemallocator = { version = "0.6", features = ["profiling", "unprefixed_malloc_on_supported_platforms"] }
+time = "0.3"
+tiny-skia = "0.12"
+tokio = { version = "1", features = ["full"] }
+tokio-retry = "0.3"
+tokio-stream = { version = "0.1", features = ["net"] }
+tokio-tungstenite = "0.27"
+tokio-util = { version = "0.7", features = ["rt"] }
+toml = "0.9"
+toml_edit = "0.22"
+tonic = { version = "0.14", features = ["tls-aws-lc", "gzip", "deflate", "zstd"] }
+tonic-prost = "0.14"
+tonic-prost-build = "0.14"
+tower = "0.5"
+tower-http = "0.6"
+tracing = "0.1"
+tracing-opentelemetry = "0.33"
+tracing-subscriber = { version = "0.3.23", default-features = false, features = ["env-filter", "smallvec", "tracing-log", "std", "ansi"] }
+ts-rs = "12.0"
+tui-scrollbar = "0.2"
+two-face = { version = "0.4", default-features = false, features = ["syntect-fancy"] }
+unicode-normalization = "0.1"
+unicode-segmentation = "1.12.0"
+unicode-width = "0.2"
+url = "2"
+urlencoding = "2"
+uuid = { version = "1", features = ["serde", "v4", "v5"] }
+vte = "0.15.0"
+wait-timeout = "0.2"
+walkdir = "2"
+webbrowser = { version = "1.0.4" }
+webpki-roots = "0.26"
+which = "8"
+whoami = "1.4"
+wildmatch = "2"
+windows = { version = "0.61", features = ["Win32_Security", "Win32_Security_Authorization", "Win32_Foundation", "Win32_System_Threading", "Win32_System_JobObjects", "Win32_System_Console", "Win32_System_Pipes"] }
+wiremock = "0.6"
+wl-clipboard-rs = "0.9"
+xai-acp-lib = { path = "vendor/grok-build/crates/codegen/xai-acp-lib" }
+xai-agent-lifecycle = { path = "vendor/grok-build/crates/codegen/xai-agent-lifecycle" }
+xai-circuit-breaker = { path = "vendor/grok-build/crates/common/xai-circuit-breaker" }
+xai-compaction-transcript = { path = "vendor/grok-build/crates/codegen/xai-compaction-transcript" }
+xai-computer-hub-core = { path = "vendor/grok-build/crates/common/xai-computer-hub-core" }
+xai-computer-hub-sdk = { path = "vendor/grok-build/crates/common/xai-computer-hub-sdk" }
+xai-fuzzy-file-search = { path = "vendor/grok-build/crates/codegen/xai-fuzzy-file-search" }
+xai-gix-status = { path = "vendor/grok-build/crates/codegen/xai-gix-status" }
+xai-grok-active-sessions = { path = "vendor/grok-build/crates/codegen/xai-grok-active-sessions" }
+xai-grok-agent = { path = "vendor/grok-build/crates/codegen/xai-grok-agent" }
+xai-grok-announcements = { path = "vendor/grok-build/crates/codegen/xai-grok-announcements" }
+xai-grok-auth = { path = "vendor/grok-build/crates/codegen/xai-grok-auth" }
+xai-grok-bundle = { path = "vendor/grok-build/crates/codegen/xai-grok-bundle" }
+xai-grok-config = { path = "vendor/grok-build/crates/codegen/xai-grok-config" }
+xai-grok-config-types = { path = "vendor/grok-build/crates/codegen/xai-grok-config-types" }
+xai-grok-diag-server = { path = "vendor/grok-build/crates/codegen/xai-grok-diag-server" }
+xai-grok-env = { path = "vendor/grok-build/crates/codegen/xai-grok-env" }
+xai-grok-extra-ca = { path = "vendor/grok-build/crates/codegen/xai-grok-extra-ca" }
+xai-grok-foreign-sessions = { path = "vendor/grok-build/crates/codegen/xai-grok-foreign-sessions" }
+xai-grok-http = { path = "vendor/grok-build/crates/codegen/xai-grok-http" }
+xai-grok-markdown = { path = "crates/xai-grok-markdown" }
+xai-grok-markdown-core = { path = "crates/xai-grok-markdown-core" }
+xai-grok-mcp = { path = "vendor/grok-build/crates/codegen/xai-grok-mcp" }
+xai-grok-memory = { path = "vendor/grok-build/crates/codegen/xai-grok-memory" }
+xai-grok-mermaid = { path = "vendor/grok-build/crates/codegen/xai-grok-mermaid" }
+xai-grok-models = { path = "vendor/grok-build/crates/codegen/xai-grok-models" }
+xai-grok-sampler = { path = "vendor/grok-build/crates/codegen/xai-grok-sampler" }
+xai-grok-secrets = { path = "vendor/grok-build/crates/codegen/xai-grok-secrets" }
+xai-grok-session-events = { path = "vendor/grok-build/crates/codegen/xai-grok-session-events" }
+xai-grok-session-search = { path = "vendor/grok-build/crates/codegen/xai-grok-session-search" }
+xai-grok-shared = { path = "vendor/grok-build/crates/codegen/xai-grok-shared" }
+xai-grok-shell = { path = "vendor/grok-build/crates/codegen/xai-grok-shell" }
+xai-grok-shell-base = { path = "vendor/grok-build/crates/codegen/xai-grok-shell-base" }
+xai-grok-shell-session-support = { path = "vendor/grok-build/crates/codegen/xai-grok-shell-session-support" }
+xai-grok-telemetry = { path = "vendor/grok-build/crates/codegen/xai-grok-telemetry" }
+xai-grok-test-support = { path = "vendor/grok-build/crates/codegen/xai-grok-test-support" }
+xai-grok-tools = { path = "vendor/grok-build/crates/codegen/xai-grok-tools" }
+xai-grok-tools-api = { path = "vendor/grok-build/crates/codegen/xai-grok-tools-api" }
+xai-grok-version = { path = "vendor/grok-build/crates/codegen/xai-grok-version" }
+xai-grok-workspace = { path = "vendor/grok-build/crates/codegen/xai-grok-workspace" }
+xai-grok-workspace-types = { path = "vendor/grok-build/crates/codegen/xai-grok-workspace-types" }
+xai-hooks-plugins-types = { path = "vendor/grok-build/crates/codegen/xai-hooks-plugins-types" }
+xai-interjection-core = { path = "vendor/grok-build/crates/common/xai-interjection-core" }
+xai-mixpanel = { path = "vendor/grok-build/crates/codegen/xai-mixpanel" }
+xai-prompt-queue = { path = "vendor/grok-build/crates/codegen/xai-prompt-queue" }
+xai-proto-build = { path = "vendor/grok-build/crates/build/xai-proto-build" }
+xai-ratatui-inline = { path = "vendor/grok-build/crates/codegen/xai-ratatui-inline" }
+xai-ratatui-textarea = { path = "vendor/grok-build/crates/codegen/xai-ratatui-textarea" }
+xai-sqlite-journal = { path = "vendor/grok-build/crates/codegen/xai-sqlite-journal" }
+xai-system-power = { path = "vendor/grok-build/crates/codegen/xai-system-power" }
+xai-test-utils = { path = "vendor/grok-build/crates/common/xai-test-utils" }
+xai-token-estimation = { path = "vendor/grok-build/crates/codegen/xai-token-estimation" }
+xai-tool-protocol = { path = "vendor/grok-build/crates/common/xai-tool-protocol" }
+xai-tool-runtime = { path = "vendor/grok-build/crates/common/xai-tool-runtime" }
+xai-tool-types = { path = "vendor/grok-build/crates/common/xai-tool-types" }
+xai-tracing = { path = "vendor/grok-build/crates/common/xai-tracing" }
+xai-tty-utils = { path = "vendor/grok-build/crates/codegen/xai-tty-utils" }
+zbus = { version = "5" }
+zip = "3"
+zstd = "0.13"
+
+
+# Ship profile for `python -m desmos tui`. Strip only — LTO and
+# codegen-units=1 across the whole pager graph cost tens of minutes of link
+# time for a TUI that is already idle at 0% CPU.
+# ponytail: no LTO, turn it on if frame time ever shows up in a profile.
+[profile.release]
+strip = "symbols"
+
+[workspace.lints.clippy]
+doc_lazy_continuation = "allow"
+doc_overindented_list_items = "allow"
+needless_lifetimes = "allow"
+single_range_in_vec_init = "allow"
+too_many_arguments = "allow"
+uninlined_format_args = "allow"
+useless_format = "allow"
+

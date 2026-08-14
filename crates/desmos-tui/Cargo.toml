@@ -1,12 +1,14 @@
 [package]
 name = "desmos-tui"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 license = "MIT"
-description = "Grok-minimal TUI over the desmos kernel"
+description = "Three-pane desmos TUI hosting grok-build scrollback"
 
 [dependencies]
-crossterm = "0.28"
-pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
-ratatui = { version = "0.29", default-features = false, features = ["crossterm"] }
-serde_json = "1"
+crossterm = { workspace = true }
+ratatui = { workspace = true, features = ["crossterm"] }
+serde_json = { workspace = true }
+toml = { workspace = true }
+unicode-width = { workspace = true }
+xai-grok-pager = { path = "../../vendor/grok-build/crates/codegen/xai-grok-pager" }
