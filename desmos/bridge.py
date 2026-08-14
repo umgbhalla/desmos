@@ -13,6 +13,20 @@ from desmos.catalog import ns_names
 from desmos.loop import new_world, reload, reload_sdk, reset_transcript, run_turns
 
 
+def _billing(model: str) -> str:
+    """A ChatGPT/Codex OAuth token bills a subscription, not tokens."""
+    from desmos.auth import openai_credential
+    from desmos.settings import provider_of
+
+    if provider_of(model) != "openai":
+        return "usage"
+    try:
+        cred = openai_credential(allow_refresh=False)
+    except Exception:  # noqa: BLE001
+        return "usage"
+    return "plan" if cred is not None and cred.kind == "oauth" else "usage"
+
+
 def _snapshot(world: Any) -> dict[str, Any]:
     from desmos.settings import provider_of
 
@@ -20,6 +34,7 @@ def _snapshot(world: Any) -> dict[str, Any]:
         "ev": "snapshot",
         "model": world.model,
         "provider": provider_of(world.model),
+        "billing": _billing(world.model),
         "thinking": world.thinking,
         "generation": world.generation,
         "cwd": str(world.cwd),

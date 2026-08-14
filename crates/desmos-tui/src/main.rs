@@ -957,6 +957,8 @@ struct CacheMeter {
     fresh_total: u64,
     out_total: u64,
     spent: f64,
+    /// Billing is a subscription, not per token: show list price, not a bill.
+    plan: bool,
     /// What the cached reads would have cost at full input price, minus what
     /// they did cost — the money the cache actually saved this session.
     saved: f64,
@@ -984,6 +986,7 @@ struct CacheMeter {
 /// so the bar needs one to divide by.
 fn model_window(model: &str) -> u64 {
     match model {
+        m if m.starts_with("gpt-") || m.starts_with("o3") || m.starts_with("o4") => 400_000,
         m if m.starts_with("claude-haiku") => 200_000,
         m if m.starts_with("claude-") => 200_000,
         _ => 200_000,
@@ -996,6 +999,7 @@ fn model_price(model: &str) -> (f64, f64) {
         m if m.starts_with("claude-opus") => (5.0, 25.0),
         m if m.starts_with("claude-sonnet") => (3.0, 15.0),
         m if m.starts_with("claude-haiku") => (1.0, 5.0),
+        m if m.starts_with("gpt-") => (1.25, 10.0),
         _ => (5.0, 25.0),
     }
 }
@@ -2008,6 +2012,9 @@ fn handle_event(app: &mut App, ev: Value) {
         }
         "ready" | "snapshot" => {
             app.picker.observe(&ev);
+            if let Some(b) = ev.get("billing").and_then(Value::as_str) {
+                app.cache.plan = b == "plan";
+            }
             if let Some(s) = ev.get("model").and_then(Value::as_str) {
                 app.model = s.into();
             }
@@ -4502,6 +4509,22 @@ fn draw_meta(f: &mut Frame, area: Rect, meter: &CacheMeter, focused: bool) {
         )
     };
     let money_row = || {
+        // A ChatGPT plan does not bill per token. Printing a dollar figure
+        // there is not an estimate, it is a number that will never appear on
+        // any invoice -- so say what it would have cost at list price instead.
+        if meter.plan {
+            return Line::from(vec![
+                Span::styled(
+                    "plan",
+                    Style::default()
+                        .fg(theme.accent_success)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                label("   "),
+                Span::styled(money(meter.spent), Style::default().fg(theme.gray)),
+                label(" at list"),
+            ]);
+        }
         Line::from(vec![
             Span::styled(
                 money(meter.spent),
@@ -5568,6 +5591,36 @@ fn format_usage(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_chatgpt_plan_does_not_print_a_bill() {
+        let mut app = App::new();
+        handle_event(
+            &mut app,
+            serde_json::json!({"ev": "snapshot", "model": "gpt-5.6-luna", "billing": "plan"}),
+        );
+        assert!(app.cache.plan, "the bridge said plan, the meter must believe it");
+        // and list price for a gpt model is not opus price
+        assert_eq!(model_price("gpt-5.6-luna"), (1.25, 10.0));
+        assert_eq!(model_window("gpt-5.6-luna"), 400_000);
+
+        app.cache
+            .observe(&serde_json::json!({"input_tokens": 1_000_000, "output_tokens": 0}), "gpt-5.6-luna");
+        assert!((app.cache.spent - 1.25).abs() < 1e-9, "{}", app.cache.spent);
+
+        let painted = paint(&mut app, 120, 36);
+        assert!(painted.contains("plan"), "plan sessions say plan:\n{painted}");
+        assert!(painted.contains("at list"), "and label the figure as list price:\n{painted}");
+        assert!(!painted.contains("spent"), "never a bill on a subscription:\n{painted}");
+
+        handle_event(
+            &mut app,
+            serde_json::json!({"ev": "snapshot", "model": "claude-opus-5", "billing": "usage"}),
+        );
+        assert!(!app.cache.plan);
+        assert!(paint(&mut app, 120, 36).contains("spent"));
+    }
+
 
     #[test]
     fn the_picker_opens_from_a_real_ready_event() {
