@@ -552,6 +552,32 @@ def self_check() -> None:
         assert "stopped" in evs
         assert calls["n"] == 1
         assert (cwd / "harness-stop.json").is_file()
+        # Exactly one terminator, on every path. The TUI clears `running` on it
+        # and drains the queue from it, so a step that ends in silence hangs
+        # the pane on "stopping" and the queued message never fires. The path
+        # that used to do that: a stop landing during a turn the model finished
+        # on its own, which satisfied neither emitter's condition.
+        assert [e for e in evs if e in ("done", "stopped")] == ["stopped"], evs
+        for landed, want in ((True, "stopped"), (False, "done")):
+            flag = {"go": False}
+
+            def final_answer(_model, _system, _messages, _max_tokens, f=flag, l=landed):
+                # No syscalls: the turn is done the moment it returns.
+                f["go"] = l
+                return {"content": [{"type": "text", "text": "all set."}], "usage": {}}
+
+            w_term = new_world(cwd, state_path=None, ns={}, persist=False)
+            w_term.complete_fn = final_answer
+            terms: list[str] = []
+            _run(
+                w_term,
+                "one shot",
+                quiet=True,
+                on_event=lambda e: terms.append(str(e.get("ev"))),
+                should_stop=lambda f=flag: f["go"],
+            )
+            got = [e for e in terms if e in ("done", "stopped")]
+            assert got == [want], f"stop landed={landed}: {got} in {terms}"
         assert w_stop.prior and w_stop.prior[-1]["prompt"] == "keep going"
         assert "transcript cleared" in w_usage.ns["reset"]()
         assert w_usage.messages == []

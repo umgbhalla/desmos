@@ -267,6 +267,48 @@ def run_turns(
     on_event: Callable[[dict[str, Any]], None] | None = None,
     should_stop: Callable[[], bool] | None = None,
 ) -> str:
+    """Run a step to its end, and always say how it ended.
+
+    Exactly one terminating event leaves here on every path, exception
+    included: ``stopped`` if the cancel flag is up, ``done`` otherwise. The TUI
+    clears ``running`` on that event and drains its queue from it, so a step
+    that returns in silence leaves the pane stuck on "stopping" with the queued
+    message never firing.
+
+    There was one such path. A stop that landed during a turn the model
+    finished on its own satisfied neither ``stopped() and not done`` in the
+    loop nor ``not cancel.is_set()`` in the bridge, so nothing was emitted at
+    all. Two emitters with complementary conditions is how a gap like that
+    hides; now there is one.
+    """
+    try:
+        return _run_turns(
+            world,
+            prompt,
+            max_turns=max_turns,
+            max_tokens=max_tokens,
+            quiet=quiet,
+            on_event=on_event,
+            should_stop=should_stop,
+        )
+    finally:
+        if on_event is not None:
+            if should_stop is not None and should_stop():
+                on_event({"ev": "stopped", "text": "stopped, saved"})
+            else:
+                on_event({"ev": "done"})
+
+
+def _run_turns(
+    world: World,
+    prompt: str,
+    *,
+    max_turns: int = 32,
+    max_tokens: int = MAX_TOKENS,
+    quiet: bool = False,
+    on_event: Callable[[dict[str, Any]], None] | None = None,
+    should_stop: Callable[[], bool] | None = None,
+) -> str:
     def emit(ev: dict[str, Any]) -> None:
         if on_event is not None:
             on_event(ev)
@@ -274,16 +316,13 @@ def run_turns(
     def stopped() -> bool:
         return should_stop is not None and should_stop()
 
-    # Hand the channel to the world so a tag handler can address the user
-    # directly. Without this the only way to say anything is speech, and speech
-    # is interleaved with every working note the model makes on the way.
+    # Tag handlers reach the wire through here.
     world.emit = emit
 
     world.messages.append({"role": "user", "content": header(world, prompt) + "\n\n" + prompt})
     last = ""
     for n in range(1, max_turns + 1):
         if stopped():
-            emit({"ev": "stopped", "text": "stopped, saved"})
             _commit_step(world, prompt, last)
             return last
         emit({"ev": "turn", "n": n})
@@ -311,8 +350,6 @@ def run_turns(
             print(last_results)
         world.messages.append({"role": "assistant", "content": assistant})
         if done or stopped():
-            if stopped() and not done:
-                emit({"ev": "stopped", "text": "stopped, saved"})
             _commit_step(world, prompt, speech)
             return speech
         world.messages.append({"role": "user", "content": format_result_message(results)})

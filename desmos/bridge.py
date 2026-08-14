@@ -87,9 +87,8 @@ def serve(cwd: Path) -> int:
                     _emit({"ev": "error", "text": "empty prompt"})
                     continue
                 cancel.clear()
+                # run_turns emits the terminator itself, on every path.
                 run_turns(world, text, quiet=True, on_event=_emit, should_stop=cancel.is_set)
-                if not cancel.is_set():
-                    _emit({"ev": "done"})
                 _emit(_snapshot(world))
             elif op == "snapshot":
                 _emit(_snapshot(world))
