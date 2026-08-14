@@ -33,9 +33,26 @@ def _shrink(path: Path, width: int = 1400) -> Path:
         return path
 
 
+def _resolve(p: Path) -> Path:
+    """Find a file whose name differs only in which spaces it uses.
+
+    macOS writes screenshot names with U+202F before AM/PM. Any round trip
+    through text normalises that to a plain space, so an exact match fails on
+    a file that is plainly sitting there. Compare whitespace-collapsed names.
+    """
+    if p.is_file():
+        return p
+    want = " ".join(p.name.split())
+    if p.parent.is_dir():
+        for c in p.parent.iterdir():
+            if " ".join(c.name.split()) == want:
+                return c
+    return p
+
+
 def image_block(path: str | Path) -> dict[str, Any]:
     """One Anthropic image content block, base64, downscaled if oversized."""
-    p = Path(path).expanduser()
+    p = _resolve(Path(path).expanduser())
     if not p.is_file():
         raise FileNotFoundError(p)
     media, _ = mimetypes.guess_type(p.name)
