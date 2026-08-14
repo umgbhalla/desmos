@@ -41,3 +41,4 @@ class World:
     messages: list[dict[str, Any]] = field(default_factory=list)
     generation: int = 1
     gen_reason: str = "gen-1"
+    persist: bool = True

@@ -21,7 +21,13 @@ def apply_edit(path: str, old_str: str, new_str: str, *, cwd: Path | None = None
         return f"edit failed: string not found in {path}"
     if count > 1:
         return f"edit failed: found {count} occurrences in {path}, need exactly 1 — widen the snippet"
-    filepath.write_text(content.replace(old_str, new_str, 1), encoding="utf-8")
+    next_text = content.replace(old_str, new_str, 1)
+    if filepath.suffix == ".py":
+        try:
+            compile(next_text, str(filepath), "exec")
+        except SyntaxError as exc:
+            return f"edit failed: SyntaxError line {exc.lineno}: {exc.msg} — not written"
+    filepath.write_text(next_text, encoding="utf-8")
     return f"Edited {filepath.resolve()}"
 
 

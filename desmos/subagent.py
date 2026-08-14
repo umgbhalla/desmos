@@ -125,11 +125,15 @@ def _persist(run: Run) -> None:
         pass
 
 
+_DEPTH = threading.local()
+
+
 def _child_world(cfg: EffectiveConfig, parent: Any):
     from desmos.loop import new_world, seed_builtins
 
     cwd = Path(cfg.cwd) if cfg.cwd else parent.cwd
-    w = new_world(cwd, state_path=None, ns={})  # no persistence: never clobber the parent
+    # persist=False: do not load or write the parent's harness.json
+    w = new_world(cwd, state_path=None, ns={}, persist=False)
     seed_builtins(w)
     w.model = cfg.model or parent.model
     w.thinking = cfg.thinking or parent.thinking
@@ -138,6 +142,7 @@ def _child_world(cfg: EffectiveConfig, parent: Any):
         for name in list(w.tools):
             if name not in allowed:
                 del w.tools[name]
+    w.tools.pop("agents", None)
     if cfg.persona_instructions:
         w.notes["persona"] = cfg.persona_instructions
     w.notes["subagent"] = (
@@ -157,20 +162,32 @@ def _execute(run: Run, parent: Any) -> None:
         w = _child_world(run.cfg, parent)
         if run.cfg.context == "resumed" and run.messages:
             w.messages = list(run.messages)
-        out = run_turns(w, run.task, max_turns=run.cfg.max_turns, quiet=True)
+        _DEPTH.n = 1
+        try:
+            out = run_turns(w, run.task, max_turns=run.cfg.max_turns, quiet=True)
+        finally:
+            _DEPTH.n = 0
         from desmos.scan import scan
 
         if scan(out):
             # Turn cap hit mid-syscall. Force one toolless turn so the parent
             # gets an answer instead of a dangling tool call.
-            out = run_turns(
-                w,
-                "Out of turns. Answer now from what you already found. No syscalls.",
-                max_turns=1,
-                quiet=True,
-            )
-            run.result = out
-            run.error = "turn cap: forced summary"
+            _DEPTH.n = 1
+            try:
+                out = run_turns(
+                    w,
+                    "Out of turns. Answer now from what you already found. No syscalls.",
+                    max_turns=1,
+                    quiet=True,
+                )
+            finally:
+                _DEPTH.n = 0
+            if scan(out):
+                run.result = "turn cap: child ended on a syscall"
+                run.error = "turn cap: forced summary still had syscalls"
+            else:
+                run.result = out
+                run.error = "turn cap: forced summary"
         else:
             run.result = out
         run.turns = len(w.log)
@@ -192,8 +209,8 @@ def _execute(run: Run, parent: Any) -> None:
 
 def spawn(task: str, agent: str = "general", *, resume: str | None = None, **over: Any) -> str:
     """Start a child agent. Returns its id immediately; nothing blocks."""
-    from desmos.loop import new_world
-
+    if getattr(_DEPTH, "n", 0) >= 1:
+        raise ValueError("subagent depth cap: children cannot spawn")
     parent = over.pop("parent", None) or _parent()
     cfg = resolve(agent, **over)
     run = Run(id=uuid.uuid4().hex[:8], task=task, cfg=cfg)
@@ -234,11 +251,17 @@ def wait(*ids: str, timeout: float = 600.0, poll: float = 0.5) -> list[dict[str,
     targets = list(ids) or list(RUNS)
     deadline = time.time() + timeout
     while time.time() < deadline:
-        pending = [i for i in targets if RUNS[i].state in ("pending", "running")]
+        pending = [i for i in targets if i in RUNS and RUNS[i].state in ("pending", "running")]
         if not pending:
             break
         time.sleep(poll)
-    return [RUNS[i].brief() for i in targets]
+    out = []
+    for i in targets:
+        if i in RUNS:
+            out.append(RUNS[i].brief())
+        else:
+            out.append({"id": i, "agent": "", "state": "unknown", "secs": 0.0, "turns": 0, "out": ""})
+    return out
 
 
 def status() -> list[dict[str, Any]]:
@@ -246,7 +269,9 @@ def status() -> list[dict[str, Any]]:
 
 
 def result(rid: str) -> str:
-    r = RUNS[rid]
+    r = RUNS.get(rid)
+    if r is None:
+        return f"<unknown {rid}>"
     return r.result or r.error or f"<{r.state}>"
 
 

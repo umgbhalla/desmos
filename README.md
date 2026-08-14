@@ -36,8 +36,13 @@ next `complete()` sees the change. No restart.
 uv venv && uv pip install -e ".[kernel]"
 source .venv/bin/activate
 python -m desmos console          # IPython with step and world bound
+python -m desmos tui              # grok-minimal viewport (needs cargo)
 python -m desmos kernel           # install a Jupyter kernelspec named Desmos
 ```
+
+The TUI is grok-build's inline scaffold: finalized turns go into the
+terminal's native scrollback; status + `❯` stay pinned. `/thinking low`,
+`/reset`, `/reload`, esc quits.
 
 Ordinary cells stay Python. `step("...")` is the agent. Syscall results
 append as user-role `<result>` blocks on the same transcript (Pi-style).

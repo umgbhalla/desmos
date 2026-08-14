@@ -167,6 +167,13 @@ def self_check() -> None:
         spoken = w_usage.ns["step"]("hi there")
         assert spoken.strip() == "hello"
         assert "tokens:0" in w_usage.messages[2]["content"]
+        seen: list[str] = []
+        w_usage.ns["reset"]()
+        w_usage.complete_fn = fake_usage
+        from desmos.loop import run_turns as _run
+
+        _run(w_usage, "ping", quiet=True, on_event=lambda e: seen.append(str(e.get("ev"))))
+        assert "speech" in seen and "result" in seen and "turn" in seen
         assert "transcript cleared" in w_usage.ns["reset"]()
         assert w_usage.messages == []
 
@@ -177,6 +184,69 @@ def self_check() -> None:
         assert w3.notes["note"] == "usage line"
         assert "generation 1" in rollback(w3, 1)
         assert "note" not in w3.notes
+
+        py = cwd / "broke.py"
+        py.write_text("x = 1\n")
+        bad = dispatch(world, Block("edit", "x = 1\n---\nx =\n", {"path": str(py)}))
+        assert "SyntaxError" in bad
+        assert py.read_text(encoding="utf-8") == "x = 1\n"
+
+        from desmos.persist import save as save_world
+        from desmos.subagent import _child_world, resolve, wait
+
+        parent = new_world(cwd, state_path=cwd / "harness-iso.json")
+        dispatch(
+            parent,
+            Block("register", "def handle(body, **a):\n    return 'SECRET'\n", {"name": "secret", "doc": "parent only"}),
+        )
+        child = _child_world(resolve("explore"), parent)
+        assert child.persist is False
+        assert "secret" not in child.tools
+        assert "agents" not in child.tools
+        child.notes["pwn"] = "from-child"
+        save_world(child)
+        on_disk = __import__("json").loads((cwd / "harness-iso.json").read_text(encoding="utf-8"))
+        assert "pwn" not in on_disk.get("notes", {})
+        unknown = wait("nope")
+        assert unknown[0]["state"] == "unknown"
+        import desmos.subagent as S
+
+        S._DEPTH.n = 1
+        try:
+            try:
+                S.spawn("should fail")
+            except ValueError as exc:
+                assert "depth" in str(exc)
+            else:
+                raise AssertionError("child spawn should be blocked")
+        finally:
+            S._DEPTH.n = 0
+
+        import threading
+
+        import desmos.complete as C
+
+        tdir = cwd / "traj"
+        tdir.mkdir()
+        prev = C.TRAJECTORY_DIR
+        C.TRAJECTORY_DIR = str(tdir)
+        try:
+            def _write(i: int) -> None:
+                C.log_payload({"system": [{"type": "text", "text": f"s{i}"}], "messages": []}, [])
+
+            threads = [threading.Thread(target=_write, args=(i,)) for i in range(16)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+            files = list(tdir.glob("*.json"))
+            assert len(files) == 16
+            for f in files:
+                rec = __import__("json").loads(f.read_text(encoding="utf-8"))
+                assert "system_digest" in rec
+            assert len(C.trajectory(16)) == 16
+        finally:
+            C.TRAJECTORY_DIR = prev
 
         try:
             from IPython.core.interactiveshell import InteractiveShell

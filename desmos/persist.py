@@ -15,6 +15,8 @@ def state_file(world: World) -> Path:
 
 
 def save(world: World) -> None:
+    if not world.persist:
+        return
     path = state_file(world)
     path.parent.mkdir(parents=True, exist_ok=True)
     data = {
@@ -35,6 +37,8 @@ def save(world: World) -> None:
 
 
 def load(world: World) -> None:
+    if not world.persist:
+        return
     path = state_file(world)
     if not path.exists():
         return

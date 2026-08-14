@@ -20,6 +20,9 @@ vendor/
 .ipynb_checkpoints/
 *.log
 
+# rust
+target/
+
 # python
 __pycache__/
 *.py[cod]

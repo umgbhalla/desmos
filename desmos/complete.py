@@ -218,11 +218,14 @@ def complete(
 
 TRAJECTORY_DIR = os.environ.get("DESMOS_TRAJECTORY", ".desmos/trajectory")
 LAST: dict[str, Any] = {}
+_TRAJ_LOCK = __import__("threading").Lock()
 
 
 def log_payload(payload: dict[str, Any], betas: list[str]) -> str:
     """Persist the exact outgoing POST body so a reload can be verified."""
     import hashlib
+    import tempfile
+    import threading
     import time
 
     record: dict[str, Any] = {
@@ -241,15 +244,25 @@ def log_payload(payload: dict[str, Any], betas: list[str]) -> str:
         for b in sysblocks
     ]
     record["n_messages"] = len(payload.get("messages") or [])
-    LAST.clear()
-    LAST.update(record)
+    with _TRAJ_LOCK:
+        LAST.clear()
+        LAST.update(record)
     try:
         os.makedirs(TRAJECTORY_DIR, exist_ok=True)
-        n = len([f for f in os.listdir(TRAJECTORY_DIR) if f.endswith(".json")]) + 1
-        path = os.path.join(TRAJECTORY_DIR, f"{n:04d}.json")
-        with open(path, "w") as fh:
-            json.dump(record, fh, indent=2)
-        return path
+        name = f"{time.time_ns()}-{os.getpid()}-{threading.get_ident()}.json"
+        dest = os.path.join(TRAJECTORY_DIR, name)
+        fd, tmp = tempfile.mkstemp(prefix="traj-", suffix=".tmp", dir=TRAJECTORY_DIR)
+        try:
+            with os.fdopen(fd, "w") as fh:
+                json.dump(record, fh, indent=2)
+            os.replace(tmp, dest)
+        except Exception:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+        return dest
     except OSError:
         return ""
 
@@ -261,8 +274,13 @@ def trajectory(n: int = 1) -> list[dict[str, Any]]:
     files = sorted(f for f in os.listdir(TRAJECTORY_DIR) if f.endswith(".json"))
     out = []
     for f in files[-n:]:
-        with open(os.path.join(TRAJECTORY_DIR, f)) as fh:
-            rec = json.load(fh)
+        try:
+            with open(os.path.join(TRAJECTORY_DIR, f)) as fh:
+                rec = json.load(fh)
+        except (OSError, ValueError):
+            continue
+        if not isinstance(rec, dict):
+            continue
         out.append(
             {
                 "file": f,

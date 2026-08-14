@@ -83,6 +83,8 @@ def turn(
     world: World, messages: list[dict[str, Any]], max_tokens: int
 ) -> tuple[str, list[tuple[Block, str]], bool, list[dict[str, Any]]]:
     install_resources(world)
+    if world.ns.get("world") is not world:
+        bind_step(world)  # ns lost its handles (cleanup, reload, stale exec globals)
     if world.complete_fn:
         resp = world.complete_fn(world.model, system_prompt(world), messages, max_tokens)
     else:
@@ -116,22 +118,33 @@ def run_turns(
     max_turns: int = 32,
     max_tokens: int = 8192,
     quiet: bool = False,
+    on_event: Callable[[dict[str, Any]], None] | None = None,
 ) -> str:
+    def emit(ev: dict[str, Any]) -> None:
+        if on_event is not None:
+            on_event(ev)
+
     world.messages.append({"role": "user", "content": header(world, prompt) + "\n\n" + prompt})
     last = ""
     for n in range(1, max_turns + 1):
+        emit({"ev": "turn", "n": n})
         if not quiet:
             print(f"\n===== turn {n} =====")
         speech, results, done, assistant = turn(world, world.messages, max_tokens)
         last = speech
         thoughts = thinking_text(assistant)
+        if thoughts:
+            emit({"ev": "thinking", "text": thoughts})
         if thoughts and not quiet:
             print("--- thinking ---")
             print(thoughts)
             print("--------------")
+        emit({"ev": "speech", "text": speech})
         if not quiet:
             print(speech)
         last_results = format_results(results) if results else ""
+        for b, r in results:
+            emit({"ev": "result", "tag": b.tag, "text": clip(r, 2000)})
         if last_results and not quiet:
             print("\n--- results ---")
             print(last_results)
@@ -150,15 +163,22 @@ def run_turns(
     return last
 
 
-def new_world(cwd: Path, state_path: Path | None = None, *, ns: dict[str, Any] | None = None) -> World:
-    world = World(cwd=cwd, state_path=state_path)
+def new_world(
+    cwd: Path,
+    state_path: Path | None = None,
+    *,
+    ns: dict[str, Any] | None = None,
+    persist: bool = True,
+) -> World:
+    world = World(cwd=cwd, state_path=state_path, persist=persist)
     if ns is not None:
         world.ns = ns
     world.ns.setdefault("CWD", str(cwd))
     seed_builtins(world)
     install_resources(world)
-    load(world)
-    ensure_gen1(world)
+    if persist:
+        load(world)
+        ensure_gen1(world)
     return world
 
 

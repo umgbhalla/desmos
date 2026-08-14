@@ -70,6 +70,39 @@ def cmd_run(args: argparse.Namespace) -> int:
     return run(args)
 
 
+def cmd_bridge(args: argparse.Namespace) -> int:
+    _on_path()
+    from desmos.bridge import serve
+
+    return serve(Path(args.cwd).resolve())
+
+
+def cmd_tui(args: argparse.Namespace) -> int:
+    _on_path()
+    import shutil
+    import subprocess
+
+    cargo = shutil.which("cargo")
+    if cargo is None:
+        print("desmos tui needs rustc/cargo (the grok-build inline viewport is Rust)")
+        return 1
+    root = _repo_root()
+    manifest = root / "crates" / "desmos-tui" / "Cargo.toml"
+    cmd = [
+        cargo,
+        "run",
+        "--quiet",
+        "--manifest-path",
+        str(manifest),
+        "--",
+        "--python",
+        sys.executable,
+        "--cwd",
+        str(Path(args.cwd).resolve()),
+    ]
+    return subprocess.call(cmd, cwd=str(root))
+
+
 def main() -> int:
     p = argparse.ArgumentParser(prog="desmos")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -92,6 +125,14 @@ def main() -> int:
     r.add_argument("--cwd", default=".")
     r.add_argument("--out", default="")
     r.set_defaults(func=cmd_run)
+
+    b = sub.add_parser("bridge", help="JSONL stdio bridge (used by desmos-tui)")
+    b.add_argument("--cwd", default=".")
+    b.set_defaults(func=cmd_bridge)
+
+    t = sub.add_parser("tui", help="grok-minimal TUI over the kernel")
+    t.add_argument("--cwd", default=".")
+    t.set_defaults(func=cmd_tui)
 
     args = p.parse_args()
     if args.cmd == "run" and not args.out:
