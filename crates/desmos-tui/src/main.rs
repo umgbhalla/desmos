@@ -872,7 +872,7 @@ struct App {
     running: bool,
     turn_started: Option<Instant>,
     /// First chrome paint waits for the bridge `ready` snapshot so the
-    /// status line never flashes `think:— gen —`.
+    /// status line never flashes `effort:— gen —`.
     ready: bool,
     /// Click on grok `[stop]` — applied in the event loop with the bridge.
     want_stop: bool,
@@ -4823,7 +4823,7 @@ fn draw_input(f: &mut Frame, area: Rect, app: &mut App) {
         .map(|id| format!(" session {id} "))
         .unwrap_or_else(|| {
             format!(
-                " {}  think:{}  gen {} ",
+                " {}  effort:{}  gen {} ",
                 if app.model.is_empty() {
                     "—"
                 } else {
@@ -5629,8 +5629,17 @@ fn format_usage(
     let out = get("output_tokens");
     let total = fresh + read + write;
     let hit = if total == 0 { 0 } else { 100 * read / total };
+    // OpenAI bills reasoning separately and often returns no summary to show
+    // for it, so the block counts above can read 0 on a turn that spent most of
+    // its output budget thinking. Print the tokens when the provider sends them.
+    let reasoning = get("reasoning_tokens");
+    let thought_line = if reasoning > 0 {
+        format!("thinking {thoughts}  redacted {redacted}  reasoning {reasoning} tok")
+    } else {
+        format!("thinking {thoughts}  redacted {redacted}")
+    };
     format!(
-        "model {model}  effort {thinking}\nthinking {thoughts}  redacted {redacted}\nfresh in {fresh}  cache read {read}  cache write {write}  out {out}\ncache hit {hit}%"
+        "model {model}  effort {thinking}\n{thought_line}\nfresh in {fresh}  cache read {read}  cache write {write}  out {out}\ncache hit {hit}%"
     )
 }
 
@@ -7972,7 +7981,7 @@ mod tests {
         assert!(!app.ready);
         let before = paint(&mut app, 120, 24);
         assert!(
-            before.contains("think:—") && before.contains("gen —"),
+            before.contains("effort:—") && before.contains("gen —"),
             "empty chrome before ready:\n{before}"
         );
         handle_event(
@@ -7990,9 +7999,9 @@ mod tests {
         assert_eq!(app.generation, "7");
         let after = paint(&mut app, 120, 24);
         assert!(after.contains("claude-opus-5"), "{after}");
-        assert!(after.contains("think:low"), "{after}");
+        assert!(after.contains("effort:low"), "{after}");
         assert!(after.contains("gen 7"), "{after}");
-        assert!(!after.contains("think:—"), "{after}");
+        assert!(!after.contains("effort:—"), "{after}");
         assert!(!after.contains("gen —"), "{after}");
     }
 

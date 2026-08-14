@@ -206,6 +206,13 @@ def thought_blocks(blocks: list[dict[str, Any]]) -> list[dict[str, Any]]:
         kind = block.get("type")
         if kind == "thinking" and (block.get("thinking") or "").strip():
             out.append({"redacted": False, "text": block["thinking"]})
+        elif kind == "thinking" and block.get("openai") is not None:
+            # A reasoning item whose summary came back empty -- routine at low
+            # effort, where the summary is "auto" and often absent. The thought
+            # happened and was billed; counting it as nothing made the wire card
+            # read "thinking 0" for a turn that visibly spent seconds thinking.
+            # Unreadable is what redacted already means here.
+            out.append({"redacted": True, "text": ""})
         elif kind == "redacted_thinking":
             out.append({"redacted": True, "text": ""})
     return out
@@ -375,9 +382,10 @@ def read_sse(
     """Parse an Anthropic event-stream into one assembled message."""
     state: dict[str, Any] = {"message": {}, "blocks": []}
     data_parts: list[str] = []
+    saw_stop = False
 
     def flush() -> None:
-        nonlocal data_parts
+        nonlocal data_parts, saw_stop
         if not data_parts:
             return
         raw = "\n".join(data_parts)
@@ -386,6 +394,8 @@ def read_sse(
             return
         ev = json.loads(raw)
         if isinstance(ev, dict):
+            if ev.get("type") == "message_stop":
+                saw_stop = True
             apply_stream_event(state, ev, on_event)
 
     for line in lines:
@@ -404,6 +414,13 @@ def read_sse(
         if line.startswith("data:"):
             data_parts.append(line[5:].lstrip())
     flush()
+    # A stream that just runs dry is not a finished answer. Without this the
+    # half-written reply is returned as if the model had chosen to stop: its
+    # last syscall has no closing tag, scan() skips unterminated blocks, the
+    # turn reports done, and a dropped socket gets committed as the step's
+    # result. Ctrl+C is the one legitimate early exit, so it is not an error.
+    if not saw_stop and not (should_stop is not None and should_stop()):
+        raise RuntimeError("Anthropic stream ended before message_stop")
     return assemble_message(state)
 
 

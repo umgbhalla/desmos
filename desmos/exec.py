@@ -67,7 +67,7 @@ def run_python(
             exec(compile(ast.Module([last], []), "<python>", "exec"), ns)
         return clip(buf.getvalue().strip() or "ok")
     except Exception:
-        return clip((buf.getvalue() + traceback.format_exc()).strip())
+        return clip((buf.getvalue() + traceback.format_exc()).strip(), keep="tail")
 
 
 def run_bash(
@@ -131,9 +131,9 @@ def run_bash(
         proc.stdout.close()
     out = b"".join(parts).decode("utf-8", errors="replace")
     if timed_out:
-        return clip(f"timeout after {limit}s\n{out}".strip())
+        return clip(f"timeout after {limit}s\n{out}".strip(), keep="tail")
     if proc.returncode:
-        return clip(f"exit {proc.returncode}\n{out}".strip())
+        return clip(f"exit {proc.returncode}\n{out}".strip(), keep="tail")
     return clip(out.strip() or "ok")
 
 

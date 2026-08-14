@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 from desmos.const import FROZEN, PRIOR_KEEP
@@ -33,7 +34,14 @@ def save(world: World) -> None:
         "thinking": world.thinking,
         "messages": world.messages[-80:],
     }
-    path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    # Write then rename. A full-file write killed halfway leaves truncated
+    # JSON, and load() treats a ValueError as "never configured" and returns an
+    # empty world -- so a crash mid-save silently discards the session instead
+    # of failing loudly. Same tempfile+replace settings.save and the trajectory
+    # log already use.
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    os.replace(tmp, path)
 
 
 def load(world: World) -> None:

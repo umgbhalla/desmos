@@ -52,10 +52,20 @@ def _snapshot(world: Any) -> dict[str, Any]:
 # wedges the bridge on any <python> that prints. Write to the real handle.
 _WIRE = sys.stdout
 
+# One NDJSON line per event, and a line only means anything whole. Subagents
+# run on their own threads and every one of them reaches this function through
+# child_event, so the main loop and up to a poolful of children write here at
+# once. TextIOWrapper.write is not documented atomic; two interleaved writes
+# are one corrupt line, which the TUI's parser drops -- taking a real event
+# with it. Serialize the pair.
+_WIRE_LOCK = threading.Lock()
+
 
 def _emit(ev: dict[str, Any]) -> None:
-    _WIRE.write(json.dumps(ev, default=str) + "\n")
-    _WIRE.flush()
+    line = json.dumps(ev, default=str) + "\n"
+    with _WIRE_LOCK:
+        _WIRE.write(line)
+        _WIRE.flush()
 
 
 def serve(cwd: Path) -> int:

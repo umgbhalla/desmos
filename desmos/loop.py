@@ -295,6 +295,12 @@ def run_turns(
     all. Two emitters with complementary conditions is how a gap like that
     hides; now there is one.
     """
+    if world.running:
+        raise RuntimeError(
+            "a step is already running on this world; call step() from a new "
+            "turn, or spawn() a subagent, which gets its own world"
+        )
+    world.running = True
     try:
         return _run_turns(
             world,
@@ -306,6 +312,7 @@ def run_turns(
             should_stop=should_stop,
         )
     finally:
+        world.running = False
         if on_event is not None:
             if should_stop is not None and should_stop():
                 on_event({"ev": "stopped", "text": "stopped, saved"})
@@ -412,6 +419,8 @@ def bind_step(world: World) -> Callable[..., str]:
 
 def reset_transcript(world: World) -> str:
     """Drop the append-only chat so a poisoned turn cannot train the next one."""
+    if world.running:
+        raise RuntimeError("cannot reset the transcript from inside a running step")
     n = len(world.messages)
     world.messages.clear()
     world.prior.clear()

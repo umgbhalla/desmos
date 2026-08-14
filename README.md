@@ -42,9 +42,28 @@ python -m desmos tui --grok       # grok-build pager, desmos as ACP agent
 python -m desmos kernel           # install a Jupyter kernelspec named Desmos
 ```
 
-Default TUI: middle is the turn story, right is wire calls (`complete()` and
-syscalls, USER vs LLM). `--grok` launches grok-build's pager-bin (`--minimal
---no-leader`) with `python -m desmos acp` on stdio.
+Default TUI, left column then right:
+
+```
+story        the turn: your prompt, thinking, speech as markdown
+POST in/out  the last complete() request and reply as a folding JSON tree
+queue        follow-ups stacked while a step runs (hidden when empty)
+input        the composer
+
+calls        the wire: complete() cards and every syscall with body + result
+meta         context bar, cache hit, spend
+git          status / branches / log, tabbed
+files        the file the git cursor points at, or the filesystem
+keys         what the focused pane's keys do
+```
+
+`ctrl+p` opens the settings picker (provider, model, effort). `ctrl+g` and
+`ctrl+b` toggle the git and file panes. Tab cycles panes; in every pane the
+arrows mean the same thing — up/down moves the cursor, left/right drives that
+pane's second axis (fold, tab, directory, order).
+
+`--grok` launches grok-build's pager-bin (`--minimal --no-leader`) with
+`python -m desmos acp` on stdio.
 
 Ordinary cells stay Python. `step("...")` is the agent. Syscall results
 append as user-role `<result>` blocks on the same transcript (Pi-style).
@@ -56,12 +75,43 @@ editing the SDK: `<reload_sdk/>` (or `reload_sdk()` in a cell) reimports
 `desmos.*` and rebinds `step` without restarting IPython. New ABI/loop apply
 on the next `complete()`.
 
-## Headless
+## Two providers
+
+Anthropic and OpenAI, one transcript, switchable mid-session.
+
+```
+anthropic   claude-opus-5, claude-sonnet-4-6      ANTHROPIC_API_KEY
+openai      gpt-5.6-sol, -luna, -terra            device login, ~/.desmos/auth.json
+```
+
+`ctrl+p` in the TUI picks provider → model → effort and saves the choice to
+`~/.desmos/settings.json` (`DESMOS_SETTINGS` moves that file). The saved choice
+outranks whatever the last session persisted. A machine with no settings file
+has not been onboarded, so the TUI opens the picker instead of guessing.
+
+Switching keeps the transcript. Blocks the other provider made survive as
+plain text — lossy, never fatal — because a reasoning item is opaque to
+anything but the endpoint that produced it. Nothing is compacted or discarded
+to make a switch work.
+
+The system prompt adapts to the family it is driving (`desmos/dialect.py`): the
+capability half is identical, the working-style half is not. Asking Opus 5 for
+brevity shortens its answers; asking GPT-5.6 the same thing shortens the
+artifact instead, so it is not asked.
+
+Both providers fold the transcript server-side once it grows past the trigger —
+Anthropic via `compact_20260112`, OpenAI via Responses `context_management`.
+The returned block is opaque, replayed verbatim, and is the cut point for
+everything before it. desmos never rewrites history locally; a fold paints a
+`FOLD` card on the wire pane.
 
 `ANTHROPIC_API_KEY` comes from the environment. Never commit it.
 `DESMOS_MODEL` overrides the default (`claude-opus-5`).
 `DESMOS_THINKING` is the effort floor (`low` by default). Opus 5 uses adaptive
 thinking; older Claude 4 models use a token budget plus interleaved thinking.
+On OpenAI the same dial becomes `reasoning.effort`.
+
+## Headless
 
 ```bash
 python -m desmos check

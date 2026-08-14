@@ -51,7 +51,11 @@ ORIGINATOR = os.environ.get("DESMOS_OPENAI_ORIGINATOR") or "codex_cli_rs"
 
 # What the model picker offers. Order is the order the menu shows.
 MODELS = ("gpt-5.6-sol", "gpt-5.6-luna", "gpt-5.6-terra")
-EFFORTS = ("low", "high", "xhigh")
+# The 5.6 ladder is none/low/medium/high/xhigh/max. Offering three of six meant
+# `medium` -- the rung OpenAI calls the everyday balance -- was unreachable, and
+# `max` collapsed onto xhigh below, so the top of the ladder could not be asked
+# for at all.
+EFFORTS = ("low", "medium", "high", "xhigh", "max")
 
 
 def is_openai(model: str) -> bool:
@@ -64,9 +68,7 @@ def effort_of(thinking: str | None) -> str:
     raw = (thinking or "low").strip().lower()
     if raw in {"off", "none", "0", "false", "minimal"}:
         return "none"
-    if raw in {"max", "xhigh"}:
-        return "xhigh"
-    if raw in {"low", "medium", "high"}:
+    if raw in {"low", "medium", "high", "xhigh", "max"}:
         return raw
     return "low"
 

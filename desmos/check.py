@@ -476,6 +476,26 @@ def self_check() -> None:
             should_stop=lambda: halted["go"],
         )
         assert "one" in text_of(sse_stop)
+        # A stream that runs dry is not a finished answer. Returned as one, the
+        # half-written reply's last syscall has no closing tag, scan() skips
+        # unterminated blocks, the turn reports done, and a dropped socket gets
+        # committed as the step's result. Ctrl+C is the one legitimate early
+        # exit -- sse_stop above must keep working, which is why this is not
+        # simply "no message_stop means raise".
+        try:
+            read_sse(
+                [
+                    'data: {"type":"message_start","message":{"role":"assistant"}}',
+                    "",
+                    'data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}',
+                    "",
+                    'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"half a <bash>ls"}}',
+                    "",
+                ]
+            )
+            raise AssertionError("a truncated stream must not read as a finished answer")
+        except RuntimeError as exc:
+            assert "message_stop" in str(exc), exc
         assert "two" not in text_of(sse_stop)
 
         from desmos.complete import iter_sse_lines
@@ -523,6 +543,9 @@ def self_check() -> None:
                     conn,
                     b'data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}}\n\n',
                 )
+                # A real stream terminates. Without this the fixture was a
+                # truncated response that the parser accepted as a finished one.
+                _chunk(conn, b'data: {"type":"message_stop"}\n\n')
                 conn.sendall(b"0\r\n\r\n")
             finally:
                 conn.close()
@@ -695,6 +718,45 @@ def self_check() -> None:
         _run(w_fold, "long run", quiet=True, on_event=fold_evs.append)
         assert any(e.get("ev") == "compacted" for e in fold_evs), [e.get("ev") for e in fold_evs]
         assert compaction_block(w_fold.messages[-1]["content"]) == fold, w_fold.messages[-1]
+
+        # step() and reset() are published into the kernel, so the model can
+        # reach them from a <python> block mid-turn. A nested run appends its
+        # whole exchange before the outer assistant message lands; reset()
+        # clears the list the outer loop is appending to. Both are refused.
+        w_re = new_world(cwd, state_path=None, persist=False, ns={})
+        reentered: list[str] = []
+
+        def reentrant(_m, _s, _msgs, _mt):
+            try:
+                w_re.ns["step"]("nested")
+            except RuntimeError as exc:
+                reentered.append(str(exc))
+            try:
+                w_re.ns["reset"]()
+            except RuntimeError as exc:
+                reentered.append(str(exc))
+            return {"content": [{"type": "text", "text": "done"}], "usage": {}}
+
+        w_re.complete_fn = reentrant
+        _run(w_re, "try to re-enter", quiet=True)
+        assert len(reentered) == 2, reentered
+        assert "already running" in reentered[0], reentered
+        assert "inside a running step" in reentered[1], reentered
+        assert w_re.running is False, "the flag must clear even after a refusal"
+        assert w_re.messages, "the outer step still committed its own transcript"
+
+        # A traceback is the last thing a failing script prints. Head-clipping
+        # a noisy failure returned progress and no error.
+        from desmos.scan import clip as _clip
+
+        noisy = "chatter\n" * 4000 + "ZeroDivisionError: division by zero"
+        assert "ZeroDivisionError" in _clip(noisy, 600, keep="tail")
+        assert "ZeroDivisionError" not in _clip(noisy, 600)
+        assert "chatter" in _clip(noisy, 600), "the head is still right for ordinary output"
+        assert len(_clip(noisy, 600, keep="tail")) <= 600 + 40
+        assert _clip("short", 600, keep="tail") == "short"
+        boom = dispatch(world, Block("python", "print('x' * 9000)\n1/0", {}))
+        assert "ZeroDivisionError" in boom, boom[:200]
 
         assert "transcript cleared" in w_usage.ns["reset"]()
         assert w_usage.messages == []
@@ -997,7 +1059,16 @@ def self_check() -> None:
             names = [p["provider"] for p in ready["providers"]]
             assert names == ["anthropic", "openai"], names
             oai = next(p for p in ready["providers"] if p["provider"] == "openai")
-            assert "gpt-5.6-sol" in oai["models"] and oai["efforts"] == ["low", "high", "xhigh"]
+            # The full 5.6 ladder. Offering three of six rungs meant `medium`
+            # -- the everyday balance -- could not be selected, and `max`
+            # collapsed onto xhigh in effort_of, so the top could not be asked
+            # for at all.
+            assert "gpt-5.6-sol" in oai["models"], oai["models"]
+            assert oai["efforts"] == ["low", "medium", "high", "xhigh", "max"], oai["efforts"]
+            from desmos.openai import effort_of as _eff
+
+            assert [_eff(x) for x in oai["efforts"]] == oai["efforts"], "every offered rung must survive the mapping"
+            assert _eff("off") == "none" and _eff("nonsense") == "low"
             assert oai["can_login"] is True
             assert ready["provider"] in ("anthropic", "openai")
 
@@ -1074,7 +1145,9 @@ def self_check() -> None:
 
         assert _oai.is_openai("gpt-5.6-sol") and not _oai.is_openai("claude-opus-5")
         assert _oai.effort_of("xhigh") == "xhigh" and _oai.effort_of("off") == "none"
-        assert set(_oai.EFFORTS) == {"low", "high", "xhigh"}
+        assert set(_oai.EFFORTS) == {"low", "medium", "high", "xhigh", "max"}
+        assert _oai.effort_of("max") == "max", "max is its own rung above xhigh, not an alias for it"
+        assert _oai.effort_of("medium") == "medium"
         assert "gpt-5.6-sol" in _oai.MODELS and "gpt-5.6-luna" in _oai.MODELS
 
         reasoning_item = {

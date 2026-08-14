@@ -42,3 +42,10 @@ class World:
     generation: int = 1
     gen_reason: str = "gen-1"
     persist: bool = True
+    # True while run_turns owns this world. bind_step publishes step/reset into
+    # the kernel, so a <python> block can call them from inside a turn -- and a
+    # nested run appends its whole exchange before the outer assistant message
+    # lands, writing a transcript whose causality is wrong and then replaying it
+    # forever. reset() is worse: it clears the list the outer loop is appending
+    # to. Neither is worth supporting; both are worth refusing.
+    running: bool = False

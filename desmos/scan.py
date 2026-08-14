@@ -13,10 +13,20 @@ TAG_OPEN = re.compile(
 ATTR = re.compile(r'([A-Za-z_][\w.-]*)\s*=\s*"([^"]*)"')
 
 
-def clip(text: str, cap: int = RESULT_CAP) -> str:
+def clip(text: str, cap: int = RESULT_CAP, *, keep: str = "head") -> str:
+    """Trim to `cap`, keeping the head by default or the tail on demand.
+
+    Which end matters depends on what the text is. Output reads top-down, so
+    the head is right. A traceback is the last thing printed, so a script that
+    logged its way past the cap before dying returned a result with the error
+    trimmed off -- the model saw a wall of progress and no reason for failure.
+    """
     if len(text) <= cap:
         return text
-    return text[: cap - 24] + f"\n…[{len(text) - cap + 24} chars clipped]"
+    room = cap - 24
+    if keep == "tail":
+        return f"…[{len(text) - room} chars clipped]\n" + text[-room:]
+    return text[:room] + f"\n…[{len(text) - room} chars clipped]"
 
 
 def scan(text: str) -> list[Block]:
