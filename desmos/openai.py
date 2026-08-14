@@ -26,6 +26,24 @@ from typing import Any, Callable, Iterable
 from desmos import auth
 from desmos.complete import COMPACT_BLOCK, iter_sse_lines, log_payload
 
+# The ABI was written for a model that emits XML in prose. A Responses model
+# defaults to assuming it has real function tools, so without this it narrates
+# a shell command it never ran and then reports the output it imagined. Blunt
+# on purpose: measured, the ABI alone produced a hallucinated result, and this
+# paragraph produced the tag.
+CONTRACT = """
+
+# how you act here
+
+You have no built-in tools. The only way to make anything happen is to write
+the XML syscall in your reply, exactly as documented above, and then stop
+generating. The harness runs it and sends the output back as the next message.
+
+Never describe a command as done, and never state its output, unless that
+output arrived in a result you were given. If you have not emitted the tag
+yet, you have not run anything.
+"""
+
 API_URL = "https://api.openai.com/v1/responses"
 CHATGPT_URL = "https://chatgpt.com/backend-api/codex/responses"
 COMPACT_URL = "https://api.openai.com/v1/responses/compact"
@@ -129,7 +147,7 @@ def payload_for(
         "model": model,
         # The system prompt is instructions, not the first input item. Put it in
         # input and it becomes a turn the model can compact away.
-        "instructions": system,
+        "instructions": system + CONTRACT,
         "input": to_input(messages),
         "stream": True,
         "store": False,

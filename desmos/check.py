@@ -1119,7 +1119,9 @@ def self_check() -> None:
 
         body = _oai.payload_for("gpt-5.6-sol", "SYS", [{"role": "user", "content": "hi"}], 4096,
                                 thinking="xhigh", compact_threshold=250000, cache_key="k1")
-        assert body["instructions"] == "SYS" and body["store"] is False
+        assert body["instructions"].startswith("SYS") and body["store"] is False
+        # the ABI alone let the model narrate a command it never ran
+        assert "you have not run anything" in body["instructions"].lower()
         assert body["reasoning"] == {"effort": "xhigh", "summary": "auto"}
         assert body["include"] == ["reasoning.encrypted_content"]
         assert body["context_management"] == [{"type": "compaction", "compact_threshold": 250000}]
