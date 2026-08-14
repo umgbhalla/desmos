@@ -3799,10 +3799,10 @@ fn meter_row(
 
 /// Draw chunks in the order they occur.
 ///
-/// `segment_bar_spans` sorts everything into a few buckets and gives each one
-/// contiguous block: that answers how much, and destroys where. This keeps the
-/// order, sampling the run at the midpoint of every cell, so a fat chunk late
-/// in the trajectory shows up late in the bar.
+/// Sorting chunks into buckets and giving each one contiguous block answers
+/// how much and destroys where. This keeps the order, sampling the run at the
+/// midpoint of every cell, so a fat chunk late in the trajectory shows up late
+/// in the bar. That is what replaced the bucketed bar, and why.
 fn sequence_bar_spans(
     width: u16,
     chunks: &[(u64, ratatui::style::Color)],
