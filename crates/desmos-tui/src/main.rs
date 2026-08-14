@@ -1019,6 +1019,43 @@ impl CacheMeter {
         // the sequence and the percentages can never describe different
         // requests.
         let mut chunks: Vec<(u64, u8)> = Vec::new();
+
+        // OpenAI Responses calls use `instructions` and `input`, not the
+        // Anthropic-shaped `system` and `messages`. Without this branch the
+        // OpenAI context bar had no role chunks at all.
+        if request.get("instructions").is_some() || request.get("input").is_some() {
+            if let Some(instructions) = request.get("instructions") {
+                chunks.push((instructions.to_string().len() as u64, 0));
+            }
+            if let Some(items) = request.get("input").and_then(Value::as_array) {
+                for item in items {
+                    let item_type = item.get("type").and_then(Value::as_str).unwrap_or("");
+                    let item_len = item.to_string().len() as u64;
+                    let kind = match item_type {
+                        "reasoning" => 3,
+                        "function_call" | "function_call_output"
+                        | "custom_tool_call" | "custom_tool_call_output" => 2,
+                        "message" => match item.get("role").and_then(Value::as_str) {
+                            Some("user") => {
+                                if item.to_string().contains("<result") { 2 } else { 1 }
+                            }
+                            Some("assistant") => 4,
+                            _ => 0,
+                        },
+                        _ => 0,
+                    };
+                    chunks.push((item_len, kind));
+                }
+            }
+            let mut split = [0u64; 5];
+            for (len, kind) in &chunks {
+                split[*kind as usize] += *len;
+            }
+            self.roles = split;
+            self.chunks = chunks;
+            return;
+        }
+
         if let Some(sys) = request.get("system") {
             chunks.push((sys.to_string().len() as u64, 0));
         }
@@ -6264,6 +6301,58 @@ mod tests {
             from_chunks[*kind as usize] += *len;
         }
         assert_eq!(from_chunks, m.roles, "totals disagree with the sequence");
+    }
+
+    #[test]
+    fn openai_responses_roles_are_not_empty() {
+        let mut m = CacheMeter::default();
+        m.observe_roles(&json!({
+            "instructions": "system and catalog",
+            "input": [
+                {"type": "message", "role": "user",
+                 "content": [{"type": "input_text", "text": "typed"}]},
+                {"type": "function_call_output", "call_id": "c", "output": "<result>tool</result>"},
+                {"type": "reasoning", "summary": [], "encrypted_content": "opaque"},
+                {"type": "message", "role": "assistant",
+                 "content": [{"type": "output_text", "text": "answer"}]}
+            ]
+        }));
+        assert!(m.roles[0] > 0, "instructions slot empty: {:?}", m.roles);
+        assert!(m.roles[1] > 0, "prompt slot empty: {:?}", m.roles);
+        assert!(m.roles[2] > 0, "tool slot empty: {:?}", m.roles);
+        assert!(m.roles[3] > 0, "reasoning slot empty: {:?}", m.roles);
+        assert!(m.roles[4] > 0, "speech slot empty: {:?}", m.roles);
+        assert_eq!(m.chunks.len(), 5, "one chunk per Responses item: {:?}", m.chunks);
+    }
+
+    #[test]
+    fn complete_event_records_openai_response_roles() {
+        let mut app = App::new();
+        handle_event(
+            &mut app,
+            json!({
+                "ev": "complete",
+                "n": 1,
+                "model": "gpt-5.6-luna",
+                "usage": {"input_tokens": 100},
+                "request": {
+                    "instructions": "system",
+                    "input": [
+                        {"type": "message", "role": "user",
+                         "content": [{"type": "input_text", "text": "prompt"}]},
+                        {"type": "reasoning", "encrypted_content": "opaque"},
+                        {"type": "message", "role": "assistant",
+                         "content": [{"type": "output_text", "text": "answer"}]}
+                    ]
+                },
+                "response": {}
+            }),
+        );
+        assert!(app.cache.roles[0] > 0, "system was not recorded");
+        assert!(app.cache.roles[1] > 0, "prompt was not recorded");
+        assert!(app.cache.roles[3] > 0, "reasoning was not recorded");
+        assert!(app.cache.roles[4] > 0, "speech was not recorded");
+        assert!(!app.cache.chunks.is_empty(), "event path recorded no chunks");
     }
 
     #[test]
