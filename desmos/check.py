@@ -153,6 +153,29 @@ def self_check() -> None:
         # The factual half is shared; only the register changes.
         assert capabilities() in system_prompt(world)
 
+        # Cross-provider round trip. Switching to OpenAI and back used to brick
+        # the session: openai.py puts its item id in "signature" as a provenance
+        # marker, wire_content saw a truthy signature and replayed it, and
+        # Anthropic answered 400 "Invalid `signature` in `thinking` block".
+        # Found by switching providers mid-session in a live TUI, not by reading.
+        from desmos.complete import wire_content as _wire
+
+        oai_turn = [
+            {"type": "thinking", "thinking": "pondered", "signature": "rs_abc123", "openai": {"type": "reasoning"}},
+            {"type": "text", "text": "said out loud", "openai": {"type": "message"}},
+            {"type": "compaction", "summary": "folded by openai", "openai": {"type": "compaction"}},
+        ]
+        replayed = _wire(oai_turn)
+        assert all(b.get("type") != "compaction" for b in replayed), replayed
+        assert not any("openai" in b for b in replayed), "no foreign field may reach the wire"
+        for b in replayed:
+            assert b.get("type") != "thinking", "a foreign thought must not replay as thinking"
+            assert "signature" not in b, b
+        assert any(b["type"] == "text" and b["text"] == "said out loud" for b in replayed), replayed
+        # Our own signed thought still replays -- the fix must not cost that.
+        ours = _wire([{"type": "thinking", "thinking": "mine", "signature": "sig"}])
+        assert ours == [{"type": "thinking", "thinking": "mine", "signature": "sig"}], ours
+
         assert "<edit" in ABI
         assert "<reload_sdk" in ABI
         assert "XML tags are syscalls" in ABI

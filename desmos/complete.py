@@ -96,9 +96,20 @@ def wire_content(content: Any) -> list[dict[str, Any]]:
         if not isinstance(raw, dict):
             continue
         kind = raw.get("type")
+        # A block another provider produced. openai.py stamps every one of its
+        # blocks with the raw item under "openai", and it puts that item's id in
+        # "signature" as a provenance marker -- not as an Anthropic thinking
+        # signature. Replaying one here is a hard 400 ("Invalid `signature` in
+        # `thinking` block"), which bricks any session that switched to OpenAI
+        # and back. Speech still replays; the provider-shaped parts do not.
+        foreign = raw.get("openai") is not None
         if kind == "thinking":
             text = raw.get("thinking") or ""
             signature = raw.get("signature") or ""
+            if foreign:
+                if text.strip():
+                    blocks.append({"type": "text", "text": text})
+                continue
             if raw.get("redacted") and (raw.get("data") or signature):
                 blocks.append({"type": "redacted_thinking", "data": raw.get("data") or signature})
                 continue
@@ -116,7 +127,10 @@ def wire_content(content: Any) -> list[dict[str, Any]]:
             # it folded; drop it on the way back out and the next request
             # carries no cut point, so the fold silently un-does itself and the
             # transcript grows again with nothing on screen to say why.
-            blocks.append(dict(raw))
+            # A fold another provider made is not a cut point here, though --
+            # it names turns this endpoint never folded.
+            if not foreign:
+                blocks.append(dict(raw))
         elif kind == "text":
             text = raw.get("text") or ""
             if text:
