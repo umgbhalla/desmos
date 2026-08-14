@@ -322,6 +322,21 @@ def headers_for(cred: auth.Credential) -> tuple[str, dict[str, str]]:
     return API_URL, base
 
 
+def unsupported_field(detail: str) -> str | None:
+    """The parameter name in an 'Unsupported parameter: x' style 400, if any."""
+    import re
+
+    for pat in (
+        r"[Uu]nsupported parameter:?\s*'?([A-Za-z0-9_.]+)",
+        r"[Uu]nknown parameter:?\s*'?([A-Za-z0-9_.]+)",
+        r"[Uu]nrecognized (?:request )?argument:?\s*'?([A-Za-z0-9_.]+)",
+    ):
+        m = re.search(pat, detail)
+        if m:
+            return m.group(1).split(".")[0]
+    return None
+
+
 def complete(
     model: str,
     system: str,
@@ -346,7 +361,8 @@ def complete(
         cache_key=cache_key,
     )
     log_payload(body, [])
-    for attempt in range(2):
+    dropped: list[str] = []
+    for _ in range(6):
         req = urllib.request.Request(url, data=json.dumps(body).encode(), headers=headers, method="POST")
         try:
             with urllib.request.urlopen(req, timeout=300) as resp:
@@ -355,13 +371,19 @@ def complete(
                 )
         except urllib.error.HTTPError as e:
             detail = e.read().decode("utf-8", "replace")
-            # This endpoint set changes under us. One retry without the newest
-            # field beats a dead session; anything else is a real error.
-            if attempt == 0 and e.code == 400 and "context_management" in detail:
-                body.pop("context_management", None)
+            # The two endpoints do not accept the same body -- the Codex backend
+            # rejects max_output_tokens, for one -- and the accepted set moves.
+            # Drop exactly the field it names and try again; a session that
+            # keeps working beats a correct-looking request that 400s.
+            field = unsupported_field(detail)
+            if e.code == 400 and field and field in body:
+                body.pop(field, None)
+                dropped.append(field)
+                log_payload(body, [])
                 continue
-            raise RuntimeError(f"OpenAI HTTP {e.code}: {detail[:2000]}") from e
-    raise RuntimeError("OpenAI request failed")
+            note = f" (dropped {', '.join(dropped)})" if dropped else ""
+            raise RuntimeError(f"OpenAI HTTP {e.code}{note}: {detail[:2000]}") from e
+    raise RuntimeError(f"OpenAI kept rejecting fields: dropped {', '.join(dropped)}")
 
 
 def compact_window(model: str, items: list[dict[str, Any]], *, instructions: str = "") -> list[dict[str, Any]]:

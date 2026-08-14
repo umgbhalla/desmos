@@ -33,6 +33,7 @@
 //! front runs. Empty Enter is send-now (stop + fire the front).
 
 mod json_tree;
+mod picker;
 mod prompt;
 mod queue;
 mod side;
@@ -887,6 +888,8 @@ struct App {
     post_req: Value,
     post_resp: Value,
     post_inspect: Option<PostInspect>,
+    /// Onboarding / settings overlay. Modal when open.
+    picker: picker::Picker,
     story_scratch: ScratchBuffer,
     calls_scratch: ScratchBuffer,
     story_sel: ResolvedSelectionModel,
@@ -1149,6 +1152,7 @@ impl App {
             post_req: json!({}),
             post_resp: json!({}),
             post_inspect: None,
+            picker: picker::Picker::default(),
             story_scratch: ScratchBuffer::new(),
             calls_scratch: ScratchBuffer::new(),
             story_sel: ResolvedSelectionModel::default(),
@@ -1995,7 +1999,15 @@ fn handle_child(app: &mut App, ev: &Value) {
 fn handle_event(app: &mut App, ev: Value) {
     let kind = ev.get("ev").and_then(Value::as_str).unwrap_or("");
     match kind {
+        "picker" => app.picker.observe(&ev),
+        "login" => {
+            let text = ev.get("text").and_then(Value::as_str).unwrap_or("");
+            let done = ev.get("done").and_then(Value::as_bool).unwrap_or(false)
+                || ev.get("failed").and_then(Value::as_bool).unwrap_or(false);
+            app.picker.login_line(text, done);
+        }
         "ready" | "snapshot" => {
+            app.picker.observe(&ev);
             if let Some(s) = ev.get("model").and_then(Value::as_str) {
                 app.model = s.into();
             }
@@ -2138,6 +2150,31 @@ fn on_ctrl_c(bridge: Option<&mut Bridge>, app: &mut App) -> io::Result<bool> {
     Ok(true)
 }
 
+/// Turn a picker decision into a bridge op. The picker never sends anything
+/// itself; this is the only place a choice becomes a request.
+fn apply_picker(
+    mut bridge: Option<&mut Bridge>,
+    app: &mut App,
+    action: picker::PickerAction,
+) -> io::Result<bool> {
+    match action {
+        picker::PickerAction::None | picker::PickerAction::Close => {}
+        picker::PickerAction::Login { .. } => {
+            if let Some(b) = bridge.as_mut() {
+                b.send(&json!({"op": "login", "method": "auto"}))?;
+            }
+        }
+        picker::PickerAction::Apply { model, effort } => {
+            if let Some(b) = bridge.as_mut() {
+                b.send(&json!({"op": "model", "model": model, "effort": effort}))?;
+            }
+            app.model = model;
+            app.thinking = effort;
+        }
+    }
+    Ok(false)
+}
+
 fn handle_key(
     mut bridge: Option<&mut Bridge>,
     app: &mut App,
@@ -2145,6 +2182,16 @@ fn handle_key(
 ) -> io::Result<bool> {
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
         return on_ctrl_c(bridge.as_deref_mut(), app);
+    }
+    // The picker is modal on purpose. On a fresh machine there is no session
+    // behind it to type into, so it has to win before any pane sees the key.
+    if app.picker.open {
+        let action = app.picker.key(key.code);
+        return apply_picker(bridge.as_deref_mut(), app, action);
+    }
+    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('p') {
+        app.picker.open_for_change();
+        return Ok(false);
     }
     // ctrl+g / ctrl+b open the side panes from anywhere, including the input
     // box: a pane you have to tab to before you can open is a pane nobody
@@ -3939,6 +3986,13 @@ fn draw(f: &mut Frame, app: &mut App) {
     if app.viewer.is_some() {
         draw_viewer(f, app);
     }
+    // Last, so it covers everything: on a fresh machine there is no session
+    // behind it, and when reopened it is the only thing being interacted with.
+    if app.picker.open {
+        let area = f.area();
+        let buf = f.buffer_mut();
+        app.picker.render(buf, area);
+    }
 }
 
 fn draw_json_tree(
@@ -5514,6 +5568,96 @@ fn format_usage(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn the_picker_opens_from_a_real_ready_event() {
+        let mut app = App::new();
+        handle_event(
+            &mut app,
+            serde_json::json!({
+                "ev": "ready",
+                "model": "claude-opus-5",
+                "thinking": "low",
+                "onboarding": true,
+                "current": serde_json::Value::Null,
+                "providers": [
+                    {"provider": "anthropic", "ok": true, "plan": "", "can_login": false,
+                     "models": ["claude-opus-5"], "efforts": ["low", "high", "xhigh"]},
+                    {"provider": "openai", "ok": false, "detail": "no credential", "can_login": true,
+                     "models": ["gpt-5.6-sol", "gpt-5.6-luna"], "efforts": ["low", "high", "xhigh"]}
+                ]
+            }),
+        );
+        assert!(app.picker.open, "a fresh machine must land on the picker");
+        let rows = app.picker.lines().join("\n");
+        assert!(rows.contains("anthropic"), "{rows}");
+        assert!(rows.contains("enter to sign in"), "unauthed provider must offer login:\n{rows}");
+
+        // an unauthed provider cannot be chosen: enter starts a login instead
+        app.picker.sel = 1;
+        assert_eq!(
+            app.picker.key(KeyCode::Enter),
+            picker::PickerAction::Login { provider: "openai".into() }
+        );
+        assert!(app.picker.open, "login must not close the picker");
+
+        // signing in arrives as a picker event, and then the provider is usable
+        handle_event(
+            &mut app,
+            serde_json::json!({
+                "ev": "picker",
+                "onboarding": true,
+                "current": serde_json::Value::Null,
+                "providers": [
+                    {"provider": "anthropic", "ok": true, "can_login": false,
+                     "models": ["claude-opus-5"], "efforts": ["low", "high", "xhigh"]},
+                    {"provider": "openai", "ok": true, "plan": "pro", "can_login": true,
+                     "models": ["gpt-5.6-sol", "gpt-5.6-luna"], "efforts": ["low", "high", "xhigh"]}
+                ]
+            }),
+        );
+        app.picker.sel = 1;
+        assert_eq!(app.picker.key(KeyCode::Enter), picker::PickerAction::None);
+        assert_eq!(app.picker.stage, picker::Stage::Model);
+        app.picker.key(KeyCode::Char('j')); // luna
+        app.picker.key(KeyCode::Enter);
+        assert_eq!(app.picker.stage, picker::Stage::Effort);
+        app.picker.key(KeyCode::Char('k')); // wrap to xhigh
+        let done = app.picker.key(KeyCode::Enter);
+        assert_eq!(
+            done,
+            picker::PickerAction::Apply { model: "gpt-5.6-luna".into(), effort: "xhigh".into() }
+        );
+        assert!(!app.picker.open, "choosing an effort closes the picker");
+    }
+
+    #[test]
+    fn a_configured_session_does_not_reopen_the_picker() {
+        let mut app = App::new();
+        handle_event(
+            &mut app,
+            serde_json::json!({
+                "ev": "ready",
+                "model": "gpt-5.6-sol",
+                "onboarding": false,
+                "current": {"provider": "openai", "model": "gpt-5.6-sol", "effort": "high"},
+                "providers": [
+                    {"provider": "anthropic", "ok": true, "can_login": false,
+                     "models": ["claude-opus-5"], "efforts": ["low", "high", "xhigh"]},
+                    {"provider": "openai", "ok": true, "can_login": true,
+                     "models": ["gpt-5.6-sol", "gpt-5.6-luna"], "efforts": ["low", "high", "xhigh"]}
+                ]
+            }),
+        );
+        assert!(!app.picker.open, "a configured session boots straight into the chat");
+        // ...and reopening points at what is already in use
+        app.picker.open_for_change();
+        assert_eq!(app.picker.current_provider().unwrap().name, "openai");
+        assert_eq!(app.picker.effort_idx, 1);
+        assert_eq!(app.picker.key(KeyCode::Esc), picker::PickerAction::Close);
+        assert!(!app.picker.open);
+    }
+
     use super::*;
     use ratatui::backend::TestBackend;
     use xai_grok_pager::glyphs;
