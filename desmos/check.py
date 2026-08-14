@@ -121,6 +121,14 @@ def self_check() -> None:
         assert payload["thinking"] == {"type": "adaptive", "display": "summarized"}
         assert payload["output_config"] == {"effort": "low"}
         assert payload["_betas"] == []
+        # Without these the model keeps writing past its own syscall and
+        # invents the reply to it, then reasons from the invention. Both
+        # markers are anchored to a line start so prose can still name them.
+        stops = payload["stop_sequences"]
+        assert len(stops) == 2, stops
+        assert all(x.startswith("\n") for x in stops), stops
+        assert any("res" in x for x in stops), stops
+        assert any("user" in x for x in stops), stops
         replay = cached_payload(
             "claude-opus-5",
             ABI + "\n\n# tools\nx",

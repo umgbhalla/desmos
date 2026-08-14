@@ -200,6 +200,14 @@ def cached_payload(
         "max_tokens": max_tokens,
         "system": sys_blocks,
         "messages": msgs,
+        # A turn is over the moment the model hands back a syscall. Left to
+        # run, it keeps writing -- and what it writes next is the reply to its
+        # own call: an invented result block, then conclusions drawn from the
+        # invention. Measured on one session, 67% of assistant output was
+        # self-written transcript, and every false commit hash and phantom test
+        # count came from reading that back as fact. These cut generation at
+        # the moment it starts impersonating the harness.
+        "stop_sequences": ["\n<result", "\nuser<"],
     }
     payload["_betas"] = apply_thinking(payload, model, thinking)
     return payload
