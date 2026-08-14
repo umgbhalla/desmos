@@ -274,6 +274,11 @@ def run_turns(
     def stopped() -> bool:
         return should_stop is not None and should_stop()
 
+    # Hand the channel to the world so a tag handler can address the user
+    # directly. Without this the only way to say anything is speech, and speech
+    # is interleaved with every working note the model makes on the way.
+    world.emit = emit
+
     world.messages.append({"role": "user", "content": header(world, prompt) + "\n\n" + prompt})
     last = ""
     for n in range(1, max_turns + 1):

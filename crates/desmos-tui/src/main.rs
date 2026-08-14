@@ -1800,6 +1800,19 @@ fn handle_event(app: &mut App, ev: Value) {
             app.status = "idle".into();
             app.drain_after = app.send_now && !app.queue.is_empty();
         }
+        // A message addressed to the reader rather than thought out loud.
+        // Speech is interleaved with every working note a turn produces; this
+        // is the channel that survives that noise.
+        "say" => {
+            app.stream.finish(&mut app.story);
+            let t = ev.get("text").and_then(Value::as_str).unwrap_or("");
+            let mark = match ev.get("level").and_then(Value::as_str) {
+                Some("warn") => "\u{25b2}",
+                Some("done") => "\u{2713}",
+                _ => "\u{25c6}",
+            };
+            app.story_push(RenderBlock::system(format!("{mark} {t}")));
+        }
         "error" => {
             app.stream.finish(&mut app.story);
             finish_exec(&mut app.calls, &mut app.exec);
@@ -5061,6 +5074,37 @@ mod tests {
         let mut term = Terminal::new(backend).unwrap();
         term.draw(|f| draw(f, app)).unwrap();
         buffer_text(&term)
+    }
+
+    #[test]
+    fn a_say_event_lands_in_the_story_not_the_wire() {
+        let mut app = App::new();
+        app.ready = true;
+        let before = app.calls.len();
+        handle_event(
+            &mut app,
+            json!({"ev": "say", "text": "meter rebuilt, 104 tests green", "level": "done"}),
+        );
+        let text = paint(&mut app, 110, 26);
+        assert!(
+            text.contains("meter rebuilt"),
+            "say never reached the story:\n{text}"
+        );
+        assert_eq!(app.calls.len(), before, "say should not push a wire card");
+    }
+
+    #[test]
+    fn a_say_level_picks_its_own_mark() {
+        for (level, mark) in [("warn", '\u{25b2}'), ("done", '\u{2713}'), ("note", '\u{25c6}')] {
+            let mut app = App::new();
+            app.ready = true;
+            handle_event(&mut app, json!({"ev": "say", "text": "MARKME", "level": level}));
+            let text = paint(&mut app, 110, 26);
+            assert!(
+                text.contains(mark),
+                "level {level:?} missing its mark {mark:?}:\n{text}"
+            );
+        }
     }
 
     #[test]
