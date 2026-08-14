@@ -14,9 +14,12 @@ from desmos.loop import new_world, reload, reload_sdk, reset_transcript, run_tur
 
 
 def _snapshot(world: Any) -> dict[str, Any]:
+    from desmos.settings import provider_of
+
     return {
         "ev": "snapshot",
         "model": world.model,
+        "provider": provider_of(world.model),
         "thinking": world.thinking,
         "generation": world.generation,
         "cwd": str(world.cwd),
@@ -42,6 +45,13 @@ def _emit(ev: dict[str, Any]) -> None:
 
 def serve(cwd: Path) -> int:
     world = new_world(cwd)
+    from desmos.settings import load as _load_settings
+
+    saved = _load_settings()
+    if saved is not None:
+        # A saved choice outranks whatever the last session persisted; it is the
+        # one the user made on purpose.
+        world.model, world.thinking = saved.model, saved.effort
     import desmos.subagent as S
 
     S.bind(world)
@@ -74,7 +84,13 @@ def serve(cwd: Path) -> int:
         inbox.put(None)
 
     threading.Thread(target=reader, daemon=True).start()
-    _emit({"ev": "ready", **{k: v for k, v in _snapshot(world).items() if k != "ev"}})
+    from desmos.settings import picker as _picker
+
+    _emit({
+        "ev": "ready",
+        **{k: v for k, v in _snapshot(world).items() if k != "ev"},
+        **_picker(),
+    })
     while True:
         msg = inbox.get()
         if msg is None:
@@ -99,6 +115,47 @@ def serve(cwd: Path) -> int:
                 _emit({"ev": "speech", "text": reload_sdk(world)})
                 _emit({"ev": "speech", "text": reload(world)})
                 _emit(_snapshot(world))
+            elif op == "model":
+                from desmos import settings as _settings
+
+                model = str(msg.get("model") or world.model)
+                effort = str(msg.get("effort") or world.thinking)
+                choice = _settings.Settings(
+                    provider=_settings.provider_of(model), model=model, effort=effort
+                )
+                if not choice.valid():
+                    _emit({"ev": "error", "text": f"unknown model/effort: {model} {effort}"})
+                    continue
+                if not _settings.usable(choice.provider):
+                    _emit({"ev": "error", "text": f"{choice.provider} has no usable credential"})
+                    continue
+                world.model, world.thinking = choice.model, choice.effort
+                _settings.save(choice)
+                _emit(_snapshot(world))
+            elif op == "picker":
+                from desmos.settings import picker
+
+                _emit({"ev": "picker", **picker()})
+            elif op == "login":
+                from desmos import auth as _auth
+                from desmos.settings import picker
+
+                method = str(msg.get("method") or "auto")
+
+                def do_login(method: str = method) -> None:
+                    # Blocking, and it waits on a human. Off the inbox thread so
+                    # the TUI keeps painting; progress lines are the only way the
+                    # user learns which URL to open.
+                    try:
+                        cred = _auth.login_openai(
+                            notify=lambda t: _emit({"ev": "login", "text": t}), method=method
+                        )
+                        _emit({"ev": "login", "text": f"signed in {cred.masked()}", "done": True})
+                    except Exception as exc:  # noqa: BLE001
+                        _emit({"ev": "login", "text": f"{type(exc).__name__}: {exc}", "failed": True})
+                    _emit({"ev": "picker", **picker()})
+
+                threading.Thread(target=do_login, daemon=True).start()
             elif op == "thinking":
                 level = str(msg.get("level") or "low").strip()
                 world.thinking = level

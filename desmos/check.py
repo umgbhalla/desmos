@@ -927,6 +927,58 @@ def self_check() -> None:
 
 
 
+
+        # --- bridge: the picker and the model op, driven as a real subprocess ---
+        import subprocess as _sp
+        import sys
+
+        bridge_env = dict(os.environ)
+        bridge_env["DESMOS_SETTINGS"] = str(cwd / "settings.json")
+        bridge_env["PYTHONPATH"] = str(Path(__file__).resolve().parent.parent)
+        (cwd / "bridgecwd").mkdir(exist_ok=True)
+        proc = _sp.Popen(
+            [sys.executable, "-m", "desmos", "bridge", "--cwd", str(cwd / "bridgecwd")],
+            stdin=_sp.PIPE, stdout=_sp.PIPE, stderr=_sp.PIPE, text=True, env=bridge_env,
+        )
+        try:
+            ready = json.loads(proc.stdout.readline())
+            assert ready["ev"] == "ready", ready
+            assert ready["onboarding"] is True and ready["current"] is None, ready
+            names = [p["provider"] for p in ready["providers"]]
+            assert names == ["anthropic", "openai"], names
+            oai = next(p for p in ready["providers"] if p["provider"] == "openai")
+            assert "gpt-5.6-sol" in oai["models"] and oai["efforts"] == ["low", "high", "xhigh"]
+            assert oai["can_login"] is True
+            assert ready["provider"] in ("anthropic", "openai")
+
+            proc.stdin.write(json.dumps({"op": "model", "model": "gpt-5.6-luna", "effort": "xhigh"}) + "\n")
+            proc.stdin.flush()
+            snap = json.loads(proc.stdout.readline())
+            assert snap["ev"] == "snapshot" and snap["model"] == "gpt-5.6-luna", snap
+            assert snap["provider"] == "openai" and snap["thinking"] == "xhigh", snap
+            saved = json.loads((cwd / "settings.json").read_text())
+            assert saved == {"provider": "openai", "model": "gpt-5.6-luna", "effort": "xhigh"}, saved
+
+            proc.stdin.write(json.dumps({"op": "model", "model": "gpt-9-nope"}) + "\n")
+            proc.stdin.flush()
+            bad = json.loads(proc.stdout.readline())
+            assert bad["ev"] == "error" and "gpt-9-nope" in bad["text"], bad
+
+            proc.stdin.write(json.dumps({"op": "picker"}) + "\n")
+            proc.stdin.flush()
+            pick = json.loads(proc.stdout.readline())
+            assert pick["ev"] == "picker" and pick["onboarding"] is False, pick
+            assert pick["current"]["model"] == "gpt-5.6-luna", pick
+        finally:
+            proc.stdin.write(json.dumps({"op": "quit"}) + "\n")
+            proc.stdin.flush()
+            proc.wait(timeout=20)
+
+        from desmos import settings as _st
+
+        assert _st.provider_of("gpt-5.6-sol") == "openai"
+        assert _st.provider_of("claude-opus-5") == "anthropic"
+
         # --- device login: the poll loop, driven with no network and no sleeping ---
         calls: list = []
         replies = [
