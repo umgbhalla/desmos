@@ -33,6 +33,50 @@ def _fake_id_token(*, plan: str, account: str, ttl: int = 3600) -> str:
     return f"{head}.{body}.sig-not-checked"
 
 
+def _check_path_deps_tracked() -> None:
+    """Every `path = ` dep in the root Cargo.toml is committed.
+
+    vendor/grok-build is in the repo so a clone builds without fetching
+    anything. That guarantee is one .gitignore line from being false, and it
+    fails silently: `cargo build` works here because the files are on disk, and
+    breaks only for whoever clones next. It already happened once -- a bare
+    `build/` in a global gitignore swallowed crates/build/xai-proto-build.
+
+    Asks git what is tracked rather than what exists, because the whole failure
+    mode is a file that exists locally and is not in the repo.
+    """
+    import re
+    import subprocess
+
+    root = Path(__file__).resolve().parent.parent
+    manifest = root / "Cargo.toml"
+    if not manifest.exists() or not (root / ".git").exists():
+        return
+
+    deps = {m for m in re.findall(r'path\s*=\s*"([^"]+)"', manifest.read_text())}
+    missing = []
+    for rel in sorted(deps):
+        target = (root / rel / "Cargo.toml").resolve()
+        if not target.exists():
+            missing.append(f"{rel}/Cargo.toml does not exist")
+            continue
+        tracked = subprocess.run(
+            ["git", "-C", str(root), "ls-files", "--error-unmatch", str(target)],
+            capture_output=True, check=False,
+        )
+        if tracked.returncode != 0:
+            why = subprocess.run(
+                ["git", "-C", str(root), "check-ignore", "-v", str(target)],
+                capture_output=True, text=True, check=False,
+            ).stdout.strip()
+            missing.append(f"{rel} is not committed" + (f" ({why})" if why else ""))
+
+    assert not missing, (
+        "root Cargo.toml points at crates a fresh clone will not have:\n  "
+        + "\n  ".join(missing)
+    )
+
+
 def _check_vendor_patch() -> None:
     """The vendored pager still carries our DESMOS_ACP branch.
 
@@ -1548,6 +1592,7 @@ def self_check() -> None:
         # go missing on a fresh clone. What can still go missing is the branch
         # itself, if a sync overwrites it -- and that is silent, because the
         # pager compiles either way and just runs grok's agent instead of ours.
+        _check_path_deps_tracked()
         _check_vendor_patch()
 
         try:

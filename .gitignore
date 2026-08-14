@@ -18,6 +18,13 @@ vendor/*
 vendor/grok-build/.git-upstream/
 vendor/grok-build/target/
 vendor/grok-build/**/target/
+# ~/.gitignore_global carries a bare `build/`, which matches
+# vendor/grok-build/crates/build/ -- the home of xai-proto-build, a workspace
+# member and a path dep of our root Cargo.toml. Committing the tree and then
+# dropping one crate is worse than not committing it: the repo looks
+# self-contained and a fresh clone still fails to build. A repo rule beats a
+# global one, so re-include the directory here.
+!vendor/grok-build/crates/build/
 
 # tooling caches
 .mypy_cache/
@@ -35,8 +42,13 @@ __pycache__/
 *.egg-info/
 .venv/
 venv/
-dist/
-build/
+# Root-anchored. Unanchored `build/` also matched
+# vendor/grok-build/crates/build/, which holds xai-proto-build -- a workspace
+# member and a path dep of our root Cargo.toml. That silently dropped one crate
+# out of a tree we had just committed to make a clone self-contained, and a
+# `!` rule cannot win it back: git never descends into an excluded directory.
+/dist/
+/build/
 
 .DS_Store
 .idea/
