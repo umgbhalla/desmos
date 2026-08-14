@@ -153,7 +153,16 @@ impl Picker {
         }
     }
 
-    pub fn open_for_change(&mut self) {
+    /// Open pointed at what is actually running.
+    ///
+    /// point_at only fires from observe(), and only for an event carrying a
+    /// `current` block -- ready and picker. A model switch emits a snapshot,
+    /// which has no such block, so the cursor kept whatever was last chosen
+    /// here: open it after `/model claude-opus-5` and it highlighted openai.
+    /// A selector that does not agree with the thing it selects is worse than
+    /// no selector, because it makes every choice feel like it did nothing.
+    pub fn open_for_change(&mut self, model: &str, effort: &str) {
+        self.point_at(model, effort);
         self.open = true;
         self.stage = Stage::Provider;
         self.sel = self.provider_idx;

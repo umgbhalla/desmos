@@ -1616,15 +1616,30 @@ fn grok_appearance() -> AppearanceConfig {
     // fallback: it zeroes the outer vertical pad and clamps the horizontal pad
     // to one cell. A pager.toml that asks for compact cannot un-ask.
     cfg.prompt.compact = true;
+    // `/dense` used to write a setting nothing read: every pad below was a
+    // constant, so the toggle changed a stored bool and not one cell of the
+    // screen. These are the knobs that actually cost rows and columns.
+    let dense = appearance_cache::load();
     // Two cells of pad on each side of every block, inside a pane that is a
     // third of the screen. One cell still separates content from the accent
-    // column, which is all the pad was doing.
-    cfg.scrollback.layout.block_pad_left = 1;
-    cfg.scrollback.layout.block_pad_right = 1;
+    // column, which is all the pad was doing -- and dense drops even that.
+    let pad = if dense { 0 } else { 1 };
+    cfg.scrollback.layout.block_pad_left = pad;
+    cfg.scrollback.layout.block_pad_right = pad;
+    cfg.scrollback.layout.outer_vpad = 0;
+    cfg.scrollback.layout.outer_hpad_left = pad;
+    cfg.scrollback.layout.outer_hpad_right = pad;
     // A blank row above and below every user prompt. The prompt already has an
     // accent column and a background tint; it does not also need two rows of
     // air, and it is the most frequent block in the story.
     cfg.scrollback.blocks.prompt.vpad = false;
+    // An edit card's blank rows are the other per-block pair, and they were
+    // never turned off at all.
+    cfg.scrollback.blocks.edit.vpad = !dense;
+    // A timeline gutter is a column on every row. Dense gives it back.
+    if dense {
+        cfg.show_timeline = false;
+    }
     // The turn-status row lives in a one-row band of its own, immediately above
     // the composer border. Its gap row would come out of the story.
     cfg.turn_status.gap = false;
@@ -2429,7 +2444,8 @@ fn handle_key(
         return apply_picker(bridge.as_deref_mut(), app, action);
     }
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('p') {
-        app.picker.open_for_change();
+        let (m, e) = (app.model.clone(), app.thinking.clone());
+        app.picker.open_for_change(&m, &e);
         return Ok(false);
     }
     // An open completion list is modal for the four keys it owns, and has to
@@ -3034,7 +3050,8 @@ fn submit_prompt(mut bridge: Option<&mut Bridge>, app: &mut App) -> io::Result<b
         // what they want.
         let want = rest.trim();
         if want.is_empty() {
-            app.picker.open_for_change();
+            let (m, e) = (app.model.clone(), app.thinking.clone());
+            app.picker.open_for_change(&m, &e);
         } else if let Some(b) = bridge.as_mut() {
             b.send(&json!({"op": "model", "model": want, "effort": app.thinking}))?;
             app.status = format!("model {want}");
@@ -6201,8 +6218,12 @@ mod tests {
             }),
         );
         assert!(!app.picker.open, "a configured session boots straight into the chat");
-        // ...and reopening points at what is already in use
-        app.picker.open_for_change();
+        // ...and reopening points at what is already in use. This is the whole
+        // contract: point_at only fires for an event carrying `current`, and a
+        // model switch emits a snapshot, which has none — so opening the picker
+        // used to highlight whatever was last chosen in it rather than what was
+        // running.
+        app.picker.open_for_change("gpt-5.6-sol", "high");
         assert_eq!(app.picker.current_provider().unwrap().name, "openai");
         assert_eq!(app.picker.effort_idx, 1);
         assert_eq!(app.picker.key(KeyCode::Esc), picker::PickerAction::Close);
@@ -8086,10 +8107,22 @@ mod tests {
     #[test]
     fn density_is_the_default_and_the_story_gets_the_rows() {
         // The single policy point: every pane's appearance comes from here.
+        // /dense used to write a setting nothing read: every pad here was a
+        // constant, so toggling it changed a stored bool and not one cell.
+        appearance_cache::set(false);
+        let roomy = grok_appearance();
+        appearance_cache::set(true);
         let cfg = grok_appearance();
         assert!(cfg.prompt.compact, "compact is the default, not a fallback");
-        assert_eq!(cfg.scrollback.layout.block_pad_left, 1);
-        assert_eq!(cfg.scrollback.layout.block_pad_right, 1);
+        assert!(
+            cfg.scrollback.layout.block_pad_left < roomy.scrollback.layout.block_pad_left,
+            "dense has to actually take a column back"
+        );
+        assert!(cfg.scrollback.layout.block_pad_right < roomy.scrollback.layout.block_pad_right);
+        assert!(
+            !cfg.scrollback.blocks.edit.vpad && roomy.scrollback.blocks.edit.vpad,
+            "and an edit card's blank rows, which were never toggled at all"
+        );
         assert!(!cfg.scrollback.blocks.prompt.vpad, "a prompt does not need two blank rows");
         assert!(!cfg.turn_status.gap);
 
