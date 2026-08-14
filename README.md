@@ -38,12 +38,13 @@ source .venv/bin/activate
 python -m desmos console          # IPython with step and world bound
 python -m desmos tui              # trajectory | calls | input  (needs cargo)
 python -m desmos tui --demo       # same layout, no API key
+python -m desmos tui --grok       # grok-build pager, desmos as ACP agent
 python -m desmos kernel           # install a Jupyter kernelspec named Desmos
 ```
 
-The TUI is grok-build's inline scaffold: finalized turns go into the
-terminal's native scrollback; status + `❯` stay pinned. `/thinking low`,
-`/reset`, `/reload`, esc quits.
+Default TUI: middle is the turn story, right is wire calls (`complete()` and
+syscalls, USER vs LLM). `--grok` launches grok-build's pager-bin (`--minimal
+--no-leader`) with `python -m desmos acp` on stdio.
 
 Ordinary cells stay Python. `step("...")` is the agent. Syscall results
 append as user-role `<result>` blocks on the same transcript (Pi-style).

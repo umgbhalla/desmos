@@ -248,6 +248,74 @@ def self_check() -> None:
         finally:
             C.TRAJECTORY_DIR = prev
 
+        import json
+        from io import StringIO
+
+        from desmos.acp import AcpServer, serve as acp_serve
+
+        acp_in = StringIO(
+            json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": 1}})
+            + "\n"
+            + json.dumps({"jsonrpc": "2.0", "id": 2, "method": "authenticate", "params": {"methodId": "none"}})
+            + "\n"
+            + json.dumps({"jsonrpc": "2.0", "id": 3, "method": "session/new", "params": {"cwd": str(cwd)}})
+            + "\n"
+            + json.dumps({"jsonrpc": "2.0", "id": 4, "method": "nope", "params": {}})
+            + "\n"
+        )
+        acp_out = StringIO()
+        assert acp_serve(acp_in, acp_out, cwd=cwd) == 0
+        acp_replies = [json.loads(line) for line in acp_out.getvalue().splitlines() if line.strip()]
+        assert [r.get("id") for r in acp_replies] == [1, 2, 3, 4]
+        init = acp_replies[0]["result"]
+        assert init["protocolVersion"] == 1
+        assert init["authMethods"][0]["id"] == "none"
+        assert init["agentCapabilities"]["loadSession"] is False
+        assert init["agentCapabilities"]["promptCapabilities"]["image"] is True
+        assert init["_meta"]["grokShell"] is False
+        assert acp_replies[1]["result"] == {}
+        assert acp_replies[2]["result"]["sessionId"]
+        assert acp_replies[3]["error"]["code"] == -32601
+
+        notes: list[dict] = []
+        acp = AcpServer(notes.append, default_cwd=cwd)
+        created = acp.handle({"jsonrpc": "2.0", "id": 10, "method": "session/new", "params": {"cwd": str(cwd)}})
+        assert created is not None
+        sid = created["result"]["sessionId"]
+
+        def fake_acp(_model, _system, messages, _max_tokens):
+            blob = json.dumps(messages)
+            if "<result" in blob:
+                return {"content": [{"type": "text", "text": "done"}], "usage": {}}
+            return {
+                "content": [
+                    {"type": "thinking", "thinking": "hmm", "signature": "sig"},
+                    {"type": "text", "text": "<python>1+1</python>"},
+                ],
+                "usage": {},
+            }
+
+        acp.sessions[sid].complete_fn = fake_acp
+        prompted = acp.handle({
+            "jsonrpc": "2.0",
+            "id": 11,
+            "method": "session/prompt",
+            "params": {
+                "sessionId": sid,
+                "prompt": [{"type": "text", "text": "add one"}],
+                "_meta": {"promptId": "p-check"},
+            },
+        })
+        assert prompted == {"jsonrpc": "2.0", "id": 11, "result": {"stopReason": "end_turn"}}
+        kinds = [n["params"]["update"]["sessionUpdate"] for n in notes if n.get("method") == "session/update"]
+        assert "agent_thought_chunk" in kinds
+        assert "agent_message_chunk" in kinds
+        assert "tool_call" in kinds
+        assert "tool_call_update" in kinds
+        assert all(n["params"].get("_meta", {}).get("promptId") == "p-check" for n in notes if n.get("method") == "session/update")
+        tool = next(n["params"]["update"] for n in notes if n.get("method") == "session/update" and n["params"]["update"]["sessionUpdate"] == "tool_call")
+        assert tool["title"] == "python" and tool["kind"] == "execute"
+
         try:
             from IPython.core.interactiveshell import InteractiveShell
         except ImportError:

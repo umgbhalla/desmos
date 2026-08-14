@@ -1,4 +1,4 @@
-"""desmos console / kernel / check / run."""
+"""desmos console / kernel / check / run / acp."""
 
 from __future__ import annotations
 
@@ -77,6 +77,14 @@ def cmd_bridge(args: argparse.Namespace) -> int:
     return serve(Path(args.cwd).resolve())
 
 
+def cmd_acp(_args: argparse.Namespace) -> int:
+    _on_path()
+    from desmos.acp import serve
+
+    cwd = Path(os.environ.get("DESMOS_CWD") or os.environ.get("PWD") or ".").resolve()
+    return serve(cwd=cwd)
+
+
 def cmd_tui(args: argparse.Namespace) -> int:
     _on_path()
     import shutil
@@ -84,21 +92,42 @@ def cmd_tui(args: argparse.Namespace) -> int:
 
     cargo = shutil.which("cargo")
     if cargo is None:
-        print("desmos tui needs rustc/cargo (the grok-build inline viewport is Rust)")
+        print("desmos tui needs cargo")
         return 1
     root = _repo_root()
-    manifest = root / "crates" / "desmos-tui" / "Cargo.toml"
+    cwd = str(Path(args.cwd).resolve())
+    if getattr(args, "grok", False):
+        grok = root / "vendor" / "grok-build"
+        if not grok.is_dir():
+            print("clone grok-build into vendor/grok-build")
+            return 1
+        env = os.environ.copy()
+        env["DESMOS_ACP"] = f"{sys.executable} -m desmos acp"
+        env["DESMOS_CWD"] = cwd
+        env["RUSTUP_TOOLCHAIN"] = "1.97.1"
+        cmd = [
+            cargo,
+            "run",
+            "-p",
+            "xai-grok-pager-bin",
+            "--",
+            "--minimal",
+            "--no-leader",
+            "--cwd",
+            cwd,
+        ]
+        return subprocess.call(cmd, cwd=str(grok), env=env)
     cmd = [
         cargo,
         "run",
         "--quiet",
         "--manifest-path",
-        str(manifest),
+        str(root / "crates" / "desmos-tui" / "Cargo.toml"),
         "--",
         "--python",
         sys.executable,
         "--cwd",
-        str(Path(args.cwd).resolve()),
+        cwd,
     ]
     if getattr(args, "demo", False):
         cmd.append("--demo")
@@ -132,10 +161,14 @@ def main() -> int:
     b.add_argument("--cwd", default=".")
     b.set_defaults(func=cmd_bridge)
 
-    t = sub.add_parser("tui", help="three-pane TUI: trajectory + calls + input")
+    t = sub.add_parser("tui", help="three-pane TUI: trajectory | calls | input")
     t.add_argument("--cwd", default=".")
     t.add_argument("--demo", action="store_true", help="seed a fake turn (no API)")
+    t.add_argument("--grok", action="store_true", help="launch grok-build pager via ACP instead")
     t.set_defaults(func=cmd_tui)
+
+    a = sub.add_parser("acp", help="ACP stdio server for grok-build's pager")
+    a.set_defaults(func=cmd_acp)
 
     args = p.parse_args()
     if args.cmd == "run" and not args.out:

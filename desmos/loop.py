@@ -132,6 +132,17 @@ def run_turns(
             print(f"\n===== turn {n} =====")
         speech, results, done, assistant = turn(world, world.messages, max_tokens)
         last = speech
+        usage = (world.log[-1].get("usage") if world.log else {}) or {}
+        emit(
+            {
+                "ev": "complete",
+                "n": n,
+                "origin": "user" if n == 1 else "llm",
+                "model": world.model,
+                "thinking": world.thinking,
+                "usage": usage,
+            }
+        )
         thoughts = thinking_text(assistant)
         if thoughts:
             emit({"ev": "thinking", "text": thoughts})
