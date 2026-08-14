@@ -86,6 +86,43 @@ def _text_of(content: Any) -> str:
     return "".join(parts)
 
 
+def _user_content(content: Any) -> list[dict[str, Any]]:
+    """Anthropic user blocks -> Responses input parts, images included.
+
+    An image arrives here in Anthropic's shape -- a source dict with a media
+    type and base64 -- because that is what vision.attach writes into the
+    transcript. Responses wants one flat `input_image` whose `image_url` is a
+    data URL, which is also the only shape the Codex backend accepts (it has
+    no `input_file` and no uploaded ids). Collapsing the whole message to text,
+    which is what this used to do, silently dropped every screenshot the
+    moment the session was on an OpenAI model.
+    """
+    if isinstance(content, str):
+        return [{"type": "input_text", "text": content}] if content.strip() else []
+    parts: list[dict[str, Any]] = []
+    for block in content if isinstance(content, list) else []:
+        if isinstance(block, str):
+            if block.strip():
+                parts.append({"type": "input_text", "text": block})
+            continue
+        if not isinstance(block, dict):
+            continue
+        kind = block.get("type")
+        if kind == "image":
+            src = block.get("source") or {}
+            if src.get("type") == "base64" and src.get("data"):
+                media = src.get("media_type") or "image/png"
+                parts.append(
+                    {"type": "input_image", "image_url": f"data:{media};base64,{src['data']}"}
+                )
+            elif src.get("url"):
+                parts.append({"type": "input_image", "image_url": src["url"]})
+            continue
+        if kind == "text" and isinstance(block.get("text"), str) and block["text"].strip():
+            parts.append({"type": "input_text", "text": block["text"]})
+    return parts
+
+
 def to_input(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Anthropic-shaped transcript -> Responses input array.
 
@@ -98,11 +135,9 @@ def to_input(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
         role = msg.get("role")
         content = msg.get("content")
         if role == "user":
-            text = _text_of(content)
-            if text:
-                items.append(
-                    {"type": "message", "role": "user", "content": [{"type": "input_text", "text": text}]}
-                )
+            parts = _user_content(content)
+            if parts:
+                items.append({"type": "message", "role": "user", "content": parts})
             continue
         if role != "assistant":
             continue

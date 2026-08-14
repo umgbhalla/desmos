@@ -1113,6 +1113,19 @@ def self_check() -> None:
         assert back[0]["content"][0]["type"] == "input_text"
         assert reasoning_item in back, back
         assert msg_item in back, back
+        # An attached screenshot has to survive the crossing. Anthropic's block
+        # shape goes in, Responses' flat data-URL input_image comes out -- the
+        # only image shape the Codex backend takes.
+        shot = _oai.to_input([{"role": "user", "content": [
+            {"type": "text", "text": "what is this"},
+            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AAAB"}},
+        ]}])
+        assert shot[0]["content"] == [
+            {"type": "input_text", "text": "what is this"},
+            {"type": "input_image", "image_url": "data:image/png;base64,AAAB"},
+        ], shot
+        assert _oai.to_input([{"role": "user", "content": "plain"}])[0]["content"][0]["text"] == "plain"
+
         # ...and a foreign thought (no provider item) degrades to speech, not a crash
         foreign = _oai.to_input([{"role": "assistant", "content": [{"type": "thinking", "thinking": "x"}]}])
         assert foreign[0]["content"][0]["text"] == "x"
