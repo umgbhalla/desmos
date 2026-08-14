@@ -1666,6 +1666,9 @@ fn handle_event(app: &mut App, ev: Value) {
             let thinking = ev.get("thinking").and_then(Value::as_str).unwrap_or("");
             let usage = ev.get("usage").cloned().unwrap_or(json!({}));
             app.cache.observe(&usage, model);
+            if let Some(req) = ev.get("request") {
+                app.cache.observe_roles(req);
+            }
             let thoughts = ev.get("thoughts").and_then(Value::as_u64).unwrap_or(0);
             let redacted = ev.get("redacted").and_then(Value::as_u64).unwrap_or(0);
             app.call_push(wire_complete(
@@ -3503,7 +3506,17 @@ fn pct(part: u64, total: u64) -> String {
 /// A bar split into proportional coloured runs. Any nonzero part gets at least
 /// one cell so a small slice never rounds away, and the widest run absorbs the
 /// remainder so the bar fills exactly `width`.
-fn segment_bar_spans(width: u16, parts: &[(u64, ratatui::style::Color)], bg: ratatui::style::Color) -> Vec<Span<'static>> {
+/// A bar split into coloured runs, one per part, sized by share of the total.
+///
+/// Largest-remainder allocation: floor every share, then hand the leftover
+/// cells to the parts with the biggest fractional loss. Floors can only
+/// undershoot, so the bar fills its width exactly and never overruns it — a
+/// three-part split in one cell paints one cell, not three.
+fn segment_bar_spans(
+    width: u16,
+    parts: &[(u64, ratatui::style::Color)],
+    bg: ratatui::style::Color,
+) -> Vec<Span<'static>> {
     let w = width as usize;
     if w == 0 {
         return Vec::new();
@@ -3512,37 +3525,39 @@ fn segment_bar_spans(width: u16, parts: &[(u64, ratatui::style::Color)], bg: rat
     if total == 0 {
         return vec![Span::styled("\u{2588}".repeat(w), Style::default().fg(bg))];
     }
-    let mut cells: Vec<usize> = parts
+    let exact: Vec<f64> = parts
         .iter()
-        .map(|(v, _)| ((*v as f64 / total as f64) * w as f64).floor() as usize)
+        .map(|(v, _)| *v as f64 / total as f64 * w as f64)
         .collect();
-    for (i, (v, _)) in parts.iter().enumerate() {
-        if *v > 0 && cells[i] == 0 {
-            cells[i] = 1;
-        }
+    let mut cells: Vec<usize> = exact.iter().map(|e| e.floor() as usize).collect();
+    let used: usize = cells.iter().sum();
+    let mut order: Vec<usize> = (0..parts.len()).collect();
+    order.sort_by(|&a, &b| {
+        let fa = exact[a] - exact[a].floor();
+        let fb = exact[b] - exact[b].floor();
+        fb.partial_cmp(&fa).unwrap_or(std::cmp::Ordering::Equal)
+    });
+    for i in order.into_iter().take(w - used) {
+        cells[i] += 1;
     }
-    let mut used: usize = cells.iter().sum();
-    while used > w {
-        let Some(i) = cells
+    // A slice that exists should be visible: give every non-zero part a cell,
+    // paid for out of the widest one. Only while someone has a cell to spare —
+    // at one cell wide, the majority keeps it and the rest go unpainted.
+    for i in 0..parts.len() {
+        if parts[i].0 == 0 || cells[i] > 0 {
+            continue;
+        }
+        let Some(donor) = cells
             .iter()
             .enumerate()
             .filter(|(_, c)| **c > 1)
             .max_by_key(|(_, c)| **c)
-            .map(|(i, _)| i)
+            .map(|(j, _)| j)
         else {
             break;
         };
-        cells[i] -= 1;
-        used -= 1;
-    }
-    if used < w
-        && let Some(i) = cells
-            .iter()
-            .enumerate()
-            .max_by_key(|(_, c)| **c)
-            .map(|(i, _)| i)
-    {
-        cells[i] += w - used;
+        cells[donor] -= 1;
+        cells[i] += 1;
     }
     parts
         .iter()
@@ -3609,9 +3624,33 @@ fn draw_meta(f: &mut Frame, area: Rect, meter: &CacheMeter, focused: bool) {
     let val = |s: String| Span::styled(s, Style::default().fg(theme.text_primary));
     let hit = |v: u64| Span::styled(format!("{v:>3}%"), Style::default().fg(fg));
 
-    let lines = match Tier::of(inner.height) {
-        // One row: the numbers that change a decision — is the cache warm,
-        // and what has this session cost. The title already carries the TTL.
+    // One row, two zones: how long the cache entry has left, and what the
+    // last call did with it. They answer the same question — is the window
+    // working for me — so they share a row instead of stacking.
+    let split_row = |w: u16| -> Line<'static> {
+        let left = (w / 2).saturating_sub(1);
+        let right = w.saturating_sub(left + 1);
+        let mut spans = progress_bar_spans(left, ratio, bar_fg, theme.bg_base);
+        spans.push(Span::raw(" "));
+        spans.extend(segment_bar_spans(
+            right,
+            &[
+                (meter.write, theme.accent_tool),
+                (meter.read, theme.accent_success),
+            ],
+            theme.bg_base,
+        ));
+        Line::from(spans)
+    };
+    let ttl_text = match secs {
+        Some(sec) => format!("{}:{:02}", sec / 60, sec % 60),
+        None => "cold".into(),
+    };
+
+    // Priority order: what a glance needs first, then detail. Whatever the
+    // pane cannot fit is dropped from the tail, not clipped mid-thought.
+    let mut lines = match Tier::of(inner.height) {
+        // One row: is the cache warm, and what has this session cost.
         Tier::Line => vec![Line::from(vec![
             hit(meter.hit_total()),
             label("  warm "),
@@ -3624,9 +3663,8 @@ fn draw_meta(f: &mut Frame, area: Rect, meter: &CacheMeter, focused: bool) {
                     .add_modifier(Modifier::BOLD),
             ),
         ])],
-        // Two or three rows: the bar earns its row, the rest condenses.
         Tier::Dense => vec![
-            bar(),
+            split_row(inner.width),
             Line::from(vec![
                 hit(meter.hit_total()),
                 label("  warm "),
@@ -3643,8 +3681,16 @@ fn draw_meta(f: &mut Frame, area: Rect, meter: &CacheMeter, focused: bool) {
             ]),
         ],
         Tier::Full => vec![
-            bar(),
-            // Trajectory split by role: what is actually filling the window.
+            split_row(inner.width),
+            Line::from(vec![
+                label("ttl "),
+                Span::styled(format!("{ttl_text:<5}"), Style::default().fg(fg)),
+                Span::styled(" write ", Style::default().fg(theme.accent_tool)),
+                val(format!("{:<7}", tokens(meter.write))),
+                Span::styled(" read ", Style::default().fg(theme.accent_success)),
+                val(tokens(meter.read)),
+            ]),
+            // What is filling the window this call, by role.
             Line::from(segment_bar_spans(
                 inner.width,
                 &[
@@ -3662,59 +3708,36 @@ fn draw_meta(f: &mut Frame, area: Rect, meter: &CacheMeter, focused: bool) {
                 Span::styled("  ast ", Style::default().fg(theme.accent_assistant)),
                 val(pct(meter.roles[2], meter.roles.iter().sum())),
             ]),
-            // Read vs write on the last call: a write-heavy call just paid to
-            // fill the cache rather than riding it.
-            Line::from(segment_bar_spans(
-                inner.width,
-                &[
-                    (meter.read, theme.accent_success),
-                    (meter.write, theme.accent_tool),
-                ],
-                theme.bg_base,
-            )),
+            // Session so far.
             Line::from(vec![
-                Span::styled("read ", Style::default().fg(theme.accent_success)),
-                val(pct(meter.read, meter.read + meter.write)),
-                Span::styled("  write ", Style::default().fg(theme.accent_tool)),
-                val(pct(meter.write, meter.read + meter.write)),
+                label("warm "),
+                Span::styled(
+                    format!("{}/{}", meter.warm, meter.calls),
+                    Style::default().fg(theme.accent_success),
+                ),
+                label("  rate "),
+                hit(meter.hit_total()),
+                label("  spent "),
+                Span::styled(
+                    money(meter.spent),
+                    Style::default()
+                        .fg(theme.accent_user)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                label("  saved "),
+                Span::styled(money(meter.saved), Style::default().fg(theme.accent_success)),
             ]),
-            // This call.
+            // Detail, only if the pane was grown for it.
             Line::from(vec![
                 label("call  "),
                 hit(meter.hit()),
-                label("  read "),
-                val(format!("{:>7}", tokens(meter.read))),
                 label("  in "),
                 val(format!("{:>5}", tokens(meter.fresh))),
                 label("  gen "),
                 val(format!("{:>5}", tokens(meter.out))),
             ]),
-            // Session so far.
             Line::from(vec![
-                label("warm  "),
-                Span::styled(
-                    format!("{:>3}/{}", meter.warm, meter.calls),
-                    Style::default().fg(theme.accent_success),
-                ),
-                label(" calls   rate "),
-                hit(meter.hit_total()),
-            ]),
-            Line::from(vec![
-                label("spent "),
-                Span::styled(
-                    format!("{:>8}", money(meter.spent)),
-                    Style::default()
-                        .fg(theme.accent_user)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                label("   saved "),
-                Span::styled(
-                    format!("{:>8}", money(meter.saved)),
-                    Style::default().fg(theme.accent_success),
-                ),
-            ]),
-            Line::from(vec![
-                label("tokens "),
+                label("total "),
                 val(format!(
                     "read {}  write {}  in {}  gen {}",
                     tokens(meter.read_total),
@@ -3725,6 +3748,7 @@ fn draw_meta(f: &mut Frame, area: Rect, meter: &CacheMeter, focused: bool) {
             ]),
         ],
     };
+    lines.truncate(inner.height as usize);
     f.render_widget(Paragraph::new(lines), inner);
 }
 
@@ -4630,6 +4654,73 @@ mod tests {
         buffer_text(&term)
     }
 
+
+    #[test]
+    fn segment_bar_fills_exactly_and_keeps_small_slices() {
+        let c = ratatui::style::Color::Red;
+        for w in [1u16, 7, 20, 44] {
+            for parts in [
+                vec![(100u64, c), (1, c), (1, c)],
+                vec![(1u64, c), (0, c), (99, c)],
+                vec![(5u64, c), (5, c)],
+            ] {
+                let spans = segment_bar_spans(w, &parts, c);
+                let painted: usize = spans.iter().map(|s| s.content.chars().count()).sum();
+                let sizes: Vec<u64> = parts.iter().map(|p| p.0).collect();
+                assert_eq!(painted, w as usize, "w={w} parts={sizes:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn segment_bar_gives_a_tiny_slice_at_least_one_cell() {
+        let a = ratatui::style::Color::Red;
+        let b = ratatui::style::Color::Blue;
+        // 1 part in 1000 would floor to zero cells at width 20.
+        let spans = segment_bar_spans(20, &[(999, a), (1, b)], a);
+        assert!(spans.len() >= 2, "small slice vanished: {} runs", spans.len());
+    }
+
+    #[test]
+    fn segment_bar_with_no_data_is_all_background() {
+        let c = ratatui::style::Color::Red;
+        let spans = segment_bar_spans(10, &[(0, c), (0, c)], c);
+        let painted: usize = spans.iter().map(|s| s.content.chars().count()).sum();
+        assert_eq!(painted, 10);
+    }
+
+    #[test]
+    fn role_split_attributes_system_user_and_assistant() {
+        let mut m = CacheMeter::default();
+        m.observe_roles(&json!({
+            "system": [{"type":"text","text":"SYSTEMTEXT"}],
+            "messages": [
+                {"role":"user","content":"UUUU"},
+                {"role":"assistant","content":"AAAAAAAA"},
+                {"role":"user","content":"UU"}
+            ]
+        }));
+        assert!(m.roles[0] > 0, "system slot empty: {:?}", m.roles);
+        assert!(m.roles[1] > 0, "user slot empty: {:?}", m.roles);
+        assert!(m.roles[2] > 0, "assistant slot empty: {:?}", m.roles);
+    }
+
+    #[test]
+    fn an_unlabelled_message_counts_as_system() {
+        let mut m = CacheMeter::default();
+        m.observe_roles(&json!({"messages":[{"content":"NOROLE"}]}));
+        assert!(m.roles[0] > 0, "unlabelled went nowhere: {:?}", m.roles);
+        assert_eq!(m.roles[1], 0);
+        assert_eq!(m.roles[2], 0);
+    }
+
+    #[test]
+    fn pct_is_a_dash_when_there_is_no_total() {
+        assert_eq!(pct(0, 0).trim(), "-%");
+        assert_eq!(pct(1, 4).trim(), "25%");
+        assert_eq!(pct(3, 3).trim(), "100%");
+    }
+
     /// A request event carries an empty response. It must not clear the out
     /// pane nor relabel the held reply: the pane showed #5's body, went blank
     /// under "#6", then jumped when the real reply landed.
@@ -5180,9 +5271,9 @@ mod tests {
         );
         // Rows the meter can be dragged to, and what has to survive each.
         for (rows, wants, drops) in [
-            (3u16, "spent", "tokens "),
-            (5, "saved", "tokens "),
-            (9, "tokens ", ""),
+            (3u16, "spent", "total "),
+            (5, "saved", "total "),
+            (9, "total ", ""),
         ] {
             app.layout.meter_h = rows;
             let text = paint(&mut app, 150, 40);
