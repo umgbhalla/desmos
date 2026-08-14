@@ -36,7 +36,7 @@ mod json_tree;
 mod prompt;
 mod queue;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::process::{Child, ChildStdin, Command, Stdio};
@@ -563,6 +563,9 @@ struct App {
     focus: Focus,
     traj_area: Rect,
     call_area: Rect,
+    /// Wire cards the reader folded or opened by hand. reflow_wire leaves
+    /// these alone; without it the auto-open would fight every keystroke.
+    wire_manual: HashSet<EntryId>,
     post_in_area: Rect,
     post_out_area: Rect,
     queue_area: Rect,
@@ -735,6 +738,7 @@ impl App {
             focus: Focus::Input,
             traj_area: Rect::default(),
             call_area: Rect::default(),
+            wire_manual: HashSet::new(),
             post_in_area: Rect::default(),
             post_out_area: Rect::default(),
             queue_area: Rect::default(),
@@ -1848,7 +1852,12 @@ fn handle_key(
         match key.code {
             KeyCode::Char('j') | KeyCode::Down => app.focused_scroll().select_next(),
             KeyCode::Char('k') | KeyCode::Up => app.focused_scroll().select_prev(),
-            KeyCode::Char('h') | KeyCode::Left => app.focused_scroll().collapse_selected(),
+            KeyCode::Char('h') | KeyCode::Left => {
+                if app.focus == Focus::Calls {
+                    pin_selected_wire(app);
+                }
+                app.focused_scroll().collapse_selected()
+            }
             KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 let _ = app.open_block_viewer();
             }
@@ -1857,6 +1866,9 @@ fn handle_key(
                 // Anything else with a viewer zooms into BlockViewerPane.
                 if key.code == KeyCode::Enter && app.open_block_viewer() {
                 } else {
+                    if app.focus == Focus::Calls {
+                        pin_selected_wire(app);
+                    }
                     app.focused_scroll().toggle_fold_selected();
                 }
             }
@@ -2264,6 +2276,7 @@ fn handle_scrollback_down(app: &mut App, calls: bool, col: u16, row: u16) {
             return;
         }
         if calls {
+            pin_selected_wire(app);
             app.calls_scroll().toggle_fold_selected();
         } else {
             app.story_scroll().toggle_fold_selected();
@@ -3096,6 +3109,12 @@ fn draw(f: &mut Frame, app: &mut App) {
         f.area(),
     );
 
+    reflow_wire(&mut app.calls, &app.wire_manual);
+    let manual = app.wire_manual.clone();
+    for child in app.children.values_mut() {
+        reflow_wire(&mut child.calls, &manual);
+    }
+
     let agent_st = current_agent_state(app);
     let activity = current_turn_activity(app);
     if activity.as_ref() != app.last_activity.as_ref() {
@@ -3907,15 +3926,61 @@ fn strip_xml(text: &str) -> String {
     out
 }
 
-/// Wire pane cards start Expanded. Grok Other/Read/Edit default to
-/// Collapsed, which hides the payload this pane exists to show.
-/// Wire cards land folded: header + preview only. `l` / Enter opens one,
-/// `h` folds it again. A live syscall is expanded by `apply_result` while it
-/// streams and folded again when it finishes.
+/// Push a wire card Collapsed. It does not stay that way: `reflow_wire` runs
+/// every frame and reopens the tail, so a fresh card is Expanded by the time
+/// it is painted. Starting folded keeps grok's Other/Read/Edit defaults from
+/// flashing their full payload for one frame before the reconcile.
+///
+/// `l` / Enter opens a card, `h` folds it; either marks it manual and
+/// `reflow_wire` stops managing it.
 fn wire_push(sb: &mut ScrollbackState, block: RenderBlock) -> EntryId {
     let eid = sb.push_block(block);
     set_wire_mode(sb, eid, DisplayMode::Collapsed);
     eid
+}
+
+/// How many trailing wire cards stay open. The tail is where the reader is
+/// looking; older cards fold back to a header + preview.
+const WIRE_OPEN: usize = 3;
+
+/// Keep the tail of the wire pane open: the last `WIRE_OPEN` cards, plus any
+/// card still running, are Expanded; everything above them collapses. Cards
+/// in `manual` were folded or opened by hand and are never touched.
+///
+/// Runs every frame. It is a fold-state reconcile, not an event handler, so a
+/// card that arrives while another is streaming still ends up in the right
+/// state without every push site remembering to call it.
+fn reflow_wire(sb: &mut ScrollbackState, manual: &HashSet<EntryId>) {
+    let n = sb.len();
+    let mut rows: Vec<(EntryId, bool)> = Vec::with_capacity(n);
+    for i in 0..n {
+        if let Some(e) = sb.entry(i) {
+            rows.push((e.id, e.is_running));
+        }
+    }
+    let cut = rows.len().saturating_sub(WIRE_OPEN);
+    for (idx, (id, running)) in rows.into_iter().enumerate() {
+        if manual.contains(&id) {
+            continue;
+        }
+        let want = if running || idx >= cut {
+            DisplayMode::Expanded
+        } else {
+            DisplayMode::Collapsed
+        };
+        set_wire_mode(sb, id, want);
+    }
+}
+
+/// Record that the reader took manual control of the selected wire card.
+fn pin_selected_wire(app: &mut App) {
+    let Some(i) = app.calls.selected() else {
+        return;
+    };
+    if let Some(e) = app.calls.entry(i) {
+        let id = e.id;
+        app.wire_manual.insert(id);
+    }
 }
 
 fn set_wire_mode(sb: &mut ScrollbackState, id: EntryId, mode: DisplayMode) {
@@ -4127,6 +4192,59 @@ mod tests {
         let mut term = Terminal::new(backend).unwrap();
         term.draw(|f| draw(f, app)).unwrap();
         buffer_text(&term)
+    }
+
+    fn wire_modes(app: &App) -> Vec<DisplayMode> {
+        (0..app.calls.len())
+            .filter_map(|i| app.calls.entry(i).map(|e| e.display_mode))
+            .collect()
+    }
+
+    #[test]
+    fn last_three_wire_cards_stay_open() {
+        let mut app = App::new();
+        for i in 0..7 {
+            wire_push(&mut app.calls, RenderBlock::agent_message(format!("CARD{i}")));
+        }
+        let _ = paint(&mut app, 140, 40);
+        let modes = wire_modes(&app);
+        assert_eq!(modes.len(), 7);
+        for (i, m) in modes.iter().enumerate() {
+            if i >= 4 {
+                assert_eq!(*m, DisplayMode::Expanded, "card {i} should be open: {modes:?}");
+            } else {
+                assert_eq!(*m, DisplayMode::Collapsed, "card {i} should be folded: {modes:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_running_card_stays_open_however_old() {
+        let mut app = App::new();
+        let old = wire_push(&mut app.calls, RenderBlock::agent_message("OLDRUNNER"));
+        app.calls.set_last_running(true);
+        for i in 0..6 {
+            wire_push(&mut app.calls, RenderBlock::agent_message(format!("CARD{i}")));
+        }
+        let _ = paint(&mut app, 140, 40);
+        let mode = app.calls.get_by_id(old).map(|e| e.display_mode);
+        assert_eq!(mode, Some(DisplayMode::Expanded), "a running card must not fold");
+    }
+
+    #[test]
+    fn a_hand_folded_card_is_left_alone() {
+        let mut app = App::new();
+        let mut last = None;
+        for i in 0..3 {
+            last = Some(wire_push(&mut app.calls, RenderBlock::agent_message(format!("CARD{i}"))));
+        }
+        let _ = paint(&mut app, 140, 40);
+        let id = last.unwrap();
+        app.wire_manual.insert(id);
+        set_wire_mode(&mut app.calls, id, DisplayMode::Collapsed);
+        let _ = paint(&mut app, 140, 40);
+        let mode = app.calls.get_by_id(id).map(|e| e.display_mode);
+        assert_eq!(mode, Some(DisplayMode::Collapsed), "reflow overrode a manual fold");
     }
 
     #[test]
