@@ -2853,6 +2853,7 @@ dependencies = [
  "toml",
  "unicode-width 0.2.0",
  "xai-grok-pager",
+ "xai-grok-pager-diff",
 ]
 
 [[package]]

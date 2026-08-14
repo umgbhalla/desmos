@@ -65,8 +65,9 @@ use xai_grok_pager::appearance::{
     self, AppearanceConfig, RawAppearanceConfig, cache as appearance_cache,
 };
 use xai_grok_pager::scrollback::blocks::{
-    ExecuteToolCallBlock, OtherToolCallBlock, SubagentBlock, ToolCallBlock,
+    EditToolCallBlock, ExecuteToolCallBlock, OtherToolCallBlock, SubagentBlock, ToolCallBlock,
 };
+use xai_grok_pager_diff::diff_hunks_from_strings;
 #[cfg(test)]
 use xai_grok_pager::scrollback::blocks::SubagentBlockKind;
 use xai_grok_pager::clipboard::SystemClipboard;
@@ -4061,6 +4062,29 @@ fn wire_syscall(tag: &str, body: &str, attrs: &Value, result: &str) -> RenderBlo
             }
             RenderBlock::ToolCall(ToolCallBlock::Execute(block))
         }
+        "edit" => {
+            let path = attrs
+                .get("path")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let (old, new) = split_edit_body(body);
+            let start = edit_start_line(&path, &old, &new);
+            let hunks = diff_hunks_from_strings(&old, &new, start);
+            let label = if path.is_empty() {
+                "edit".to_string()
+            } else {
+                path.clone()
+            };
+            let mut block = EditToolCallBlock::new(label, hunks);
+            // looks_failed only knows bash/python exit conventions, so edit
+            // needs its own read: the handler answers with a confirmation
+            // line, and anything that opens like an error is a failure.
+            if edit_failed(result) {
+                block = block.with_error(first_line(result));
+            }
+            RenderBlock::ToolCall(ToolCallBlock::Edit(block))
+        }
         _ => {
             let summary = {
                 let attrs_s = attr_summary(attrs);
@@ -4093,6 +4117,68 @@ fn wire_syscall(tag: &str, body: &str, attrs: &Value, result: &str) -> RenderBlo
             ))
         }
     }
+}
+
+/// An edit result that opens like an error message. The handler answers
+/// "Edited <path>" (or similar) when it worked, so only the known failure
+/// shapes count -- a confirmation must never be painted as a red card.
+fn edit_failed(result: &str) -> bool {
+    let t = result.trim_start();
+    if t.is_empty() {
+        return false;
+    }
+    let low = t.to_ascii_lowercase();
+    low.starts_with("error")
+        || low.starts_with("unknown tag")
+        || low.starts_with("not a file")
+        || low.starts_with("no match")
+        || low.starts_with("traceback")
+}
+
+/// The edit tag body is `old\n---\nnew`, split on the first `---` that sits
+/// alone on a line. A body with no separator is treated as a pure insertion so
+/// the card still renders something truthful instead of an empty diff.
+fn split_edit_body(body: &str) -> (String, String) {
+    let mut before: Vec<&str> = Vec::new();
+    let mut after: Vec<&str> = Vec::new();
+    let mut seen = false;
+    for line in body.split('\n') {
+        if !seen && line.trim_end() == "---" {
+            seen = true;
+            continue;
+        }
+        if seen { after.push(line) } else { before.push(line) }
+    }
+    if !seen {
+        return (String::new(), body.to_string());
+    }
+    (before.join("\n"), after.join("\n"))
+}
+
+/// 1-based line where the edit lands, so the diff gutter shows real file line
+/// numbers instead of counting from 1.
+///
+/// The card is built both before the write (file still holds `old`) and after
+/// it (file holds `new`), so try both. An unreadable path or a match that is
+/// not unique falls back to 1 — a wrong offset is worse than an honest one.
+fn edit_start_line(path: &str, old: &str, new: &str) -> usize {
+    if path.is_empty() {
+        return 1;
+    }
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return 1;
+    };
+    for probe in [old, new] {
+        if probe.is_empty() {
+            continue;
+        }
+        if let Some(byte) = text.find(probe)
+            && text.match_indices(probe).count() == 1
+        {
+            return text[..byte].matches('\n').count() + 1;
+        }
+    }
+    1
 }
 
 fn syscall_label(tag: &str, attrs: &Value) -> String {
@@ -4192,6 +4278,74 @@ mod tests {
         let mut term = Terminal::new(backend).unwrap();
         term.draw(|f| draw(f, app)).unwrap();
         buffer_text(&term)
+    }
+
+    #[test]
+    #[ignore]
+    fn zz_diff_render() {
+        let mut app = App::new();
+        handle_event(&mut app, json!({
+            "ev": "result", "tag": "edit",
+            "attrs": {"path": "desmos/loop.py"},
+            "body": "    max_tokens: int = 8192,\n---\n    max_tokens: int = MAX_TOKENS,",
+            "text": "Edited desmos/loop.py",
+        }));
+        app.layout.wire_pct = 72;
+        panic!("{}", paint(&mut app, 128, 20));
+    }
+
+
+    #[test]
+    fn edit_tag_becomes_a_real_diff_block() {
+        let attrs = json!({"path": "notes.txt"});
+        let block = wire_syscall("edit", "alpha\nbeta\n---\nalpha\nGAMMA\n", &attrs, "Edited notes.txt");
+        let RenderBlock::ToolCall(ToolCallBlock::Edit(e)) = block else {
+            panic!("edit must render as a diff, not a generic Other card");
+        };
+        assert_eq!(e.path, "notes.txt");
+        // DiffHunk is a flat Vec<DiffLine>; tag is similar::ChangeTag.
+        let tags: Vec<String> = e
+            .hunks
+            .iter()
+            .flat_map(|h| h.iter().map(|l| format!("{:?}", l.tag)))
+            .collect();
+        assert!(tags.iter().any(|t| t == "Delete"), "no removed line: {tags:?}");
+        assert!(tags.iter().any(|t| t == "Insert"), "no added line: {tags:?}");
+        let texts: Vec<&str> = e
+            .hunks
+            .iter()
+            .flat_map(|h| h.iter().map(|l| l.text.as_str()))
+            .collect();
+        assert!(texts.iter().any(|t| t.contains("beta")), "old text missing: {texts:?}");
+        assert!(texts.iter().any(|t| t.contains("GAMMA")), "new text missing: {texts:?}");
+    }
+
+    #[test]
+    fn edit_body_splits_on_a_lone_separator() {
+        let (o, n) = split_edit_body("a\nb\n---\nc\nd");
+        assert_eq!(o, "a\nb");
+        assert_eq!(n, "c\nd");
+        // A --- inside the payload must not split again.
+        let (o2, n2) = split_edit_body("x\n---\ny\n---\nz");
+        assert_eq!(o2, "x");
+        assert_eq!(n2, "y\n---\nz");
+    }
+
+    #[test]
+    fn edit_body_without_a_separator_is_an_insertion() {
+        let (o, n) = split_edit_body("just new text");
+        assert!(o.is_empty(), "old side should be empty, got {o:?}");
+        assert_eq!(n, "just new text");
+    }
+
+    #[test]
+    fn a_failed_edit_carries_its_error() {
+        let attrs = json!({"path": "gone.txt"});
+        let block = wire_syscall("edit", "a\n---\nb", &attrs, "error: no such file");
+        let RenderBlock::ToolCall(ToolCallBlock::Edit(e)) = block else {
+            panic!("expected an edit block");
+        };
+        assert!(!e.is_success(), "a failing edit must not look successful");
     }
 
     fn wire_modes(app: &App) -> Vec<DisplayMode> {
@@ -4625,9 +4779,11 @@ mod tests {
             text.contains("notes/cache.md") && text.contains("last-user only"),
             "edit body/path missing:\n{text}"
         );
+        // The confirmation line is gone on purpose: an edit card renders the
+        // diff, and the -/+ rows above are the evidence the write landed.
         assert!(
-            text.contains("wrote notes/cache.md"),
-            "edit result missing:\n{text}"
+            text.contains("old cache line"),
+            "removed line missing from the diff:\n{text}"
         );
         let idx = app.calls.len().saturating_sub(1);
         let mode = app.calls.entry(idx).map(|e| e.display_mode());
