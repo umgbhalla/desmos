@@ -8,6 +8,8 @@ import os
 import sys
 from pathlib import Path
 
+from desmos.const import MAX_TOKENS
+
 
 def _repo_root() -> Path:
     return Path(__file__).resolve().parent.parent
@@ -318,7 +320,7 @@ def main() -> int:
     r.add_argument("task")
     r.add_argument("--model", default=os.environ.get("DESMOS_MODEL") or "claude-opus-5")
     r.add_argument("--max-turns", type=int, default=32)
-    r.add_argument("--max-tokens", type=int, default=8192)
+    r.add_argument("--max-tokens", type=int, default=MAX_TOKENS)
     r.add_argument("--cwd", default=".")
     r.add_argument("--out", default="")
     r.set_defaults(func=cmd_run)

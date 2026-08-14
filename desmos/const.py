@@ -18,6 +18,7 @@ FROZEN = frozenset(
     }
 )
 RESULT_CAP = 8000
+MAX_TOKENS = int(os.environ.get("DESMOS_MAX_TOKENS") or 128000)
 BASH_TIMEOUT = 60
 PRIOR_KEEP = 8
 DEFAULT_MODEL = os.environ.get("DESMOS_MODEL") or "claude-opus-5"

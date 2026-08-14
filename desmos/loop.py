@@ -15,7 +15,7 @@ from desmos.complete import (
     thought_blocks,
     thinking_text,
 )
-from desmos.const import FROZEN, PRIOR_KEEP
+from desmos.const import FROZEN, MAX_TOKENS, PRIOR_KEEP
 from desmos.dispatch import dispatch
 from desmos.generations import ensure_gen1, evolve, rollback
 from desmos.persist import load, save
@@ -262,7 +262,7 @@ def run_turns(
     prompt: str,
     *,
     max_turns: int = 32,
-    max_tokens: int = 8192,
+    max_tokens: int = MAX_TOKENS,
     quiet: bool = False,
     on_event: Callable[[dict[str, Any]], None] | None = None,
     should_stop: Callable[[], bool] | None = None,
@@ -337,7 +337,7 @@ def new_world(
 
 
 def bind_step(world: World) -> Callable[..., str]:
-    def step(prompt: str, *, max_turns: int = 32, max_tokens: int = 8192) -> str:
+    def step(prompt: str, *, max_turns: int = 32, max_tokens: int = MAX_TOKENS) -> str:
         if not isinstance(prompt, str) or not prompt.strip():
             raise TypeError("step(prompt) needs a non-empty string")
         from desmos.loop import run_turns as _run
