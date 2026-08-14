@@ -687,10 +687,12 @@ struct CacheMeter {
     /// they did cost — the money the cache actually saved this session.
     saved: f64,
     area: Rect,
-    /// Characters of the last request attributable to each role, so the
-    /// trajectory bar shows what is filling the window instead of one
-    /// undifferentiated block. Order: system, user, assistant.
-    roles: [u64; 3],
+    /// Characters of the last request, split by what actually produced them.
+    /// The wire only has three roles, which is too coarse to act on: syscall
+    /// output rides the user role, and replayed thinking rides the assistant
+    /// role, so both hide inside a slice named for someone else.
+    /// Order: system, prompt, tool, thinking, speech.
+    roles: [u64; 5],
     /// Context ceiling for the model that answered, so "how full" has a
     /// denominator. Zero until the first call lands.
     window: u64,
@@ -739,18 +741,46 @@ impl CacheMeter {
     }
 
     fn observe_roles(&mut self, request: &Value) {
-        let mut split = [0u64; 3];
+        let mut split = [0u64; 5];
         if let Some(sys) = request.get("system") {
             split[0] += sys.to_string().len() as u64;
         }
-        if let Some(msgs) = request.get("messages").and_then(Value::as_array) {
-            for m in msgs {
-                let len = m.to_string().len() as u64;
-                match m.get("role").and_then(Value::as_str) {
-                    Some("user") => split[1] += len,
-                    Some("assistant") => split[2] += len,
-                    _ => split[0] += len,
+        let Some(msgs) = request.get("messages").and_then(Value::as_array) else {
+            self.roles = split;
+            return;
+        };
+        for m in msgs {
+            let len = m.to_string().len() as u64;
+            match m.get("role").and_then(Value::as_str) {
+                // Syscall output is sent as a user turn, but it is not
+                // something anyone typed -- and it is the first thing worth
+                // trimming, so it earns its own slice.
+                Some("user") => {
+                    let tool = m
+                        .get("content")
+                        .map(|c| match c.as_str() {
+                            Some(t) => t.contains("<result"),
+                            None => c.to_string().contains("<result"),
+                        })
+                        .unwrap_or(false);
+                    split[usize::from(tool) + 1] += len;
                 }
+                // Thinking is replayed on every call and outweighs the speech.
+                // Counted together they say "the assistant is large"; counted
+                // apart they say which half to compact.
+                Some("assistant") => match m.get("content").and_then(Value::as_array) {
+                    Some(blocks) => {
+                        for b in blocks {
+                            let bl = b.to_string().len() as u64;
+                            match b.get("type").and_then(Value::as_str) {
+                                Some("thinking" | "redacted_thinking") => split[3] += bl,
+                                _ => split[4] += bl,
+                            }
+                        }
+                    }
+                    None => split[4] += len,
+                },
+                _ => split[0] += len,
             }
         }
         self.roles = split;
@@ -3747,7 +3777,8 @@ fn meter_row(
     // value wins -- a number you cannot read is worse than a missing word.
     let mut text: Vec<Option<char>> = vec![None; w];
     let vchars: Vec<char> = value.chars().collect();
-    let vstart = w.saturating_sub(vchars.len());
+    // One cell of gutter on the right so the value never touches the border.
+    let vstart = w.saturating_sub(vchars.len() + 1);
     for (i, ch) in vchars.iter().enumerate() {
         if vstart + i < w {
             text[vstart + i] = Some(*ch);
@@ -4043,7 +4074,9 @@ fn draw_meta(f: &mut Frame, area: Rect, meter: &CacheMeter, focused: bool) {
     let roles = [
         (meter.roles[0], theme.accent_skill),
         (meter.roles[1], theme.accent_user),
-        (meter.roles[2], theme.accent_assistant),
+        (meter.roles[2], theme.accent_success),
+        (meter.roles[3], theme.accent_tool),
+        (meter.roles[4], theme.accent_assistant),
     ];
     // How full, and full of what -- one bar answers both. A role split
     // normalised to 100% looks identical at 8k and at 180k, which is the one
@@ -5031,6 +5064,49 @@ mod tests {
     }
 
     #[test]
+    fn syscall_output_is_not_counted_as_something_you_typed() {
+        // Tool results ride the user role on the wire. They are the first
+        // thing worth trimming, so they must not hide in the prompt slice.
+        let mut m = CacheMeter::default();
+        m.observe_roles(&json!({
+            "messages": [
+                {"role": "user", "content": "please look at the meter"},
+                {"role": "user", "content": "<result tag=\"bash\">a very long dump</result>"}
+            ]
+        }));
+        assert!(m.roles[1] > 0, "prompt slot empty: {:?}", m.roles);
+        assert!(m.roles[2] > 0, "tool slot empty: {:?}", m.roles);
+        assert!(
+            m.roles[2] > m.roles[1],
+            "the longer result should outweigh the prompt: {:?}",
+            m.roles
+        );
+    }
+
+    #[test]
+    fn thinking_is_counted_apart_from_speech() {
+        // Replayed thinking outweighs the speech; together they only say
+        // "the assistant is large", which is not something you can act on.
+        let mut m = CacheMeter::default();
+        m.observe_roles(&json!({
+            "messages": [{
+                "role": "assistant",
+                "content": [
+                    {"type": "thinking", "thinking": "TTTTTTTTTTTTTTTTTTTTTTTTTTTTTT"},
+                    {"type": "text", "text": "ok"}
+                ]
+            }]
+        }));
+        assert!(m.roles[3] > 0, "thinking slot empty: {:?}", m.roles);
+        assert!(m.roles[4] > 0, "speech slot empty: {:?}", m.roles);
+        assert!(
+            m.roles[3] > m.roles[4],
+            "thinking should outweigh the short reply: {:?}",
+            m.roles
+        );
+    }
+
+    #[test]
     fn a_meter_row_paints_exactly_its_width() {
         let c = ratatui::style::Color::Red;
         let t = ratatui::style::Color::Black;
@@ -5142,8 +5218,8 @@ mod tests {
             ]
         }));
         assert!(m.roles[0] > 0, "system slot empty: {:?}", m.roles);
-        assert!(m.roles[1] > 0, "user slot empty: {:?}", m.roles);
-        assert!(m.roles[2] > 0, "assistant slot empty: {:?}", m.roles);
+        assert!(m.roles[1] > 0, "prompt slot empty: {:?}", m.roles);
+        assert!(m.roles[4] > 0, "speech slot empty: {:?}", m.roles);
     }
 
     #[test]
@@ -5151,8 +5227,7 @@ mod tests {
         let mut m = CacheMeter::default();
         m.observe_roles(&json!({"messages":[{"content":"NOROLE"}]}));
         assert!(m.roles[0] > 0, "unlabelled went nowhere: {:?}", m.roles);
-        assert_eq!(m.roles[1], 0);
-        assert_eq!(m.roles[2], 0);
+        assert_eq!(m.roles[1..], [0, 0, 0, 0]);
     }
 
     #[test]
