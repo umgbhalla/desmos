@@ -237,7 +237,7 @@ impl PromptBuf {
     }
 
     pub fn move_up(&mut self, width: u16) {
-        let lay = self.layout(" ❯ ", width);
+        let lay = self.layout(" ", width);
         if lay.cursor_row == 0 {
             return;
         }
@@ -245,7 +245,7 @@ impl PromptBuf {
     }
 
     pub fn move_down(&mut self, width: u16) {
-        let lay = self.layout(" ❯ ", width);
+        let lay = self.layout(" ", width);
         let last = lay.lines.len().saturating_sub(1) as u16;
         if lay.cursor_row >= last {
             return;
@@ -254,17 +254,17 @@ impl PromptBuf {
     }
 
     pub fn move_line_home(&mut self, width: u16) {
-        let lay = self.layout(" ❯ ", width);
+        let lay = self.layout(" ", width);
         let col = if lay.cursor_row == 0 {
-            UnicodeWidthStr::width(" ❯ ") as u16
+            UnicodeWidthStr::width(" ") as u16
         } else {
-            UnicodeWidthStr::width(" ❯ ") as u16
+            UnicodeWidthStr::width(" ") as u16
         };
         self.click(col, lay.cursor_row, width);
     }
 
     pub fn move_line_end(&mut self, width: u16) {
-        let lay = self.layout(" ❯ ", width);
+        let lay = self.layout(" ", width);
         self.click(width.saturating_sub(1), lay.cursor_row, width);
     }
 
@@ -345,7 +345,7 @@ impl PromptBuf {
     }
 
     pub fn display_rows(&self, width: u16) -> u16 {
-        self.layout(" ❯ ", width).lines.len().max(1) as u16
+        self.layout(" ", width).lines.len().max(1) as u16
     }
 
     pub fn layout(&self, prefix: &str, width: u16) -> PromptLayout {
@@ -444,7 +444,7 @@ impl PromptBuf {
     }
 
     pub fn click(&mut self, col: u16, row: u16, width: u16) -> Option<u64> {
-        let lay = self.layout(" ❯ ", width);
+        let lay = self.layout(" ", width);
         for b in &lay.chip_boxes {
             if b.row == row && col >= b.col && col < b.col.saturating_add(b.width) {
                 self.seg = b.seg;
@@ -458,7 +458,7 @@ impl PromptBuf {
             // Step left until the layout cursor matches. Bounded by send len.
             let budget = self.to_send().chars().count() + self.segs.len() + 4;
             for _ in 0..budget {
-                let now = self.layout(" ❯ ", width);
+                let now = self.layout(" ", width);
                 if now.cursor_row < row {
                     break;
                 }
@@ -828,7 +828,7 @@ mod tests {
         assert_eq!(p.to_send(), "a\nb\nc\nd");
         assert!(p.preview_body().is_some());
         assert!(!p.preview_on_chip(), "cursor sits after the chip");
-        let lay = p.layout(" ❯ ", 80);
+        let lay = p.layout(" ", 80);
         let shown = lay
             .lines
             .iter()
@@ -845,7 +845,7 @@ mod tests {
         let body = "x".repeat(PASTE_CHIP_DISPLAY_BYTES + 1);
         p.handle_paste(&body);
         assert_eq!(p.to_send(), body);
-        let lay = p.layout(" ❯ ", 80);
+        let lay = p.layout(" ", 80);
         let shown = lay
             .lines
             .iter()
@@ -920,7 +920,7 @@ mod tests {
         let mut p = PromptBuf::new();
         p.insert_str("aaa\nbbb");
         assert!(p.is_multiline());
-        let lay = p.layout(" ❯ ", 80);
+        let lay = p.layout(" ", 80);
         assert!(
             lay.lines.len() >= 2,
             "expected two visual rows, got {}",
@@ -949,13 +949,13 @@ mod tests {
     fn up_down_crosses_hard_newlines() {
         let mut p = PromptBuf::new();
         p.insert_str("aaa\nbbb");
-        let down = p.layout(" ❯ ", 80);
+        let down = p.layout(" ", 80);
         assert_eq!(down.cursor_row, 1);
         p.move_up(80);
-        let up = p.layout(" ❯ ", 80);
+        let up = p.layout(" ", 80);
         assert_eq!(up.cursor_row, 0);
         p.move_down(80);
-        let back = p.layout(" ❯ ", 80);
+        let back = p.layout(" ", 80);
         assert_eq!(back.cursor_row, 1);
     }
 }

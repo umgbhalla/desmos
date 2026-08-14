@@ -96,6 +96,11 @@ def wire_content(content: Any) -> list[dict[str, Any]]:
         if not isinstance(raw, dict):
             continue
         kind = raw.get("type")
+        # Only provenance across *providers* matters here. A signature Opus 5
+        # produced replays to Sonnet 4.6 and is accepted -- checked against the
+        # live endpoint, not assumed -- so switching inside the Anthropic list
+        # needs no fence and the signature is replayed as-is.
+        #
         # A block another provider produced. openai.py stamps every one of its
         # blocks with the raw item under "openai", and it puts that item's id in
         # "signature" as a provenance marker -- not as an Anthropic thinking

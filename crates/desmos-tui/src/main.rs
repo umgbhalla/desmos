@@ -37,6 +37,7 @@ mod picker;
 mod prompt;
 mod queue;
 mod side;
+mod slash;
 
 use std::collections::{HashMap, HashSet};
 use std::io::{self, BufRead, BufReader, Write};
@@ -868,6 +869,14 @@ struct App {
     prompt: PromptBuf,
     model: String,
     thinking: String,
+    /// A switch the bridge has not applied yet. `op: model` queues behind a
+    /// running step, so writing app.model on the picker's say-so made the
+    /// header claim a model the harness was not using — for up to max_turns.
+    /// Hold it here and let the bridge's snapshot be the thing that promotes it.
+    model_pending: Option<(String, String)>,
+    /// Slash completion for the composer. Recomputed on every keystroke that
+    /// changes the line, so it never has to be dismissed explicitly.
+    slash: slash::Slash,
     generation: String,
     running: bool,
     turn_started: Option<Instant>,
@@ -1176,6 +1185,8 @@ impl App {
             prompt: PromptBuf::new(),
             model: String::new(),
             thinking: String::new(),
+            model_pending: None,
+            slash: slash::Slash::default(),
             generation: String::new(),
             running: false,
             turn_started: None,
@@ -2054,6 +2065,11 @@ fn handle_event(app: &mut App, ev: Value) {
             }
             if let Some(s) = ev.get("model").and_then(Value::as_str) {
                 app.model = s.into();
+                // The bridge is the authority. Once it reports the model we
+                // queued, the pending badge has nothing left to announce.
+                if app.model_pending.as_ref().is_some_and(|(m, _)| m == s) {
+                    app.model_pending = None;
+                }
             }
             if let Some(s) = ev.get("thinking").and_then(Value::as_str) {
                 app.thinking = s.into();
@@ -2212,8 +2228,17 @@ fn apply_picker(
             if let Some(b) = bridge.as_mut() {
                 b.send(&json!({"op": "model", "model": model, "effort": effort}))?;
             }
-            app.model = model;
-            app.thinking = effort;
+            // Idle, the bridge picks this up immediately, so showing it now is
+            // honest. Mid-step the op waits in the inbox behind run_turns —
+            // claiming the new model there would be a lie for the rest of the
+            // step, so it stays pending until the bridge says otherwise.
+            if app.running {
+                app.status = format!("{model} after this step");
+                app.model_pending = Some((model, effort));
+            } else {
+                app.model = model;
+                app.thinking = effort;
+            }
         }
     }
     Ok(false)
@@ -2236,6 +2261,34 @@ fn handle_key(
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('p') {
         app.picker.open_for_change();
         return Ok(false);
+    }
+    // An open completion list is modal for the four keys it owns, and has to
+    // say so up here: Tab and Esc are claimed by the global pane-cycle further
+    // down, so a handler in the input branch never sees them.
+    if app.slash.open && app.focus == Focus::Input {
+        match key.code {
+            KeyCode::Up => {
+                app.slash.move_sel(-1);
+                return Ok(false);
+            }
+            KeyCode::Down => {
+                app.slash.move_sel(1);
+                return Ok(false);
+            }
+            KeyCode::Tab | KeyCode::Enter => {
+                if let Some(line) = app.slash.accept() {
+                    app.prompt.clear();
+                    app.prompt.insert_str(&line);
+                    app.slash.update(&app.prompt.to_send(), &app.picker);
+                }
+                return Ok(false);
+            }
+            KeyCode::Esc => {
+                app.slash.close();
+                return Ok(false);
+            }
+            _ => {}
+        }
     }
     // ctrl+g / ctrl+b open the side panes from anywhere, including the input
     // box: a pane you have to tab to before you can open is a pane nobody
@@ -2607,6 +2660,10 @@ fn handle_key(
         }
         _ => {}
     }
+    // One recompute after any edit, rather than a call at each of the dozen
+    // sites that can change the line. A line that stopped being a command
+    // closes the list on its own.
+    app.slash.update(&app.prompt.to_send(), &app.picker);
     Ok(false)
 }
 
@@ -4852,8 +4909,15 @@ fn draw_input(f: &mut Frame, area: Rect, app: &mut App) {
         .as_deref()
         .map(|id| format!(" session {id} "))
         .unwrap_or_else(|| {
+            // A queued switch is named as queued. The alternative — printing it
+            // as current — is the header claiming a model the wire is not using.
+            let queued = app
+                .model_pending
+                .as_ref()
+                .map(|(m, e)| format!("  → {m}/{e} queued"))
+                .unwrap_or_default();
             format!(
-                " {}  effort:{}  gen {} ",
+                " {}  effort:{}  gen {}{queued} ",
                 if app.model.is_empty() {
                     "—"
                 } else {
@@ -4871,7 +4935,7 @@ fn draw_input(f: &mut Frame, area: Rect, app: &mut App) {
                 },
             )
         });
-    let prefix = " ❯ ";
+    let prefix = " ";
     let focused = app.focus == Focus::Input;
     let border = if focused {
         theme.prompt_border_active
@@ -4922,10 +4986,91 @@ fn draw_input(f: &mut Frame, area: Rect, app: &mut App) {
         f.set_cursor_position(Position { x, y });
     }
     if focused {
+        // A paste preview and a command list want the same strip of screen and
+        // never apply at once — a pasted body is not a slash line.
+        draw_slash(f, app.input_area, app);
         if let Some(body) = app.prompt.preview_body() {
             draw_paste_preview(f, app.input_area, body, app.prompt.preview_on_chip());
         }
     }
+}
+
+/// The completion list, above the composer, plus the verdict on what is
+/// typed. The verdict is the point: a bad model id used to be discoverable
+/// only by sending it and reading an error a step later.
+fn draw_slash(f: &mut Frame, input: Rect, app: &App) {
+    let theme = Theme::current();
+    let verdict = slash::verdict(&app.prompt.to_send(), &app.picker);
+    if !app.slash.open && matches!(verdict, slash::Verdict::NotACommand) {
+        return;
+    }
+    let (mark, note, tone) = match &verdict {
+        slash::Verdict::Ready => ("✓", String::new(), theme.accent_success),
+        slash::Verdict::NeedsArg(help) => ("·", (*help).to_string(), theme.text_secondary),
+        slash::Verdict::Unknown(what) => ("✗", format!("no such command {what}"), theme.accent_user),
+        slash::Verdict::BadArg { got, expected } => (
+            "✗",
+            format!("{got} is not one of: {expected}"),
+            theme.accent_user,
+        ),
+        slash::Verdict::NotACommand => ("", String::new(), theme.text_secondary),
+    };
+    let rows = app.slash.items.len().min(8);
+    let h = rows as u16 + if note.is_empty() { 2 } else { 3 };
+    if input.width < 12 || input.y < h {
+        return;
+    }
+    let area = Rect {
+        x: input.x,
+        y: input.y.saturating_sub(h),
+        width: input.width.min(88),
+        height: h,
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(tone))
+        .title(Span::styled(
+            format!(" {mark} commands "),
+            Style::default().fg(tone).add_modifier(Modifier::BOLD),
+        ))
+        .style(Style::default().bg(theme.bg_base).fg(theme.text_primary));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+    let width = inner.width as usize;
+    let mut lines: Vec<Line> = app
+        .slash
+        .items
+        .iter()
+        .take(rows)
+        .enumerate()
+        .map(|(i, item)| {
+            let on = i == app.slash.sel;
+            let body = if item.help.is_empty() {
+                item.text.clone()
+            } else {
+                format!("{:<14} {}", item.text, item.help)
+            };
+            let body: String = body.chars().take(width).collect();
+            let mut line = Line::from(Span::styled(
+                body,
+                Style::default().fg(if on { tone } else { theme.text_primary }),
+            ));
+            if on {
+                line = line.style(Style::default().bg(theme.bg_highlight));
+            }
+            line
+        })
+        .collect();
+    if !note.is_empty() {
+        lines.push(Line::from(Span::styled(
+            note.chars().take(width).collect::<String>(),
+            Style::default().fg(tone),
+        )));
+    }
+    f.render_widget(Paragraph::new(lines), inner);
 }
 
 fn draw_paste_preview(f: &mut Frame, input: Rect, body: &str, on_chip: bool) {
@@ -7148,6 +7293,116 @@ mod tests {
     /// The bridge op for switching models existed from the start; nothing
     /// typed to it, so the picker was the only way in. And `/compact` reads
     /// like "fold the transcript" while only changing row spacing.
+    /// A picker holding the catalog a live bridge would have published.
+    fn stocked_picker() -> picker::Picker {
+        let mut p = picker::Picker::default();
+        p.observe(&json!({
+            "ev": "ready",
+            "providers": [
+                {"provider": "anthropic", "ok": true, "models": ["claude-opus-5", "claude-sonnet-4-6"],
+                 "efforts": ["low", "high", "xhigh"], "can_login": false},
+                {"provider": "openai", "ok": true, "models": ["gpt-5.6-sol", "gpt-5.6-luna"],
+                 "efforts": ["low", "medium", "high", "xhigh", "max"], "can_login": true},
+                {"provider": "ghost", "ok": false, "models": ["never-offer-me"],
+                 "efforts": ["low"], "can_login": false},
+            ],
+        }));
+        p
+    }
+
+    /// Every command was reachable only by knowing it existed, and a bad
+    /// argument was discoverable only by sending it.
+    #[test]
+    fn slash_completes_commands_then_their_arguments() {
+        let pick = stocked_picker();
+        let mut s = slash::Slash::default();
+
+        s.update("/mod", &pick);
+        assert!(s.open);
+        assert_eq!(s.items[0].text, "/model");
+        // A command that takes an argument leaves the cursor in the argument.
+        assert_eq!(s.accept().as_deref(), Some("/model "));
+
+        // Now the argument position offers real models from the catalog.
+        s.update("/model ", &pick);
+        let offered: Vec<&str> = s.items.iter().map(|i| i.text.as_str()).collect();
+        assert!(offered.contains(&"claude-opus-5") && offered.contains(&"gpt-5.6-sol"), "{offered:?}");
+        assert!(!offered.contains(&"never-offer-me"), "a provider with no credential is a guaranteed error");
+
+        s.update("/model gpt", &pick);
+        assert_eq!(s.items.len(), 2, "{:?}", s.items);
+        assert_eq!(s.accept().as_deref(), Some("/model gpt-5.6-sol"));
+
+        // Tab and Esc belong to the global pane-cycle, so an open list has to
+        // claim them before that runs — this was a real miss, caught live.
+        let mut app = App::new();
+        app.picker = stocked_picker();
+        app.set_focus(Focus::Input);
+        for c in "/mod".chars() {
+            handle_key(None, &mut app, press(KeyCode::Char(c))).unwrap();
+        }
+        assert!(app.slash.open, "typing a slash opens the list");
+        handle_key(None, &mut app, tab()).unwrap();
+        assert_eq!(app.focus, Focus::Input, "Tab must complete, not cycle panes");
+        assert_eq!(app.prompt.to_send(), "/model ");
+        handle_key(None, &mut app, press(KeyCode::Esc)).unwrap();
+        assert!(!app.slash.open);
+        assert_eq!(app.focus, Focus::Input, "Esc dismissed the list, not the pane");
+
+        // A command taking nothing has nothing to complete.
+        s.update("/reset ", &pick);
+        assert!(!s.open);
+        // Prose is not a command.
+        s.update("what about /model", &pick);
+        assert!(!s.open);
+    }
+
+    #[test]
+    fn slash_says_whether_it_will_work_before_you_send_it() {
+        let pick = stocked_picker();
+        use slash::Verdict;
+        assert_eq!(slash::verdict("hello there", &pick), Verdict::NotACommand);
+        assert_eq!(slash::verdict("/reset", &pick), Verdict::Ready);
+        assert_eq!(slash::verdict("/model", &pick), Verdict::Ready, "bare /model opens the picker");
+        assert_eq!(slash::verdict("/model claude-opus-5", &pick), Verdict::Ready);
+        assert_eq!(slash::verdict("/theme rosepine", &pick), Verdict::Ready);
+        assert!(matches!(slash::verdict("/thinking", &pick), Verdict::NeedsArg(_)));
+        assert!(matches!(slash::verdict("/nonsense", &pick), Verdict::Unknown(_)));
+        match slash::verdict("/model gpt-9", &pick) {
+            Verdict::BadArg { got, expected } => {
+                assert_eq!(got, "gpt-9");
+                assert!(expected.contains("gpt-5.6-sol"), "{expected}");
+            }
+            other => panic!("{other:?}"),
+        }
+        // An effort the current build cannot serve is caught the same way.
+        assert!(matches!(slash::verdict("/thinking ludicrous", &pick), Verdict::BadArg { .. }));
+        assert_eq!(slash::verdict("/thinking xhigh", &pick), Verdict::Ready);
+    }
+
+    #[test]
+    fn a_queued_switch_is_labelled_queued_not_current() {
+        let mut app = App::new();
+        app.model = "claude-opus-5".into();
+        app.running = true;
+        let _ = apply_picker(
+            None,
+            &mut app,
+            picker::PickerAction::Apply { model: "gpt-5.6-sol".into(), effort: "low".into() },
+        );
+        assert_eq!(app.model, "claude-opus-5", "the wire is still on the old model");
+        assert!(app.model_pending.is_some());
+        // The badge has to survive a composer that is not the whole screen —
+        // the right column takes roughly a third of it.
+        let painted = paint(&mut app, 120, 40);
+        assert!(painted.contains("→ gpt-5.6-sol/low queued"), "{painted}");
+
+        // The bridge's snapshot is what promotes it.
+        handle_event(&mut app, json!({"ev": "snapshot", "model": "gpt-5.6-sol", "thinking": "low"}));
+        assert_eq!(app.model, "gpt-5.6-sol");
+        assert!(app.model_pending.is_none());
+    }
+
     #[test]
     fn model_and_dense_are_local_slashes_and_compact_still_answers() {
         for line in ["/model", "/model gpt-5.6-sol", "/dense", "/compact"] {
@@ -7263,7 +7518,7 @@ mod tests {
         assert!(app.story.animation_tick() > t0);
         app.set_focus(Focus::Input);
         let text = paint(&mut app, 120, 30);
-        assert!(text.contains('❯'), "running must keep grok prompt:\n{text}");
+        assert!(!text.contains('❯'), "input must not show a chevron:\n{text}");
         assert!(
             !text.contains(" … "),
             "running must not replace the prompt with ellipsis:\n{text}"
@@ -7329,7 +7584,7 @@ mod tests {
         );
         let expected_x = app.input_area.x
             + 2 // floating gutter, then the box's own border
-            + UnicodeWidthStr::width(" ❯ ") as u16
+            + UnicodeWidthStr::width(" ") as u16
             + UnicodeWidthStr::width("hi") as u16;
         assert_eq!(pos.x, expected_x, "caret not at end of prompt");
         assert!(
@@ -8088,7 +8343,7 @@ mod tests {
             "turn-status must spin a grok braille frame:\n{text}"
         );
         assert!(text.contains("[stop]"), "turn-status [stop] missing:\n{text}");
-        assert!(text.contains('❯'), "{text}");
+        assert!(!text.contains('❯'), "input must not show a chevron:\n{text}");
     }
 
     #[test]
