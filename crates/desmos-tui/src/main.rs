@@ -2916,22 +2916,31 @@ fn draw_scrollback(
     } else {
         theme.gray_bright
     };
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(border))
-        .title(Span::styled(
-            format!(" {title} "),
-            Style::default().fg(accent).add_modifier(Modifier::BOLD),
-        ))
-        .style(Style::default().bg(theme.bg_base).fg(theme.text_primary));
-    let inner = block.inner(area);
-    f.render_widget(block, area);
+    // Lay out before drawing the frame: the border title carries the count of
+    // rows scrolled off the top, so it has to be known before the block is
+    // rendered. Overflow below is stamped on the bottom border afterwards.
+    let inner = Block::default().borders(Borders::ALL).inner(area);
     if inner.width == 0 || inner.height == 0 {
         return;
     }
     state.begin_frame();
     state.prepare_layout(inner.width, inner.height);
     clamp_scroll(state);
+    let (above, below) = hidden_rows(state);
+    let heading = if above > 0 {
+        format!(" {title}  {above} more up ")
+    } else {
+        format!(" {title} ")
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(border))
+        .title(Span::styled(
+            heading,
+            Style::default().fg(accent).add_modifier(Modifier::BOLD),
+        ))
+        .style(Style::default().bg(theme.bg_base).fg(theme.text_primary));
+    f.render_widget(block, area);
     let hover = hovered_entry(sel_model, mouse);
     let output = ScrollbackPane::new()
         .active(focused)
@@ -2947,6 +2956,50 @@ fn draw_scrollback(
     if let Some(persist) = text.persist {
         render_persistent_selection_overlay(sel_model, &persist, None, f.buffer_mut());
     }
+    if below > 0 {
+        stamp_footer(f, area, &format!(" {below} more down "), theme.gray_bright);
+    }
+}
+
+/// Rows of this scrollback that are outside the viewport: (above, below).
+/// Follow mode pins the view to the tail, so nothing is ever hidden below it.
+fn hidden_rows(sb: &ScrollbackState) -> (usize, usize) {
+    let (off, vp, total) = sb.scroll_info();
+    if vp == 0 {
+        return (0, 0);
+    }
+    let vp = vp as usize;
+    let above = off.min(total);
+    let below = total.saturating_sub(off + vp);
+    (above, below)
+}
+
+/// Write a short label into the bottom border of `area`, right-aligned one
+/// cell in from the corner. Purely decorative: it overwrites border glyphs
+/// that the block already painted.
+fn stamp_footer(f: &mut Frame, area: Rect, label: &str, color: ratatui::style::Color) {
+    if area.height < 2 || area.width < 4 {
+        return;
+    }
+    let w = label.chars().count() as u16;
+    if w + 2 > area.width {
+        return;
+    }
+    let x = area.x + area.width - 1 - w;
+    let y = area.y + area.height - 1;
+    let spot = Rect {
+        x,
+        y,
+        width: w,
+        height: 1,
+    };
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            label.to_string(),
+            Style::default().fg(color),
+        ))),
+        spot,
+    );
 }
 
 fn tick_scrollbacks(app: &mut App) -> bool {
@@ -3065,43 +3118,51 @@ fn draw(f: &mut Frame, app: &mut App) {
         .saturating_sub(queue_h)
         .saturating_sub(turn_h);
     let post_h = app.layout.post_h.min(rest / 3);
+    // The body is split left/right first, so the wire column runs the full
+    // height down to the queue. The POST tree sits under the story column
+    // only -- it used to span both, which capped the call stack at a third of
+    // the screen and silently scrolled older cards away.
     let cols = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(6),
-            Constraint::Length(post_h),
             Constraint::Length(queue_h),
             Constraint::Length(turn_h),
             Constraint::Length(input_h),
         ])
         .split(f.area());
-    let panes = Layout::default()
+    let body = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
             Constraint::Percentage(100 - app.layout.wire_pct),
             Constraint::Percentage(app.layout.wire_pct),
         ])
         .split(cols[0]);
-    // Bottom fifth of the wire column is the meter: cache TTL + last POST.
-    let meter_h = app.layout.meter_h.min(panes[1].height.saturating_sub(3));
+    let post_h = post_h.min(body[0].height.saturating_sub(3));
+    let left = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(3), Constraint::Length(post_h)])
+        .split(body[0]);
+    // Bottom of the wire column is the meter: cache TTL + last POST.
+    let meter_h = app.layout.meter_h.min(body[1].height.saturating_sub(3));
     let wire = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(3), Constraint::Length(meter_h)])
-        .split(panes[1]);
-    let panes = [panes[0], wire[0]];
+        .split(body[1]);
+    let panes = [left[0], wire[0]];
     app.cache.area = wire[1];
     let posts = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(cols[1]);
+        .split(left[1]);
 
     app.traj_area = panes[0];
     app.call_area = panes[1];
     app.post_in_area = posts[0];
     app.post_out_area = posts[1];
-    app.queue_area = cols[2];
-    app.turn_status_area = cols[3];
-    app.input_area = cols[4];
+    app.queue_area = cols[1];
+    app.turn_status_area = cols[2];
+    app.input_area = cols[3];
 
     let viewing = app.viewing.clone();
     let child_ok = viewing
@@ -3188,14 +3249,14 @@ fn draw(f: &mut Frame, app: &mut App) {
         app.focus == Focus::PostOut,
     );
     draw_cache_meter(f, app.cache.area, &app.cache, app.focus == Focus::Meter);
-    draw_queue(f, cols[2], app);
+    draw_queue(f, cols[1], app);
     if show_turn {
         let cancel_hovered = app.mouse.is_some_and(|(c, r)| {
             app.turn_cancel.is_some_and(|a| hit(a, c, r))
         });
         let out = turn_status::render_turn_status(
             f.buffer_mut(),
-            cols[3],
+            cols[2],
             TurnStatusArgs {
                 state: &agent_st,
                 activity: &activity,
@@ -3225,7 +3286,7 @@ fn draw(f: &mut Frame, app: &mut App) {
     } else {
         app.turn_cancel = None;
     }
-    draw_input(f, cols[4], app);
+    draw_input(f, cols[3], app);
     if app.post_inspect.is_some() {
         draw_post_inspect(f, app);
     }
@@ -4066,6 +4127,55 @@ mod tests {
         let mut term = Terminal::new(backend).unwrap();
         term.draw(|f| draw(f, app)).unwrap();
         buffer_text(&term)
+    }
+
+    #[test]
+    fn wire_column_reaches_the_queue_not_just_the_top_third() {
+        // POST in/out sit under the story column, so the calls border must
+        // extend below the row where the POST panes start.
+        let mut app = App::new();
+        seed_demo(&mut app);
+        let text = paint(&mut app, 140, 40);
+        let calls_rows: Vec<usize> = text
+            .lines()
+            .enumerate()
+            .filter(|(_, l)| l.contains("calls") || l.contains("cache"))
+            .map(|(i, _)| i)
+            .collect();
+        let post_row = row_of(&text, "POST in").expect(&text);
+        let lowest = *calls_rows.iter().max().expect(&text);
+        assert!(
+            lowest > post_row,
+            "wire column stops above the POST split (wire {lowest} <= post {post_row}):\n{text}"
+        );
+    }
+
+    #[test]
+    fn overflowing_pane_reports_how_much_is_hidden() {
+        let mut app = App::new();
+        for i in 0..60 {
+            app.story_push(RenderBlock::agent_message(format!("ROW{i} filler line")));
+        }
+        // Paint once so prepare_layout establishes a viewport; scroll_up is a
+        // no-op while viewport_height is 0.
+        let first = paint(&mut app, 120, 30);
+        assert!(first.contains("more up"), "tail view hides rows above:\n{first}");
+        assert!(
+            !first.contains("more down"),
+            "follow mode is pinned to the tail, nothing is below it:\n{first}"
+        );
+        app.story.scroll_up(20);
+        let text = paint(&mut app, 120, 30);
+        assert!(text.contains("more up"), "no up-overflow marker:\n{text}");
+        assert!(text.contains("more down"), "no down-overflow marker:\n{text}");
+    }
+
+    #[test]
+    fn a_pane_that_fits_shows_no_overflow_marker() {
+        let mut app = App::new();
+        app.story_push(RenderBlock::agent_message("just one short line"));
+        let text = paint(&mut app, 120, 30);
+        assert!(!text.contains("more up"), "spurious overflow marker:\n{text}");
     }
 
     #[test]
