@@ -126,6 +126,33 @@ def self_check() -> None:
         assert "turn-status" in prompt or "turn status" in prompt
         assert "ready snapshot" in prompt
         assert "height 0" in prompt or "skipped" in prompt
+        # Capabilities the code has and the catalog used to leave unsaid. Each
+        # of these is reachable today; the model just had no way to know.
+        for owed in ("batching:", "6000", "spawn(", "fanout(", "gather(", "reset()", "before_dispatch", "old_str"):
+            assert owed in prompt, owed
+
+        # Two dialects, opposite directions. A conciseness instruction cuts
+        # Opus 5's length ~20%; the same words make GPT-5.6 return a shorter
+        # artifact instead of a shorter explanation. Averaging them is wrong
+        # for both, so assert they actually differ.
+        from desmos.dialect import capabilities, dialect, family
+
+        assert family("claude-opus-5") == "anthropic"
+        assert family("gpt-5.6-sol") == "openai"
+        assert family("codex-mini") == "openai"
+        assert family("") == "anthropic", "unknown model falls back to anthropic"
+        anth, oai = dialect("claude-opus-5"), dialect("gpt-5.6-sol")
+        assert anth != oai
+        # The load-bearing difference: ask Opus 5 for brevity and responses get
+        # ~20% shorter; ask GPT-5.6 and it returns a shorter *artifact* instead.
+        # ("brief initial plan" is fine on openai -- that is about the plan,
+        # not about how much of the deliverable to hand back.)
+        assert "responses focused and brief" in anth
+        assert "concise" not in oai and "responses focused and brief" not in oai
+        assert len(oai) < len(anth), "openai dialect must stay the shorter one"
+        # The factual half is shared; only the register changes.
+        assert capabilities() in system_prompt(world)
+
         assert "<edit" in ABI
         assert "<reload_sdk" in ABI
         assert "XML tags are syscalls" in ABI

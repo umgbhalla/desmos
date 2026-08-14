@@ -75,6 +75,12 @@ def catalog(world: World) -> str:
     if mem:
         lines.append(mem)
     lines.append(runtime_block(world))
+    # Capabilities the code has and the catalog never said out loud, plus the
+    # working style the driving model's family actually responds to. Last, so
+    # it reads as instruction rather than reference.
+    from desmos.dialect import block as dialect_block
+
+    lines.append(dialect_block(world))
     return "\n".join(lines)
 
 
