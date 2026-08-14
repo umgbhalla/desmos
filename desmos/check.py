@@ -11,6 +11,28 @@ from desmos.complete import INTERLEAVED_BETA, text_of
 from desmos.types import Block
 
 
+def _fake_id_token(*, plan: str, account: str, ttl: int = 3600) -> str:
+    """A JWT-shaped string carrying the claims auth.py reads. Unsigned on purpose."""
+    import base64 as _b64
+    import json as _json
+    import time as _time
+
+    def seg(obj: dict) -> str:
+        return _b64.urlsafe_b64encode(_json.dumps(obj).encode()).decode().rstrip("=")
+
+    head = seg({"alg": "none", "typ": "JWT"})
+    body = seg(
+        {
+            "exp": int(_time.time()) + ttl,
+            "https://api.openai.com/auth": {
+                "chatgpt_account_id": account,
+                "chatgpt_plan_type": plan,
+            },
+        }
+    )
+    return f"{head}.{body}.sig-not-checked"
+
+
 def self_check() -> None:
     import tempfile
 
@@ -787,6 +809,121 @@ def self_check() -> None:
         assert all(n["params"].get("_meta", {}).get("promptId") == "p-check" for n in notes if n.get("method") == "session/update")
         tool = next(n["params"]["update"] for n in notes if n.get("method") == "session/update" and n["params"]["update"]["sessionUpdate"] == "tool_call")
         assert tool["title"] == "python" and tool["kind"] == "execute"
+
+        # --- auth: file schema, credential precedence, masking (no network) ---
+        import base64
+        import json
+        import os
+        import time
+        import urllib.parse
+
+        from desmos import auth as _auth
+
+        old_env = {k: os.environ.get(k) for k in ("OPENAI_API_KEY", "DESMOS_AUTH", "CODEX_HOME", "ANTHROPIC_API_KEY")}
+        try:
+            authdir = cwd / "authhome"
+            authdir.mkdir()
+            os.environ["DESMOS_AUTH"] = str(authdir / "auth.json")
+            os.environ["CODEX_HOME"] = str(cwd / "nocodex")
+            os.environ.pop("OPENAI_API_KEY", None)
+            assert _auth.desmos_auth_path() == authdir / "auth.json"
+            assert _auth.openai_credential() is None
+            try:
+                _auth.credential("openai")
+                raise AssertionError("expected NeedsAuth")
+            except _auth.NeedsAuth:
+                pass
+
+            # an oauth file we wrote ourselves, in Codex's own schema
+            fake_jwt = _fake_id_token(plan="pro", account="acct-42")
+            _auth.write_auth_file(
+                _auth.desmos_auth_path(),
+                {
+                    "access_token": fake_jwt,
+                    "refresh_token": "rt-1",
+                    "id_token": fake_jwt,
+                    "expires_at": int(time.time()) + 3600,
+                },
+            )
+            raw = json.loads(_auth.desmos_auth_path().read_text())
+            assert "tokens" in raw and raw["tokens"]["refresh_token"] == "rt-1", raw
+            assert oct(_auth.desmos_auth_path().stat().st_mode)[-3:] == "600"
+            cred = _auth.openai_credential()
+            assert cred is not None and cred.kind == "oauth"
+            assert cred.account_id == "acct-42" and cred.plan == "pro"
+            assert not cred.expired()
+            assert fake_jwt not in cred.masked() and "…" in cred.masked()
+
+            # env key wins over the stored oauth token
+            os.environ["OPENAI_API_KEY"] = "sk-openai-test-key"
+            cred = _auth.openai_credential()
+            assert cred.kind == "env" and cred.source == "OPENAI_API_KEY"
+            rows = {r["provider"]: r for r in _auth.status()}
+            assert rows["openai"]["ok"] and "openai" in rows and "anthropic" in rows
+            assert "sk-openai-test-key" not in json.dumps(rows)
+
+            assert _auth.logout_openai() == [str(_auth.desmos_auth_path())]
+            os.environ.pop("OPENAI_API_KEY", None)
+            assert _auth.openai_credential() is None
+        finally:
+            for k, v in old_env.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+
+        # --- browser login: pkce, consent url, and a real localhost callback ---
+        import hashlib
+        import socket
+        import threading
+        import urllib.request
+
+        verifier, challenge = _auth._pkce()
+        assert base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).decode().rstrip("=") == challenge
+        url = _auth.authorize_url(challenge, "st-1")
+        assert url.startswith(_auth.AUTH_BASE + "/oauth/authorize?")
+        for want in ("code_challenge_method=S256", "code_challenge=" + challenge, "state=st-1",
+                     urllib.parse.quote(_auth.LOCAL_REDIRECT_URI, safe="")):
+            assert want in url, want
+
+        probe = socket.socket()
+        probe.bind(("127.0.0.1", 0))
+        free_port = probe.getsockname()[1]
+        probe.close()
+        real_port = _auth.LOCAL_PORT
+        _auth.LOCAL_PORT = free_port
+        try:
+            for state, query, expect in (
+                ("st-2", "code=ac-9&state=st-2", "ac-9"),
+                ("st-3", "code=ac-9&state=wrong", None),
+            ):
+                out: dict = {}
+
+                def serve(state=state, out=out):
+                    try:
+                        out["code"] = _auth.wait_for_callback(state, timeout=10)
+                    except Exception as e:  # NeedsAuth on mismatch
+                        out["err"] = str(e)
+
+                t = threading.Thread(target=serve, daemon=True)
+                t.start()
+                body = b""
+                hit = f"http://127.0.0.1:{free_port}{_auth.CALLBACK_PATH}?{query}"
+                for _ in range(100):
+                    try:
+                        body = urllib.request.urlopen(hit, timeout=2).read()
+                        break
+                    except OSError:
+                        time.sleep(0.05)
+                t.join(12)
+                assert not t.is_alive(), "callback server never returned"
+                assert b"signed in" in body, body[:80]
+                if expect:
+                    assert out.get("code") == expect, out
+                else:
+                    assert "code" not in out and "state mismatch" in out.get("err", ""), out
+        finally:
+            _auth.LOCAL_PORT = real_port
 
         try:
             from IPython.core.interactiveshell import InteractiveShell

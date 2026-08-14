@@ -302,6 +302,42 @@ def _tui_binary(root: Path, release: bool = True) -> Path | None:
     return binary
 
 
+def cmd_auth(args: argparse.Namespace) -> int:
+    """Show, log in to, or log out of a provider."""
+    from desmos import auth
+
+    action = getattr(args, "action", None) or "status"
+    if action == "status":
+        rows = auth.status()
+        for row in rows:
+            if not row["ok"]:
+                print(f"--  {row['provider']:<10} {row['detail']}")
+                continue
+            bits = [f"{row['kind']} {row['token']}", f"via {row['source']}"]
+            for k in ("plan", "account"):
+                if row.get(k):
+                    bits.append(f"{k}={row[k]}")
+            if row.get("expires_in") is not None:
+                bits.append(f"expires in {row['expires_in'] // 3600}h")
+            print(f"ok  {row['provider']:<10} " + "  ".join(bits))
+        return 0 if any(r["ok"] for r in rows) else 1
+    if action == "login":
+        if args.provider != "openai":
+            print("only openai supports interactive login; anthropic reads ANTHROPIC_API_KEY")
+            return 2
+        cred = auth.login_openai(
+            notify=lambda msg: print(msg, flush=True),
+            method="device" if args.device else "browser",
+        )
+        print(f"logged in: {cred.masked()} plan={cred.plan or '?'}")
+        return 0
+    if action == "logout":
+        removed = auth.logout_openai()
+        print("removed" if removed else "nothing to remove")
+        return 0
+    return 2
+
+
 def main() -> int:
     p = argparse.ArgumentParser(prog="desmos")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -335,6 +371,12 @@ def main() -> int:
     t.add_argument("--grok", action="store_true", help="launch grok-build pager via ACP instead")
     t.add_argument("--debug", action="store_true", help="dev build (default is release)")
     t.set_defaults(func=cmd_tui)
+
+    au = sub.add_parser("auth", help="provider credentials: status, login, logout")
+    au.add_argument("action", nargs="?", default="status", choices=["status", "login", "logout"])
+    au.add_argument("--provider", default="openai", choices=["openai", "anthropic"])
+    au.add_argument("--device", action="store_true", help="device code instead of the browser round trip")
+    au.set_defaults(func=cmd_auth)
 
     a = sub.add_parser("acp", help="ACP stdio server for grok-build's pager")
     a.set_defaults(func=cmd_acp)
