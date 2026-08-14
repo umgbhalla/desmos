@@ -10,8 +10,14 @@ id_ed25519
 .desmos/
 runs/
 
-# vendored clones — analysis only, never committed
-vendor/
+# vendored clones. grok-build is committed — desmos-tui imports it, so it is
+# source, not a reference copy, and a clone must build without fetching it.
+# Everything else under vendor/ is an analysis clone and stays out.
+vendor/*
+!vendor/grok-build/
+vendor/grok-build/.git-upstream/
+vendor/grok-build/target/
+vendor/grok-build/**/target/
 
 # tooling caches
 .mypy_cache/
