@@ -1413,6 +1413,14 @@ fn grok_appearance() -> AppearanceConfig {
     // style drops the verb: the description stands as the title, the command
     // follows on its own line, the output after that.
     cfg.scrollback.blocks.execute.header_style = appearance::ExecuteHeaderStyle::Shell;
+    // A streaming thought spent three rows on chrome before a word of reasoning:
+    // the header, a blank separator the header always drags with it, and the
+    // ellipsis row. The header is the one I can drop, and it is the one that was
+    // never earning its rows here -- the turn-status row already says Thinking
+    // with a spinner and the elapsed time. Collapsed mode keeps its header
+    // regardless of this flag, so a finished thought still reads "Thought for
+    // 12s".
+    cfg.scrollback.blocks.thinking.header = false;
     cfg.show_timestamps = appearance_cache::load_timestamps();
     cfg.show_timeline = appearance_cache::load_show_timeline();
     cfg.prompt.compact = appearance_cache::load();
@@ -5500,6 +5508,54 @@ mod tests {
         let mut term = Terminal::new(backend).unwrap();
         term.draw(|f| draw(f, app)).unwrap();
         buffer_text(&term)
+    }
+
+    /// A streaming thought spends no row on chrome it does not need.
+    ///
+    /// It used to open with three: a "Thinking…" header, the blank separator the
+    /// header always drags with it, and the ellipsis marking the clipped tail.
+    /// The turn-status row already says Thinking with a spinner and the elapsed
+    /// time, so the header was the copy, and its blank was pure waste. Only the
+    /// ellipsis earns its row -- without it the body looks like a paragraph that
+    /// happens to start mid-sentence.
+    #[test]
+    fn a_streaming_thought_does_not_repeat_the_status_row() {
+        let mut app = App::new();
+        app.ready = true;
+        handle_event(&mut app, json!({"ev": "turn", "text": "go"}));
+        for i in 0..8 {
+            handle_event(&mut app, json!({
+                "ev": "thinking", "delta": true,
+                "text": format!("reasoning line number {i} with enough words to fill a row\n"),
+            }));
+        }
+        let text = paint(&mut app, 70, 30);
+        let body: Vec<&str> = text.lines().skip(1).take(4).collect();
+        assert!(
+            !body.iter().any(|l| l.contains("Thinking")),
+            "the header is the status row's job:\n{}",
+            body.join("\n")
+        );
+        assert!(
+            body[0].contains('\u{2026}'),
+            "the clipped marker should lead:\n{}",
+            body.join("\n")
+        );
+        // The row under the marker is reasoning, not the blank separator.
+        let under = body[1].trim_start_matches(['\u{2502}', '\u{2503}', ' ']);
+        assert!(
+            under.chars().any(char::is_alphabetic),
+            "chrome is still eating the row under the marker:\n{}",
+            body.join("\n")
+        );
+
+        // Collapsed keeps its own header, so a finished thought is still labelled.
+        handle_event(&mut app, json!({"ev": "speech", "delta": true, "text": "Answer.\n"}));
+        let text = paint(&mut app, 70, 30);
+        assert!(
+            text.contains("Thought for"),
+            "a finished thought must still say what it was:\n{text}"
+        );
     }
 
     fn call(tag: &str, target: Option<&str>) -> Seg {
