@@ -447,6 +447,8 @@ struct StreamCursor {
     speech_raw: String,
     speech_shown: String,
     pending_think: String,
+    /// The invisible stretch since the last prose.
+    run: WorkRun,
 }
 
 impl StreamCursor {
@@ -471,6 +473,7 @@ impl StreamCursor {
             return;
         }
         if self.speech.is_none() && !shown.is_empty() {
+            self.run.fold(story);
             self.speech = Some(story.start_streaming_agent());
         }
         if let Some(id) = self.speech {
@@ -507,6 +510,11 @@ impl StreamCursor {
                 story.remove_entry(id);
             } else {
                 story.finish_running(id);
+                let ms = story.get_by_id(id).and_then(|e| match &e.block {
+                    RenderBlock::Thinking(t) => t.elapsed_time_ms(),
+                    _ => None,
+                });
+                self.run.thought(id, ms);
             }
         }
     }
@@ -523,6 +531,230 @@ impl StreamCursor {
     fn finish(&mut self, story: &mut ScrollbackState) {
         self.finish_think(story);
         self.finish_speech(story);
+    }
+}
+
+
+
+
+/// What a call was aimed at, when that is structural rather than payload.
+///
+/// A path from an attr is a target. For a shell command the *program* is the
+/// semantic part -- `cargo`, `git`, `grep` -- while its flags and arguments are
+/// the payload the calls pane already holds, so only the bare program name
+/// comes across, and only after stepping past a leading `cd`.
+fn call_target(tag: &str, ev: &Value) -> Option<String> {
+    if let Some(p) = ev
+        .get("attrs")
+        .and_then(|a| a.get("path"))
+        .and_then(Value::as_str)
+    {
+        return Some(
+            p.rsplit('/')
+                .next()
+                .filter(|s| !s.is_empty())
+                .unwrap_or(p)
+                .to_string(),
+        );
+    }
+    if tag != "bash" {
+        return None;
+    }
+    let body = ev.get("body").and_then(Value::as_str)?;
+    for step in body.split("&&").flat_map(|s| s.split(';')) {
+        let Some(word) = step.split_whitespace().next() else {
+            continue;
+        };
+        if matches!(word, "cd" | "export" | "set" | "source" | "") || word.contains('=') {
+            continue;
+        }
+        let prog = word.rsplit('/').next().unwrap_or(word);
+        return Some(prog.to_string());
+    }
+    None
+}
+
+/// `git rev-parse --short HEAD`, or None outside a repo.
+///
+/// Called once per run, at the first syscall, never from the render path.
+fn git_head() -> Option<String> {
+    let out = std::process::Command::new("git")
+        .args(["rev-parse", "--short", "HEAD"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!s.is_empty()).then_some(s)
+}
+
+/// What the repo looks like at the seam, where prose starts.
+///
+/// A run of invisible work is worth reading precisely because it changed
+/// something on disk, and the reader should not have to go look. A moved HEAD
+/// is the headline; otherwise the dirty count is.
+fn git_tail(head_at_start: Option<&str>) -> Option<String> {
+    let head = git_head();
+    if let (Some(before), Some(now)) = (head_at_start, head.as_deref()) {
+        if before != now {
+            return Some(format!("\u{00b7} committed {now}"));
+        }
+    }
+    let out = std::process::Command::new("git")
+        .args(["status", "--porcelain"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let dirty = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .count();
+    match dirty {
+        0 => Some("\u{00b7} tree clean".into()),
+        1 => Some("\u{00b7} 1 file dirty".into()),
+        n => Some(format!("\u{00b7} {n} files dirty")),
+    }
+}
+
+/// One thing that happened where the story could not see it.
+#[derive(Debug, Clone, PartialEq)]
+enum Seg {
+    /// A finished thought, in milliseconds.
+    Thought(u64),
+    /// A syscall: the tag, and a target only where one is structural.
+    Call { tag: String, target: Option<String> },
+}
+
+/// A stretch of invisible work — the thoughts and syscalls between two pieces
+/// of prose — folded into one line the reader can actually follow.
+///
+/// The story is a whitelist of narrative kinds, so a run of tool work shows up
+/// as nothing but a stack of collapsed thoughts: three "Thought for 9s" rows
+/// and no hint that six files were read and two were rewritten. This is the
+/// connective tissue. It never carries a body, because it is built from tags
+/// and attrs and never sees one.
+#[derive(Default)]
+struct WorkRun {
+    segs: Vec<Seg>,
+    /// Thought blocks to fold away once the row replaces them.
+    thoughts: Vec<EntryId>,
+    /// HEAD when the run's first call landed, to spot a commit at the seam.
+    head_at_start: Option<String>,
+}
+
+/// Below this a run is not worth a row: the collapsed thought already says
+/// everything, and a line for one grep is worse than silence.
+const RUN_MIN_CALLS: usize = 2;
+
+impl WorkRun {
+    fn call(&mut self, tag: &str, target: Option<String>) {
+        if self.head_at_start.is_none() {
+            self.head_at_start = git_head();
+        }
+        self.segs.push(Seg::Call {
+            tag: tag.to_string(),
+            target,
+        });
+    }
+
+    fn thought(&mut self, id: EntryId, elapsed_ms: Option<i64>) {
+        self.thoughts.push(id);
+        self.segs
+            .push(Seg::Thought(elapsed_ms.unwrap_or(0).max(0) as u64));
+    }
+
+    fn calls(&self) -> usize {
+        self.segs
+            .iter()
+            .filter(|s| matches!(s, Seg::Call { .. }))
+            .count()
+    }
+
+    /// Replace the run's thought blocks with a single sentence. Called at the
+    /// seam, just before prose starts, so the row lands above the answer.
+    fn fold(&mut self, story: &mut ScrollbackState) {
+        if self.calls() < RUN_MIN_CALLS {
+            self.reset();
+            return;
+        }
+        let mut line = work_sentence(&self.segs);
+        if let Some(tail) = git_tail(self.head_at_start.as_deref()) {
+            line.push_str("  ");
+            line.push_str(&tail);
+        }
+        for id in self.thoughts.drain(..) {
+            story.remove_entry(id);
+        }
+        story.push_block(RenderBlock::system(line));
+        self.reset();
+    }
+
+    fn reset(&mut self) {
+        self.segs.clear();
+        self.thoughts.clear();
+        self.head_at_start = None;
+    }
+}
+
+/// Render a run as one line: thoughts as durations, calls compressed.
+///
+/// Consecutive calls with the same tag become `tag xN`, a lone call keeps its
+/// target, and a run longer than [`SENTENCE_MAX`] groups elides its middle. One
+/// line, always, so the row cannot push the transcript around as it grows.
+fn work_sentence(segs: &[Seg]) -> String {
+    // Group into alternating thought / work phases.
+    let mut phases: Vec<String> = Vec::new();
+    let mut work: Vec<(String, Option<String>, usize)> = Vec::new();
+    let flush = |work: &mut Vec<(String, Option<String>, usize)>, out: &mut Vec<String>| {
+        if work.is_empty() {
+            return;
+        }
+        let parts: Vec<String> = work
+            .drain(..)
+            .map(|(tag, target, n)| match (n, target) {
+                (1, Some(t)) => format!("{tag} {t}"),
+                (1, None) => tag,
+                (n, _) => format!("{tag} \u{00d7}{n}"),
+            })
+            .collect();
+        out.push(parts.join(", "));
+    };
+    for seg in segs {
+        match seg {
+            Seg::Thought(ms) => {
+                flush(&mut work, &mut phases);
+                phases.push(format!("thought {}", human_secs(*ms)));
+            }
+            Seg::Call { tag, target } => match work.last_mut() {
+                Some((t, _, n)) if t == tag => *n += 1,
+                _ => work.push((tag.clone(), target.clone(), 1)),
+            },
+        }
+    }
+    flush(&mut work, &mut phases);
+
+    const SENTENCE_MAX: usize = 5;
+    if phases.len() > SENTENCE_MAX {
+        let head = phases[..2].join(" \u{2192} ");
+        let tail = phases[phases.len() - 2..].join(" \u{2192} ");
+        return format!("{head} \u{2192} \u{2026} \u{2192} {tail}");
+    }
+    phases.join(" \u{2192} ")
+}
+
+/// Durations read as durations: 900ms is "0.9s", 95s is "1m35s".
+fn human_secs(ms: u64) -> String {
+    let secs = ms as f64 / 1000.0;
+    if secs < 10.0 {
+        format!("{secs:.1}s")
+    } else if secs < 60.0 {
+        format!("{}s", secs.round() as u64)
+    } else {
+        let s = secs.round() as u64;
+        format!("{}m{:02}s", s / 60, s % 60)
     }
 }
 
@@ -1758,6 +1990,12 @@ fn handle_event(app: &mut App, ev: Value) {
         }
         "result" => {
             app.stream.finish(&mut app.story);
+            let phase = ev.get("phase").and_then(Value::as_str).unwrap_or("done");
+            if phase != "start" && phase != "delta" {
+                let tag = ev.get("tag").and_then(Value::as_str).unwrap_or("?");
+                let target = call_target(tag, &ev);
+                app.stream.run.call(tag, target);
+            }
             apply_result(&mut app.calls, &mut app.exec, &ev);
         }
         "post" => {
@@ -1765,6 +2003,15 @@ fn handle_event(app: &mut App, ev: Value) {
             let empty = json!({});
             let req = ev.get("request").unwrap_or(&empty);
             app.set_last_post(n, req, &empty);
+        }
+        // The wire pane exists so the human sees what the harness did. A fold
+        // rewrites the transcript the model reads, so it belongs here and not
+        // in the story — it is not something the model said.
+        "compacted" => {
+            let n = ev.get("n").and_then(Value::as_u64).unwrap_or(0);
+            let kept = ev.get("kept").and_then(Value::as_u64).unwrap_or(0);
+            let summary = ev.get("text").and_then(Value::as_str).unwrap_or("");
+            app.call_push(wire_compacted(n, kept, summary));
         }
         "complete" => {
             app.stream.finish(&mut app.story);
@@ -1797,6 +2044,7 @@ fn handle_event(app: &mut App, ev: Value) {
         }
         "done" => {
             app.stream.finish(&mut app.story);
+            app.stream.run.fold(&mut app.story);
             finish_exec(&mut app.calls, &mut app.exec);
             app.running = false;
             app.turn_started = None;
@@ -4986,6 +5234,25 @@ fn wire_complete(
     ))
 }
 
+/// Wire card for a server-side fold. The model's memory just got rewritten,
+/// which is the largest thing the harness does to itself in a run — without a
+/// card the only symptom is the context bar dropping for no stated reason.
+fn wire_compacted(n: u64, kept: u64, summary: &str) -> RenderBlock {
+    let head = if kept > 0 {
+        format!("FOLD:  POST #{n}  {kept} kept")
+    } else {
+        format!("FOLD:  POST #{n}")
+    };
+    let body = if summary.trim().is_empty() {
+        "earlier turns folded by the server".to_string()
+    } else {
+        summary.to_string()
+    };
+    RenderBlock::ToolCall(ToolCallBlock::Other(
+        OtherToolCallBlock::new(head, "context compacted".to_string()).with_output(body),
+    ))
+}
+
 /// Wire card for one XML syscall: the body that ran, then the result.
 fn wire_syscall(tag: &str, body: &str, attrs: &Value, result: &str) -> RenderBlock {
     match tag {
@@ -5233,6 +5500,135 @@ mod tests {
         let mut term = Terminal::new(backend).unwrap();
         term.draw(|f| draw(f, app)).unwrap();
         buffer_text(&term)
+    }
+
+    fn call(tag: &str, target: Option<&str>) -> Seg {
+        Seg::Call {
+            tag: tag.into(),
+            target: target.map(Into::into),
+        }
+    }
+
+    /// The sentence is the whole point: it has to read like one.
+    #[test]
+    fn a_run_reads_as_one_sentence() {
+        let segs = vec![
+            Seg::Thought(12_000),
+            call("edit", Some("main.rs")),
+            call("python", None),
+            call("python", None),
+            call("bash", Some("cargo")),
+            Seg::Thought(8_400),
+            call("bash", Some("cargo")),
+        ];
+        assert_eq!(
+            work_sentence(&segs),
+            "thought 12s \u{2192} edit main.rs, python \u{00d7}2, bash cargo \u{2192} thought 8.4s \u{2192} bash cargo"
+        );
+    }
+
+    #[test]
+    fn a_long_run_elides_its_middle_instead_of_wrapping() {
+        let mut segs = Vec::new();
+        for i in 0..8 {
+            segs.push(Seg::Thought(1_000 * (i + 1)));
+            segs.push(call("bash", Some("git")));
+        }
+        let line = work_sentence(&segs);
+        assert!(line.contains('\u{2026}'), "long run must elide: {line}");
+        assert!(line.len() < 90, "still too long: {line}");
+    }
+
+    #[test]
+    fn durations_read_as_durations() {
+        assert_eq!(human_secs(900), "0.9s");
+        assert_eq!(human_secs(9_400), "9.4s");
+        assert_eq!(human_secs(12_000), "12s");
+        assert_eq!(human_secs(95_000), "1m35s");
+    }
+
+    /// A shell command contributes its program and nothing else. This is the
+    /// rule that keeps the row from becoming a second calls pane.
+    #[test]
+    fn a_shell_call_contributes_its_program_not_its_command() {
+        let ev = json!({
+            "tag": "bash",
+            "body": "cd /Users/zeus/hub/desmos && cargo test --workspace 2>&1 | grep FAIL",
+        });
+        assert_eq!(call_target("bash", &ev).as_deref(), Some("cargo"));
+        let edit = json!({"tag": "edit", "attrs": {"path": "crates/desmos-tui/src/main.rs"}});
+        assert_eq!(call_target("edit", &edit).as_deref(), Some("main.rs"));
+    }
+
+    /// Driven through handle_event, because the row is only worth anything if
+    /// the real event path builds it. The thoughts must be gone: two rows
+    /// saying the same thing is what this replaced.
+    #[test]
+    fn invisible_work_folds_into_one_row_above_the_prose() {
+        let mut app = App::new();
+        handle_event(&mut app, json!({"ev": "turn", "text": "go"}));
+        handle_event(
+            &mut app,
+            json!({"ev": "thinking", "delta": true, "text": "planning the change\n"}),
+        );
+        for (tag, body) in [("bash", "cd /tmp && cargo build"), ("bash", "cd /tmp && cargo test")] {
+            handle_event(
+                &mut app,
+                json!({"ev": "result", "tag": tag, "body": body, "text": "ok"}),
+            );
+        }
+        handle_event(
+            &mut app,
+            json!({"ev": "speech", "delta": true, "text": "Done, 111 green."}),
+        );
+        let _ = paint(&mut app, 120, 34);
+
+        let kinds: Vec<&str> = (0..app.story.len())
+            .filter_map(|i| app.story.entry(i).map(|e| match &e.block {
+                RenderBlock::Thinking(_) => "Thinking",
+                RenderBlock::System(_) => "System",
+                RenderBlock::AgentMessage(_) => "AgentMessage",
+                _ => "other",
+            }))
+            .collect();
+        assert_eq!(
+            kinds,
+            vec!["System", "AgentMessage"],
+            "the run should be one row, then the prose: {kinds:?}"
+        );
+        let row = (0..app.story.len())
+            .find_map(|i| match app.story.entry(i).map(|e| &e.block) {
+                Some(RenderBlock::System(b)) => Some(b.text.clone()),
+                _ => None,
+            })
+            .expect("work row");
+        assert!(row.contains("bash \u{00d7}2"), "calls not compressed: {row}");
+        assert!(row.contains("thought"), "thinking not folded in: {row}");
+        assert!(!row.contains("cargo build"), "a command body leaked: {row}");
+    }
+
+    /// One call is not a run. A row for a lone grep is worse than silence.
+    #[test]
+    fn a_single_call_leaves_the_story_alone() {
+        let mut app = App::new();
+        handle_event(&mut app, json!({"ev": "turn", "text": "go"}));
+        handle_event(
+            &mut app,
+            json!({"ev": "thinking", "delta": true, "text": "one look\n"}),
+        );
+        handle_event(
+            &mut app,
+            json!({"ev": "result", "tag": "grep", "body": "pattern", "text": "hit"}),
+        );
+        handle_event(&mut app, json!({"ev": "speech", "delta": true, "text": "Found it."}));
+        let _ = paint(&mut app, 120, 34);
+        let thoughts = (0..app.story.len())
+            .filter(|i| matches!(
+                app.story.entry(*i).map(|e| &e.block),
+                Some(RenderBlock::Thinking(_))
+            ))
+            .count();
+        assert_eq!(thoughts, 1, "a lone call must not fold the thought away");
     }
 
     /// The composer belongs to the story column, and the legend takes the same
@@ -6246,6 +6642,28 @@ mod tests {
             app.calls.select_next();
         }
         app.calls.goto_top();
+    }
+
+    /// A fold rewrites what the model remembers. It is the harness acting on
+    /// itself, not something the model said, so it belongs on the wire.
+    #[test]
+    fn a_fold_lands_on_the_wire_and_never_in_the_story() {
+        let mut app = App::new();
+        handle_event(
+            &mut app,
+            json!({"ev": "compacted", "n": 7, "kept": 12, "text": "folded 40 turns"}),
+        );
+        app.set_focus(Focus::Calls);
+        let _ = paint(&mut app, 100, 40);
+        expand_calls(&mut app);
+        let wire = paint(&mut app, 100, 60);
+        assert!(wire.contains("FOLD"), "{wire}");
+        assert!(wire.contains("#7") && wire.contains("12 kept"), "{wire}");
+        assert!(wire.contains("folded 40 turns"), "{wire}");
+
+        // `paint` renders both columns, so assert on the scrollback itself
+        // rather than the frame text: the story took no entry at all.
+        assert_eq!(app.story.len(), 0, "a fold is not speech");
     }
 
     #[test]
