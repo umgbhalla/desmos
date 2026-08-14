@@ -35,6 +35,7 @@
 mod json_tree;
 mod prompt;
 mod queue;
+mod side;
 
 use std::collections::{HashMap, HashSet};
 use std::io::{self, BufRead, BufReader, Write};
@@ -105,6 +106,8 @@ enum Focus {
     Story,
     Calls,
     Meter,
+    Git,
+    Files,
     PostIn,
     PostOut,
     Queue,
@@ -175,7 +178,9 @@ impl Focus {
         match self {
             Self::Story => Self::Calls,
             Self::Calls => Self::Meter,
-            Self::Meter => Self::PostIn,
+            Self::Meter => Self::Git,
+            Self::Git => Self::Files,
+            Self::Files => Self::PostIn,
             Self::PostIn => Self::PostOut,
             Self::PostOut => Self::Queue,
             Self::Queue => Self::Input,
@@ -188,7 +193,9 @@ impl Focus {
             Self::Story => Self::Input,
             Self::Calls => Self::Story,
             Self::Meter => Self::Calls,
-            Self::PostIn => Self::Meter,
+            Self::Git => Self::Meter,
+            Self::Files => Self::Git,
+            Self::PostIn => Self::Files,
             Self::PostOut => Self::PostIn,
             Self::Queue => Self::PostOut,
             Self::Input => Self::Queue,
@@ -198,7 +205,7 @@ impl Focus {
     /// Tab cycle. A pane collapsed to zero rows is not a pane.
     fn next_open(self, open: &dyn Fn(Focus) -> bool) -> Self {
         let mut f = self.next();
-        for _ in 0..6 {
+        for _ in 0..8 {
             if open(f) {
                 break;
             }
@@ -209,7 +216,7 @@ impl Focus {
 
     fn prev_open(self, open: &dyn Fn(Focus) -> bool) -> Self {
         let mut f = self.prev();
-        for _ in 0..6 {
+        for _ in 0..8 {
             if open(f) {
                 break;
             }
@@ -231,6 +238,10 @@ struct PaneLayout {
     meter_h: u16,
     /// Width of POST in as a percent of the POST row; the rest is POST out.
     post_split: u16,
+    /// Rows for the git pane; 0 keeps it closed, which is how it starts.
+    git_h: u16,
+    /// Rows for the file view under it; 0 keeps it closed.
+    files_h: u16,
 }
 
 /// Which way a resize key pushes. `+`/`-` drive each pane's main axis;
@@ -248,6 +259,8 @@ impl Default for PaneLayout {
             post_h: 12,
             meter_h: 7,
             post_split: 50,
+            git_h: 0,
+            files_h: 0,
         }
     }
 }
@@ -259,6 +272,9 @@ impl PaneLayout {
     const MAX_METER: u16 = 12;
     const MIN_SPLIT: u16 = 20;
     const MAX_SPLIT: u16 = 80;
+    const MAX_SIDE: u16 = 30;
+    /// What a closed side pane opens to — enough for a tab strip and a few rows.
+    const OPEN_SIDE: u16 = 10;
 
     /// The axis `+` / `-` drives for a pane: the one it can actually give away
     /// space along. Story and calls share a width; meter and POST own rows.
@@ -293,6 +309,11 @@ impl PaneLayout {
                 self.post_h = (self.post_h as i16 - by).clamp(0, Self::MAX_POST as i16) as u16
             }
             (Focus::Meter, Axis::Vertical) => self.meter_h = step(self.meter_h, 0, Self::MAX_METER),
+            (Focus::Git, Axis::Vertical) => self.git_h = step(self.git_h, 0, Self::MAX_SIDE),
+            (Focus::Files, Axis::Vertical) => self.files_h = step(self.files_h, 0, Self::MAX_SIDE),
+            (Focus::Git | Focus::Files, Axis::Horizontal) => {
+                self.wire_pct = step(self.wire_pct, Self::MIN_WIRE, Self::MAX_WIRE)
+            }
             (Focus::PostIn | Focus::PostOut, Axis::Vertical) => {
                 self.post_h = step(self.post_h, 0, Self::MAX_POST)
             }
@@ -333,6 +354,8 @@ impl PaneLayout {
             post_h: n("post_h", d.post_h).min(Self::MAX_POST),
             meter_h: n("meter_h", d.meter_h).min(Self::MAX_METER),
             post_split: n("post_split", d.post_split).clamp(Self::MIN_SPLIT, Self::MAX_SPLIT),
+            git_h: n("git_h", d.git_h).min(Self::MAX_SIDE),
+            files_h: n("files_h", d.files_h).min(Self::MAX_SIDE),
         }
     }
 
@@ -348,6 +371,8 @@ impl PaneLayout {
                 "post_h": self.post_h,
                 "meter_h": self.meter_h,
                 "post_split": self.post_split,
+                "git_h": self.git_h,
+                "files_h": self.files_h,
             })
             .to_string(),
         );
@@ -628,6 +653,10 @@ struct App {
     story_text: TextSel,
     calls_text: TextSel,
     cache: CacheMeter,
+    git: side::GitPane,
+    files: side::FilePane,
+    git_area: Rect,
+    files_area: Rect,
     layout: PaneLayout,
 }
 
@@ -827,6 +856,10 @@ impl App {
             story_text: TextSel::default(),
             calls_text: TextSel::default(),
             cache: CacheMeter::default(),
+            git: side::GitPane::new(&std::env::current_dir().unwrap_or_default()),
+            files: side::FilePane::default(),
+            git_area: Rect::default(),
+            files_area: Rect::default(),
             layout: PaneLayout::load(),
         };
         app.apply_grok_settings();
@@ -1064,6 +1097,8 @@ impl App {
             Focus::Story => self.story_scroll().on_activate(),
             Focus::Calls => self.calls_scroll().on_activate(),
             Focus::Meter
+            | Focus::Git
+            | Focus::Files
             | Focus::PostIn
             | Focus::PostOut
             | Focus::Queue
@@ -1380,6 +1415,12 @@ fn run(
         }
         // Cache TTL burns down while nothing else is live; one repaint a
         // second is enough for the bar and keeps idle CPU at zero otherwise.
+        if app.layout.git_h > 0 {
+            app.git.poll(false);
+        }
+        if app.git.drain() {
+            dirty = true;
+        }
         let cache_live = app.cache.left().is_some();
         if cache_live && last_cache.elapsed() >= Duration::from_secs(1) {
             dirty = true;
@@ -1751,6 +1792,37 @@ fn handle_key(
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
         return on_ctrl_c(bridge.as_deref_mut(), app);
     }
+    // ctrl+g / ctrl+b open the side panes from anywhere, including the input
+    // box: a pane you have to tab to before you can open is a pane nobody
+    // opens. Pressing the key on an open pane closes it again.
+    if key.modifiers.contains(KeyModifiers::CONTROL)
+        && matches!(key.code, KeyCode::Char('g') | KeyCode::Char('b'))
+        && app.viewer.is_none()
+        && app.post_inspect.is_none()
+    {
+        let git = key.code == KeyCode::Char('g');
+        let (h, focus) = if git {
+            (&mut app.layout.git_h, Focus::Git)
+        } else {
+            (&mut app.layout.files_h, Focus::Files)
+        };
+        if *h == 0 {
+            *h = PaneLayout::OPEN_SIDE;
+            app.layout.save();
+            app.set_focus(focus);
+            if git {
+                app.git.poll(true);
+            }
+        } else {
+            *h = 0;
+            app.layout.save();
+            if app.focus == focus {
+                app.set_focus(Focus::Input);
+            }
+        }
+        return Ok(false);
+    }
+
     // Pane resize runs before every pane-specific branch: the POST trees and
     // the queue consume their keys and return, so a resize handled later never
     // reaches them. `+` grows the focused pane, `-` shrinks it, `0` resets.
@@ -1948,6 +2020,50 @@ fn handle_key(
         return Ok(false);
     }
 
+    if app.focus == Focus::Git && !matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
+        let rows = app.git_area.height.saturating_sub(2) as usize;
+        match key.code {
+            KeyCode::Char('j') | KeyCode::Down => app.git.select(1),
+            KeyCode::Char('k') | KeyCode::Up => app.git.select(-1),
+            KeyCode::PageDown => app.git.select(rows as i32),
+            KeyCode::PageUp => app.git.select(-(rows as i32)),
+            KeyCode::Char(']') => app.git.next_tab(1),
+            KeyCode::Char('[') => app.git.next_tab(-1),
+            KeyCode::Char('r') => app.git.poll(true),
+            KeyCode::Char('i') => app.set_focus(Focus::Input),
+            KeyCode::Enter | KeyCode::Char('l') => {
+                // Opening a row is what fills the file pane, so open that pane
+                // too rather than loading into something invisible.
+                let path = app.git.selected().and_then(|r| r.path.clone());
+                if path.is_some() {
+                    app.files.show(path.as_deref());
+                    if app.layout.files_h == 0 {
+                        app.layout.files_h = PaneLayout::OPEN_SIDE;
+                        app.layout.save();
+                    }
+                    app.set_focus(Focus::Files);
+                }
+            }
+            _ => {}
+        }
+        // Walking the list previews as it goes, the way druk's tree does.
+        let path = app.git.selected().and_then(|r| r.path.clone());
+        app.files.show(path.as_deref());
+        return Ok(false);
+    }
+    if app.focus == Focus::Files && !matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
+        let rows = app.files_area.height.saturating_sub(2) as usize;
+        match key.code {
+            KeyCode::Char('j') | KeyCode::Down => app.files.scroll_by(1, rows),
+            KeyCode::Char('k') | KeyCode::Up => app.files.scroll_by(-1, rows),
+            KeyCode::PageDown => app.files.scroll_by(rows as i32, rows),
+            KeyCode::PageUp => app.files.scroll_by(-(rows as i32), rows),
+            KeyCode::Char('i') => app.set_focus(Focus::Input),
+            KeyCode::Esc => app.set_focus(Focus::Git),
+            _ => {}
+        }
+        return Ok(false);
+    }
     if app.focus != Focus::Input {
         match key.code {
             KeyCode::Char('j') | KeyCode::Down => app.focused_scroll().select_next(),
@@ -2020,10 +2136,14 @@ fn pane_open(app: &App) -> impl Fn(Focus) -> bool + use<> {
     let queue = !app.queue.is_empty();
     let post = app.layout.post_h > 0;
     let meter = app.layout.meter_h > 0;
+    let git = app.layout.git_h > 0;
+    let files = app.layout.files_h > 0;
     move |f| match f {
         Focus::Queue => queue,
         Focus::PostIn | Focus::PostOut => post,
         Focus::Meter => meter,
+        Focus::Git => git,
+        Focus::Files => files,
         _ => true,
     }
 }
@@ -2091,8 +2211,7 @@ fn start_step(
     line: String,
 ) -> io::Result<()> {
     app.story_push(RenderBlock::user_prompt(&line));
-    let idx = app.story.len().saturating_sub(1);
-    app.story.follow_new_turn(Some(idx), true);
+    app.story.follow_new_turn(None, false);
     if app.viewing.is_some() {
         app.status = "esc to leave session".into();
         return Ok(());
@@ -2122,8 +2241,7 @@ fn submit_prompt(mut bridge: Option<&mut Bridge>, app: &mut App) -> io::Result<b
     }
     if is_local_slash(&line) {
         app.story_push(RenderBlock::user_prompt(&line));
-        let idx = app.story.len().saturating_sub(1);
-        app.story.follow_new_turn(Some(idx), true);
+        app.story.follow_new_turn(None, false);
     if let Some(name) = line.strip_prefix("/theme") {
         let name = name.trim();
         if name.is_empty() {
@@ -3263,14 +3381,29 @@ fn draw(f: &mut Frame, app: &mut App) {
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(3), Constraint::Length(post_h)])
         .split(body[0]);
-    // Bottom of the wire column is the meter: cache TTL + last POST.
-    let meter_h = app.layout.meter_h.min(body[1].height.saturating_sub(3));
+    // The wire column stacks: calls, the meta pane, then the two side panes —
+    // git and the file it points at. Both side panes start closed, so this is
+    // the same column it was until someone opens one.
+    let spare = body[1].height.saturating_sub(3);
+    let meter_h = app.layout.meter_h.min(spare);
+    let git_h = app.layout.git_h.min(spare.saturating_sub(meter_h));
+    let files_h = app
+        .layout
+        .files_h
+        .min(spare.saturating_sub(meter_h + git_h));
     let wire = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(3), Constraint::Length(meter_h)])
+        .constraints([
+            Constraint::Min(3),
+            Constraint::Length(meter_h),
+            Constraint::Length(git_h),
+            Constraint::Length(files_h),
+        ])
         .split(body[1]);
     let panes = [left[0], wire[0]];
     app.cache.area = wire[1];
+    app.git_area = wire[2];
+    app.files_area = wire[3];
     let posts = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
@@ -3372,6 +3505,8 @@ fn draw(f: &mut Frame, app: &mut App) {
         app.focus == Focus::PostOut,
     );
     draw_meta(f, app.cache.area, &app.cache, app.focus == Focus::Meter);
+    draw_git(f, app.git_area, app);
+    draw_files(f, app.files_area, app);
     draw_queue(f, cols[1], app);
     if show_turn {
         let cancel_hovered = app.mouse.is_some_and(|(c, r)| {
@@ -3565,6 +3700,159 @@ fn segment_bar_spans(
         .filter(|(_, c)| *c > 0)
         .map(|((_, color), c)| Span::styled("\u{2588}".repeat(c), Style::default().fg(*color)))
         .collect()
+}
+
+/// Git state as a tab strip over rows — druk's sidebar, with the views it
+/// makes sense to have beside a wire pane. The strip is drawn in the border
+/// title so it costs no row of its own.
+fn draw_git(f: &mut Frame, area: Rect, app: &mut App) {
+    if area.height < 3 || area.width == 0 {
+        return;
+    }
+    let theme = Theme::current();
+    let focused = app.focus == Focus::Git;
+    let border = if focused {
+        theme.accent_skill
+    } else {
+        theme.gray_bright
+    };
+    let mut title: Vec<Span> = vec![Span::raw(" ")];
+    for tab in side::GitTab::ALL {
+        let on = tab == app.git.tab;
+        title.push(Span::styled(
+            format!(" {} ", tab.label()),
+            if on {
+                Style::default()
+                    .fg(theme.accent_skill)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(theme.text_secondary)
+            },
+        ));
+    }
+    let branch = app.git.branch().to_string();
+    if !branch.is_empty() {
+        title.push(Span::styled(
+            format!(" {branch} "),
+            Style::default().fg(theme.text_secondary),
+        ));
+    }
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(border))
+        .title(Line::from(title))
+        .style(Style::default().bg(theme.bg_base).fg(theme.text_primary));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+    app.git.clamp(inner.height as usize);
+    let rows = app.git.rows();
+    if let Some(err) = app.git.error() {
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                err.to_string(),
+                Style::default().fg(theme.accent_user),
+            ))),
+            inner,
+        );
+        return;
+    }
+    if rows.is_empty() {
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "clean",
+                Style::default().fg(theme.text_secondary),
+            ))),
+            inner,
+        );
+        return;
+    }
+    let lines: Vec<Line> = rows
+        .iter()
+        .enumerate()
+        .skip(app.git.scroll)
+        .take(inner.height as usize)
+        .map(|(i, row)| {
+            let mark_style = match row.mark.as_str() {
+                "??" => Style::default().fg(theme.text_secondary),
+                "*" => Style::default().fg(theme.accent_success),
+                m if m.starts_with('D') => Style::default().fg(theme.accent_user),
+                _ => Style::default().fg(theme.accent_tool),
+            };
+            let mut line = Line::from(vec![
+                Span::styled(format!("{:<3}", row.mark), mark_style),
+                Span::styled(row.text.clone(), Style::default().fg(theme.text_primary)),
+            ]);
+            if focused && i == app.git.sel {
+                line = line.style(Style::default().bg(theme.bg_highlight));
+            }
+            line
+        })
+        .collect();
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
+/// The file the git cursor points at, read-only. druk puts an editor here;
+/// this is the part of it that belongs next to a harness — see what changed
+/// without leaving the pane.
+fn draw_files(f: &mut Frame, area: Rect, app: &mut App) {
+    if area.height < 3 || area.width == 0 {
+        return;
+    }
+    let theme = Theme::current();
+    let focused = app.focus == Focus::Files;
+    let border = if focused {
+        theme.accent_assistant
+    } else {
+        theme.gray_bright
+    };
+    let title = format!(" {} ", app.files.title());
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(border))
+        .title(Span::styled(
+            title,
+            Style::default()
+                .fg(theme.accent_assistant)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .style(Style::default().bg(theme.bg_base).fg(theme.text_primary));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+    if let Some(note) = &app.files.note {
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                note.clone(),
+                Style::default().fg(theme.text_secondary),
+            ))),
+            inner,
+        );
+        return;
+    }
+    let width = inner.width as usize;
+    let lines: Vec<Line> = app
+        .files
+        .lines
+        .iter()
+        .enumerate()
+        .skip(app.files.scroll)
+        .take(inner.height as usize)
+        .map(|(i, text)| {
+            let n = format!("{:>4} ", i + 1);
+            let room = width.saturating_sub(n.len());
+            let body: String = text.chars().take(room).collect();
+            Line::from(vec![
+                Span::styled(n, Style::default().fg(theme.gray_bright)),
+                Span::styled(body, Style::default().fg(theme.text_primary)),
+            ])
+        })
+        .collect();
+    f.render_widget(Paragraph::new(lines), inner);
 }
 
 fn draw_meta(f: &mut Frame, area: Rect, meter: &CacheMeter, focused: bool) {
@@ -3825,6 +4113,19 @@ fn focus_hints(app: &App, enter_hint: &str) -> Vec<String> {
         Focus::Meter => {
             hints.push("+/- rows".into());
             hints.push("ctrl-←/→ width".into());
+            hints.push("i input".into());
+        }
+        Focus::Git => {
+            hints.push("j/k move".into());
+            hints.push("[/] tab".into());
+            hints.push("enter open".into());
+            hints.push("r refresh".into());
+            hints.push("+/- rows".into());
+            hints.push("i input".into());
+        }
+        Focus::Files => {
+            hints.push("j/k scroll".into());
+            hints.push("+/- rows".into());
             hints.push("i input".into());
         }
         Focus::PostIn | Focus::PostOut => {
