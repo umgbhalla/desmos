@@ -1813,19 +1813,6 @@ fn handle_event(app: &mut App, ev: Value) {
             app.status = "idle".into();
             app.drain_after = app.send_now && !app.queue.is_empty();
         }
-        // A message addressed to the reader rather than thought out loud.
-        // Speech is interleaved with every working note a turn produces; this
-        // is the channel that survives that noise.
-        "say" => {
-            app.stream.finish(&mut app.story);
-            let t = ev.get("text").and_then(Value::as_str).unwrap_or("");
-            let mark = match ev.get("level").and_then(Value::as_str) {
-                Some("warn") => "\u{25b2}",
-                Some("done") => "\u{2713}",
-                _ => "\u{25c6}",
-            };
-            app.story_push(RenderBlock::system(format!("{mark} {t}")));
-        }
         "error" => {
             app.stream.finish(&mut app.story);
             finish_exec(&mut app.calls, &mut app.exec);
@@ -4276,42 +4263,56 @@ fn key_rows(app: &App) -> Vec<(&'static str, String)> {
             }
             rows.push(("⇧⏎", "newline".into()));
         }
+        // Arrows read the same everywhere: ↑↓ moves the cursor in this pane,
+        // ←→ drives whatever that pane's second axis is. j/k/h/l alias them.
         Focus::Story | Focus::Calls => {
-            rows.push(("j k", "move".into()));
-            rows.push(("h l", "fold".into()));
+            rows.push(("↑ ↓", "move".into()));
+            rows.push(("← →", "fold".into()));
             rows.push(("⏎", "open".into()));
             rows.push(("r", "raw".into()));
             rows.push(("i", "input".into()));
         }
+        // No cursor and nothing to fold, so the meter's arrows are the resize
+        // ones and nothing else.
         Focus::Meter => {
             rows.push(("+ -", "rows".into()));
             rows.push(("^← →", "width".into()));
             rows.push(("i", "input".into()));
         }
         Focus::Git => {
-            rows.push(("j k", "move".into()));
-            rows.push(("[ ]", "tab".into()));
-            rows.push(("⏎", "open".into()));
+            rows.push(("↑ ↓", "move".into()));
+            rows.push(("← →", "tab".into()));
+            rows.push(("⏎", "open file".into()));
             rows.push(("r", "refresh".into()));
             rows.push(("+ -", "rows".into()));
             rows.push(("i", "input".into()));
         }
         Focus::Files => {
-            rows.push(("j k", "scroll".into()));
+            rows.push(("↑ ↓", if app.files.in_file() { "scroll" } else { "move" }.into()));
+            rows.push((
+                "← →",
+                if app.files.in_file() {
+                    "back to dir"
+                } else {
+                    "up / into"
+                }
+                .into(),
+            ));
+            rows.push(("␛", "git".into()));
             rows.push(("+ -", "rows".into()));
             rows.push(("i", "input".into()));
         }
         Focus::PostIn | Focus::PostOut => {
-            rows.push(("j k", "move".into()));
-            rows.push(("h l", "fold".into()));
+            rows.push(("↑ ↓", "move".into()));
+            rows.push(("← →", "fold".into()));
             rows.push(("e", "inspect".into()));
             rows.push(("+ -", "rows".into()));
             rows.push(("^← →", "split".into()));
             rows.push(("i", "input".into()));
         }
         Focus::Queue => {
-            rows.push(("j k", "select".into()));
-            rows.push(("[ ]", "reorder".into()));
+            rows.push(("↑ ↓", "select".into()));
+            rows.push(("← →", "reorder".into()));
             rows.push(("d", "drop".into()));
             rows.push(("⏎", "send now".into()));
             rows.push(("i", "input".into()));
@@ -5499,37 +5500,6 @@ mod tests {
     }
 
     #[test]
-    fn a_say_event_lands_in_the_story_not_the_wire() {
-        let mut app = App::new();
-        app.ready = true;
-        let before = app.calls.len();
-        handle_event(
-            &mut app,
-            json!({"ev": "say", "text": "meter rebuilt, 104 tests green", "level": "done"}),
-        );
-        let text = paint(&mut app, 110, 26);
-        assert!(
-            text.contains("meter rebuilt"),
-            "say never reached the story:\n{text}"
-        );
-        assert_eq!(app.calls.len(), before, "say should not push a wire card");
-    }
-
-    #[test]
-    fn a_say_level_picks_its_own_mark() {
-        for (level, mark) in [("warn", '\u{25b2}'), ("done", '\u{2713}'), ("note", '\u{25c6}')] {
-            let mut app = App::new();
-            app.ready = true;
-            handle_event(&mut app, json!({"ev": "say", "text": "MARKME", "level": level}));
-            let text = paint(&mut app, 110, 26);
-            assert!(
-                text.contains(mark),
-                "level {level:?} missing its mark {mark:?}:\n{text}"
-            );
-        }
-    }
-
-    #[test]
     fn syscall_output_is_not_counted_as_something_you_typed() {
         // Tool results ride the user role on the wire. They are the first
         // thing worth trimming, so they must not hide in the prompt slice.
@@ -6159,6 +6129,14 @@ mod tests {
         assert_eq!(PaneLayout::default().meter_h, 5);
         let inner = PaneLayout::default().meter_h - 2;
         assert_eq!(Tier::of(inner), Tier::Full);
+        // Both side panes are open out of the box. A saved `.desmos/tui.json`
+        // still wins — `0` on any pane is what puts these back.
+        let d = PaneLayout::default();
+        assert!(d.git_h > 0 && d.files_h > 0, "side panes start open");
+        assert!(
+            d.meter_h + d.git_h + d.files_h < 24,
+            "the wire column still belongs to the calls pane"
+        );
     }
 
     #[test]
@@ -7022,6 +7000,65 @@ mod tests {
 
     fn backtab() -> KeyEvent {
         KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE)
+    }
+
+    fn press(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    /// Esc used to fall past every side pane into the quit at the bottom of the
+    /// global branch, because `focused_scroll` maps each of them to the story
+    /// and an unselected story means "nothing left to dismiss, so leave".
+    #[test]
+    fn esc_in_the_side_column_steps_back_instead_of_quitting() {
+        let mut app = App::new();
+        for (from, to) in [
+            (Focus::Files, Focus::Git),
+            (Focus::Git, Focus::Input),
+            (Focus::Meter, Focus::Input),
+        ] {
+            app.set_focus(from);
+            let quit = handle_key(None, &mut app, press(KeyCode::Esc)).unwrap();
+            assert!(!quit, "Esc in {} must not quit", focus_name(from));
+            assert_eq!(app.focus, to, "Esc in {}", focus_name(from));
+        }
+    }
+
+    /// Every pane answers the arrows, and answers them about itself. The meter
+    /// has no cursor, so its arrows must do nothing at all — they used to drive
+    /// the story pane's selection from three panes away.
+    #[test]
+    fn arrows_stay_inside_the_pane_that_has_focus() {
+        let mut app = App::new();
+        seed_demo(&mut app);
+        // A scrollback has no rows to select until it has been laid out once.
+        paint(&mut app, 100, 40);
+        app.set_focus(Focus::Story);
+        app.story.goto_top();
+        handle_key(None, &mut app, press(KeyCode::Down)).unwrap();
+        let moved = app.story.selected();
+        assert!(moved.is_some(), "↓ selects in the story");
+
+        app.set_focus(Focus::Meter);
+        handle_key(None, &mut app, press(KeyCode::Down)).unwrap();
+        handle_key(None, &mut app, press(KeyCode::Up)).unwrap();
+        assert_eq!(
+            app.story.selected(),
+            moved,
+            "the meter has no cursor, so its arrows must not move the story's"
+        );
+
+        app.queue.push("one".into());
+        app.queue.push("two".into());
+        app.set_focus(Focus::Queue);
+        app.queue.selected = Some(1);
+        handle_key(None, &mut app, press(KeyCode::Left)).unwrap();
+        assert_eq!(app.queue.selected, Some(0), "← reorders the queue");
+
+        app.set_focus(Focus::Git);
+        let tab_before = app.git.tab;
+        handle_key(None, &mut app, press(KeyCode::Right)).unwrap();
+        assert_ne!(app.git.tab, tab_before, "→ walks the git tab strip");
     }
 
     #[test]
