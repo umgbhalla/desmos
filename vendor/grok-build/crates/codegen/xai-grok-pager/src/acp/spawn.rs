@@ -1,20 +1,24 @@
 //! Agent spawning — creates the agent process and ACP channels.
 //!
-//! Simplified to only support GrokShell (in-process) mode.
-//! Subprocess and remote modes can be added later if needed.
+//! Supports in-process GrokShell and an out-of-process NDJSON stdio ACP
+//! agent (`DESMOS_ACP`).
 
 use std::io::IsTerminal;
+use std::process::Stdio;
 use std::rc::Rc;
 use std::thread;
 use std::time::Duration;
 
 use anyhow::Result;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, simplex};
+use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 use tokio_util::sync::CancellationToken;
 use xai_grok_telemetry::startup::{self, StartupPhase};
 
+use agent_client_protocol as acp;
 use xai_acp_lib::{
     AcpAgentChannel, AcpClientChannel, AcpClientTx, AcpGatewayReceiver, AcpGatewaySender,
-    acp_channels,
+    LineBufferedRead, acp_channels,
 };
 use xai_grok_shell::{
     agent::{MvpAgent, activity::SESSION_FLUSH_GRACE, config::Config as AgentConfig},
@@ -242,6 +246,173 @@ pub async fn spawn_grok_shell(
     })
 }
 
+/// Result of spawning an out-of-process newline-delimited JSON-RPC ACP agent.
+pub struct SpawnedStdioAgent {
+    pub thread_handle: thread::JoinHandle<Result<()>>,
+    pub channel: AcpClientChannel,
+    pub cancel: CancellationToken,
+}
+
+const STDIO_ACP_MAX_BUF: usize = 8 * 1024 * 1024;
+
+/// Spawn `cmd` as a stdio ACP agent (NDJSON on stdin/stdout).
+///
+/// On Unix, `cmd` is parsed by `sh -c` so values like `python -m desmos acp`
+/// work. Stdin/stdout are piped, stderr is inherited, `current_dir` is the
+/// process cwd. The child is killed when `cancel` fires.
+pub async fn spawn_stdio_acp(cmd: &str, cancel: &CancellationToken) -> Result<SpawnedStdioAgent> {
+    startup::enter(StartupPhase::SpawnWorker);
+    tracing::info!(cmd, "spawning stdio ACP agent from DESMOS_ACP");
+
+    let mut child = spawn_stdio_child(cmd)?;
+    let stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("stdio ACP child stdin not piped"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("stdio ACP child stdout not piped"))?;
+
+    let (client_channel, agent_channel) = acp_channels();
+    let (incoming_read, incoming_write) = simplex(STDIO_ACP_MAX_BUF);
+    let (outgoing_read, outgoing_write) = simplex(STDIO_ACP_MAX_BUF);
+
+    let bridge_cancel = cancel.child_token();
+    let thread_cancel = bridge_cancel.clone();
+    let thread_handle = thread::Builder::new()
+        .name("pager-stdio-acp".into())
+        .spawn(move || -> Result<()> {
+            let mut builder = tokio::runtime::Builder::new_current_thread();
+            let rt = xai_tty_utils::runtime::apply_blocking_pool(builder.enable_all()).build()?;
+            let local = tokio::task::LocalSet::new();
+            local.block_on(&rt, async move {
+                let cancel_r = thread_cancel.clone();
+                let reader_task = tokio::task::spawn_local(async move {
+                    let mut stdout = BufReader::new(stdout);
+                    let mut incoming_write = incoming_write;
+                    let mut line = String::new();
+                    loop {
+                        line.clear();
+                        tokio::select! {
+                            biased;
+                            _ = cancel_r.cancelled() => break,
+                            result = stdout.read_line(&mut line) => {
+                                match result {
+                                    Ok(0) => break,
+                                    Ok(_) => {
+                                        if incoming_write.write_all(line.as_bytes()).await.is_err() {
+                                            break;
+                                        }
+                                    }
+                                    Err(_) => break,
+                                }
+                            }
+                        }
+                    }
+                });
+
+                let cancel_w = thread_cancel.clone();
+                let writer_task = tokio::task::spawn_local(async move {
+                    let mut reader = BufReader::new(outgoing_read);
+                    let mut stdin = stdin;
+                    let mut line = String::new();
+                    loop {
+                        line.clear();
+                        tokio::select! {
+                            biased;
+                            _ = cancel_w.cancelled() => break,
+                            result = reader.read_line(&mut line) => {
+                                match result {
+                                    Ok(0) => break,
+                                    Ok(_) => {
+                                        let pending = line.trim_end();
+                                        if pending.is_empty() {
+                                            continue;
+                                        }
+                                        if stdin.write_all(pending.as_bytes()).await.is_err()
+                                            || stdin.write_all(b"\n").await.is_err()
+                                            || stdin.flush().await.is_err()
+                                        {
+                                            break;
+                                        }
+                                    }
+                                    Err(_) => break,
+                                }
+                            }
+                        }
+                    }
+                });
+
+                let gw_tx = AcpGatewaySender::new(agent_channel.tx).with_tracing(true);
+                let incoming = LineBufferedRead::spawn_local(incoming_read.compat());
+                let (conn, handle_io) = acp::ClientSideConnection::new(
+                    gw_tx,
+                    outgoing_write.compat_write(),
+                    incoming,
+                    |fut| {
+                        tokio::task::spawn_local(fut);
+                    },
+                );
+                let gw_rx = AcpGatewayReceiver::new(agent_channel.rx, conn).with_tracing(true);
+                tokio::task::spawn_local(handle_io);
+                tokio::task::spawn_local(gw_rx.run());
+                tokio::task::yield_now().await;
+
+                tokio::select! {
+                    biased;
+                    _ = thread_cancel.cancelled() => {
+                        let _ = child.start_kill();
+                        let _ = child.wait().await;
+                    }
+                    status = child.wait() => {
+                        tracing::warn!(?status, "stdio ACP agent exited");
+                        thread_cancel.cancel();
+                    }
+                }
+                reader_task.abort();
+                writer_task.abort();
+                Ok(())
+            })
+        })?;
+
+    Ok(SpawnedStdioAgent {
+        thread_handle,
+        channel: client_channel,
+        cancel: bridge_cancel,
+    })
+}
+
+fn spawn_stdio_child(cmd: &str) -> Result<tokio::process::Child> {
+    let cwd = std::env::current_dir()?;
+    let mut command = stdio_acp_command(cmd);
+    command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .current_dir(&cwd)
+        .kill_on_drop(true);
+    xai_tty_utils::detach_command(&mut command);
+    command
+        .spawn()
+        .map_err(|e| anyhow::anyhow!("failed to spawn DESMOS_ACP command `{cmd}`: {e}"))
+}
+
+fn stdio_acp_command(cmd: &str) -> tokio::process::Command {
+    #[cfg(unix)]
+    {
+        let mut command = tokio::process::Command::new("sh");
+        command.arg("-c").arg(cmd);
+        command
+    }
+    #[cfg(not(unix))]
+    {
+        let mut command = tokio::process::Command::new("cmd");
+        command.arg("/C").arg(cmd);
+        command
+    }
+}
+
 /// Spawn an agent in a dedicated thread with direct RPC dispatch.
 ///
 /// The agent runs on a single-threaded tokio LocalSet runtime.
@@ -365,6 +536,21 @@ mod tests {
         assert!(
             started.elapsed() < Duration::from_secs(5),
             "join must return at its budget, not wait out the worker"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stdio_acp_command_uses_sh_c() {
+        let cmd = stdio_acp_command("python -m desmos acp");
+        assert_eq!(cmd.as_std().get_program(), std::ffi::OsStr::new("sh"));
+        let args: Vec<_> = cmd.as_std().get_args().collect();
+        assert_eq!(
+            args,
+            [
+                std::ffi::OsStr::new("-c"),
+                std::ffi::OsStr::new("python -m desmos acp")
+            ]
         );
     }
 

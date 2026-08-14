@@ -902,6 +902,8 @@ pub async fn run(
         set_terminal_title(t);
     }
     const CONNECT_UI_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+    // Stdio ACP (DESMOS_ACP) must use connect() — never the grok leader.
+    let use_leader = use_leader && std::env::var("DESMOS_ACP").is_err();
     let fallback_flags = use_leader.then(|| connect_flags.clone());
     let primary_target = if use_leader {
         crate::acp::AgentKind::Leader

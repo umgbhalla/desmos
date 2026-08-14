@@ -202,10 +202,33 @@ pub async fn connect(cancel: &CancellationToken, flags: ConnectFlags) -> Result<
 
     apply_config_writes(&flags);
 
-    let memory_config = agent_config.memory_config.clone();
-    let spawned = spawn::spawn_grok_shell(agent_config, cancel, memory_config).await?;
-    let auth_manager = spawned.auth_manager.clone();
-    let (tx, rx) = (spawned.channel.tx, spawned.channel.rx);
+    let (tx, rx, spawned_cancel, agent_thread, auth_manager) =
+        if let Ok(cmd) = std::env::var("DESMOS_ACP") {
+            let spawned = spawn::spawn_stdio_acp(&cmd, cancel).await?;
+            // Out-of-process agent: local AuthManager, no refresher (same as leader).
+            let auth_manager = std::sync::Arc::new(xai_grok_shell::auth::AuthManager::new(
+                &xai_grok_shell::util::grok_home::grok_home(),
+                agent_config.grok_com_config.clone(),
+            ));
+            (
+                spawned.channel.tx,
+                spawned.channel.rx,
+                spawned.cancel,
+                Some(spawned.thread_handle),
+                auth_manager,
+            )
+        } else {
+            let memory_config = agent_config.memory_config.clone();
+            let spawned = spawn::spawn_grok_shell(agent_config, cancel, memory_config).await?;
+            let auth_manager = spawned.auth_manager.clone();
+            (
+                spawned.channel.tx,
+                spawned.channel.rx,
+                spawned.cancel,
+                Some(spawned.thread_handle),
+                auth_manager,
+            )
+        };
 
     startup::enter(StartupPhase::AcpInitialize);
     let (
@@ -241,8 +264,8 @@ pub async fn connect(cancel: &CancellationToken, flags: ConnectFlags) -> Result<
         models,
         is_grok_shell,
         auth_methods,
-        cancel: spawned.cancel,
-        agent_thread: Some(spawned.thread_handle),
+        cancel: spawned_cancel,
+        agent_thread,
         available_commands,
         needs_login,
         login_label,
