@@ -120,7 +120,12 @@ def self_check() -> None:
         )
         assert payload["thinking"] == {"type": "adaptive", "display": "summarized"}
         assert payload["output_config"] == {"effort": "low"}
-        assert payload["_betas"] == []
+        # Adaptive thinking interleaves on its own and asks for no beta of its
+        # own. Compaction is the only header an adaptive model carries.
+        from desmos.complete import COMPACT_BETA as _CB, INTERLEAVED_BETA
+
+        assert INTERLEAVED_BETA not in payload["_betas"], payload["_betas"]
+        assert payload["_betas"] == [_CB], payload["_betas"]
         # Without these the model keeps writing past its own syscall and
         # invents the reply to it, then reasons from the invention. Both
         # markers are anchored to a line start so prose can still name them.
@@ -579,6 +584,46 @@ def self_check() -> None:
             got = [e for e in terms if e in ("done", "stopped")]
             assert got == [want], f"stop landed={landed}: {got} in {terms}"
         assert w_stop.prior and w_stop.prior[-1]["prompt"] == "keep going"
+        # Compaction. The server folds old turns and hands back a `compaction`
+        # block; that block is the cut point the next request replays. Both
+        # allowlists it has to cross drop unknown block types by default, and
+        # dropping it fails silently -- the run still answers, the transcript
+        # just never folds. So assert the whole round trip, not the request knob.
+        from desmos.complete import (
+            COMPACT_BETA,
+            COMPACT_STRATEGY,
+            assistant_content,
+            cached_payload,
+            compaction_block,
+            wire_content,
+        )
+
+        fold = {"type": "compaction", "id": "cmp_1", "content": "folded 40 turns"}
+        kept = assistant_content({"content": [fold, {"type": "text", "text": "ok"}]})
+        assert compaction_block(kept) == fold, kept
+        assert wire_content(kept)[0] == fold, "a fold must survive the replay path too"
+
+        built = cached_payload("claude-opus-5", "abi", [{"role": "user", "content": "hi"}], 256)
+        assert built["context_management"] == {"edits": [{"type": COMPACT_STRATEGY}]}
+        assert COMPACT_BETA in built["_betas"]
+        # A model without server-side compaction must not carry the knob or the
+        # beta -- an unsupported pair is a 400, not a no-op.
+        old = cached_payload("claude-3-haiku-20240307", "abi", [{"role": "user", "content": "hi"}], 256)
+        assert "context_management" not in old
+        assert COMPACT_BETA not in old["_betas"]
+
+        # A fold reaches the wire pane. Without the event the only symptom is
+        # the context bar dropping with nothing on screen to explain it.
+        w_fold = new_world(cwd, state_path=cwd / "harness-fold.json", ns={})
+        w_fold.complete_fn = lambda *_: {
+            "content": [fold, {"type": "text", "text": "done"}],
+            "usage": {},
+        }
+        fold_evs: list[dict] = []
+        _run(w_fold, "long run", quiet=True, on_event=fold_evs.append)
+        assert any(e.get("ev") == "compacted" for e in fold_evs), [e.get("ev") for e in fold_evs]
+        assert compaction_block(w_fold.messages[-1]["content"]) == fold, w_fold.messages[-1]
+
         assert "transcript cleared" in w_usage.ns["reset"]()
         assert w_usage.messages == []
 

@@ -9,6 +9,7 @@ from desmos.complete import (
     LAST,
     assistant_content,
     cached_payload,
+    compaction_block,
     complete,
     redact_wire,
     text_of,
@@ -188,6 +189,19 @@ def turn(
     n_thoughts = sum(1 for p in parts if not p["redacted"])
     n_redacted = sum(1 for p in parts if p["redacted"])
     usage = (world.log[-1].get("usage") if world.log else {}) or {}
+    # A fold rewrites what the model remembers. That is the largest thing the
+    # harness does to itself in a run, and without this event the only trace is
+    # the context bar dropping for no stated reason.
+    fold = compaction_block(assistant)
+    if fold is not None:
+        # The block's summary field is the server's, not ours. Read whichever
+        # string it carries rather than asserting a shape; the trajectory log
+        # has the exact wire block if this ever needs pinning down.
+        summary = next(
+            (v for k, v in fold.items() if k != "type" and isinstance(v, str) and v.strip()),
+            "",
+        )
+        fire({"ev": "compacted", "n": n, "kept": len(messages), "text": summary})
     fire(
         {
             "ev": "complete",

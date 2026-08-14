@@ -7,6 +7,14 @@ import urllib.request
 from typing import Any, Callable, Iterable
 
 INTERLEAVED_BETA = "interleaved-thinking-2025-05-14"
+# Server-side compaction. The API folds earlier turns into a `compaction`
+# block once the input crosses the trigger, and uses that block on the next
+# request to replace everything before it. The transcript stays append-only:
+# nothing local is rewritten, so the ABI and catalog cache blocks -- which sit
+# ahead of every message -- are never touched by a fold.
+COMPACT_BETA = "compact-2026-01-12"
+COMPACT_STRATEGY = "compact_20260112"
+COMPACT_BLOCK = "compaction"
 ADAPTIVE_MARKERS = (
     "opus-5",
     "opus-4-6",
@@ -69,6 +77,14 @@ def apply_thinking(payload: dict[str, Any], model: str, level: str | None) -> li
     return [INTERLEAVED_BETA]
 
 
+def apply_compaction(payload: dict[str, Any], model: str) -> list[str]:
+    """Ask the server to fold old turns. Same model set as adaptive thinking."""
+    if not adaptive_model(model):
+        return []
+    payload["context_management"] = {"edits": [{"type": COMPACT_STRATEGY}]}
+    return [COMPACT_BETA]
+
+
 def wire_content(content: Any) -> list[dict[str, Any]]:
     """Replay assistant blocks the way Pi convertMessages / tau _anthropic_message do."""
     if isinstance(content, str):
@@ -95,6 +111,12 @@ def wire_content(content: Any) -> list[dict[str, Any]]:
             data = raw.get("data") or ""
             if data:
                 blocks.append({"type": "redacted_thinking", "data": data})
+        elif kind == COMPACT_BLOCK:
+            # Replay verbatim. This block is the server's pointer to the turns
+            # it folded; drop it on the way back out and the next request
+            # carries no cut point, so the fold silently un-does itself and the
+            # transcript grows again with nothing on screen to say why.
+            blocks.append(dict(raw))
         elif kind == "text":
             text = raw.get("text") or ""
             if text:
@@ -103,13 +125,15 @@ def wire_content(content: Any) -> list[dict[str, Any]]:
 
 
 def assistant_content(resp: dict[str, Any]) -> list[dict[str, Any]]:
-    """Keep thinking / redacted_thinking / text. Drop everything else."""
+    """Keep thinking / redacted_thinking / compaction / text. Drop everything else."""
     blocks: list[dict[str, Any]] = []
     for raw in resp.get("content") or []:
         if not isinstance(raw, dict):
             continue
         kind = raw.get("type")
-        if kind == "thinking":
+        if kind == COMPACT_BLOCK:
+            blocks.append(dict(raw))
+        elif kind == "thinking":
             item = {"type": "thinking", "thinking": raw.get("thinking") or ""}
             if raw.get("signature"):
                 item["signature"] = raw["signature"]
@@ -121,6 +145,14 @@ def assistant_content(resp: dict[str, Any]) -> list[dict[str, Any]]:
             if text:
                 blocks.append({"type": "text", "text": text})
     return blocks or [{"type": "text", "text": ""}]
+
+
+def compaction_block(blocks: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """The fold marker in an assembled assistant message, if the server sent one."""
+    for block in blocks:
+        if isinstance(block, dict) and block.get("type") == COMPACT_BLOCK:
+            return block
+    return None
 
 
 def thinking_text(blocks: list[dict[str, Any]]) -> str:
@@ -209,7 +241,7 @@ def cached_payload(
         # the moment it starts impersonating the harness.
         "stop_sequences": ["\n<result", "\nuser<"],
     }
-    payload["_betas"] = apply_thinking(payload, model, thinking)
+    payload["_betas"] = apply_thinking(payload, model, thinking) + apply_compaction(payload, model)
     return payload
 
 
@@ -261,6 +293,14 @@ def apply_stream_event(
                 on_event({"kind": "text_delta", "text": chunk})
         elif dtype == "signature_delta":
             block["signature"] = (block.get("signature") or "") + (delta.get("signature") or "")
+        else:
+            # A delta for a block type this harness does not special-case still
+            # belongs to that block. Append its string fields rather than
+            # dropping them, so a block we only pass through (a compaction
+            # summary) assembles whole instead of arriving empty.
+            for field, value in delta.items():
+                if field != "type" and isinstance(value, str):
+                    block[field] = (block.get(field) or "") + value
         return
     if kind == "content_block_stop":
         return
