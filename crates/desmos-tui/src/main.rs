@@ -4671,7 +4671,8 @@ fn apply_speech(story: &mut ScrollbackState, stream: &mut StreamCursor, text: &s
     }
     stream.finish_think(story);
     stream.finish_speech(story);
-    let spoken = strip_xml(text);
+    // The story carries prose. A syscall goes to the calls pane, body and all.
+    let spoken = strip_syscalls(text);
     if !spoken.trim().is_empty() {
         story.push_block(RenderBlock::agent_message(spoken));
     }
@@ -5150,6 +5151,73 @@ mod tests {
         let mut term = Terminal::new(backend).unwrap();
         term.draw(|f| draw(f, app)).unwrap();
         buffer_text(&term)
+    }
+
+    #[test]
+    fn the_story_pane_shows_prose_and_not_commands() {
+        // Drives the real event path. Asserts on the painted story, so a
+        // renderer that exists but is never called cannot pass this.
+        let mut app = App::new();
+        app.ready = true;
+        let speech = format!(
+            "Checking the meter now.\n{}bash{}cargo test --workspace{}bash{}\nAll green.",
+            '<', '>', "</", '>'
+        );
+        handle_event(&mut app, json!({"ev": "speech", "text": speech}));
+        let text = paint(&mut app, 100, 24);
+        assert!(text.contains("Checking the meter"), "prose missing:\n{text}");
+        assert!(text.contains("All green"), "prose missing:\n{text}");
+        assert!(
+            !text.contains("cargo test --workspace"),
+            "the command leaked into the story:\n{text}"
+        );
+    }
+
+    #[test]
+    fn a_syscall_leaves_nothing_behind() {
+        // strip_xml kept the command; the story is prose only.
+        let one = format!("{}bash{}cd /tmp && cargo test{}bash{}", '<', '>', "</", '>');
+        assert_eq!(strip_syscalls(&one).trim(), "", "body survived: {:?}", strip_syscalls(&one));
+        assert_eq!(strip_xml(&one).trim(), "cd /tmp && cargo test", "strip_xml changed behaviour");
+    }
+
+    #[test]
+    fn prose_around_a_multiline_call_survives() {
+        let src = format!(
+            "before\n{}edit path=\"f\"{}a\n---\nb{}edit{}\nafter",
+            '<', '>', "</", '>'
+        );
+        let got = strip_syscalls(&src);
+        assert!(got.contains("before"), "{got:?}");
+        assert!(got.contains("after"), "{got:?}");
+        assert!(!got.contains("---"), "body survived: {got:?}");
+        assert!(!got.contains("path="), "attrs survived: {got:?}");
+    }
+
+    #[test]
+    fn naming_a_tool_in_a_sentence_still_reads() {
+        // No closer, so nothing to drop: the sentence keeps its shape.
+        let src = format!("use {}python{} for the kernel", '<', '>');
+        let got = strip_syscalls(&src);
+        assert!(got.contains("use "), "{got:?}");
+        assert!(got.contains("for the kernel"), "{got:?}");
+        // And a backticked mention is untouched, code spans being sacred.
+        let fenced = format!("use `{}python{}` not raw", '<', '>');
+        assert!(strip_syscalls(&fenced).contains("python"), "{:?}", strip_syscalls(&fenced));
+    }
+
+    #[test]
+    fn two_calls_in_one_turn_both_go() {
+        let src = format!(
+            "one{}bash{}ls{}bash{} two {}python{}x=1{}python{} three",
+            '<', '>', "</", '>', '<', '>', "</", '>'
+        );
+        let got = strip_syscalls(&src);
+        assert!(got.contains("one"), "{got:?}");
+        assert!(got.contains("two"), "{got:?}");
+        assert!(got.contains("three"), "{got:?}");
+        assert!(!got.contains("ls"), "{got:?}");
+        assert!(!got.contains("x=1"), "{got:?}");
     }
 
     #[test]
