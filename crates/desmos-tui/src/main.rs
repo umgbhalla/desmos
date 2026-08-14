@@ -693,6 +693,12 @@ struct CacheMeter {
     /// role, so both hide inside a slice named for someone else.
     /// Order: system, prompt, tool, thinking, speech.
     roles: [u64; 5],
+    /// The same request as an ordered run of chunks -- one per message, or per
+    /// block for an assistant turn -- each carrying its length and its kind.
+    /// Totals say how much; this says where. A single huge tool result and a
+    /// hundred small ones weigh the same in a percentage and look nothing
+    /// alike here.
+    chunks: Vec<(u64, u8)>,
     /// Context ceiling for the model that answered, so "how full" has a
     /// denominator. Zero until the first call lands.
     window: u64,
@@ -3775,7 +3781,7 @@ fn meter_row(
             }
         } else {
             let mut at = 0usize;
-            for span in segment_bar_spans(filled as u16, segments, track) {
+            for span in sequence_bar_spans(filled as u16, segments, track) {
                 let n = span.content.chars().count();
                 let color = span.style.fg.unwrap_or(track);
                 for cell in bg.iter_mut().skip(at).take(n) {
@@ -3827,6 +3833,55 @@ fn meter_row(
         spans.push(Span::styled(run, st));
     }
     Line::from(spans)
+}
+
+/// Draw chunks in the order they occur.
+///
+/// `segment_bar_spans` sorts everything into a few buckets and gives each one
+/// contiguous block: that answers how much, and destroys where. This keeps the
+/// order, sampling the run at the midpoint of every cell, so a fat chunk late
+/// in the trajectory shows up late in the bar.
+fn sequence_bar_spans(
+    width: u16,
+    chunks: &[(u64, ratatui::style::Color)],
+    empty: ratatui::style::Color,
+) -> Vec<Span<'static>> {
+    let w = width as usize;
+    if w == 0 || chunks.is_empty() {
+        return Vec::new();
+    }
+    let total: u64 = chunks.iter().map(|(n, _)| *n).sum();
+    if total == 0 {
+        return vec![Span::styled("█".repeat(w), Style::default().fg(empty))];
+    }
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut run = String::new();
+    let mut cur: Option<ratatui::style::Color> = None;
+    for i in 0..w {
+        let mid = total * (2 * i as u64 + 1) / (2 * w as u64);
+        let mut acc = 0u64;
+        let mut color = chunks[chunks.len() - 1].1;
+        for (n, c) in chunks {
+            acc += *n;
+            if mid < acc {
+                color = *c;
+                break;
+            }
+        }
+        if cur == Some(color) {
+            run.push('█');
+        } else {
+            if let Some(prev) = cur {
+                spans.push(Span::styled(std::mem::take(&mut run), Style::default().fg(prev)));
+            }
+            run.push('█');
+            cur = Some(color);
+        }
+    }
+    if let Some(prev) = cur {
+        spans.push(Span::styled(run, Style::default().fg(prev)));
+    }
+    spans
 }
 
 fn segment_bar_spans(
@@ -4084,13 +4139,29 @@ fn draw_meta(f: &mut Frame, area: Rect, meter: &CacheMeter, focused: bool) {
     } else {
         meter.window
     };
-    let roles = [
-        (meter.roles[0], theme.accent_skill),
-        (meter.roles[1], theme.accent_user),
-        (meter.roles[2], theme.accent_success),
-        (meter.roles[3], theme.accent_tool),
-        (meter.roles[4], theme.accent_assistant),
-    ];
+    let kind_color = |k: u8| match k {
+        0 => theme.accent_skill,
+        1 => theme.accent_user,
+        2 => theme.accent_success,
+        3 => theme.accent_tool,
+        _ => theme.accent_assistant,
+    };
+    // The run in order, not five buckets. Where the weight sits in the
+    // trajectory is the part a percentage cannot say.
+    let roles: Vec<(u64, ratatui::style::Color)> = if meter.chunks.is_empty() {
+        meter
+            .roles
+            .iter()
+            .enumerate()
+            .map(|(i, n)| (*n, kind_color(i as u8)))
+            .collect()
+    } else {
+        meter
+            .chunks
+            .iter()
+            .map(|(n, k)| (*n, kind_color(*k)))
+            .collect()
+    };
     // How full, and full of what -- one bar answers both. A role split
     // normalised to 100% looks identical at 8k and at 180k, which is the one
     // thing worth knowing.
