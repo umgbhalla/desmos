@@ -24,7 +24,7 @@ import uuid
 from typing import Any, Callable, Iterable
 
 from desmos import auth
-from desmos.complete import COMPACT_BLOCK, iter_sse_lines, log_payload
+from desmos.complete import COMPACT_BLOCK, _open_with_retry, iter_sse_lines, log_payload
 
 # The ABI was written for a model that emits XML in prose. A Responses model
 # defaults to assuming it has real function tools, so without this it narrates
@@ -328,9 +328,10 @@ def read_sse(
 ) -> dict[str, Any]:
     state: dict[str, Any] = {"items": []}
     parts: list[str] = []
+    saw_end = False
 
     def flush() -> None:
-        nonlocal parts
+        nonlocal parts, saw_end
         if not parts:
             return
         raw = "\n".join(parts)
@@ -339,6 +340,10 @@ def read_sse(
             return
         ev = json.loads(raw)
         if isinstance(ev, dict):
+            if str(ev.get("type") or "").startswith(
+                ("response.completed", "response.incomplete", "response.failed")
+            ):
+                saw_end = True
             apply_stream_event(state, ev, on_event)
 
     for line in lines:
@@ -355,6 +360,12 @@ def read_sse(
         if line.startswith("data:"):
             parts.append(line[5:].lstrip())
     flush()
+    # The Anthropic path learned this tonight and the OpenAI path never did: a
+    # stream that simply runs out is not a finished answer. Returned as one,
+    # its half-written syscall has no closing tag, scan() drops it, and the
+    # truncated reply is committed as the step's result.
+    if not saw_end and not (should_stop is not None and should_stop()):
+        raise RuntimeError("OpenAI stream ended before response.completed")
     return assemble(state, model)
 
 
@@ -443,7 +454,10 @@ def complete(
     for _ in range(6):
         req = urllib.request.Request(url, data=json.dumps(body).encode(), headers=headers, method="POST")
         try:
-            with urllib.request.urlopen(req, timeout=300) as resp:
+            # Same retry the Anthropic path uses. This loop only ever retried a
+            # 400 naming an unsupported field, so a 429 -- routine on a plan --
+            # or any 5xx raised straight out and killed the whole step.
+            with _open_with_retry(req, on_event=on_event, should_stop=should_stop) as resp:
                 return read_sse(
                     iter_sse_lines(resp), model, on_event=on_event, should_stop=should_stop
                 )

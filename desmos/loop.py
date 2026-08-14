@@ -272,6 +272,17 @@ def turn(
                     "text": clip(r),
                 }
             )
+    # No syscalls usually means the model finished. It also looks exactly like
+    # a reply the endpoint cut off mid-tag: scan() drops an unterminated block,
+    # so `<bash>ls` with no closing tag parses to nothing. stop_reason is the
+    # only thing that tells the two apart, and it was written to world.log and
+    # read by nobody. A cut-off turn is not a finished one.
+    cut = resp.get("stop_reason") in {"max_tokens", "refusal"}
+    if cut and not blocks:
+        note = f"[reply was cut short: {resp.get('stop_reason')} — continue from where it stopped]"
+        messages.append({"role": "user", "content": note})
+        fire({"ev": "error", "n": n, "text": note})
+        return speech, results, False, assistant
     return speech, results, not blocks, assistant
 
 
@@ -402,10 +413,23 @@ def _run_turns(
         if results:
             world.messages.append({"role": "user", "content": format_result_message(results)})
         if done or stopped():
+            if stopped():
+                # A stop left no trace in the transcript, so the next step read
+                # the model's own tags, whichever results happened to run, and
+                # nothing saying it had been interrupted -- which reads as work
+                # that finished.
+                world.messages.append(
+                    {"role": "user", "content": f"[stopped by the user after turn {n}]"}
+                )
             _commit_step(world, prompt, speech)
             return speech
+    # Same for the cap: it was printed, and the bridge runs quiet=True, so the
+    # only signal was a `done` event identical to a clean finish.
+    note = f"[hit max_turns={max_turns} — the task was not finished]"
+    world.messages.append({"role": "user", "content": note})
+    emit({"ev": "error", "text": note})
     if not quiet:
-        print(f"\n[hit max_turns={max_turns}]")
+        print(f"\n{note}")
     _commit_step(world, prompt, last)
     return last
 

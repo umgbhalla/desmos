@@ -77,6 +77,27 @@ def apply_thinking(payload: dict[str, Any], model: str, level: str | None) -> li
     return [INTERLEAVED_BETA]
 
 
+# Where the Responses endpoint should start folding. Anthropic picks its own
+# trigger; OpenAI wants a number, and without one the fold never happens.
+OPENAI_COMPACT_TRIGGER = int(os.environ.get("DESMOS_COMPACT_TRIGGER") or 300_000)
+_CACHE_KEY: str | None = None
+
+
+def session_cache_key() -> str:
+    """A stable key for this process, so the endpoint can reuse its prefix.
+
+    Stable is the whole point: a fresh key per request is the same as no key.
+    It lives for the life of the bridge, which is also the life of the
+    transcript it is caching.
+    """
+    global _CACHE_KEY
+    if _CACHE_KEY is None:
+        import uuid
+
+        _CACHE_KEY = f"desmos-{uuid.uuid4().hex[:16]}"
+    return _CACHE_KEY
+
+
 def apply_compaction(payload: dict[str, Any], model: str) -> list[str]:
     """Ask the server to fold old turns. Same model set as adaptive thinking."""
     if not adaptive_model(model):
@@ -507,6 +528,10 @@ def complete(
     if is_openai(model):
         from desmos import openai as openai_provider
 
+        # payload_for has accepted both of these from the start and nothing
+        # ever passed them, so server-side folding was unreachable on OpenAI
+        # and prompt_cache_key never went out. A long session grew until the
+        # endpoint refused it.
         return openai_provider.complete(
             model,
             system,
@@ -515,6 +540,8 @@ def complete(
             thinking=thinking,
             on_event=on_event,
             should_stop=should_stop,
+            compact_threshold=OPENAI_COMPACT_TRIGGER,
+            cache_key=session_cache_key(),
         )
     key = os.environ.get("ANTHROPIC_API_KEY")
     if not key:

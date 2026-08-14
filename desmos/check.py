@@ -864,8 +864,79 @@ def self_check() -> None:
 
         _run(w_ord, "batch then stop", quiet=True, on_event=stop_after_first, should_stop=lambda: halt["go"])
         tail = [m["role"] for m in w_ord.messages]
-        assert tail == ["user", "assistant", "user"], tail
-        assert "<result" in str(w_ord.messages[-1]["content"]), "a stop must not eat results that ran"
+        # user prompt, assistant turn, its results, then the stop marker.
+        assert tail == ["user", "assistant", "user", "user"], tail
+        assert "<result" in str(w_ord.messages[-2]["content"]), "a stop must not eat results that ran"
+        assert "stopped by the user" in str(w_ord.messages[-1]["content"]), w_ord.messages[-1]
+
+        # A backgrounded grandchild inherits stdout and can hold the pipe open
+        # for as long as it likes. The unbounded read that waited for it made
+        # `sleep 20 & echo started` with timeout=3 return after 20 seconds, and
+        # for all 20 the deadline and should_stop were unreachable -- kernel,
+        # bridge inbox and stop button wedged behind a process nobody awaited.
+        import time as _time
+
+        from desmos.exec import run_bash as _bash
+
+        started = _time.monotonic()
+        out = _bash("sleep 20 & echo started", cwd, timeout=3)
+        took = _time.monotonic() - started
+        assert took < 8, f"a backgrounded grandchild held the harness for {took:.1f}s"
+        assert "started" in out, out
+        # And a timeout takes the whole group with it, not just /bin/sh.
+        started = _time.monotonic()
+        out = _bash("sh -c 'sleep 30 & wait'", cwd, timeout=2)
+        assert _time.monotonic() - started < 6, out
+        assert "timeout after" in out, out
+
+        # A reply the endpoint cut off is not a reply that finished. scan drops
+        # an unterminated tag, so `<bash>ls` with no closer parses to nothing
+        # and used to report a clean finish; stop_reason is the only difference.
+        w_cut = new_world(cwd, state_path=None, persist=False, ns={})
+        cut_calls = {"n": 0}
+
+        def truncated(_m, _s, _msgs, _mt):
+            cut_calls["n"] += 1
+            if cut_calls["n"] == 1:
+                return {
+                    "content": [{"type": "text", "text": "I will run <bash>ls"}],
+                    "stop_reason": "max_tokens",
+                    "usage": {},
+                }
+            return {"content": [{"type": "text", "text": "done"}], "usage": {}}
+
+        w_cut.complete_fn = truncated
+        cut_evs: list[dict] = []
+        _run(w_cut, "get cut off", quiet=True, on_event=cut_evs.append)
+        assert cut_calls["n"] == 2, "a truncated turn must not end the step"
+        assert any("cut short" in str(m.get("content")) for m in w_cut.messages), w_cut.messages
+        assert any(e.get("ev") == "error" and "cut short" in e.get("text", "") for e in cut_evs)
+
+        # Hitting the cap is not finishing either.
+        w_cap = new_world(cwd, state_path=None, persist=False, ns={})
+        w_cap.complete_fn = lambda *_: {
+            "content": [{"type": "text", "text": "<python>1</python>"}],
+            "usage": {},
+        }
+        cap_evs: list[dict] = []
+        _run(w_cap, "loop forever", quiet=True, max_turns=3, on_event=cap_evs.append)
+        assert any("max_turns" in str(m.get("content")) for m in w_cap.messages), "the cap must be said"
+        assert any("max_turns" in e.get("text", "") for e in cap_evs if e.get("ev") == "error")
+
+        # The OpenAI stream needs the terminal check the Anthropic one grew.
+        from desmos import openai as _oai_stream
+
+        try:
+            _oai_stream.read_sse(
+                [
+                    'data: {"type":"response.output_item.added","item":{"type":"message","id":"m"}}',
+                    "",
+                ],
+                "gpt-5.6-sol",
+            )
+            raise AssertionError("a truncated Responses stream must not read as finished")
+        except RuntimeError as exc:
+            assert "response.completed" in str(exc), exc
 
         # <bash> is one subprocess per call, so nothing it does survives. The
         # persistent shell is the other half: state carries, exit codes come
