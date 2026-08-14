@@ -15,6 +15,7 @@ FROZEN = frozenset(
         "reload_sdk",
         "evolve",
         "rollback",
+        "memory",
     }
 )
 RESULT_CAP = 8000

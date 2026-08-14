@@ -55,6 +55,10 @@ def dispatch(
             on_chunk=on_chunk,
             should_stop=should_stop,
         )
+    if block.tag == "shell":
+        from desmos.shell import run as run_shell
+
+        return run_shell(world, block.body, block.attrs)
     if block.tag == "edit":
         old, new = parse_edit_body(block.body, block.attrs)
         return apply_edit(block.attrs.get("path", ""), old, new, cwd=world.cwd)
@@ -90,6 +94,10 @@ def dispatch(
         except ValueError:
             return f"rollback failed: bad n {raw!r}"
         return rollback(world, n)
+    if block.tag == "memory":
+        from desmos.memory import handle_memory
+
+        return handle_memory(world, block.body, block.attrs)
     tool = world.tools.get(block.tag)
     if tool is None or tool.handler is None:
         known = ", ".join(sorted(world.tools) or sorted(FROZEN))

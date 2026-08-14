@@ -57,6 +57,77 @@ def self_check() -> None:
         assert "spawn session" in prompt
         assert "POST in" in prompt
         assert "mid popup" in prompt
+
+        # Durable memory is a progressive-disclosure store, not a newest-tail
+        # log. Migration keeps an exact backup, promotes old high-priority facts
+        # into the routing summary, and leaves details available through bounded
+        # tool retrieval.
+        memory_dir = cwd / "memory-check"
+        memory_dir.mkdir()
+        legacy = (
+            "# MEMORY\n\n## 2025-01-01\n"
+            "- Umang prefers actual tools before narration.\n"
+            "## 2026-01-01\n"
+            "- newest noise " + "x" * 4000 + "\n"
+        )
+        (memory_dir / "MEMORY.md").write_text(legacy, encoding="utf-8")
+        memory_world = new_world(memory_dir, state_path=memory_dir / "harness.json")
+        memory_prompt = system_prompt(memory_world)
+        assert memory_world.tools["memory"].frozen
+        assert "Umang prefers actual tools before narration" in memory_prompt
+        assert "x" * 500 not in memory_prompt
+        assert (memory_dir / "memories" / "legacy_MEMORY.md").read_text(encoding="utf-8") == legacy
+        assert (memory_dir / "memories" / "records.jsonl").is_file()
+        assert (memory_dir / "memory_summary.md").is_file()
+
+        remembered = dispatch(
+            memory_world,
+            Block(
+                "memory",
+                "Umang's name is Umang.",
+                {"id": "user.umang.identity", "scope": "user", "kind": "identity"},
+            ),
+        )
+        assert "remembered user.umang.identity" in remembered
+        updated = dispatch(
+            memory_world,
+            Block(
+                "memory",
+                "Umang's name is Umang.",
+                {"id": "user.umang.identity", "scope": "user", "kind": "identity"},
+            ),
+        )
+        assert "updated user.umang.identity" in updated
+        search_result = dispatch(memory_world, Block("memory", "search Umang identity", {}))
+        assert "user.umang.identity" in search_result
+        read_result = dispatch(memory_world, Block("memory", "read user.umang.identity", {}))
+        assert '"scope": "user"' in read_result
+        assert "verified user.umang.identity" in dispatch(
+            memory_world, Block("memory", "verify user.umang.identity", {})
+        )
+
+        secret_result = dispatch(
+            memory_world,
+            Block(
+                "memory",
+                "api_key=abcdefghijk123456789",
+                {"id": "repo.secret-test", "scope": "repo", "kind": "test"},
+            ),
+        )
+        assert "remembered repo.secret-test" in secret_result
+        secret_read = dispatch(memory_world, Block("memory", "read repo.secret-test", {}))
+        assert "[REDACTED_SECRET]" in secret_read
+        assert "abcdefghijk123456789" not in secret_read
+
+        memory_world2 = new_world(memory_dir, state_path=memory_dir / "harness.json")
+        assert memory_world2.tools["memory"].frozen
+        assert "Umang's name is Umang" in system_prompt(memory_world2)
+        assert "forgot user.umang.identity" in dispatch(
+            memory_world2, Block("memory", "forget user.umang.identity", {})
+        )
+        assert "no match" == dispatch(memory_world2, Block("memory", "search user.umang.identity", {}))
+        assert "consolidated" in dispatch(memory_world2, Block("memory", "consolidate", {}))
+
         from desmos.cli import (
             _repo_root,
             _tui_binary,

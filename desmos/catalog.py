@@ -157,19 +157,7 @@ def header(world: World, task: str) -> str:
 
 
 def memory_block(world: World, budget: int = 2000) -> str:
-    """Tail of .desmos/MEMORY.md — durable episodes, not doctrine.
+    """Small routing summary; detailed durable memories stay tool-retrievable."""
+    from desmos.memory import prompt_summary
 
-    On disk it is theoretically durable; in the prompt it is actually
-    consulted. Tail-only and capped so an append-only log can never
-    crowd out the transcript.
-    """
-    path = state_file(world).parent / "MEMORY.md"
-    try:
-        text = path.read_text().strip()
-    except OSError:
-        return ""
-    if not text:
-        return ""
-    if len(text) > budget:
-        text = "...\n" + text[-budget:]
-    return "# memory (durable, newest last)\n" + text
+    return prompt_summary(world, budget)

@@ -52,6 +52,10 @@ _BUILTIN_DOCS = (
     ("reload_sdk", "reimport desmos.* and rebind step; next complete() uses the new ABI"),
     ("evolve", "snapshot grown state as the next generation"),
     ("rollback", "restore generation n="),
+    (
+        "memory",
+        "structured durable memory: body remembers; actions show/search/read/forget/verify/consolidate",
+    ),
 )
 
 
@@ -469,6 +473,7 @@ def reload_sdk(world: World | None = None) -> str:
         "desmos.edit",
         "desmos.exec",
         "desmos.persist",
+        "desmos.memory",
         "desmos.generations",
         "desmos.auth",
         "desmos.openai",
