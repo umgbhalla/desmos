@@ -296,8 +296,11 @@ def _execute(run: Run, parent: Any) -> None:
                 publish_progress()
             elif kind == "result" and ev.get("phase") == "done":
                 tag = str(ev.get("tag") or "tool")
-                run.observed_tools.append(tag)
-                run.progress = f"collected {tag} evidence"
+                if tag in w.tools:
+                    run.observed_tools.append(tag)
+                    run.progress = f"collected {tag} evidence"
+                else:
+                    run.progress = f"ignored unknown {tag} tag"
                 publish_progress()
             payload = {k: v for k, v in ev.items() if k != "ev"}
             _emit({"ev": "child", "id": run.id, "kind": kind, **payload})
