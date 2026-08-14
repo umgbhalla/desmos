@@ -2445,13 +2445,35 @@ fn handle_key(
                 app.slash.move_sel(1);
                 return Ok(false);
             }
-            KeyCode::Tab | KeyCode::Enter => {
+            // Tab always completes. Enter only completes when there is
+            // something left to complete -- otherwise it sends.
+            //
+            // Enter used to accept unconditionally, which made a command with
+            // no argument unrunnable: typing /reset left one suggestion,
+            // accepting it produced the line already typed, the list matched
+            // it again, and Enter looped there forever. The only escape was a
+            // space, because "/reset " has an empty argument and closes the
+            // list. Accepting is only a move if it changes the line.
+            KeyCode::Tab => {
                 if let Some(line) = app.slash.accept() {
                     app.prompt.clear();
                     app.prompt.insert_str(&line);
                     app.slash.update(&app.prompt.to_send(), &app.picker);
                 }
                 return Ok(false);
+            }
+            KeyCode::Enter => {
+                let typed = app.prompt.to_send();
+                match app.slash.accept() {
+                    Some(line) if line != typed => {
+                        app.prompt.clear();
+                        app.prompt.insert_str(&line);
+                        app.slash.update(&app.prompt.to_send(), &app.picker);
+                        return Ok(false);
+                    }
+                    // Nothing to add. Dismiss and let this Enter send.
+                    _ => app.slash.close(),
+                }
             }
             KeyCode::Esc => {
                 app.slash.close();
@@ -7951,6 +7973,42 @@ mod tests {
         // Prose is not a command.
         s.update("what about /model", &pick);
         assert!(!s.open);
+    }
+
+    /// Enter accepted unconditionally, so a command taking no argument could
+    /// never be sent: /reset left one suggestion, accepting it produced the
+    /// line already typed, the list matched again, and Enter looped there.
+    /// The only way out was to type a space.
+    #[test]
+    fn enter_sends_a_command_that_has_nothing_left_to_complete() {
+        let mut app = App::new();
+        app.picker = stocked_picker();
+        app.set_focus(Focus::Input);
+        for c in "/reset".chars() {
+            handle_key(None, &mut app, press(KeyCode::Char(c))).unwrap();
+        }
+        assert!(app.slash.open, "the list is up");
+        handle_key(None, &mut app, press(KeyCode::Enter)).unwrap();
+        // Sent: the composer is empty and the list is gone. Looping would have
+        // left "/reset" sitting in the composer with the list still open.
+        assert!(!app.slash.open, "the list must not survive the send");
+        assert_eq!(app.prompt.to_send(), "", "Enter sent it instead of re-completing");
+
+        // A prefix still has something to add, so Enter completes there.
+        for c in "/mod".chars() {
+            handle_key(None, &mut app, press(KeyCode::Char(c))).unwrap();
+        }
+        handle_key(None, &mut app, press(KeyCode::Enter)).unwrap();
+        assert_eq!(app.prompt.to_send(), "/model ", "a prefix completes");
+        assert!(app.slash.open, "and the argument list opens");
+
+        // Argument chosen: nothing left to add, so this Enter sends.
+        for c in "gpt-5.6-sol".chars() {
+            handle_key(None, &mut app, press(KeyCode::Char(c))).unwrap();
+        }
+        handle_key(None, &mut app, press(KeyCode::Enter)).unwrap();
+        assert_eq!(app.prompt.to_send(), "");
+        assert!(!app.slash.open);
     }
 
     #[test]
