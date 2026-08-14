@@ -35,12 +35,15 @@ pub struct JsonTree {
     scroll: usize,
     layout_w: u16,
     layout: TreeLayout,
+    /// Rows scrolled off (above, below) at the last `lines()` call.
+    hidden: (usize, usize),
 }
 
 impl Default for JsonTree {
     fn default() -> Self {
         Self {
             children: Vec::new(),
+            hidden: (0, 0),
             selected: 0,
             scroll: 0,
             layout_w: 0,
@@ -68,6 +71,7 @@ impl JsonTree {
         };
         Self {
             children,
+            hidden: (0, 0),
             selected: 0,
             scroll: 0,
             layout_w: 0,
@@ -154,6 +158,11 @@ impl JsonTree {
         }
     }
 
+    /// (above, below) rows the viewport is hiding, from the last `lines()`.
+    pub fn hidden(&self) -> (usize, usize) {
+        self.hidden
+    }
+
     pub fn lines(&mut self, width: u16, height: u16, focused: bool) -> Vec<Line<'static>> {
         self.ensure_layout(width);
         let lay = &self.layout;
@@ -171,6 +180,10 @@ impl JsonTree {
         let theme = Theme::current();
         let start = self.scroll;
         let end = (start + height as usize).min(self.layout.lines.len());
+        // What the viewport cut off, for the caller's overflow markers. The
+        // returned vec is already truncated to `height`, so a caller cannot
+        // work this out after the fact.
+        self.hidden = (start, self.layout.lines.len().saturating_sub(end));
         (start..end)
             .map(|i| {
                 let mut line = self.layout.lines[i].clone();

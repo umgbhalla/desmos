@@ -87,6 +87,7 @@ use xai_grok_pager::input::is_mod_enter;
 use xai_grok_pager::theme::{Theme, ThemeKind, cache as theme_cache};
 use xai_grok_pager::util;
 use xai_grok_pager::views::block_viewer::{BlockViewerPane, ViewerKind};
+use xai_grok_pager::views::progress_bar::progress_bar_spans;
 use xai_grok_pager::views::modal_window::{
     ModalSizing, ModalWindowConfig, ModalWindowOutcome, ModalWindowState, Shortcut,
     handle_modal_key, handle_modal_mouse, render_modal_window,
@@ -3399,25 +3400,72 @@ fn draw_json_tree(
 ) {
     let theme = Theme::current();
     let border = if focused { accent } else { theme.gray_bright };
+    // Lay the rows out first: the title reports what scrolled off the top, so
+    // the count has to exist before the block is built. Same contract the
+    // scrollback panes already follow.
+    let inner = Block::default().borders(Borders::ALL).inner(area);
+    if inner.width == 0 || inner.height == 0 {
+        f.render_widget(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(border))
+                .title(Span::styled(
+                    format!(" {title} "),
+                    Style::default().fg(accent).add_modifier(Modifier::BOLD),
+                ))
+                .style(Style::default().bg(theme.bg_base).fg(theme.text_primary)),
+            area,
+        );
+        return;
+    }
+    let lines = tree.lines(inner.width, inner.height, focused);
+    let (above, below) = tree.hidden();
+    let heading = if above > 0 {
+        format!(" {title}  {above} more up ")
+    } else {
+        format!(" {title} ")
+    };
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(border))
         .title(Span::styled(
-            format!(" {title} "),
+            heading,
             Style::default().fg(accent).add_modifier(Modifier::BOLD),
         ))
         .style(Style::default().bg(theme.bg_base).fg(theme.text_primary));
-    let inner = block.inner(area);
     f.render_widget(block, area);
-    if inner.width == 0 || inner.height == 0 {
-        return;
-    }
-    let lines = tree.lines(inner.width, inner.height, focused);
     f.render_widget(Paragraph::new(lines), inner);
+    if below > 0 {
+        stamp_footer(f, area, &format!("{below} more down"), theme.gray_bright);
+    }
 }
 
 /// Cache meter: how much of the prompt-cache TTL is left, fading as it burns
 /// down, plus the token split of the last `complete()`.
+/// How much a pane can say in the rows it was given. A pane picks its own
+/// rendering from this instead of drawing one layout and letting ratatui clip
+/// the tail — a clipped meter and a cold meter look identical.
+///
+/// Rows only: width is handled by the panes themselves (`fit_status`, the
+/// scrollback's own wrapping, `truncate_width` in the queue). Derived fresh
+/// every frame and never stored, so there is no stale tier to oscillate on.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Tier {
+    Line,
+    Dense,
+    Full,
+}
+
+impl Tier {
+    fn of(rows: u16) -> Self {
+        match rows {
+            0..=1 => Self::Line,
+            2..=4 => Self::Dense,
+            _ => Self::Full,
+        }
+    }
+}
+
 fn draw_cache_meter(f: &mut Frame, area: Rect, meter: &CacheMeter, focused: bool) {
     if area.height == 0 || area.width == 0 {
         return;
@@ -3459,71 +3507,104 @@ fn draw_cache_meter(f: &mut Frame, area: Rect, meter: &CacheMeter, focused: bool
         r if r < 0.6 => (theme.accent_tool, false),
         _ => (theme.accent_success, false),
     };
-    let width = inner.width as usize;
-    let filled = ((width as f32) * ratio).round() as usize;
-    let mut bar = Style::default().fg(fg);
+    let mut bar_fg = fg;
     if dim {
-        bar = bar.add_modifier(Modifier::DIM);
+        bar_fg = theme.gray_bright;
     }
+    let bar = || {
+        Line::from(progress_bar_spans(
+            inner.width,
+            ratio,
+            bar_fg,
+            theme.bg_base,
+        ))
+    };
     let label = |s: &str| Span::styled(s.to_string(), Style::default().fg(theme.text_secondary));
     let val = |s: String| Span::styled(s, Style::default().fg(theme.text_primary));
-    let lines = vec![
-        Line::from(vec![
-            Span::styled("█".repeat(filled), bar),
+    let hit = |v: u64| Span::styled(format!("{v:>3}%"), Style::default().fg(fg));
+
+    let lines = match Tier::of(inner.height) {
+        // One row: the numbers that change a decision — is the cache warm,
+        // and what has this session cost. The title already carries the TTL.
+        Tier::Line => vec![Line::from(vec![
+            hit(meter.hit_total()),
+            label("  warm "),
+            val(format!("{}/{}", meter.warm, meter.calls)),
+            label("  spent "),
             Span::styled(
-                "░".repeat(width.saturating_sub(filled)),
-                Style::default().fg(theme.gray_bright),
-            ),
-        ]),
-        // This call.
-        Line::from(vec![
-            label("call  "),
-            Span::styled(format!("{:>3}%", meter.hit()), Style::default().fg(fg)),
-            label("  read "),
-            val(format!("{:>7}", tokens(meter.read))),
-            label("  in "),
-            val(format!("{:>5}", tokens(meter.fresh))),
-            label("  gen "),
-            val(format!("{:>5}", tokens(meter.out))),
-        ]),
-        // Session so far.
-        Line::from(vec![
-            label("warm  "),
-            Span::styled(
-                format!("{:>3}/{}", meter.warm, meter.calls),
-                Style::default().fg(theme.accent_success),
-            ),
-            label(" calls   rate "),
-            Span::styled(
-                format!("{:>3}%", meter.hit_total()),
-                Style::default().fg(fg),
-            ),
-        ]),
-        Line::from(vec![
-            label("spent "),
-            Span::styled(
-                format!("{:>8}", money(meter.spent)),
+                money(meter.spent),
                 Style::default()
                     .fg(theme.accent_user)
                     .add_modifier(Modifier::BOLD),
             ),
-            label("   saved "),
-            Span::styled(
-                format!("{:>8}", money(meter.saved)),
-                Style::default().fg(theme.accent_success),
-            ),
-        ]),
-        Line::from(vec![
-            label("tokens "),
-            val(format!(
-                "read {}  write {}  in {}  gen {}",
-                tokens(meter.read_total),
-                tokens(meter.write_total),
-                tokens(meter.fresh_total),
-                tokens(meter.out_total)
-            )),
-        ]),
-    ];
+        ])],
+        // Two or three rows: the bar earns its row, the rest condenses.
+        Tier::Dense => vec![
+            bar(),
+            Line::from(vec![
+                hit(meter.hit_total()),
+                label("  warm "),
+                val(format!("{}/{}", meter.warm, meter.calls)),
+                label("  spent "),
+                Span::styled(
+                    money(meter.spent),
+                    Style::default()
+                        .fg(theme.accent_user)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                label("  saved "),
+                Span::styled(money(meter.saved), Style::default().fg(theme.accent_success)),
+            ]),
+        ],
+        Tier::Full => vec![
+            bar(),
+            // This call.
+            Line::from(vec![
+                label("call  "),
+                hit(meter.hit()),
+                label("  read "),
+                val(format!("{:>7}", tokens(meter.read))),
+                label("  in "),
+                val(format!("{:>5}", tokens(meter.fresh))),
+                label("  gen "),
+                val(format!("{:>5}", tokens(meter.out))),
+            ]),
+            // Session so far.
+            Line::from(vec![
+                label("warm  "),
+                Span::styled(
+                    format!("{:>3}/{}", meter.warm, meter.calls),
+                    Style::default().fg(theme.accent_success),
+                ),
+                label(" calls   rate "),
+                hit(meter.hit_total()),
+            ]),
+            Line::from(vec![
+                label("spent "),
+                Span::styled(
+                    format!("{:>8}", money(meter.spent)),
+                    Style::default()
+                        .fg(theme.accent_user)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                label("   saved "),
+                Span::styled(
+                    format!("{:>8}", money(meter.saved)),
+                    Style::default().fg(theme.accent_success),
+                ),
+            ]),
+            Line::from(vec![
+                label("tokens "),
+                val(format!(
+                    "read {}  write {}  in {}  gen {}",
+                    tokens(meter.read_total),
+                    tokens(meter.write_total),
+                    tokens(meter.fresh_total),
+                    tokens(meter.out_total)
+                )),
+            ]),
+        ],
+    };
     f.render_widget(Paragraph::new(lines), inner);
 }
 
@@ -4943,6 +5024,59 @@ mod tests {
         assert_eq!(l.wire_pct, PaneLayout::MIN_WIRE);
         assert_eq!(l.post_split, PaneLayout::MIN_SPLIT);
         assert_eq!((l.meter_h, l.post_h), (0, 0), "both panes must reach hidden");
+    }
+
+    #[test]
+    fn tier_boundaries_and_the_default_layout() {
+        assert_eq!(Tier::of(0), Tier::Line);
+        assert_eq!(Tier::of(1), Tier::Line);
+        assert_eq!(Tier::of(2), Tier::Dense);
+        assert_eq!(Tier::of(4), Tier::Dense);
+        assert_eq!(Tier::of(5), Tier::Full);
+        assert_eq!(Tier::of(12), Tier::Full);
+        // The shipped default (meter_h 7, two border rows) must stay Full, or
+        // every user's meter silently changes shape on upgrade.
+        let inner = PaneLayout::default().meter_h - 2;
+        assert_eq!(Tier::of(inner), Tier::Full);
+    }
+
+    #[test]
+    fn a_short_meter_keeps_the_numbers_that_decide_something() {
+        let mut app = App::new();
+        handle_event(
+            &mut app,
+            json!({
+                "ev": "complete",
+                "n": 1,
+                "origin": "user",
+                "model": "claude-opus-5",
+                "usage": {
+                    "input_tokens": 10,
+                    "cache_read_input_tokens": 40000,
+                    "cache_creation_input_tokens": 0,
+                    "output_tokens": 100,
+                },
+            }),
+        );
+        // Rows the meter can be dragged to, and what has to survive each.
+        for (rows, wants, drops) in [
+            (3u16, "spent", "tokens "),
+            (5, "saved", "tokens "),
+            (9, "tokens ", ""),
+        ] {
+            app.layout.meter_h = rows;
+            let text = paint(&mut app, 150, 40);
+            assert!(
+                text.contains(wants),
+                "meter_h {rows} must still show {wants:?}:\n{text}"
+            );
+            if !drops.is_empty() {
+                assert!(
+                    !text.contains(drops),
+                    "meter_h {rows} must not try to draw {drops:?}:\n{text}"
+                );
+            }
+        }
     }
 
     #[test]
