@@ -71,6 +71,9 @@ def catalog(world: World) -> str:
         block = format_skills_for_prompt(world.skills)
         if block:
             lines.append(block)
+    mem = memory_block(world)
+    if mem:
+        lines.append(mem)
     lines.append(runtime_block(world))
     return "\n".join(lines)
 
@@ -108,7 +111,15 @@ def runtime_block(world: World) -> str:
             f"shared_skills: {home / '.agents' / 'skills'}",
             f"project_extensions: {world.cwd / '.desmos' / 'extensions'}",
             f"user_extensions: {home / '.desmos' / 'extensions'}",
-            "transcript: world.messages is append-only. step() continues it. Syscall output arrives as user <result> blocks — not a restated task.",
+            "tui: python -m desmos tui",
+            "  middle: turn story (you / think / speech). speech is markdown.",
+            "  right: wire only — complete() cards and XML syscalls. USER = your enter started the POST. LLM = the model called again. Do not narrate the same sentences into both panes.",
+            "  bottom: input. Tab/Shift-Tab cycles story → calls → input. j/k or arrows highlight a block. h/l or ←/→ or Enter folds (Collapsed / Truncated / Expanded). r = raw markdown. click selects, double-click folds, wheel scrolls the pane under the cursor.",
+            "  blocks: you = UserPrompt, think = Thinking (starts collapsed), speech = AgentMessage (grok markdown), wire = ToolCall. Never stamp everything 'out'.",
+            "  markdown: grok-build AgentMessageBlock via xai_grok_markdown pretty + syntect tokyo-night. Speak markdown. Never emit angle-bracket tags in prose.",
+            "  acp: python -m desmos tui --grok attaches grok-build pager via NDJSON JSON-RPC 2.0 (not Content-Length).",
+            "transcript: world.messages is append-only. step() continues it. Syscall output arrives as user <result> blocks — not a restated task. Never write a result block in your own speech.",
+            "complete: Opus 5 is adaptive thinking + output_config.effort (default low). Older Claude 4 uses a token budget + interleaved thinking. Thinking/redacted blocks are replayed on the wire, not restated as speech.",
             "reload: every turn rediscovers skills/extensions. After writing SKILL.md this turn, emit <reload/> then <skill name=\"…\"/>, or wait one turn.",
             "reload_sdk: <reload_sdk/> reimports desmos.*, reseeds missing builtins, rebinds step. Does not wipe ns, notes, or messages. New ABI/loop apply on the next complete().",
             "edit: <edit path=\"file\">old\\n---\\nnew</edit> — exactly one occurrence. Relative paths are cwd-relative. Or edit.run(path, old, new).",
@@ -132,3 +143,22 @@ def header(world: World, task: str) -> str:
             lines.append(f"     you: {clip(item['speech'], 400)}")
     lines.append(f"prompt: {task}")
     return "\n".join(lines)
+
+
+def memory_block(world: World, budget: int = 2000) -> str:
+    """Tail of .desmos/MEMORY.md — durable episodes, not doctrine.
+
+    On disk it is theoretically durable; in the prompt it is actually
+    consulted. Tail-only and capped so an append-only log can never
+    crowd out the transcript.
+    """
+    path = state_file(world).parent / "MEMORY.md"
+    try:
+        text = path.read_text().strip()
+    except OSError:
+        return ""
+    if not text:
+        return ""
+    if len(text) > budget:
+        text = "...\n" + text[-budget:]
+    return "# memory (durable, newest last)\n" + text

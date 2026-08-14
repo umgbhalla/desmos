@@ -41,6 +41,13 @@ def digest(messages: list[dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
+def _is_turn_start(msg: dict[str, Any]) -> bool:
+    """True for a genuine user prompt, not a syscall result block."""
+    if msg.get("role") != "user":
+        return False
+    return "<result" not in _text(msg)
+
+
 def weight(messages: list[dict[str, Any]]) -> int:
     return sum(len(json.dumps(m, default=str)) for m in messages)
 
@@ -56,7 +63,10 @@ def compact(world: Any, keep: int = 24, floor: int = 40) -> dict[str, int]:
     if len(msgs) < floor:
         return {"before": before, "after": before, "folded": 0}
     head, tail = msgs[:-keep], msgs[-keep:]
-    while tail and tail[0].get("role") != "user":
+    # A valid cut is a real user turn. Syscall output also arrives as role
+    # "user" (<result> blocks), so cutting there orphans a tag from its
+    # result — the tail would open with an answer to a question nobody sees.
+    while tail and not _is_turn_start(tail[0]):
         head.append(tail.pop(0))
     if not tail:
         return {"before": before, "after": before, "folded": 0}
