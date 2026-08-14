@@ -510,6 +510,10 @@ impl StreamCursor {
                 story.remove_entry(id);
             } else {
                 story.finish_running(id);
+                // A live thought streams Expanded, and grok keeps an Expanded
+                // thinking block expanded on finish (Ctrl+E stickiness). The
+                // record we want is one row, so say so explicitly.
+                set_wire_mode(story, id, DisplayMode::Collapsed);
                 let ms = story.get_by_id(id).and_then(|e| match &e.block {
                     RenderBlock::Thinking(t) => t.elapsed_time_ms(),
                     _ => None,
@@ -4864,6 +4868,12 @@ fn start_thinking(story: &mut ScrollbackState, stream: &mut StreamCursor) {
     }
     let id = story.push_block(RenderBlock::thinking_streaming());
     story.set_last_running(true);
+    // Grok's truncated mode marks the clipped head with a bare "…" row. That
+    // marker only reads as a marker under the header, and the header is the
+    // status row's job -- so a live thought renders its whole body (grok
+    // minimal does the same in its live tail) and the pane's bottom edge does
+    // the clipping. finish_think folds it back to one collapsed row.
+    set_wire_mode(story, id, DisplayMode::Expanded);
     stream.think = Some(id);
 }
 
@@ -4960,11 +4970,7 @@ fn apply_thinking(
         if text.is_empty() {
             return;
         }
-        if stream.think.is_none() {
-            let id = story.push_block(RenderBlock::thinking_streaming());
-            story.set_last_running(true);
-            stream.think = Some(id);
-        }
+        start_thinking(story, stream);
         stream.pending_think.push_str(text);
         return;
     }
@@ -5510,14 +5516,16 @@ mod tests {
         buffer_text(&term)
     }
 
-    /// A streaming thought spends no row on chrome it does not need.
+    /// A streaming thought is body, and nothing but body.
     ///
-    /// It used to open with three: a "Thinking…" header, the blank separator the
-    /// header always drags with it, and the ellipsis marking the clipped tail.
-    /// The turn-status row already says Thinking with a spinner and the elapsed
-    /// time, so the header was the copy, and its blank was pure waste. Only the
-    /// ellipsis earns its row -- without it the body looks like a paragraph that
-    /// happens to start mid-sentence.
+    /// It used to open with three rows of chrome: a "Thinking…" header, the
+    /// blank separator the header always drags with it, and grok's "…" marking
+    /// the clipped head. The turn-status row already says Thinking with a
+    /// spinner and the elapsed time, so the header was a copy and its blank was
+    /// waste; the marker only reads as a marker under that header. So a live
+    /// thought streams Expanded -- whole body, no chrome, the pane's bottom edge
+    /// doing the clipping, which is how grok minimal draws its live tail -- and
+    /// collapses to a single "Thought for Xs" row the moment it ends.
     #[test]
     fn a_streaming_thought_does_not_repeat_the_status_row() {
         let mut app = App::new();
@@ -5530,31 +5538,35 @@ mod tests {
             }));
         }
         let text = paint(&mut app, 70, 30);
-        let body: Vec<&str> = text.lines().skip(1).take(4).collect();
         assert!(
-            !body.iter().any(|l| l.contains("Thinking")),
-            "the header is the status row's job:\n{}",
-            body.join("\n")
+            !text.contains("Thinking"),
+            "the header is the status row's job:\n{text}"
         );
         assert!(
-            body[0].contains('\u{2026}'),
-            "the clipped marker should lead:\n{}",
-            body.join("\n")
+            !text.contains('\u{2026}'),
+            "no marker: the body is all there is:\n{text}"
         );
-        // The row under the marker is reasoning, not the blank separator.
-        let under = body[1].trim_start_matches(['\u{2502}', '\u{2503}', ' ']);
         assert!(
-            under.chars().any(char::is_alphabetic),
-            "chrome is still eating the row under the marker:\n{}",
-            body.join("\n")
+            text.contains("number 7"),
+            "the newest reasoning must be on screen:\n{text}"
+        );
+        // Truncated mode could never show more than three body rows.
+        let rows = text.lines().filter(|l| l.contains("number")).count();
+        assert!(
+            rows > 3,
+            "a live thought renders its body, not a 3-row window ({rows}):\n{text}"
         );
 
-        // Collapsed keeps its own header, so a finished thought is still labelled.
+        // One row, labelled, the moment it stops.
         handle_event(&mut app, json!({"ev": "speech", "delta": true, "text": "Answer.\n"}));
         let text = paint(&mut app, 70, 30);
         assert!(
             text.contains("Thought for"),
             "a finished thought must still say what it was:\n{text}"
+        );
+        assert!(
+            !text.contains("number 3"),
+            "a finished thought is one collapsed row:\n{text}"
         );
     }
 
