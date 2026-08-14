@@ -3343,7 +3343,7 @@ fn draw(f: &mut Frame, app: &mut App) {
         theme.accent_assistant,
         app.focus == Focus::PostOut,
     );
-    draw_cache_meter(f, app.cache.area, &app.cache, app.focus == Focus::Meter);
+    draw_meta(f, app.cache.area, &app.cache, app.focus == Focus::Meter);
     draw_queue(f, cols[1], app);
     if show_turn {
         let cancel_hovered = app.mouse.is_some_and(|(c, r)| {
@@ -3440,8 +3440,9 @@ fn draw_json_tree(
     }
 }
 
-/// Cache meter: how much of the prompt-cache TTL is left, fading as it burns
-/// down, plus the token split of the last `complete()`.
+/// The meta pane: prompt-cache TTL burning down, the token split of the last
+/// `complete()`, and what the session has spent. Named for what it holds now,
+/// not for the one number it started as.
 /// How much a pane can say in the rows it was given. A pane picks its own
 /// rendering from this instead of drawing one layout and letting ratatui clip
 /// the tail — a clipped meter and a cold meter look identical.
@@ -3466,7 +3467,7 @@ impl Tier {
     }
 }
 
-fn draw_cache_meter(f: &mut Frame, area: Rect, meter: &CacheMeter, focused: bool) {
+fn draw_meta(f: &mut Frame, area: Rect, meter: &CacheMeter, focused: bool) {
     if area.height == 0 || area.width == 0 {
         return;
     }
@@ -3475,8 +3476,8 @@ fn draw_cache_meter(f: &mut Frame, area: Rect, meter: &CacheMeter, focused: bool
     let secs = left.map(|l| (l * meter.ttl.as_secs_f32()).round() as u64);
     let ttl_label = if meter.ttl.as_secs() >= 3600 { "1h" } else { "5m" };
     let title = match secs {
-        Some(s) => format!(" cache  {ttl_label}  {}:{:02} left ", s / 60, s % 60),
-        None => " cache  cold ".to_string(),
+        Some(s) => format!(" meta  cache {ttl_label} {}:{:02} ", s / 60, s % 60),
+        None => " meta  cache cold ".to_string(),
     };
     let border = if focused {
         theme.accent_tool
