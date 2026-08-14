@@ -597,6 +597,10 @@ struct App {
     story_sel: ResolvedSelectionModel,
     calls_sel: ResolvedSelectionModel,
     post_n: u64,
+    /// Sequence number of the response currently in `post_out`. Lags `post_n`
+    /// while a step is in flight: the out pane is still holding the previous
+    /// turn's reply, and saying so beats blanking it under a new number.
+    post_out_n: u64,
     queue: QueryQueue,
     send_now: bool,
     drain_after: bool,
@@ -772,6 +776,7 @@ impl App {
             story_sel: ResolvedSelectionModel::default(),
             calls_sel: ResolvedSelectionModel::default(),
             post_n: 0,
+            post_out_n: 0,
             queue: QueryQueue::default(),
             send_now: false,
             drain_after: false,
@@ -995,9 +1000,15 @@ impl App {
     fn set_last_post(&mut self, n: u64, request: &Value, response: &Value) {
         self.post_n = n;
         self.post_req = request.clone();
-        self.post_resp = response.clone();
         self.post_in = JsonTree::from_value(request);
-        self.post_out = JsonTree::from_value(response);
+        // The request event carries an empty response. Keep the previous reply
+        // and its number rather than clearing the pane, so a completed turn
+        // stays readable until the next one actually answers.
+        if !response.is_null() && response != &json!({}) {
+            self.post_resp = response.clone();
+            self.post_out = JsonTree::from_value(response);
+            self.post_out_n = n;
+        }
         if let Some(inspect) = self.post_inspect.as_mut() {
             inspect.sync_raw(n, request, response);
         }
@@ -2135,6 +2146,7 @@ fn submit_prompt(mut bridge: Option<&mut Bridge>, app: &mut App) -> io::Result<b
         app.post_resp = json!({});
         app.post_inspect = None;
         app.post_n = 0;
+        app.post_out_n = 0;
         app.queue.clear();
         app.send_now = false;
     } else if line == "/reload" {
@@ -3306,10 +3318,13 @@ fn draw(f: &mut Frame, app: &mut App) {
     } else {
         format!("POST in #{n}")
     };
-    let out_title = if n == 0 {
+    let on = app.post_out_n;
+    let out_title = if on == 0 {
         "POST out".to_string()
+    } else if on == n {
+        format!("POST out #{on}")
     } else {
-        format!("POST out #{n}")
+        format!("POST out #{on}  waiting #{n}")
     };
     draw_json_tree(
         f,
@@ -4412,6 +4427,34 @@ mod tests {
         let mut term = Terminal::new(backend).unwrap();
         term.draw(|f| draw(f, app)).unwrap();
         buffer_text(&term)
+    }
+
+    /// A request event carries an empty response. It must not clear the out
+    /// pane nor relabel the held reply: the pane showed #5's body, went blank
+    /// under "#6", then jumped when the real reply landed.
+    #[test]
+    fn post_out_holds_the_previous_reply_until_the_next_one_lands() {
+        let mut app = App::new();
+        handle_event(
+            &mut app,
+            json!({"ev":"complete","n":5,"model":"m",
+                   "request":{"seq":"REQFIVE"},"response":{"seq":"RESPFIVE"}}),
+        );
+        assert_eq!(app.post_n, 5);
+        assert_eq!(app.post_out_n, 5);
+        handle_event(&mut app, json!({"ev":"post","n":6,"request":{"seq":"REQSIX"}}));
+        assert_eq!(app.post_n, 6, "in pane must advance at once");
+        assert_eq!(app.post_out_n, 5, "held reply keeps its own number");
+        let text = paint(&mut app, 150, 34);
+        assert!(text.contains("POST in #6"), "in title wrong:\n{text}");
+        assert!(text.contains("POST out #5"), "out title must still say 5:\n{text}");
+        assert!(text.contains("RESPFIVE"), "held reply body was cleared:\n{text}");
+        handle_event(
+            &mut app,
+            json!({"ev":"complete","n":6,"model":"m",
+                   "request":{"seq":"REQSIX"},"response":{"seq":"RESPSIX"}}),
+        );
+        assert_eq!(app.post_out_n, 6, "reply 6 should take over");
     }
 
     /// A call that just finished must not blink shut. finish_exec used to fold
