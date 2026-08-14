@@ -4521,17 +4521,46 @@ fn draw_paste_preview(f: &mut Frame, input: Rect, body: &str, on_chip: bool) {
 
 fn spoken_prefix(text: &str) -> String {
     let spans = code_spans(text);
-    let cut = match text.rfind('<') {
-        Some(i)
-            if !text[i..].contains('>')
-                && !in_code(&spans, i)
-                && looks_like_tag_start(&text[i..]) =>
-        {
-            &text[..i]
+    // A call whose closer has not arrived yet is a syscall in flight. Hold
+    // everything from its `<` back: the alternative is that the body streams
+    // into the story as prose, and it stays there, because by the time the
+    // closer lands the chunk has already been appended to a live block.
+    //
+    // This is why the streaming path must use strip_syscalls and not
+    // strip_xml. strip_xml drops the tag markers and keeps what they wrap,
+    // which is right for prose about markup and wrong for a command.
+    let mut cut = text.len();
+    let mut i = 0usize;
+    while let Some(rel) = text[i..].find('<') {
+        let start = i + rel;
+        if in_code(&spans, start) || !looks_like_tag_start(&text[start..]) {
+            i = start + 1;
+            continue;
         }
-        _ => text,
-    };
-    strip_xml(cut)
+        let Some(gt) = text[start..].find('>') else {
+            cut = start; // opener still being typed
+            break;
+        };
+        let open_end = start + gt + 1;
+        let inner = &text[start + 1..open_end - 1];
+        let name = inner
+            .trim_end_matches('/')
+            .split_whitespace()
+            .next()
+            .unwrap_or("");
+        if name.is_empty() || inner.trim_end().ends_with('/') || name.starts_with('/') {
+            i = open_end;
+            continue;
+        }
+        match text[open_end..].find(&format!("</{name}>")) {
+            Some(rel_end) => i = open_end + rel_end + name.len() + 3,
+            None => {
+                cut = start; // body still arriving
+                break;
+            }
+        }
+    }
+    strip_syscalls(&text[..cut])
 }
 
 /// A trailing `<` is only worth withholding if it could open a tag: `<`
@@ -5204,6 +5233,59 @@ mod tests {
         let mut term = Terminal::new(backend).unwrap();
         term.draw(|f| draw(f, app)).unwrap();
         buffer_text(&term)
+    }
+
+    /// The failure this guards: a command body streamed into the story one
+    /// delta at a time, was appended to a live block, and stayed there when
+    /// the closer finally arrived. Checking only the final story misses it --
+    /// the leak is committed long before the turn ends. So assert after every
+    /// delta, the way the user actually watches it.
+    #[test]
+    fn a_streaming_call_never_flashes_its_body_into_the_story() {
+        let mut app = App::new();
+        let lt = '<';
+        let gt = '>';
+        let deltas = [
+            "Checking the repo.\n\n".to_string(),
+            format!("{lt}ba"),
+            "sh".to_string(),
+            format!("{gt}cd /tmp && echo "),
+            "\"HEAD=$(git rev-parse HEAD)\"".to_string(),
+            "; wc -l *.rs".to_string(),
+            format!("{lt}/ba"),
+            format!("sh{gt}"),
+            "\n\nDone.".to_string(),
+        ];
+        for (n, d) in deltas.iter().enumerate() {
+            handle_event(&mut app, json!({"ev": "speech", "delta": true, "text": d}));
+            let story: String = (0..app.story.len())
+                .filter_map(|i| match app.story.entry(i).map(|e| &e.block) {
+                    Some(RenderBlock::AgentMessage(m)) => Some(m.text()),
+                    _ => None,
+                })
+                .collect();
+            for leak in ["cd /tmp", "git rev-parse", "wc -l", "HEAD="] {
+                assert!(
+                    !story.contains(leak),
+                    "delta {n} leaked {leak:?} into the story: {story:?}"
+                );
+            }
+        }
+        handle_event(&mut app, json!({"ev": "complete", "n": 1}));
+        let story: String = (0..app.story.len())
+            .filter_map(|i| match app.story.entry(i).map(|e| &e.block) {
+                Some(RenderBlock::AgentMessage(m)) => Some(m.text()),
+                _ => None,
+            })
+            .collect();
+        assert!(story.contains("Checking the repo."), "prose lost: {story:?}");
+        assert!(story.contains("Done."), "prose after the call lost: {story:?}");
+        assert!(!story.contains("bash"), "tag name leaked: {story:?}");
+        // And still absent once the closer has landed: holding the body during
+        // the stream is worthless if the finished block prints it anyway.
+        for leak in ["cd /tmp", "git rev-parse", "wc -l", "HEAD="] {
+            assert!(!story.contains(leak), "final story leaked {leak:?}: {story:?}");
+        }
     }
 
     /// Every syscall shape the model actually emits, gone from the story --
@@ -6687,8 +6769,10 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(spoken, vec!["see 1 more".to_string()]);
-        assert!(!spoken.iter().any(|s| s.contains("<python>")));
+        // The `1` is the call's body: it belongs to the calls pane, and it must
+        // never appear in the story even for the one frame before it closes.
+        assert_eq!(spoken, vec!["see  more".to_string()]);
+        assert!(!spoken.iter().any(|s| s.contains("<python>") || s.contains('1')));
     }
 
     #[test]
@@ -6737,7 +6821,10 @@ mod tests {
     #[test]
     fn spoken_prefix_holds_an_unclosed_tag() {
         assert_eq!(spoken_prefix("hello <python"), "hello ");
-        assert_eq!(spoken_prefix("hello <python>x</python>!"), "hello x!");
+        // The body goes with the call. It is already a card in the calls pane.
+        assert_eq!(spoken_prefix("hello <python>x</python>!"), "hello !");
+        // Held while the closer is still in flight, not shown then retracted.
+        assert_eq!(spoken_prefix("hello <bash>rm -rf /"), "hello ");
     }
     #[test]
     fn a_less_than_in_prose_does_not_stall_the_stream() {
