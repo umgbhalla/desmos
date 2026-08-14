@@ -747,49 +747,54 @@ impl CacheMeter {
     }
 
     fn observe_roles(&mut self, request: &Value) {
-        let mut split = [0u64; 5];
+        // Record the run in order; the per-kind totals are summed from it, so
+        // the sequence and the percentages can never describe different
+        // requests.
+        let mut chunks: Vec<(u64, u8)> = Vec::new();
         if let Some(sys) = request.get("system") {
-            split[0] += sys.to_string().len() as u64;
+            chunks.push((sys.to_string().len() as u64, 0));
         }
-        let Some(msgs) = request.get("messages").and_then(Value::as_array) else {
-            self.roles = split;
-            return;
-        };
-        for m in msgs {
-            let len = m.to_string().len() as u64;
-            match m.get("role").and_then(Value::as_str) {
-                // Syscall output is sent as a user turn, but it is not
-                // something anyone typed -- and it is the first thing worth
-                // trimming, so it earns its own slice.
-                Some("user") => {
-                    let tool = m
-                        .get("content")
-                        .map(|c| match c.as_str() {
-                            Some(t) => t.contains("<result"),
-                            None => c.to_string().contains("<result"),
-                        })
-                        .unwrap_or(false);
-                    split[usize::from(tool) + 1] += len;
-                }
-                // Thinking is replayed on every call and outweighs the speech.
-                // Counted together they say "the assistant is large"; counted
-                // apart they say which half to compact.
-                Some("assistant") => match m.get("content").and_then(Value::as_array) {
-                    Some(blocks) => {
-                        for b in blocks {
-                            let bl = b.to_string().len() as u64;
-                            match b.get("type").and_then(Value::as_str) {
-                                Some("thinking" | "redacted_thinking") => split[3] += bl,
-                                _ => split[4] += bl,
+        if let Some(msgs) = request.get("messages").and_then(Value::as_array) {
+            for m in msgs {
+                let len = m.to_string().len() as u64;
+                match m.get("role").and_then(Value::as_str) {
+                    // Syscall output is sent as a user turn, but nobody typed
+                    // it, and it is the first thing worth trimming.
+                    Some("user") => {
+                        let tool = m
+                            .get("content")
+                            .map(|c| match c.as_str() {
+                                Some(t) => t.contains("<result"),
+                                None => c.to_string().contains("<result"),
+                            })
+                            .unwrap_or(false);
+                        chunks.push((len, u8::from(tool) + 1));
+                    }
+                    // One chunk per block, not per turn: thinking is replayed
+                    // on every call and outweighs the speech beside it.
+                    Some("assistant") => match m.get("content").and_then(Value::as_array) {
+                        Some(blocks) => {
+                            for b in blocks {
+                                let bl = b.to_string().len() as u64;
+                                let kind = match b.get("type").and_then(Value::as_str) {
+                                    Some("thinking" | "redacted_thinking") => 3,
+                                    _ => 4,
+                                };
+                                chunks.push((bl, kind));
                             }
                         }
-                    }
-                    None => split[4] += len,
-                },
-                _ => split[0] += len,
+                        None => chunks.push((len, 4)),
+                    },
+                    _ => chunks.push((len, 0)),
+                }
             }
         }
+        let mut split = [0u64; 5];
+        for (len, kind) in &chunks {
+            split[*kind as usize] += *len;
+        }
         self.roles = split;
+        self.chunks = chunks;
     }
 
     fn observe(&mut self, usage: &Value, model: &str) {
@@ -5145,6 +5150,54 @@ mod tests {
         let mut term = Terminal::new(backend).unwrap();
         term.draw(|f| draw(f, app)).unwrap();
         buffer_text(&term)
+    }
+
+    #[test]
+    fn a_sequence_bar_keeps_the_order_it_was_given() {
+        use ratatui::style::Color;
+        let chunks: Vec<(u64, Color)> = (0..40)
+            .map(|i| (100u64, if i % 2 == 0 { Color::Red } else { Color::Blue }))
+            .collect();
+        let spans = sequence_bar_spans(60, &chunks, Color::Black);
+        let painted: usize = spans.iter().map(|s| s.content.chars().count()).sum();
+        assert_eq!(painted, 60, "bar did not fill its width");
+        assert!(
+            spans.len() > 10,
+            "order collapsed into {} runs, so this is a bucket chart",
+            spans.len()
+        );
+    }
+
+    #[test]
+    fn a_late_chunk_lands_late_in_the_bar() {
+        use ratatui::style::Color;
+        let mut chunks: Vec<(u64, Color)> = vec![(10, Color::Red); 20];
+        chunks.push((5000, Color::Blue));
+        let spans = sequence_bar_spans(60, &chunks, Color::Black);
+        assert_eq!(spans.first().unwrap().style.fg.unwrap(), Color::Red);
+        assert_eq!(spans.last().unwrap().style.fg.unwrap(), Color::Blue);
+    }
+
+    #[test]
+    fn totals_are_derived_from_the_sequence() {
+        let mut m = CacheMeter::default();
+        m.observe_roles(&json!({
+            "system": [{"type": "text", "text": "SSSS"}],
+            "messages": [
+                {"role": "user", "content": "typed"},
+                {"role": "user", "content": "<result>dump</result>"},
+                {"role": "assistant", "content": [
+                    {"type": "thinking", "thinking": "TTTT"},
+                    {"type": "text", "text": "said"}
+                ]}
+            ]
+        }));
+        assert_eq!(m.chunks.len(), 5, "one chunk per message or block: {:?}", m.chunks);
+        let mut from_chunks = [0u64; 5];
+        for (len, kind) in &m.chunks {
+            from_chunks[*kind as usize] += *len;
+        }
+        assert_eq!(from_chunks, m.roles, "totals disagree with the sequence");
     }
 
     #[test]
