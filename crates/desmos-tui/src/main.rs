@@ -229,6 +229,16 @@ struct PaneLayout {
     post_h: u16,
     /// Rows for the cache meter; 0 hides it.
     meter_h: u16,
+    /// Width of POST in as a percent of the POST row; the rest is POST out.
+    post_split: u16,
+}
+
+/// Which way a resize key pushes. `+`/`-` drive each pane's main axis;
+/// ctrl+arrows drive whichever axis the arrow points along.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Axis {
+    Horizontal,
+    Vertical,
 }
 
 impl Default for PaneLayout {
@@ -237,6 +247,7 @@ impl Default for PaneLayout {
             wire_pct: 38,
             post_h: 12,
             meter_h: 7,
+            post_split: 50,
         }
     }
 }
@@ -246,22 +257,55 @@ impl PaneLayout {
     const MAX_WIRE: u16 = 75;
     const MAX_POST: u16 = 28;
     const MAX_METER: u16 = 12;
+    const MIN_SPLIT: u16 = 20;
+    const MAX_SPLIT: u16 = 80;
+
+    /// The axis `+` / `-` drives for a pane: the one it can actually give away
+    /// space along. Story and calls share a width; meter and POST own rows.
+    fn main_axis(focus: Focus) -> Axis {
+        match focus {
+            Focus::Story | Focus::Calls => Axis::Horizontal,
+            _ => Axis::Vertical,
+        }
+    }
 
     fn grow(&mut self, focus: Focus, by: i16) {
+        self.grow_axis(focus, Self::main_axis(focus), by);
+    }
+
+    fn grow_axis(&mut self, focus: Focus, axis: Axis, by: i16) {
         let step = |v: u16, lo: u16, hi: u16| -> u16 {
             (v as i16 + by).clamp(lo as i16, hi as i16) as u16
         };
-        match focus {
-            // Story grows by taking width off the wire column, and vice versa.
-            Focus::Story => self.wire_pct = step(self.wire_pct, Self::MIN_WIRE, Self::MAX_WIRE),
-            Focus::Calls => {
-                self.wire_pct = (self.wire_pct as i16 + by)
+        match (focus, axis) {
+            // Story widens by taking the wire column's width, and vice versa.
+            (Focus::Story, Axis::Horizontal) => {
+                self.wire_pct = (self.wire_pct as i16 - by)
                     .clamp(Self::MIN_WIRE as i16, Self::MAX_WIRE as i16)
                     as u16
             }
-            Focus::Meter => self.meter_h = step(self.meter_h, 0, Self::MAX_METER),
-            Focus::PostIn | Focus::PostOut => self.post_h = step(self.post_h, 0, Self::MAX_POST),
-            Focus::Queue | Focus::Input => {}
+            (Focus::Calls | Focus::Meter, Axis::Horizontal) => {
+                self.wire_pct = step(self.wire_pct, Self::MIN_WIRE, Self::MAX_WIRE)
+            }
+            // The top row is whatever the POST split leaves, so story and calls
+            // grow taller by pushing POST down.
+            (Focus::Story | Focus::Calls, Axis::Vertical) => {
+                self.post_h = (self.post_h as i16 - by).clamp(0, Self::MAX_POST as i16) as u16
+            }
+            (Focus::Meter, Axis::Vertical) => self.meter_h = step(self.meter_h, 0, Self::MAX_METER),
+            (Focus::PostIn | Focus::PostOut, Axis::Vertical) => {
+                self.post_h = step(self.post_h, 0, Self::MAX_POST)
+            }
+            // POST in and out share a row: one grows out of the other.
+            (Focus::PostIn, Axis::Horizontal) => {
+                self.post_split = step(self.post_split, Self::MIN_SPLIT, Self::MAX_SPLIT)
+            }
+            (Focus::PostOut, Axis::Horizontal) => {
+                self.post_split = (self.post_split as i16 - by)
+                    .clamp(Self::MIN_SPLIT as i16, Self::MAX_SPLIT as i16)
+                    as u16
+            }
+            (Focus::Queue | Focus::Input, _) => {}
         }
     }
 
@@ -288,6 +332,7 @@ impl PaneLayout {
             wire_pct: n("wire_pct", d.wire_pct).clamp(Self::MIN_WIRE, Self::MAX_WIRE),
             post_h: n("post_h", d.post_h).min(Self::MAX_POST),
             meter_h: n("meter_h", d.meter_h).min(Self::MAX_METER),
+            post_split: n("post_split", d.post_split).clamp(Self::MIN_SPLIT, Self::MAX_SPLIT),
         }
     }
 
@@ -302,6 +347,7 @@ impl PaneLayout {
                 "wire_pct": self.wire_pct,
                 "post_h": self.post_h,
                 "meter_h": self.meter_h,
+                "post_split": self.post_split,
             })
             .to_string(),
         );
@@ -1672,19 +1718,33 @@ fn handle_key(
     if app.focus != Focus::Input && app.viewer.is_none() && app.post_inspect.is_none() {
         match key.code {
             KeyCode::Char('+') | KeyCode::Char('=') => {
-                let by = if app.focus == Focus::Story { -2 } else { 2 };
-                app.layout.grow(app.focus, by);
+                app.layout.grow(app.focus, 2);
                 app.layout.save();
                 return Ok(false);
             }
             KeyCode::Char('-') | KeyCode::Char('_') => {
-                let by = if app.focus == Focus::Story { 2 } else { -2 };
-                app.layout.grow(app.focus, by);
+                app.layout.grow(app.focus, -2);
                 app.layout.save();
                 return Ok(false);
             }
             KeyCode::Char('0') => {
                 app.layout = PaneLayout::default();
+                app.layout.save();
+                return Ok(false);
+            }
+            // ctrl+arrows resize along the arrow: up/down changes rows even for
+            // panes whose `+` key drives width, left/right changes width even
+            // for the ones whose `+` drives rows.
+            KeyCode::Up | KeyCode::Down | KeyCode::Left | KeyCode::Right
+                if key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                let (axis, by) = match key.code {
+                    KeyCode::Up => (Axis::Vertical, 2),
+                    KeyCode::Down => (Axis::Vertical, -2),
+                    KeyCode::Right => (Axis::Horizontal, 2),
+                    _ => (Axis::Horizontal, -2),
+                };
+                app.layout.grow_axis(app.focus, axis, by);
                 app.layout.save();
                 return Ok(false);
             }
@@ -4280,19 +4340,53 @@ mod tests {
         buffer_text(&term)
     }
 
+    /// Removed and added rows must be visually distinguishable. grok's gutter
+    /// prints a line number, not a -/+ sign, so the distinction is colour --
+    /// which means asserting on cell styles, not on the character dump.
     #[test]
-    #[ignore]
-    fn zz_diff_render() {
+    fn edit_card_colours_removed_and_added_rows_differently() {
         let mut app = App::new();
-        handle_event(&mut app, json!({
-            "ev": "result", "tag": "edit",
-            "attrs": {"path": "desmos/loop.py"},
-            "body": "    max_tokens: int = 8192,\n---\n    max_tokens: int = MAX_TOKENS,",
-            "text": "Edited desmos/loop.py",
-        }));
-        app.layout.wire_pct = 72;
-        panic!("{}", paint(&mut app, 128, 20));
+        handle_event(
+            &mut app,
+            json!({
+                "ev": "result",
+                "tag": "edit",
+                "attrs": {"path": "notes.md"},
+                "body": "UNIQUEOLD\n---\nUNIQUENEW",
+                "text": "Edited notes.md",
+            }),
+        );
+        let backend = TestBackend::new(130, 24);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let buf = term.backend().buffer();
+        let fg_of = |needle: &str| -> Option<ratatui::style::Color> {
+            for y in 0..buf.area.height {
+                let row: String = (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol().chars().next().unwrap_or(' '))
+                    .collect();
+                if let Some(col) = row.find(needle) {
+                    return Some(buf[(col as u16, y)].fg);
+                }
+            }
+            None
+        };
+        let removed = fg_of("UNIQUEOLD").expect("removed row never painted");
+        let added = fg_of("UNIQUENEW").expect("added row never painted");
+        assert_ne!(
+            removed, added,
+            "removed and added rows painted the same colour, so the diff reads as plain text"
+        );
     }
+
+    #[test]
+    fn a_non_unique_match_falls_back_to_line_one() {
+        // desmos/loop.py holds MAX_TOKENS twice, so the offset cannot be
+        // pinned and edit_start_line must say 1 rather than guess.
+        assert_eq!(edit_start_line("does/not/exist.rs", "a", "b"), 1);
+        assert_eq!(edit_start_line("", "a", "b"), 1);
+    }
+
 
 
     #[test]
@@ -4651,6 +4745,64 @@ mod tests {
         assert!(text.contains("WIREANSWER"), "response body missing:\n{text}");
         assert!(!text.contains("opaque-secret"), "{text}");
         assert_eq!(app.post_n, 4);
+    }
+
+    #[test]
+    fn plus_grows_the_focused_pane_on_its_own_axis() {
+        let mut l = PaneLayout::default();
+        let wide = l.wire_pct;
+        l.grow(Focus::Calls, 2);
+        assert_eq!(l.wire_pct, wide + 2, "calls + must widen the wire column");
+        l.grow(Focus::Story, 2);
+        assert_eq!(l.wire_pct, wide, "story + must take that width back");
+        let rows = l.post_h;
+        l.grow(Focus::PostIn, -2);
+        assert_eq!(l.post_h, rows - 2, "post - must shorten the POST row");
+    }
+
+    #[test]
+    fn ctrl_arrows_resize_along_the_arrow() {
+        let mut l = PaneLayout::default();
+        let rows = l.post_h;
+        // Story has no height of its own: it grows by pushing POST down.
+        l.grow_axis(Focus::Story, Axis::Vertical, 2);
+        assert_eq!(l.post_h, rows - 2);
+        l.grow_axis(Focus::Calls, Axis::Vertical, -2);
+        assert_eq!(l.post_h, rows);
+        // POST in and out share one row and trade width with each other.
+        let split = l.post_split;
+        l.grow_axis(Focus::PostIn, Axis::Horizontal, 5);
+        assert_eq!(l.post_split, split + 5);
+        l.grow_axis(Focus::PostOut, Axis::Horizontal, 5);
+        assert_eq!(l.post_split, split);
+        // The meter takes rows from the calls pane above it.
+        let meter = l.meter_h;
+        l.grow_axis(Focus::Meter, Axis::Vertical, 2);
+        assert_eq!(l.meter_h, meter + 2);
+    }
+
+    #[test]
+    fn layout_sizes_stay_inside_their_clamps() {
+        let mut l = PaneLayout::default();
+        for _ in 0..50 {
+            l.grow_axis(Focus::Calls, Axis::Horizontal, 5);
+            l.grow_axis(Focus::PostIn, Axis::Horizontal, 5);
+            l.grow_axis(Focus::Meter, Axis::Vertical, 5);
+            l.grow_axis(Focus::PostIn, Axis::Vertical, 5);
+        }
+        assert_eq!(l.wire_pct, PaneLayout::MAX_WIRE);
+        assert_eq!(l.post_split, PaneLayout::MAX_SPLIT);
+        assert_eq!(l.meter_h, PaneLayout::MAX_METER);
+        assert_eq!(l.post_h, PaneLayout::MAX_POST);
+        for _ in 0..50 {
+            l.grow_axis(Focus::Calls, Axis::Horizontal, -5);
+            l.grow_axis(Focus::PostIn, Axis::Horizontal, -5);
+            l.grow_axis(Focus::Meter, Axis::Vertical, -5);
+            l.grow_axis(Focus::PostIn, Axis::Vertical, -5);
+        }
+        assert_eq!(l.wire_pct, PaneLayout::MIN_WIRE);
+        assert_eq!(l.post_split, PaneLayout::MIN_SPLIT);
+        assert_eq!((l.meter_h, l.post_h), (0, 0), "both panes must reach hidden");
     }
 
     #[test]
