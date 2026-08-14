@@ -1,0 +1,6 @@
+# grok-build proto build scripts emit `cargo:rerun-if-changed=$PROTOC`.
+# Their `bin/protoc` is a dotslash wrapper. Without dotslash they fall back
+# to PATH "protoc" and cargo treats the missing crate-local file as always
+# dirty, rebuilding the entire pager graph on every `cargo build`.
+[env]
+PROTOC = { value = "scripts/protoc", relative = true }

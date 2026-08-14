@@ -1,0 +1,15 @@
+#!/bin/sh
+# Absolute proto compiler for grok-build's build.rs.
+# Must be a real file so cargo:rerun-if-changed stays stable.
+set -eu
+for cmd in /opt/homebrew/bin/protoc /usr/local/bin/protoc; do
+    if [ -x "$cmd" ]; then
+        exec "$cmd" "$@"
+    fi
+done
+cmd=$(command -v protoc || true)
+if [ -n "${cmd}" ] && [ "${cmd}" != "$0" ]; then
+    exec "${cmd}" "$@"
+fi
+echo "desmos: protoc not found (brew install protobuf)" >&2
+exit 1

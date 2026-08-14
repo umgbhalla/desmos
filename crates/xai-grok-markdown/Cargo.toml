@@ -1,0 +1,27 @@
+[package]
+name = "xai-grok-markdown"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+authors = ["xAI"]
+description = "Streaming markdown renderer for terminal UIs (vendored from grok-build)"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }
+
+[dependencies]
+anstyle = "1.0"
+anstyle-lossy = "1.1.4"
+anstyle-syntect = "1.0.4"
+html-escape = "0.2"
+linkify = "0.10"
+pulldown-cmark = "0.13"
+ratatui = { version = "0.29", default-features = false }
+supports-color = "3.0"
+syntect = "5.3"
+two-face = { version = "0.4", default-features = false, features = ["syntect-fancy"] }
+textwrap = "0.16"
+unicode-segmentation = "1.12.0"
+unicode-width = "0.2"
+url = "2"
+xai-grok-markdown-core = { path = "../xai-grok-markdown-core" }
