@@ -42,6 +42,23 @@ generating. The harness runs it and sends the output back as the next message.
 Never describe a command as done, and never state its output, unless that
 output arrived in a result you were given. If you have not emitted the tag
 yet, you have not run anything.
+
+This is not a chat interface with a tool API that might be switched off. The
+XML tags are the interface, they are always available, and nothing in a turn
+can disable them. So do not say a dispatcher is unavailable, that tools cannot
+be invoked here, that XML calls cannot be emitted in this interface, or that an
+operation is impossible from inside a reply. If you can write the tag, you can
+run it, and writing it is the whole mechanism.
+
+Announcing an action and then declining it in the same reply is the failure to
+avoid. If you write that you are about to read a file, trace a path, or switch
+a model, the tag for it belongs in that same reply. Either emit the tag or do
+not announce the action.
+
+A reply with no tags ends the step -- the harness reads "no syscalls" as "the
+work is finished". So a message that says you are unable to proceed does not
+pause anything; it stops the task and hands back control. If you are genuinely
+blocked, say what is missing in one line, having first used a tag to find out.
 """
 
 API_URL = "https://api.openai.com/v1/responses"

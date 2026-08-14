@@ -79,6 +79,43 @@ def usable(provider: str) -> bool:
         return False
 
 
+def switch(world: Any, model: str, effort: str | None = None) -> str:
+    """Point this world at another model, and say what it cost.
+
+    The bridge's `op: model` and a `<python>switch(...)` call are the same
+    operation, so they are the same function. Assigning `world.model` by hand
+    reaches the next `complete()` too -- `turn` reads it fresh every time --
+    but skips validation, the credential check, and the settings write, so it
+    can hand the next turn a model this machine cannot call.
+
+    Returns the line to show the human. Raises ValueError when the choice is
+    not a real one, because a switch that silently did not happen is worse
+    than a refusal: every later turn reports a model the wire is not using.
+    """
+    choice = Settings(provider=provider_of(model), model=model, effort=effort or world.thinking)
+    if not choice.valid():
+        raise ValueError(f"unknown model/effort: {choice.model} {choice.effort}")
+    if not usable(choice.provider):
+        raise ValueError(f"{choice.provider} has no usable credential")
+
+    was = provider_of(str(world.model or ""))
+    world.model, world.thinking = choice.model, choice.effort
+    save(choice)
+    if was and was != choice.provider:
+        # wire_content fences blocks across providers: the other provider's
+        # thinking and its signatures cannot be replayed, so they are dropped
+        # from every later request. That is a real change to what the model can
+        # see, and silence about it reads as the harness losing reasoning for
+        # no reason.
+        return (
+            f"provider switched {was} → {choice.provider}. Speech and syscall results "
+            f"replay in full, but {was} thinking blocks cannot cross providers and are "
+            f"dropped from later requests — the new model reads the conversation without "
+            f"the old model's reasoning."
+        )
+    return f"model {choice.model} effort {choice.effort} — in effect from the next turn."
+
+
 def picker() -> dict[str, Any]:
     """Everything the onboarding screen needs, so the TUI hardcodes nothing."""
     current = load()

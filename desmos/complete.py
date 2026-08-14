@@ -315,6 +315,11 @@ class AnthropicStreamError(RuntimeError):
         self.retryable = error_type in RETRY_STREAM_ERROR_TYPES
 
 
+def _stream_budget() -> float:
+    """Total seconds the stream-retry ladder is willing to wait."""
+    return sum(min(0.5 * (2**i), STREAM_RETRY_CAP) for i in range(STREAM_RETRIES - 1))
+
+
 def _stream_has_output(state: dict[str, Any]) -> bool:
     # message_start is metadata and emits nothing. content_block_start is the
     # first event that can create visible TUI state (including redacted thought),
@@ -488,6 +493,12 @@ def _pad_blocks(state: dict[str, Any], idx: int) -> None:
 # one of them used to kill a twenty-turn step.
 RETRY_STATUS = frozenset({408, 409, 429, 500, 502, 503, 504, 529})
 RETRIES = 4
+# An in-stream overload is a different animal from a connect-time blip. The
+# endpoint is out of capacity, and that lasts minutes -- so four attempts with
+# an 8s ceiling spent 3.5 seconds in total and then reported a hard failure,
+# which reads exactly like having no retry at all. This budget is ~50s.
+STREAM_RETRIES = 8
+STREAM_RETRY_CAP = 20.0
 # Honour retry-after, but cap it. Parking for an hour with no cancel point is
 # worse than failing and letting the human decide.
 RETRY_CAP = 30.0
@@ -603,7 +614,7 @@ def complete(
         headers=headers,
         method="POST",
     )
-    for stream_attempt in range(RETRIES):
+    for stream_attempt in range(STREAM_RETRIES):
         try:
             with _open_with_retry(req, on_event=on_event, should_stop=should_stop) as resp:
                 return read_sse(
@@ -612,14 +623,21 @@ def complete(
                     should_stop=should_stop,
                 )
         except AnthropicStreamError as exc:
-            final = stream_attempt == RETRIES - 1
+            final = stream_attempt == STREAM_RETRIES - 1
             if not exc.retryable or exc.had_output or final:
                 if exc.had_output and exc.retryable:
                     raise RuntimeError(
                         f"{exc}; not retried because partial output was already emitted"
                     ) from exc
+                if final:
+                    # Say that it was retried. "Overloaded" on its own reads as
+                    # a harness that never tried, and that is the wrong thing to
+                    # go debug.
+                    raise RuntimeError(
+                        f"{exc}; gave up after {STREAM_RETRIES} attempts over ~{int(_stream_budget())}s"
+                    ) from exc
                 raise
-            delay = min(0.5 * (2**stream_attempt), 8.0)
+            delay = min(0.5 * (2**stream_attempt), STREAM_RETRY_CAP)
             reason = f"Anthropic SSE {exc.error_type}"
             if on_event is not None:
                 on_event(

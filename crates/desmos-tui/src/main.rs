@@ -60,7 +60,7 @@ use unicode_width::UnicodeWidthStr;
 use ratatui::prelude::CrosstermBackend;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::{Frame, Terminal};
 use serde_json::{Value, json};
 use xai_grok_pager::appearance::{
@@ -5226,6 +5226,10 @@ fn draw_slash(f: &mut Frame, input: Rect, app: &App) {
         width: input.width.min(88),
         height: h,
     };
+    // The popup floats over the story pane. Without wiping the cells first the
+    // text underneath shows through wherever a suggestion is shorter than the
+    // box, which rendered model names with story prose spliced onto them.
+    f.render_widget(Clear, area);
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(tone))
@@ -5253,7 +5257,11 @@ fn draw_slash(f: &mut Frame, input: Rect, app: &App) {
             } else {
                 format!("{:<14} {}", item.text, item.help)
             };
-            let body: String = body.chars().take(width).collect();
+            let mut body: String = body.chars().take(width).collect();
+            // Pad to the full inner width: a short row otherwise leaves the
+            // cells to its right holding whatever was painted before.
+            let pad = width.saturating_sub(body.chars().count());
+            body.push_str(&" ".repeat(pad));
             let mut line = Line::from(Span::styled(
                 body,
                 Style::default().fg(if on { tone } else { theme.text_primary }),

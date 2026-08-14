@@ -468,7 +468,15 @@ def bind_step(world: World) -> Callable[..., str]:
     world.ns["reset"] = lambda: reset_transcript(world)
     world.ns["evolve"] = lambda reason="": evolve(world, str(reason))
     world.ns["rollback"] = lambda n=1: rollback(world, int(n))
+    world.ns["switch"] = lambda model, effort=None: _switch(world, model, effort)
     return step
+
+
+def _switch(world: World, model: str, effort: str | None = None) -> str:
+    """`switch(...)` in the kernel. Same call the TUI picker makes."""
+    from desmos.settings import switch as _do
+
+    return _do(world, str(model), str(effort) if effort else None)
 
 
 def reset_transcript(world: World) -> str:

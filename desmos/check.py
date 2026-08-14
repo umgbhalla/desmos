@@ -1492,6 +1492,57 @@ def self_check() -> None:
             if old_key is not None:
                 os.environ["ANTHROPIC_API_KEY"] = old_key
 
+        # Live model switching is a real operation the model can perform, and
+        # the failure it replaces was a model insisting it could not. So this
+        # asserts the switch reaches the wire -- the model id the NEXT complete()
+        # is called with -- not that some sentence is in the prompt.
+        import desmos.settings as _st
+
+        seen: list[str] = []
+
+        def recording_complete(model, system, messages, max_tokens, **_kw):
+            seen.append(model)
+            if len(seen) == 1:
+                return {
+                    "content": [
+                        {"type": "text", "text": '<python>switch("claude-sonnet-4-6")</python>'}
+                    ],
+                    "usage": {},
+                }
+            return {"content": [{"type": "text", "text": "done"}], "usage": {}}
+
+        w_sw = new_world(cwd, state_path=cwd / "switch.json")
+        w_sw.model = "claude-opus-5"
+        w_sw.complete_fn = recording_complete
+        bind_step(w_sw)
+
+        real_usable, real_save = _st.usable, _st.save
+        _st.usable = lambda _p: True          # a credential check is not what this proves
+        _st.save = lambda _c: settings_path_stub  # and neither is writing ~/.desmos
+        settings_path_stub = cwd / "settings-not-written.json"
+        try:
+            w_sw.ns["step"]("switch to sonnet")
+        finally:
+            _st.usable, _st.save = real_usable, real_save
+
+        assert len(seen) >= 2, f"the switch turn never produced a second call: {seen}"
+        assert seen[0] == "claude-opus-5", f"first turn used the wrong model: {seen}"
+        assert seen[1] == "claude-sonnet-4-6", (
+            f"switch() did not reach the wire -- turn 2 still called {seen[1]!r}. "
+            "The model can only be believed about its own capabilities if they work."
+        )
+        assert w_sw.model == "claude-sonnet-4-6"
+
+        # And it refuses a choice that is not real, rather than half-applying it.
+        for bad in ("no-such-model-9", "claude-opus-5"):
+            try:
+                _st.switch(w_sw, bad, "not-an-effort")
+            except ValueError:
+                pass
+            else:
+                raise AssertionError(f"switch accepted {bad!r} with a bogus effort")
+        assert w_sw.model == "claude-sonnet-4-6", "a rejected switch still mutated the world"
+
         # vendor/grok-build is committed now, so the DESMOS_ACP branch cannot
         # go missing on a fresh clone. What can still go missing is the branch
         # itself, if a sync overwrites it -- and that is silent, because the

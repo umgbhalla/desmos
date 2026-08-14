@@ -118,6 +118,12 @@ def capabilities() -> str:
             "results arrive after your whole message, never mid-sentence. So do not write prose"
             " that predicts what a call will return, and do not branch in this reply on a value"
             " this reply is still computing. Read the results next turn.",
+            "switching model or effort mid-session: switch(\"claude-opus-5\") from <python>, or"
+            " switch(\"gpt-5.6-sol\", \"high\"). It validates the choice, checks this machine has a"
+            " credential for that provider, saves it, and returns a line describing what changed."
+            " The new model drives the next turn -- not the rest of this reply, which is already"
+            " being written by the current one. A provider change drops the previous provider's"
+            " thinking blocks from later requests; speech and results replay in full.",
         ]
     )
 
