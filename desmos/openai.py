@@ -324,6 +324,23 @@ def read_sse(
 # ------------------------------------------------------------------ transport
 
 
+_SESSION_ID = ""
+
+
+def session_id() -> str:
+    """One id for the life of the process -- a conversation, not a request.
+
+    The ChatGPT backend routes on this header, and the prompt cache lives
+    behind that routing. Measured: with a fresh uuid per request an identical
+    3417-token prefix hit the cache about half the time; pinned, it was one
+    cold miss followed by 2816 cached tokens on every call after it.
+    """
+    global _SESSION_ID
+    if not _SESSION_ID:
+        _SESSION_ID = os.environ.get("DESMOS_SESSION_ID") or str(uuid.uuid4())
+    return _SESSION_ID
+
+
 def headers_for(cred: auth.Credential) -> tuple[str, dict[str, str]]:
     """URL and headers. The ChatGPT backend needs the account id and an originator."""
     base = {
@@ -335,7 +352,7 @@ def headers_for(cred: auth.Credential) -> tuple[str, dict[str, str]]:
         base["chatgpt-account-id"] = cred.account_id or ""
         base["originator"] = ORIGINATOR
         base["OpenAI-Beta"] = "responses=experimental"
-        base["session_id"] = str(uuid.uuid4())
+        base["session_id"] = session_id()
         return CHATGPT_URL, base
     return API_URL, base
 
@@ -369,6 +386,12 @@ def complete(
 ) -> dict[str, Any]:
     cred = auth.credential("openai")
     url, headers = headers_for(cred)
+    # Measured against the live Codex backend, A/B/A on one warm prefix: with
+    # prompt_cache_key the response reports cached_tokens 0, without it 2816
+    # of 3254. The key is a routing hint on api.openai.com and a cache miss
+    # here, so it only goes out on the API-key endpoint.
+    if cred.kind != "api_key":
+        cache_key = None
     body = payload_for(
         model,
         system,

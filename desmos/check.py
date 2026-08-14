@@ -1130,6 +1130,12 @@ def self_check() -> None:
         url_oauth, h_oauth = _oai.headers_for(_auth.Credential(provider="openai", kind="oauth",
                                                                token="t", account_id="acct-1"))
         assert url_oauth == _oai.CHATGPT_URL and h_oauth["chatgpt-account-id"] == "acct-1"
+        # One session per process, not per request: the backend routes on this
+        # header and the prompt cache lives behind that routing. A fresh uuid
+        # each time halved the hit rate against the live endpoint.
+        _, h_again = _oai.headers_for(_auth.Credential(provider="openai", kind="oauth",
+                                                       token="t", account_id="acct-1"))
+        assert h_oauth["session_id"] == h_again["session_id"] != ""
         assert h_oauth["originator"] and h_oauth["Authorization"] == "Bearer t"
         url_key, h_key = _oai.headers_for(_auth.Credential(provider="openai", kind="env", token="sk-x"))
         assert url_key == _oai.API_URL and "chatgpt-account-id" not in h_key
