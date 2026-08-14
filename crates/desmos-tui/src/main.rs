@@ -5206,6 +5206,32 @@ mod tests {
         buffer_text(&term)
     }
 
+    /// Every syscall shape the model actually emits, gone from the story --
+    /// attributes, self-closing markers and mid-sentence calls included. The
+    /// calls pane already renders each as a card; a second copy as prose is
+    /// noise the reader did not ask for.
+    #[test]
+    fn no_syscall_shape_reaches_the_story() {
+        let lt = '<';
+        let gt = '>';
+        for (src, want) in [
+            (
+                format!("prose one\n{lt}bash{gt}rm -rf /tmp/x{lt}/bash{gt}\nprose two"),
+                "prose one\n\nprose two",
+            ),
+            (
+                format!("a\n{lt}edit path=\"f.rs\"{gt}OLDLINE\n---\nNEWLINE{lt}/edit{gt}\nb"),
+                "a\n\nb",
+            ),
+            (format!("c\n{lt}skill name=\"edit\"/{gt}\nd"), "c\n\nd"),
+            (format!("e\n{lt}python{gt}x=1{lt}/python{gt} tail"), "e\n tail"),
+            (format!("f {lt}bash{gt}inline cmd{lt}/bash{gt} g"), "f  g"),
+        ] {
+            assert_eq!(strip_syscalls(&src), want, "leaked from {src:?}");
+        }
+    }
+
+
     /// Only the focused pane draws a visible frame. The border cells stay put
     /// so the geometry never jumps on Tab -- they are painted in the pane
     /// background instead, which is the difference this asserts.
