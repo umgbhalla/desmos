@@ -3604,7 +3604,11 @@ fn focus_hints(app: &App, enter_hint: &str) -> Vec<String> {
         }
     }
     if app.focus != Focus::Input {
-        hints.push("+/- resize".into());
+        // A pane that already says what `+` does there does not also need the
+        // generic line — the bar is short and the tail gets cut first.
+        if !hints.iter().any(|h| h.starts_with("+/-")) {
+            hints.push("+/- resize".into());
+        }
         hints.push("0 reset".into());
         hints.push("tab panes".into());
         if app.viewing.is_some() {
@@ -3876,7 +3880,6 @@ fn apply_result(calls: &mut ScrollbackState, exec: &mut ExecStream, ev: &Value) 
                     }
                 }
                 calls.finish_running(id);
-                set_wire_mode(calls, id, DisplayMode::Collapsed);
                 // Fold state is reflow_wire's job; a finished call that is
                 // still recent stays readable instead of blinking shut.
                 calls.mark_height_dirty(id);
