@@ -53,7 +53,6 @@ use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
-#[cfg(test)]
 use unicode_width::UnicodeWidthStr;
 use ratatui::prelude::CrosstermBackend;
 use ratatui::style::{Modifier, Style};
@@ -3563,6 +3562,71 @@ fn draw_queue(f: &mut Frame, area: Rect, app: &App) {
     );
 }
 
+/// Shortcuts for the pane that has focus, most useful first. A key that does
+/// nothing where you are standing is noise, and the bar has no room for noise.
+fn focus_hints(app: &App, enter_hint: &str) -> Vec<String> {
+    let mut hints: Vec<String> = Vec::new();
+    match app.focus {
+        Focus::Input => {
+            let send = enter_hint.trim();
+            if !send.is_empty() {
+                hints.push(send.to_string());
+            }
+            hints.push("shift-enter newline".into());
+            hints.push("tab panes".into());
+        }
+        Focus::Story | Focus::Calls => {
+            hints.push("j/k move".into());
+            hints.push("h/l fold".into());
+            hints.push("enter/ctrl-f open".into());
+            hints.push("r raw".into());
+            hints.push("i input".into());
+        }
+        Focus::Meter => {
+            hints.push("+/- rows".into());
+            hints.push("ctrl-←/→ width".into());
+            hints.push("i input".into());
+        }
+        Focus::PostIn | Focus::PostOut => {
+            hints.push("j/k move".into());
+            hints.push("h/l fold".into());
+            hints.push("e inspect".into());
+            hints.push("+/- rows".into());
+            hints.push("ctrl-←/→ split".into());
+            hints.push("i input".into());
+        }
+        Focus::Queue => {
+            hints.push("j/k select".into());
+            hints.push("[/] reorder".into());
+            hints.push("d drop".into());
+            hints.push("enter send now".into());
+            hints.push("i input".into());
+        }
+    }
+    if app.focus != Focus::Input {
+        hints.push("+/- resize".into());
+        hints.push("0 reset".into());
+        hints.push("tab panes".into());
+        if app.viewing.is_some() {
+            hints.push("esc parent".into());
+        }
+    }
+    hints
+}
+
+/// Drop hints from the tail until the bar fits. The identity half (model,
+/// effort, generation, status) always wins the space it needs.
+fn fit_status(head: &str, hints: &[String], width: usize) -> String {
+    let head_w = UnicodeWidthStr::width(head);
+    for take in (0..=hints.len()).rev() {
+        let tail = hints[..take].join("   ");
+        if head_w + UnicodeWidthStr::width(tail.as_str()) <= width {
+            return format!("{head}{tail}");
+        }
+    }
+    head.to_string()
+}
+
 fn draw_input(f: &mut Frame, area: Rect, app: &mut App) {
     let session = app
         .viewing
@@ -3603,11 +3667,14 @@ fn draw_input(f: &mut Frame, area: Rect, app: &mut App) {
     } else {
         "enter send   "
     };
-    let status = format!(
-        " desmos  {session}  {}  {}   {multiline}{enter_hint}shift-enter newline   enter/ctrl-f session   tab j/k h/l  esc",
+    let head = format!(
+        " desmos  {session}  {}  {}   {multiline}",
         Theme::current_kind().display_name(),
         app.status,
     );
+    let hints = focus_hints(app, enter_hint);
+    let width = area.width as usize;
+    let status = fit_status(&head, &hints, width);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(1), Constraint::Min(2)])
@@ -3750,7 +3817,9 @@ fn finish_exec(calls: &mut ScrollbackState, exec: &mut ExecStream) {
     exec.flush(calls);
     if let Some(id) = exec.id.take() {
         calls.finish_running(id);
-        set_wire_mode(calls, id, DisplayMode::Collapsed);
+        // Do not fold here. reflow_wire owns fold state and keeps the tail
+        // open, so collapsing on finish only produces a one-frame flash
+        // before it is reopened.
     }
     exec.pending.clear();
     exec.tag.clear();
@@ -3808,6 +3877,8 @@ fn apply_result(calls: &mut ScrollbackState, exec: &mut ExecStream, ev: &Value) 
                 }
                 calls.finish_running(id);
                 set_wire_mode(calls, id, DisplayMode::Collapsed);
+                // Fold state is reflow_wire's job; a finished call that is
+                // still recent stays readable instead of blinking shut.
                 calls.mark_height_dirty(id);
             } else {
                 wire_push(calls, result_block(ev));
@@ -4338,6 +4409,42 @@ mod tests {
         let mut term = Terminal::new(backend).unwrap();
         term.draw(|f| draw(f, app)).unwrap();
         buffer_text(&term)
+    }
+
+    /// A call that just finished must not blink shut. finish_exec used to fold
+    /// it, and reflow_wire reopened it on the next frame -- one frame of
+    /// collapsed card for every completed syscall.
+    #[test]
+    fn a_just_finished_call_does_not_flash_shut() {
+        let mut app = App::new();
+        handle_event(
+            &mut app,
+            json!({"ev":"result","phase":"start","tag":"bash","attrs":{},"body":"echo hi"}),
+        );
+        let _ = paint(&mut app, 120, 30);
+        let id = app.calls.entry(0).map(|e| e.id).expect("card pushed");
+        assert_eq!(
+            app.calls.get_by_id(id).map(|e| e.display_mode),
+            Some(DisplayMode::Expanded),
+            "a running call should be open"
+        );
+        handle_event(
+            &mut app,
+            json!({"ev":"result","phase":"done","tag":"bash","attrs":{},"body":"echo hi","text":"hi"}),
+        );
+        // Checked before the next paint: nothing may fold it in between.
+        assert_ne!(
+            app.calls.get_by_id(id).map(|e| e.display_mode),
+            Some(DisplayMode::Collapsed),
+            "completed call folded before the next frame -- that is the flash"
+        );
+        let text = paint(&mut app, 120, 30);
+        assert_eq!(
+            app.calls.get_by_id(id).map(|e| e.display_mode),
+            Some(DisplayMode::Expanded),
+            "recent completed call should stay open"
+        );
+        assert!(text.contains("hi"), "output not visible:\n{text}");
     }
 
 
