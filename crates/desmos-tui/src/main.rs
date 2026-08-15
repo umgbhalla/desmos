@@ -4646,13 +4646,13 @@ fn draw(f: &mut Frame, app: &mut App) {
     // Two cells of gutter each side of the card, then its own border.
     let inner_w = body[0].width.saturating_sub(4);
     let queue_h = app.queue.display_height();
-    // The composer floats over the column: a blank row above it and a cell of
-    // gutter each side, so it reads as a card rather than one more stacked
-    // pane. An open queue is the top card of that same group, so the blank row
-    // belongs to it -- otherwise the gap lands *between* the two boxes, which
-    // is the one place it says nothing.
+    // The composer floats over the column while POST is open: a blank row above
+    // it and a cell of gutter each side, so it reads as a card rather than one
+    // more stacked pane. Once POST is fully collapsed that row is only dead
+    // space between story and input, so the composer gives it back. An open
+    // queue is the top card of the same group and owns the spacer itself.
     let queue_h = if queue_h > 0 { queue_h + 1 } else { 0 };
-    let float_rows: u16 = if queue_h > 0 { 0 } else { 1 };
+    let float_rows = input_float_rows(app);
     // Grow with what is typed, up to half the column. The old ceiling of ten
     // rows existed to leave a legend band matching it opposite; there is no
     // legend now, and a long prompt is worth more rows than a short story is.
@@ -5608,13 +5608,16 @@ fn focus_name(focus: Focus) -> &'static str {
     }
 }
 
+fn input_float_rows(app: &App) -> u16 {
+    u16::from(app.queue.is_empty() && app.layout.post_h > 0)
+}
+
 fn draw_input(f: &mut Frame, area: Rect, app: &mut App) {
     let theme = Theme::current();
-    // Float the box: a blank row above it and a cell of gutter each side, so it
-    // reads as a card laid over the story column rather than one more pane
-    // stacked in the frame. The blank row is the group's, not this box's --
-    // with the queue open it sits above the queue and the two cards touch.
-    let float = if app.queue.is_empty() { 1 } else { 0 };
+    // Float the box while POST is visible. The blank row is the group's, not
+    // this box's: with the queue open it sits above the queue and the two cards
+    // touch; with POST collapsed it disappears entirely.
+    let float = input_float_rows(app);
     let card = Rect {
         x: area.x.saturating_add(1),
         y: area.y.saturating_add(float),
@@ -7108,6 +7111,28 @@ mod tests {
         app.toggle_posts();
         let after = rows_of(&paint(&mut app, 100, 40), app.call_area);
         assert_eq!(before, after, "a POST card came back in the wrong place");
+    }
+
+    /// A fully collapsed POST leaves no spacer between story and composer.
+    #[test]
+    fn collapsed_post_gives_its_gap_row_back_to_story() {
+        let mut app = App::new();
+        app.layout.post_h = 0;
+        let text = paint(&mut app, 100, 30);
+        let rows: Vec<&str> = text.lines().collect();
+
+        assert_eq!(app.post_in_area.height, 0);
+        assert_eq!(
+            app.traj_area.y + app.traj_area.height,
+            app.input_area.y,
+            "a layout row survived between story and composer",
+        );
+        let top = app.input_area.y as usize;
+        let left: String = rows[top].chars().take(app.input_area.width as usize).collect();
+        assert!(
+            left.trim_start().starts_with('\u{250c}'),
+            "the collapsed POST left a blank row above the composer: {left:?}",
+        );
     }
 
     /// The queue and the composer are one stack of cards, not two panes with
