@@ -195,6 +195,17 @@ impl Picker {
                     self.sel = (self.sel + n - 1) % n;
                 }
             }
+            // Changing only the thinking level meant walking provider, then
+            // model, then effort -- three screens and three Enters to move one
+            // field that neither of the other two depend on.
+            K::Char('e') => {
+                self.stage = Stage::Effort;
+                self.sel = self.effort_idx;
+            }
+            K::Char('m') => {
+                self.stage = Stage::Model;
+                self.sel = self.model_idx;
+            }
             K::Esc | K::Char('q') => {
                 // A configured session can keep what it had. A fresh one cannot
                 // close the picker, because there is nothing behind it yet.
@@ -263,14 +274,41 @@ impl Picker {
     }
 
     /// The rows as painted, without a terminal. Tests read this.
+    /// What is live right now, as the picker understands it.
+    ///
+    /// provider_idx / model_idx / effort_idx track the running choice; `sel`
+    /// is only the cursor. Nothing rendered the difference, so the picker
+    /// showed a list of names with no indication which one you were already
+    /// on — you navigated blind and could not tell whether a keypress had
+    /// changed anything.
+    pub fn live(&self) -> Option<(String, String, String)> {
+        let p = self.providers.get(self.provider_idx)?;
+        Some((
+            p.name.clone(),
+            p.models.get(self.model_idx).cloned().unwrap_or_default(),
+            p.efforts.get(self.effort_idx).cloned().unwrap_or_default(),
+        ))
+    }
+
     pub fn lines(&self) -> Vec<String> {
         let mut out = Vec::new();
-        let dot = |on: bool| if on { "▸" } else { " " };
-        out.push(match self.stage {
-            Stage::Provider => "provider".to_string(),
-            Stage::Model => "model".to_string(),
-            Stage::Effort => "effort".to_string(),
+        let dot = |on: bool| if on { "\u{25b8}" } else { " " };
+        // The whole choice on one line, at every stage, so three screens of
+        // navigation never lose track of what is actually running.
+        let (lp, lm, le) = self.live().unwrap_or_default();
+        let heading = match self.stage {
+            Stage::Provider => "provider",
+            Stage::Model => "model",
+            Stage::Effort => "thinking effort",
+        };
+        out.push(if lm.is_empty() {
+            heading.to_string()
+        } else {
+            format!("{heading:<16}now: {lp} / {lm} / {le}")
         });
+        // A tick on the entry already in use. Choosing it is then obviously a
+        // no-op, and choosing anything else is obviously a change.
+        let tick = |on: bool| if on { "\u{2713}" } else { " " };
         match self.stage {
             Stage::Provider => {
                 for (i, p) in self.providers.iter().enumerate() {
@@ -282,20 +320,36 @@ impl Picker {
                     } else {
                         format!("--   {}", p.detail)
                     };
-                    out.push(format!("{} {:<10} {}", dot(i == self.sel), p.name, state));
+                    out.push(format!(
+                        "{}{} {:<10} {}",
+                        dot(i == self.sel),
+                        tick(i == self.provider_idx),
+                        p.name,
+                        state
+                    ));
                 }
             }
             Stage::Model => {
                 if let Some(p) = self.current_provider() {
                     for (i, m) in p.models.iter().enumerate() {
-                        out.push(format!("{} {}", dot(i == self.sel), m));
+                        out.push(format!(
+                            "{}{} {}",
+                            dot(i == self.sel),
+                            tick(i == self.model_idx),
+                            m
+                        ));
                     }
                 }
             }
             Stage::Effort => {
                 if let Some(p) = self.current_provider() {
                     for (i, e) in p.efforts.iter().enumerate() {
-                        out.push(format!("{} {}", dot(i == self.sel), e));
+                        out.push(format!(
+                            "{}{} {}",
+                            dot(i == self.sel),
+                            tick(i == self.effort_idx),
+                            e
+                        ));
                     }
                 }
             }
@@ -312,6 +366,8 @@ impl Picker {
             Shortcut { label: "j/k move", clickable: false, id: 0 },
             Shortcut { label: "enter choose", clickable: false, id: 1 },
             Shortcut { label: "h back", clickable: false, id: 2 },
+            Shortcut { label: "m model", clickable: false, id: 3 },
+            Shortcut { label: "e effort", clickable: false, id: 4 },
         ];
         let title = if self.configured { "settings" } else { "welcome" };
         let config = ModalWindowConfig {
