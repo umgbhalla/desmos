@@ -255,6 +255,35 @@ def self_check() -> None:
         assert family("") == "anthropic", "unknown model falls back to anthropic"
         assert dialect("claude-opus-5") != dialect("gpt-5.6-sol"), "one block cannot serve both"
 
+        # The prompt states facts about the subagent layer. Every one of them is
+        # derived here from the live objects, so a signature change fails the
+        # suite rather than quietly making the system prompt wrong.
+        from desmos.dialect import capabilities as _caps
+        from desmos import subagent as _sa
+        from desmos.loop import RESULT_CLIP as _clip_cap
+        from desmos.subagent_contracts import Budget as _Budget, TaskContract as _TC
+        import inspect as _insp
+
+        caps = _caps()
+        assert str(_clip_cap) in caps, "prompt quotes a result cap loop.py does not apply"
+        for _name, _cfg in _sa.AGENTS.items():
+            assert _name in caps, _name
+            assert str(_cfg["max_turns"]) in caps, f"{_name} turn cap not in the prompt"
+        # fanout's default agent is not spawn's. The prompt says so because a
+        # reader would otherwise assume they match.
+        assert _insp.signature(_sa.spawn).parameters["agent"].default == "general"
+        assert _insp.signature(_sa.fanout).parameters["agent"].default == "explore"
+        assert "defaults to explore" in caps
+        assert "resume" in _insp.signature(_sa.spawn).parameters and "resume" in caps
+        for _f in _TC.__dataclass_fields__:
+            assert _f in caps, f"TaskContract.{_f} is not described in the prompt"
+        for _f in _Budget.__dataclass_fields__:
+            assert _f in caps, f"Budget.{_f} is not described in the prompt"
+        for _n in ("structured_result", "judgment", "spawn", "fanout", "wait", "gather", "status"):
+            assert callable(getattr(_sa, _n)), _n
+            assert _n in caps, f"prompt names {_n} but subagent does not export it"
+
+
         # Cross-provider round trip. Switching to OpenAI and back used to brick
         # the session: openai.py puts its item id in "signature" as a provenance
         # marker, wire_content saw a truthy signature and replayed it, and

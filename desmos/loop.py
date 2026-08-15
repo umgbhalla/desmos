@@ -33,10 +33,17 @@ def format_results(results: list[tuple[Block, str]]) -> str:
     return "\n\n".join(chunks)
 
 
+#: How much of a syscall's output reaches the model. dispatch clips a handler
+#: at scan.RESULT_CAP first; this is the tighter cap that actually bounds the
+#: transcript, and it is the number the prompt quotes -- check.py ties the two
+#: together so the prompt cannot drift off it.
+RESULT_CLIP = 6000
+
+
 def format_result_message(results: list[tuple[Block, str]]) -> str:
     parts = []
     for b, r in results:
-        parts.append(f'<result tag="{b.tag}">{clip(r, 6000)}</result>')
+        parts.append(f'<result tag="{b.tag}">{clip(r, RESULT_CLIP)}</result>')
     return "\n\n".join(parts)
 
 

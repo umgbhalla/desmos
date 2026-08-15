@@ -95,10 +95,21 @@ def capabilities() -> str:
             "results are clipped at 6000 chars per call, with the dropped count marked. Filter in"
             " the call -- grep, head, a slice -- rather than dumping and losing the tail.",
             "subagents: spawn(task, agent=\"general\") returns an id and does not block."
-            " agent is general (edit, 500 turns), explore (researcher, read-only), or review"
-            " (critic, read-only). fanout(tasks) spawns many. wait(*ids, timeout=600) blocks;"
-            " gather(ids) waits and joins their output; status() lists running; result(id) reads"
-            " one. A child is an isolated World with its own transcript and no persist.",
+            " agent is general (edit, 500 turns), explore (researcher, read-only, 500), or review"
+            " (critic, read-only, 300). fanout(tasks) spawns many and defaults to explore, not"
+            " general. wait(*ids, timeout=600) blocks; gather(ids) waits and joins their output;"
+            " status() lists running; result(id) reads one; spawn(resume=id) continues a finished"
+            " run. A child is an isolated World with its own transcript and no persist.",
+            "subagent contracts: spawn also takes a TaskContract instead of a string --"
+            " objective, non_goals, deliverable_schema, required_evidence, acceptance_checks,"
+            " allowed_tools, allowed_paths, write_paths, dependencies, require_tool_use, and a budget:"
+            " Budget(max_turns, max_tokens, wall_seconds, max_retries). Under a contract"
+            " structured_result(id) returns a typed RunResult and judgment(id) returns"
+            " accepted/rejected with reasons. The judge scores the declarations against what the"
+            " parent observed at runtime, so a child cannot pass by asserting it passed; a"
+            " dependency holds a child until that run is accepted, and a rejected dependency"
+            " stops it with an explicit reason. A string task skips all of it and gives you"
+            " prose you have to take on trust.",
             "step(prompt, max_turns=32, max_total_tokens=None) runs a nested turn loop on this"
             " same world. max_total_tokens is a prompt+completion ceiling counted from the start"
             " of that step; hitting it stops the loop, says so in the transcript, and reports"
@@ -158,6 +169,8 @@ _ANTHROPIC = "\n".join(
         "You already check your own work, so do not add a verification turn and do not spawn a"
         " subagent to review what you just did. Verifying with a call in the same reply is not a"
         " separate pass -- that is just doing the work.",
+        "A child's report is a claim about its own work. Under a contract, judgment(id) is the"
+        " harness's verdict on that claim -- read the verdict, not the prose.",
         "Subagents cost a full context each. Use them for genuinely independent, sizeable tracks;"
         " do not use them for work you could finish in a handful of calls, and keep spawn counts"
         " low.",
@@ -184,6 +197,8 @@ _OPENAI = "\n".join(
         " readings would change the deliverable, ask.",
         "Decide reversible, low-impact things yourself. Ask first when an action is hard to undo,"
         " or when it is costly, public, or exposes data.",
+        "When you spawn, give the child a TaskContract with acceptance_checks and write_paths."
+        " A string task returns prose you then have to trust.",
         "Close with the outcome in the first sentence. Then separate what you verified by running"
         " it from what you are inferring, and name anything still unproven.",
     ]
