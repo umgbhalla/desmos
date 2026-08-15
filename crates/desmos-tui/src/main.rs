@@ -920,6 +920,8 @@ struct App {
     post_out_n: u64,
     queue: QueryQueue,
     send_now: bool,
+    /// Cheatsheet for the focused pane's keys, open until the next key.
+    help: bool,
     /// Slot a queued row was lifted from for editing, so Enter puts it back
     /// where it was instead of at the end of the queue.
     queue_edit: Option<usize>,
@@ -1239,6 +1241,7 @@ impl App {
             post_out_n: 0,
             queue: QueryQueue::default(),
             send_now: false,
+            help: false,
             queue_edit: None,
             drain_after: false,
             children: HashMap::new(),
@@ -2701,6 +2704,28 @@ fn handle_key(
                 app.set_focus(Focus::Input);
             }
         }
+        return Ok(false);
+    }
+
+    // The cheatsheet is a modal over the focused pane, so it eats the next key
+    // whatever it is. Anything else means guessing which keys are "dismiss" and
+    // which fall through, and a sheet you have to dismiss twice is worse than
+    // no sheet.
+    if app.help {
+        app.help = false;
+        return Ok(false);
+    }
+    // `?` in any pane but the composer. Every pane has its own verbs and none
+    // of them were written down anywhere you could read while looking at the
+    // pane; the legend that used to live on the composer border was one line
+    // for the whole app and went away with it. In the composer `?` is a
+    // question mark.
+    if key.code == KeyCode::Char('?')
+        && app.focus != Focus::Input
+        && app.viewer.is_none()
+        && app.post_inspect.is_none()
+    {
+        app.help = true;
         return Ok(false);
     }
 
@@ -4707,6 +4732,9 @@ fn draw(f: &mut Frame, app: &mut App) {
     if app.viewer.is_some() {
         draw_viewer(f, app);
     }
+    if app.help {
+        draw_help(f, app);
+    }
     // Last, so it covers everything: on a fresh machine there is no session
     // behind it, and when reopened it is the only thing being interacted with.
     if app.picker.open {
@@ -5566,6 +5594,168 @@ fn draw_input(f: &mut Frame, area: Rect, app: &mut App) {
             draw_paste_preview(f, app.input_area, body, app.prompt.preview_on_chip());
         }
     }
+}
+
+/// The keys a pane answers to. One table, read by the cheatsheet and by the
+/// test that checks the table against the handler — a legend nobody can verify
+/// is a legend that goes stale, which is how the old composer-border strip
+/// ended up describing keys that had moved.
+fn pane_keys(focus: Focus) -> (&'static str, &'static [(&'static str, &'static str)]) {
+    match focus {
+        Focus::Story | Focus::Calls => (
+            "story / calls",
+            &[
+                ("j k", "select a block"),
+                ("h", "collapse it"),
+                ("l", "fold: collapsed / truncated / expanded"),
+                ("enter", "zoom into the viewer (a spawn row opens the child)"),
+                ("ctrl-f", "zoom, without moving the fold"),
+                ("[ ]", "previous / next POST group (calls)"),
+                ("r", "raw text of the selected block"),
+                ("pgup pgdn", "scroll a page"),
+                ("i", "back to the composer"),
+            ],
+        ),
+        Focus::PostIn | Focus::PostOut => (
+            "POST in / out",
+            &[
+                ("j k", "walk the JSON tree"),
+                ("h", "fold this node"),
+                ("l enter", "open this node"),
+                ("e ctrl-f", "expand the whole side into the popup"),
+                ("pgup pgdn", "scroll a page"),
+                ("i", "back to the composer"),
+            ],
+        ),
+        Focus::Queue => (
+            "queue",
+            &[
+                ("j k", "select a queued row"),
+                ("[ ] h l", "move it earlier / later (arrows too)"),
+                ("e", "edit it in the composer (enter returns it to its slot)"),
+                ("d del", "drop it"),
+                ("enter", "send now: stop this step and run the front row"),
+                ("i", "back to the composer"),
+            ],
+        ),
+        Focus::Git => (
+            "git",
+            &[
+                ("j k", "select a row (it previews as you go)"),
+                ("[ ]", "along the tab strip in the title"),
+                ("enter l", "open the row in the files pane"),
+                ("r", "refresh"),
+                ("pgup pgdn", "scroll a page"),
+                ("i", "back to the composer"),
+            ],
+        ),
+        Focus::Files => (
+            "files",
+            &[
+                ("j k", "select"),
+                ("l enter", "into the directory / open the file"),
+                ("h", "back up (lands on the file you came from)"),
+                ("pgup pgdn", "scroll a page"),
+                ("i", "back to the composer"),
+            ],
+        ),
+        Focus::Meter => (
+            "meta",
+            &[
+                ("", "a meter: no cursor, nothing to fold"),
+                ("i", "back to the composer"),
+            ],
+        ),
+        Focus::Input => ("composer", &[]),
+    }
+}
+
+/// Keys that mean the same thing in every pane. Listed once, under the
+/// pane's own verbs.
+const SHARED_KEYS: &[(&str, &str)] = &[
+    ("tab", "next pane (shift-tab back)"),
+    ("+ -", "grow / shrink this pane, 0 resets"),
+    ("ctrl-g ctrl-b", "open or close git / files"),
+    ("?", "this sheet — any key closes it"),
+];
+
+/// Floating cheatsheet over the focused pane.
+///
+/// Over that pane, not centred on the frame: the sheet is about the pane you
+/// are standing in, and the keys differ per pane, so it has to say which one
+/// it is describing by where it lands as well as by its title.
+fn draw_help(f: &mut Frame, app: &App) {
+    let theme = Theme::current();
+    let (title, keys) = pane_keys(app.focus);
+    let rows: Vec<(&str, &str)> = keys
+        .iter()
+        .copied()
+        .chain(std::iter::once(("", "")))
+        .chain(SHARED_KEYS.iter().copied())
+        .collect();
+    let key_w = rows.iter().map(|(k, _)| k.len()).max().unwrap_or(0);
+    let w = rows
+        .iter()
+        .map(|(k, d)| key_w.max(k.len()) + 2 + d.len())
+        .max()
+        .unwrap_or(20) as u16
+        + 2;
+    let h = rows.len() as u16 + 2;
+    let pane = match app.focus {
+        Focus::Calls => app.call_area,
+        Focus::PostIn => app.post_in_area,
+        Focus::PostOut => app.post_out_area,
+        Focus::Queue => app.queue_area,
+        Focus::Git => app.git_area,
+        Focus::Files => app.files_area,
+        Focus::Meter => app.cache.area,
+        _ => app.traj_area,
+    };
+    let full = f.area();
+    let w = w.min(full.width);
+    let h = h.min(full.height);
+    // Centre on the pane, then push back inside the frame: a narrow side pane
+    // holds a sheet wider than itself, and half of it would be off-screen.
+    let x = pane
+        .x
+        .saturating_add(pane.width / 2)
+        .saturating_sub(w / 2)
+        .min(full.width.saturating_sub(w));
+    let y = pane
+        .y
+        .saturating_add(pane.height / 2)
+        .saturating_sub(h / 2)
+        .min(full.height.saturating_sub(h));
+    let area = Rect { x, y, width: w, height: h };
+    f.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme.accent_user))
+        .title(Span::styled(
+            format!(" {title} keys "),
+            Style::default()
+                .fg(theme.accent_user)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .style(Style::default().bg(theme.bg_base).fg(theme.text_primary));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+    let lines: Vec<Line> = rows
+        .iter()
+        .map(|(k, d)| {
+            Line::from(vec![
+                Span::styled(
+                    format!("{k:key_w$}  "),
+                    Style::default().fg(theme.accent_success),
+                ),
+                Span::styled((*d).to_string(), Style::default().fg(theme.text_primary)),
+            ])
+        })
+        .collect();
+    f.render_widget(Paragraph::new(lines), inner);
 }
 
 /// The completion list, above the composer, plus the verdict on what is
@@ -7986,6 +8176,127 @@ mod tests {
         let max = total.saturating_sub(vp as usize);
         assert_eq!(off, max.min(off));
         assert!(off <= max, "calls offset {off} > max {max}");
+    }
+
+    /// `?` opens the sheet for whichever pane you are standing in, and the
+    /// next key — any key — closes it.
+    #[test]
+    fn question_mark_opens_the_pane_cheatsheet() {
+        let mut app = App::new();
+        seed_demo(&mut app);
+        app.set_focus(Focus::Calls);
+        let q = KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE);
+        handle_key(None, &mut app, q).unwrap();
+        assert!(app.help, "? must open the sheet outside the composer");
+        let text = paint(&mut app, 140, 60);
+        assert!(
+            text.contains("story / calls keys"),
+            "the sheet has to name the pane it describes"
+        );
+        assert!(
+            text.contains("previous / next POST group"),
+            "the sheet has to carry that pane's own verbs"
+        );
+        handle_key(
+            None,
+            &mut app,
+            KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert!(!app.help, "any key closes it");
+    }
+
+    /// In the composer `?` is a question mark. It was the only pane where the
+    /// key already meant something.
+    #[test]
+    fn question_mark_in_the_composer_is_just_text() {
+        let mut app = App::new();
+        app.set_focus(Focus::Input);
+        handle_key(
+            None,
+            &mut app,
+            KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert!(!app.help);
+        assert_eq!(app.prompt.to_send(), "?");
+    }
+
+    /// A legend nobody checks is a legend that lies. Every `Char` key a pane's
+    /// handler answers to has to appear in that pane's table — read out of this
+    /// file, so adding a key without documenting it fails here.
+    #[test]
+    fn the_cheatsheet_lists_every_key_its_pane_answers_to() {
+        let src = include_str!("main.rs");
+        let slice = |from: &str, to: &str| -> String {
+            let a = src.find(from).unwrap_or_else(|| panic!("anchor gone: {from}"));
+            let b = src[a..]
+                .find(to)
+                .unwrap_or_else(|| panic!("end anchor gone: {to}"));
+            src[a..a + b].to_string()
+        };
+        let blocks = [
+            (
+                Focus::Queue,
+                slice(
+                    "KeyCode::Char('j') | KeyCode::Down => app.queue.select_next(),",
+                    "if app.focus == Focus::Git &&",
+                ),
+            ),
+            (
+                Focus::Git,
+                slice("if app.focus == Focus::Git &&", "if app.focus == Focus::Files"),
+            ),
+            (
+                Focus::Files,
+                slice("if app.focus == Focus::Files &&", "// The meter has no cursor"),
+            ),
+            (
+                Focus::PostIn,
+                slice(
+                    "if matches!(app.focus, Focus::PostIn | Focus::PostOut) {",
+                    "KeyCode::Char('j') | KeyCode::Down => app.queue.select_next(),",
+                ),
+            ),
+            (
+                Focus::Calls,
+                slice(
+                    "KeyCode::Char('j') | KeyCode::Down => app.focused_scroll().select_next(),",
+                    "let width = app.input_inner.width.max(20);",
+                ),
+            ),
+        ];
+        for (focus, body) in blocks {
+            let (name, keys) = pane_keys(focus);
+            let listed: Vec<String> = keys
+                .iter()
+                .flat_map(|(k, _)| k.split_whitespace())
+                .map(str::to_string)
+                .collect();
+            // Every KeyCode::Char('x') the handler matches, in source order.
+            let mut wanted: Vec<char> = Vec::new();
+            let mut rest = body.as_str();
+            while let Some(i) = rest.find("KeyCode::Char('") {
+                rest = &rest[i + "KeyCode::Char('".len()..];
+                if let Some(c) = rest.chars().next()
+                    && !wanted.contains(&c)
+                {
+                    wanted.push(c);
+                }
+            }
+            assert!(
+                wanted.len() >= 4,
+                "{name}: found only {wanted:?} — the source anchors have moved"
+            );
+            for c in wanted {
+                let plain = c.to_string();
+                let ctrl = format!("ctrl-{c}");
+                assert!(
+                    listed.contains(&plain) || listed.contains(&ctrl),
+                    "{name} answers to {c:?} and the cheatsheet does not say so: {listed:?}"
+                );
+            }
+        }
     }
 
     /// Drop used to be the only thing you could do to a queued row, so a typo
