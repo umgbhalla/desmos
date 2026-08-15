@@ -7,7 +7,7 @@ from typing import Any
 
 import desmos.subagent as subagents
 from desmos.loop import new_world
-from desmos.subagent_contracts import Budget, TaskContract
+from desmos.subagent_contracts import TaskContract
 
 LT = chr(60)
 
@@ -64,7 +64,6 @@ def self_check() -> None:
             structured(),
             tool_call(),
             structured(evidenced=False),
-            structured(usage=12),
             response("I would inspect the repository, but no results were available."),
             tool_call(),
             response("recovered report with observed arithmetic"),
@@ -85,12 +84,6 @@ def self_check() -> None:
         subagents.set_emitter(events.append)
         subagents.bind(parent)
         try:
-            defaults = Budget()
-            assert (
-                defaults.max_turns is None
-                and defaults.max_tokens is None
-                and defaults.wall_seconds is None
-            )
             assert subagents.resolve("worker").model == "gpt-5.6-sol"
             assert subagents.resolve("scout").model == "gpt-5.6-luna"
             assert subagents.resolve("security").capability == "read"
@@ -112,7 +105,6 @@ def self_check() -> None:
                 required_evidence=("command",),
                 acceptance_checks=("arithmetic is correct",),
                 allowed_tools=("python",),
-                budget=Budget(max_turns=3, max_tokens=100, wall_seconds=5),
             )
             rid = subagents.spawn(contract, agent="explore", parent=parent, model="claude-opus-5")
             settled = subagents.wait(rid, timeout=5, poll=0.01)[0]
@@ -120,7 +112,7 @@ def self_check() -> None:
             assert settled["task"] == contract.objective
             assert settled["state"] == "done" and settled["stage"] == "accepted", settled
             assert settled["stop_reason"] == "completed" and settled["accepted"] is True
-            assert settled["budget"]["tokens"] == {"used": 10, "limit": 100}
+            assert settled["usage"]["input_tokens"] + settled["usage"]["output_tokens"] == 10
             assert settled["observed_tools"] == ["python"]
             assert run.judgment is not None and run.judgment.accepted
             assert systems[0] == systems[1], "one child keeps one dedicated system prompt"
@@ -140,7 +132,6 @@ def self_check() -> None:
                 required_evidence=("command",),
                 acceptance_checks=("arithmetic is correct",),
                 allowed_tools=("python",),
-                budget=Budget(max_turns=2, max_tokens=100, wall_seconds=5),
                 dependencies=(rid,),
             )
             dependent_id = subagents.spawn(dependent, agent="explore", parent=parent, model="claude-opus-5")
@@ -153,19 +144,6 @@ def self_check() -> None:
             assert rejected.state == "done" and rejected.stage == "rejected"
             assert rejected.judgment is not None and not rejected.judgment.accepted
             assert any("lacks evidence" in reason for reason in rejected.judgment.reasons)
-
-            tiny = TaskContract(
-                objective="Exceed the token budget.",
-                required_evidence=("command",),
-                acceptance_checks=("arithmetic is correct",),
-                allowed_tools=("python",),
-                budget=Budget(max_turns=2, max_tokens=5, wall_seconds=5),
-            )
-            tiny_id = subagents.spawn(tiny, agent="explore", parent=parent, model="claude-opus-5")
-            subagents.wait(tiny_id, timeout=5, poll=0.01)
-            tiny_run = subagents.RUNS[tiny_id]
-            assert tiny_run.state == "stopped" and tiny_run.stop_reason == "token_budget"
-            assert tiny_run.judgment is not None and not tiny_run.judgment.accepted
 
             # The observed production failure: narration with zero calls. The
             # controller gives exactly one corrective step, then accepts only
@@ -249,6 +227,8 @@ def self_check() -> None:
                 and ev.get("progress") == "task guidance reminder 1"
                 for ev in events
             )
+            assert not any("max_turns" in str(ev) for ev in events)
+            assert not any("max_turns" in str(message) for message in reminder_run.messages)
             assert not reminder_responses
         finally:
             subagents.wait(timeout=5, poll=0.01)
@@ -261,6 +241,7 @@ def self_check() -> None:
 def parallel_tool_check() -> None:
     """The XML-facing batch waits at a barrier, proving both children started."""
     import threading
+    from desmos import pending
     from desmos.subagent_tool import handle
 
     with tempfile.TemporaryDirectory() as tmp:
@@ -322,6 +303,9 @@ def parallel_tool_check() -> None:
             }
             launched = json.loads(handle(json.dumps(command)))
             assert launched["count"] == 2 and len(launched["ids"]) == 2
+            notices = pending.outstanding(parent)
+            assert len(notices) == 1, "spawn_many registered one callback per child"
+            assert notices[0].name.startswith("subagent group "), notices[0].name
             settled = subagents.wait(*launched["ids"], timeout=5, poll=0.01)
             assert all(row["state"] == "done" for row in settled), settled
             assert {row[0] for row in seen} == {"gpt-5.6-sol", "gpt-5.6-luna"}
@@ -332,6 +316,7 @@ def parallel_tool_check() -> None:
             assert alpha.cfg.guidance_reminder == "KEEP ALPHA"
         finally:
             subagents.wait(timeout=5, poll=0.01)
+            pending.clear(parent)
             subagents.RUNS.clear()
             subagents.DIR = old_dir
             subagents.PARENT = old_parent

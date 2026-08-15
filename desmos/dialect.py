@@ -102,18 +102,19 @@ def capabilities() -> str:
             " security and planner roles use sol for advanced judgment; sniffer uses luna for"
             " quick reproduction/localization. model and thinking are launch overrides."
             " system_prompt, system_append, user_input, and task_template customize each child."
-            " Turn, token, and wall-time limits all default to None and remain explicit opt-in"
-            " Budget controls. guidance_every_turns defaults to 8, is configurable per launch,"
-            " and re-anchors long runs without stopping them; guidance_reminder overrides its text."
+            " Subagent launches have no turn, token, usage, or wall-time stop budget."
+            " guidance_every_turns defaults to 8, is configurable per launch, and re-anchors"
+            " long runs without stopping them; guidance_reminder overrides its text."
             " fanout(tasks) defaults to explore, not general;"
-            " spawn_many(specs) validates a whole batch before concurrent launch."
+            " spawn_many(specs) validates a whole batch before concurrent launch and registers one"
+            " parent-loop completion callback after every child settles."
             " wait(*ids, timeout=600) blocks; gather(ids) waits and joins their output; status()"
             " lists running; result(id) reads one; spawn(resume=id) continues a finished run."
             " A child is an isolated World with its own transcript and no persist.",
             "subagent contracts: spawn also takes a TaskContract instead of a string --"
             " objective, non_goals, deliverable_schema, required_evidence, acceptance_checks,"
-            " allowed_tools, allowed_paths, write_paths, dependencies, require_tool_use, and a budget:"
-            " Budget(max_turns, max_tokens, wall_seconds, max_retries). Under a contract"
+            " allowed_tools, allowed_paths, write_paths, dependencies, and require_tool_use."
+            " Under a contract"
             " structured_result(id) returns a typed RunResult and judgment(id) returns"
             " accepted/rejected with reasons. The judge scores the declarations against what the"
             " parent observed at runtime, so a child cannot pass by asserting it passed; a"
@@ -133,9 +134,13 @@ def capabilities() -> str:
             " from that hook replaces the syscall result and the call never runs.",
             "<edit> also accepts old_str= and new_str= as attributes when the body form is awkward.",
             "state: <python> calls share one kernel -- a name bound in one is there in the next,"
-            " this turn and later turns. <bash> calls do not: each is a fresh subprocess in cwd, so"
-            " a cd or an export in one is gone by the next. Chain shell state inside a single"
-            " <bash>, not across several.",
+            " this turn and later turns. Prefer <shell id=\"main\"> for command work: its cwd,"
+            " environment, interactive process, and unfinished build survive across calls."
+            " Its timeout is only the read window, never a task estimate or process kill. Use the"
+            " 5-second default for probes and polling, timeout=15 for a quiet test, timeout=30 for"
+            " a build, and timeout=60 only for a known quiet heavyweight command; when it reports"
+            " still running, poll the same shell instead of starting another command. Use <bash>"
+            " only for a quick hermetic one-shot where a fresh subprocess is the point.",
             "a failing call does not stop the ones after it. Every tag in the turn runs, and you get"
             " every result. If a later call only makes sense when an earlier one succeeded, put it"
             " in the next turn instead.",

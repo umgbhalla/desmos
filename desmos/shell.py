@@ -2,15 +2,13 @@ from __future__ import annotations
 
 """A shell that stays alive between syscalls.
 
-`<bash>` is one subprocess per call, which is the right default: it cannot
-leak state into the next call and it always terminates. What it cannot do is
-anything stateful. A cd is undone by the time the next tag runs, an activated
-venv never existed, and a program that asks a question can only be answered by
-piping the answer in before it was asked.
+`<shell>` is the default for command workflows. One PTY per named session stays
+alive until the process exits, so cd, exports, builds, tests, and interactive
+prompts behave the way they do in a terminal -- because it *is* one.
 
-`<shell>` is the other half. One PTY per named session, alive until the
-process is, so cd and export and an interactive prompt all behave the way they
-do in a terminal -- because it *is* one.
+`<bash>` is the deliberately hermetic alternative: one subprocess per call,
+with no state kept. Use it for a quick isolated probe where that reset is useful,
+not for a workflow that may continue, ask a question, or outlive one read.
 
 The hard part is not keeping it alive, it is knowing when to stop reading. A
 shell that is waiting at a prompt looks exactly like a shell still working:
@@ -43,9 +41,11 @@ MAX_BYTES = 12_000
 # a command pausing to think does not look finished, short enough that an
 # interactive prompt comes back promptly.
 QUIET = 0.35
-# Hard ceiling for a single call. A build that runs longer keeps running -- the
-# next <shell> picks up where the output left off.
-DEADLINE = 30.0
+# Hard ceiling for one read, not for the command. Five seconds keeps the agent
+# loop responsive; a build that runs longer keeps running and the next shell
+# call picks up where the output left off. Callers can explicitly use 15s for a
+# quiet test, 30s for a build, or 60s only for a known quiet heavyweight job.
+DEADLINE = 5.0
 # A process that exits immediately still has output in the pty buffer.
 EARLY_EXIT_GRACE = 0.15
 # How long output must sit unterminated before it counts as a prompt rather

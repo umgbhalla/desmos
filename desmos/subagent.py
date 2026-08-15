@@ -42,15 +42,15 @@ CAPS: dict[str, tuple[str, ...]] = {
 # bounded discovery. Every field remains a spawn-time override. The legacy
 # names are aliases so existing callers keep working.
 AGENTS: dict[str, dict[str, Any]] = {
-    "general": {"persona": "builder", "capability": "edit", "model": "gpt-5.6-sol", "max_turns": None},
-    "worker": {"persona": "builder", "capability": "edit", "model": "gpt-5.6-sol", "max_turns": None},
-    "explore": {"persona": "researcher", "capability": "read", "model": "gpt-5.6-luna", "max_turns": None},
-    "scout": {"persona": "researcher", "capability": "read", "model": "gpt-5.6-luna", "max_turns": None},
-    "review": {"persona": "critic", "capability": "read", "model": "gpt-5.6-sol", "max_turns": None},
-    "reviewer": {"persona": "critic", "capability": "read", "model": "gpt-5.6-sol", "max_turns": None},
-    "security": {"persona": "security", "capability": "read", "model": "gpt-5.6-sol", "max_turns": None},
-    "planner": {"persona": "planner", "capability": "read", "model": "gpt-5.6-sol", "max_turns": None},
-    "sniffer": {"persona": "debugger", "capability": "read", "model": "gpt-5.6-luna", "max_turns": None},
+    "general": {"persona": "builder", "capability": "edit", "model": "gpt-5.6-sol"},
+    "worker": {"persona": "builder", "capability": "edit", "model": "gpt-5.6-sol"},
+    "explore": {"persona": "researcher", "capability": "read", "model": "gpt-5.6-luna"},
+    "scout": {"persona": "researcher", "capability": "read", "model": "gpt-5.6-luna"},
+    "review": {"persona": "critic", "capability": "read", "model": "gpt-5.6-sol"},
+    "reviewer": {"persona": "critic", "capability": "read", "model": "gpt-5.6-sol"},
+    "security": {"persona": "security", "capability": "read", "model": "gpt-5.6-sol"},
+    "planner": {"persona": "planner", "capability": "read", "model": "gpt-5.6-sol"},
+    "sniffer": {"persona": "debugger", "capability": "read", "model": "gpt-5.6-luna"},
 }
 
 ROLE_GUIDE: dict[str, str] = {
@@ -71,7 +71,6 @@ class EffectiveConfig:
     capability: str = "edit"
     model: str | None = None
     thinking: str | None = None
-    max_turns: int | None = None
     cwd: str | None = None
     context: str = "new"  # new | resumed
     # Launch-time prompt controls. system_prompt replaces the generated child
@@ -111,7 +110,6 @@ def resolve(agent: str = "general", **over: Any) -> EffectiveConfig:
         capability=cap,
         model=d.get("model"),
         thinking=d.get("thinking"),
-        max_turns=(int(d["max_turns"]) if d.get("max_turns") is not None else None),
         cwd=d.get("cwd"),
         context=d.get("context", "new"),
         system_prompt=d.get("system_prompt"),
@@ -161,7 +159,6 @@ class Run:
         return round(end - self.started, 1) if self.started else 0.0
 
     def brief(self) -> dict[str, Any]:
-        budget = self.contract.budget if self.contract is not None else None
         return {
             "id": self.id,
             "agent": self.cfg.agent,
@@ -176,11 +173,7 @@ class Run:
             "steers": self.steers,
             "guidance_reminders": self.guidance_reminders,
             "observed_tools": list(self.observed_tools),
-            "budget": {
-                "turns": {"used": self.turns, "limit": budget.max_turns if budget else self.cfg.max_turns},
-                "tokens": {"used": _token_total(self.usage), "limit": budget.max_tokens if budget else None},
-                "seconds": {"used": self.secs, "limit": budget.wall_seconds if budget else None},
-            },
+            "usage": dict(self.usage),
             "out": (self.result or self.error)[:120],
         }
 
@@ -210,17 +203,6 @@ def _legacy_requires_tool(task: str) -> bool:
     }
     normalized = "".join(ch if ch.isalnum() else " " for ch in task.lower())
     return bool(words & set(normalized.split()))
-
-
-def _token_total(usage: dict[str, int]) -> int:
-    total = usage.get("total_tokens")
-    if isinstance(total, int):
-        return total
-    return sum(
-        value
-        for key, value in usage.items()
-        if key in {"input_tokens", "output_tokens"} and isinstance(value, int)
-    )
 
 
 RUNS: dict[str, Run] = {}
@@ -361,18 +343,7 @@ def _execute(run: Run, parent: Any) -> None:
     run.stage = "starting"
     run.progress = "building isolated child world"
     run.started = time.time()
-    budget = run.contract.budget if run.contract is not None else None
-    budget_stop = [""]
     _persist(run)
-
-    def should_stop() -> bool:
-        if budget is None:
-            return False
-        if budget.wall_seconds is not None and time.time() - run.started >= budget.wall_seconds:
-            budget_stop[0] = budget_stop[0] or "wall_time_budget"
-        elif budget.max_tokens is not None and _token_total(run.usage) >= budget.max_tokens:
-            budget_stop[0] = budget_stop[0] or "token_budget"
-        return bool(budget_stop[0])
 
     def publish_progress() -> None:
         _persist(run)
@@ -386,7 +357,6 @@ def _execute(run: Run, parent: Any) -> None:
                 "progress": run.progress,
                 "turns": run.turns,
                 "usage": dict(run.usage),
-                "budget": run.brief()["budget"],
             }
         )
 
@@ -421,62 +391,27 @@ def _execute(run: Run, parent: Any) -> None:
             payload = {k: v for k, v in ev.items() if k != "ev"}
             _emit({"ev": "child", "id": run.id, "kind": kind, **payload})
 
-        from desmos.scan import scan
+        def guidance_after_turn(n: int) -> str | None:
+            interval = run.cfg.guidance_every_turns
+            if interval is None or n % interval:
+                return None
+            run.guidance_reminders += 1
+            run.stage = "guidance"
+            run.progress = f"task guidance reminder {run.guidance_reminders}"
+            publish_progress()
+            return _guidance_prompt(run)
 
-        prompt = _user_prompt(run)
-        limits = [
-            value
-            for value in (
-                run.cfg.max_turns,
-                budget.max_turns if budget is not None else None,
+        _DEPTH.n = 1
+        try:
+            out = run_turns(
+                w,
+                _user_prompt(run),
+                quiet=True,
+                on_event=child_event,
+                on_continue=guidance_after_turn,
             )
-            if value is not None
-        ]
-        max_turns = min(limits) if limits else None
-        started_at_turn = len(w.log)
-
-        def run_aligned(first_prompt: str) -> str:
-            """Run to completion, inserting guidance between bounded segments."""
-            next_prompt = first_prompt
-            out = ""
-            while True:
-                used = len(w.log) - started_at_turn
-                remaining = None if max_turns is None else max_turns - used
-                if remaining is not None and remaining <= 0:
-                    return out
-                interval = run.cfg.guidance_every_turns
-                segment = remaining
-                if interval is not None:
-                    segment = interval if segment is None else min(interval, segment)
-
-                _DEPTH.n = 1
-                try:
-                    out = run_turns(
-                        w,
-                        next_prompt,
-                        max_turns=segment,
-                        quiet=True,
-                        on_event=child_event,
-                        should_stop=should_stop,
-                    )
-                finally:
-                    _DEPTH.n = 0
-
-                if budget_stop[0] or not scan(out):
-                    return out
-                used = len(w.log) - started_at_turn
-                if max_turns is not None and used >= max_turns:
-                    return out
-                if interval is None:
-                    return out
-
-                run.guidance_reminders += 1
-                run.stage = "guidance"
-                run.progress = f"task guidance reminder {run.guidance_reminders}"
-                publish_progress()
-                next_prompt = _guidance_prompt(run)
-
-        out = run_aligned(prompt)
+        finally:
+            _DEPTH.n = 0
         if run.structured and run.contract is not None:
             require_tool = run.contract.require_tool_use
         elif run.cfg.require_tool_use is not None:
@@ -484,53 +419,28 @@ def _execute(run: Run, parent: Any) -> None:
         else:
             require_tool = _legacy_requires_tool(run.task)
         no_tool_failure = False
-        if require_tool and not run.observed_tools and not budget_stop[0]:
-            remaining = None if max_turns is None else max_turns - len(w.log)
+        if require_tool and not run.observed_tools:
             run.steers += 1
             run.stage = "steering"
             run.progress = "no syscall observed; requiring action"
             publish_progress()
-            if remaining is None or remaining > 0:
-                _DEPTH.n = 1
-                try:
-                    out = run_turns(
-                        w,
-                        "You finished without using any tool. That result is unevidenced and will "
-                        "be rejected. Use one of your available syscalls now, inspect the task with "
-                        "a real call, read its result, and only then return the complete answer.",
-                        max_turns=remaining,
-                        quiet=True,
-                        on_event=child_event,
-                        should_stop=should_stop,
-                    )
-                finally:
-                    _DEPTH.n = 0
-            if not run.observed_tools:
-                no_tool_failure = True
-
-        forced_turn_cap = False
-        if max_turns is not None and scan(out) and not budget_stop[0]:
-            # Preserve the old compatibility behavior: a child that spends its
-            # last turn on a tool call gets one toolless chance to summarize.
-            forced_turn_cap = True
             _DEPTH.n = 1
             try:
                 out = run_turns(
                     w,
-                    "Out of turns. Answer now from what you already found. No syscalls.",
-                    max_turns=1,
+                    "You finished without using any tool. That result is unevidenced and will "
+                    "be rejected. Use one of your available syscalls now, inspect the task with "
+                    "a real call, read its result, and only then return the complete answer.",
                     quiet=True,
+                    on_event=child_event,
+                    on_continue=guidance_after_turn,
                 )
             finally:
                 _DEPTH.n = 0
-            if scan(out):
-                run.result = "turn cap: child ended on a syscall"
-                run.error = "turn cap: forced summary still had syscalls"
-            else:
-                run.result = out
-                run.error = "turn cap: forced summary"
-        else:
-            run.result = out
+            if not run.observed_tools:
+                no_tool_failure = True
+
+        run.result = out
 
         run.turns = len(w.log)
         run.messages = w.messages
@@ -541,16 +451,10 @@ def _execute(run: Run, parent: Any) -> None:
                     total[key] = total.get(key, 0) + value
         run.usage = total
 
-        if budget_stop[0]:
-            run.state = "stopped"
-            run.stop_reason = budget_stop[0]
-        elif no_tool_failure:
+        if no_tool_failure:
             run.state = "failed"
             run.stop_reason = "no_tool_evidence"
             run.error = "child completed twice without using a syscall"
-        elif forced_turn_cap:
-            run.state = "stopped"
-            run.stop_reason = "turn_budget"
         else:
             run.state = "done"
             run.stop_reason = "completed"
@@ -605,7 +509,6 @@ def _execute(run: Run, parent: Any) -> None:
                 "secs": run.secs,
                 "turns": run.turns,
                 "usage": dict(run.usage),
-                "budget": run.brief()["budget"],
                 "result": (run.result or "")[:800],
                 "error": run.error,
             }
@@ -624,8 +527,8 @@ def spawn(
     task_template: str | None = None,
     guidance_every_turns: int | None = None,
     guidance_reminder: str | None = None,
-    max_turns: int | None = None,
     parent: Any = None,
+    _register_pending: bool = True,
     **over: Any,
 ) -> str:
     """Start a child immediately after its typed dependencies are accepted."""
@@ -641,7 +544,6 @@ def spawn(
         "task_template": task_template,
         "guidance_every_turns": guidance_every_turns,
         "guidance_reminder": guidance_reminder,
-        "max_turns": max_turns,
     }
     over.update({key: value for key, value in explicit.items() if value is not None})
     structured = isinstance(task, TaskContract)
@@ -667,12 +569,6 @@ def spawn(
     # Raises on a contract whose tool scope and capability do not overlap, here
     # rather than in the pool thread that would otherwise build the world.
     _scoped_tags(cfg.capability, contract if structured else None)
-    if structured and contract.budget.max_turns is not None:
-        cfg.max_turns = (
-            contract.budget.max_turns
-            if cfg.max_turns is None
-            else min(cfg.max_turns, contract.budget.max_turns)
-        )
     run = Run(
         id=uuid.uuid4().hex[:8],
         task=contract.objective,
@@ -699,7 +595,6 @@ def spawn(
             "persona": cfg.persona or "",
             "task": run.task,
             "structured": structured,
-            "budget": run.brief()["budget"],
             "model": cfg.model or getattr(parent, "model", ""),
         }
     )
@@ -719,7 +614,8 @@ def spawn(
             f' Read it with result("{run.id}") or judgment("{run.id}").'
         )
 
-    _pending.register(parent, f"subagent {cfg.agent} {run.id}", _settle)
+    if _register_pending:
+        _pending.register(parent, f"subagent {cfg.agent} {run.id}", _settle)
     return run.id
 
 
@@ -835,10 +731,37 @@ def spawn_many(specs: list[dict[str, Any]], *, parent: Any = None) -> list[str]:
         cfg = resolve(agent, **item)
         _scoped_tags(cfg.capability, task if isinstance(task, TaskContract) else None)
         prepared.append((task, agent, resume, item))
-    return [
-        spawn(task, agent=agent, resume=resume, parent=parent, **over)
+    parent = parent or _parent()
+    ids = [
+        spawn(
+            task,
+            agent=agent,
+            resume=resume,
+            parent=parent,
+            _register_pending=False,
+            **over,
+        )
         for task, agent, resume, over in prepared
     ]
+
+    # A batch is one parent decision. Child lifecycle events remain individual
+    # for the TUI, but the model loop resumes once, after the complete batch is
+    # available, rather than once per child with siblings still running.
+    from desmos import pending as _pending
+
+    def _settle_group() -> str:
+        while any(RUNS[i].state in ("pending", "running") for i in ids):
+            time.sleep(0.05)
+        rows = [
+            f"{RUNS[i].cfg.agent} {i}: {RUNS[i].state}/{RUNS[i].stage}"
+            f" after {RUNS[i].turns} turns"
+            for i in ids
+        ]
+        reads = ", ".join(f'result("{i}")' for i in ids)
+        return "subagent group settled:\n" + "\n".join(rows) + f"\nRead: {reads}"
+
+    _pending.register(parent, "subagent group " + " ".join(ids), _settle_group)
+    return ids
 
 
 def fanout(tasks: list[str | TaskContract], agent: str = "explore", **over: Any) -> list[str]:

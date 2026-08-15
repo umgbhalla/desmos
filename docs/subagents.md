@@ -1,7 +1,7 @@
 # Subagent launch policy
 
 Subagents are isolated child worlds. The parent owns the task, model, prompt
-blocks, allowed tools, optional explicit limits, acceptance checks, guidance,
+blocks, allowed tools, acceptance checks, guidance,
 and integration decision. Children cannot spawn children.
 
 ## Models and roles
@@ -19,12 +19,12 @@ Sol is the default for advanced implementation and judgment. Luna is the
 default for cheap, bounded discovery. These are policies, not locks: every
 launch can override `model` and `thinking`.
 
-## Limits
+## Completion
 
-Turn, token, and wall-time ceilings are all off by default. They are arbitrary
-cutoffs for a coding task and commonly stop a child midway through an edit or
-before its final report. A typed `Budget` can still opt into `max_turns`,
-`max_tokens`, or `wall_seconds` for an intentionally bounded probe.
+Subagents have no turn, token, usage, or wall-time budget and no
+budget-triggered stop state. They run until they return a final answer, fail,
+or are cancelled by the parent. Long work is kept aligned with guidance
+instead of being cut off.
 
 ## Guidance reminders
 
@@ -56,5 +56,6 @@ evidence and acceptance checks.
 whole batch to the bounded shared executor. The `agents` XML tool exposes this
 as one JSON command with `op` set to `spawn_many` and a `tasks` array. Each
 item may contain a text `task` or a typed `contract`, an `agent`, and any
-launch override above. IDs are returned in input order; execution is
-concurrent.
+launch override above. IDs are returned in input order; execution is concurrent. The parent pending
+loop receives one grouped completion callback after every child settles;
+individual child lifecycle events still update the TUI as they happen.

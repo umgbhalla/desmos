@@ -73,8 +73,8 @@ def result_content(
 
 _BUILTIN_DOCS = (
     ("python", "exec Python in the persistent kernel"),
-    ("bash", "run a shell command in cwd — one subprocess, no state kept"),
-    ("shell", "persistent pty shell: id= names the session, cd/env/venv survive, answers prompts; timeout=, interrupt=1, close=1"),
+    ("bash", "isolated one-shot command in cwd — no state kept; use only when reset is useful"),
+    ("shell", "preferred persistent pty: id= names the session, state/processes survive; default timeout=5 is a read window, not a kill; interrupt=1, close=1"),
     ("edit", "replace one occurrence: path= and body old\\n---\\nnew"),
     ("register", "install a tag: name= and doc=, body is def handle"),
     ("system", "write or delete a system note (name=, optional delete=1)"),
@@ -404,6 +404,7 @@ def run_turns(
     should_stop: Callable[[], bool] | None = None,
     max_total_tokens: int | None = None,
     has_input: Callable[[], bool] | None = None,
+    on_continue: Callable[[int], str | None] | None = None,
 ) -> str:
     """Run a step to its end, and always say how it ended.
 
@@ -444,6 +445,7 @@ def run_turns(
             should_stop=should_stop,
             max_total_tokens=max_total_tokens,
             has_input=has_input,
+            on_continue=on_continue,
             budget_hit=hit,
         )
     finally:
@@ -468,6 +470,7 @@ def _run_turns(
     should_stop: Callable[[], bool] | None = None,
     max_total_tokens: int | None = None,
     has_input: Callable[[], bool] | None = None,
+    on_continue: Callable[[int], str | None] | None = None,
     budget_hit: list[str] | None = None,
 ) -> str:
     def emit(ev: dict[str, Any]) -> None:
@@ -575,6 +578,11 @@ def _run_turns(
                     continue
             _commit_step(world, prompt, speech)
             return speech
+        if on_continue is not None:
+            reminder = on_continue(n)
+            if reminder:
+                world.messages.append({"role": "user", "content": reminder})
+                emit({"ev": "guidance", "n": n, "text": reminder})
     # Only reachable when a caller asked for a turn cap. Same for it as for the
     # rest: it was printed, and the bridge runs quiet=True, so the only signal
     # was a `done` event identical to a clean finish.
@@ -675,6 +683,15 @@ def reload_sdk(world: World | None = None) -> str:
     import sys
 
     importlib.invalidate_caches()
+    old_subagent = sys.modules.get("desmos.subagent")
+    old_subagent_emit = getattr(old_subagent, "_EMIT", None)
+    if old_subagent_emit is None and world is not None:
+        # During a live turn the active bridge route is also installed here.
+        old_subagent_emit = getattr(world, "emit", None)
+    if old_subagent_emit is None:
+        # Import-based bridge launches keep the same module-level wire route.
+        old_subagent_emit = getattr(sys.modules.get("desmos.bridge"), "_emit", None)
+    old_subagent_runs = dict(getattr(old_subagent, "RUNS", {}))
     for name in list(sys.modules):
         if name == "edit" or name.startswith("desmos_skill_"):
             del sys.modules[name]
@@ -733,6 +750,15 @@ def reload_sdk(world: World | None = None) -> str:
         _seed(world)
         _reload(world)
         _bind(world)
+        # importlib.reload resets module globals in-place. Without restoring
+        # this binding, the next spawn silently creates an orphan World, so its
+        # pending completion can never resume the live TUI loop.
+        import desmos.subagent as _subagents
+
+        _subagents.bind(world)
+        _subagents.RUNS.update(old_subagent_runs)
+        if old_subagent_emit is not None:
+            _subagents.set_emitter(old_subagent_emit)
     return "sdk reloaded: " + ", ".join(reloaded)
 
 

@@ -7,7 +7,7 @@ import shlex
 from typing import Any
 
 import desmos.subagent as S
-from desmos.subagent_contracts import Budget, TaskContract
+from desmos.subagent_contracts import TaskContract
 
 
 def _table(rows: list[dict[str, Any]]) -> str:
@@ -23,9 +23,6 @@ def _table(rows: list[dict[str, Any]]) -> str:
 
 def _contract(raw: dict[str, Any]) -> TaskContract:
     data = dict(raw)
-    budget = data.get("budget")
-    if isinstance(budget, dict):
-        data["budget"] = Budget(**budget)
     for name in (
         "non_goals",
         "required_evidence",

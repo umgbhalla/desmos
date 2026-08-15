@@ -486,10 +486,10 @@ impl StreamCursor {
         self.think.is_some() || self.speech.is_some()
     }
 
-    fn flush(&mut self, story: &mut ScrollbackState) {
+    fn flush(&mut self, story: &mut ScrollbackState, activity: &mut ScrollbackState) {
         if let Some(id) = self.think {
             if !self.pending_think.is_empty() {
-                story.push_chunk_to_thinking(id, &self.pending_think);
+                activity.push_chunk_to_thinking(id, &self.pending_think);
                 self.pending_think.clear();
             }
         }
@@ -574,14 +574,11 @@ impl StreamCursor {
         self.speech_shown.clear();
     }
 
-    fn finish(&mut self, story: &mut ScrollbackState) {
-        self.finish_think(story);
+    fn finish(&mut self, story: &mut ScrollbackState, activity: &mut ScrollbackState) {
+        self.finish_think(activity);
         self.finish_speech(story);
     }
 }
-
-
-
 
 /// What a call was aimed at, when that is structural rather than payload.
 ///
@@ -730,8 +727,9 @@ impl WorkRun {
         });
     }
 
-    fn thought(&mut self, id: EntryId, elapsed_ms: Option<i64>) {
-        self.thoughts.push(id);
+    fn thought(&mut self, _id: EntryId, elapsed_ms: Option<i64>) {
+        // Thinking lives in Activity now, so the Story work-run summary must
+        // not retain or remove an entry id from a different scrollback.
         self.segs
             .push(Seg::Thought(elapsed_ms.unwrap_or(0).max(0) as u64));
     }
@@ -1082,6 +1080,10 @@ struct App {
     /// same, or a dead session answers a prompt with a POST card labelled
     /// "demo" and then sits there.
     demo: bool,
+    /// The bridge was attached and then died. Distinct from having no
+    /// bridge at all: --demo and the pane tests run without one on purpose,
+    /// and telling them the harness is gone is a lie they cannot act on.
+    bridge_gone: bool,
 }
 
 /// Prompt-cache window for the meter under the calls pane.
@@ -1444,6 +1446,7 @@ impl App {
             files_area: Rect::default(),
             layout: PaneLayout::load(),
             demo: false,
+            bridge_gone: false,
         };
         app.apply_grok_settings();
         app
@@ -1929,10 +1932,10 @@ fn seed_demo(app: &mut App) {
     app.story_push(RenderBlock::user_prompt(
         "look around the kernel\nand list what you can grow",
     ));
-    app.story_push(RenderBlock::thinking(
+    app.call_push(RenderBlock::thinking(
         "cwd is mine. peek ns, then fire the smallest probe.",
     ));
-    app.story_push(RenderBlock::thinking(
+    app.call_push(RenderBlock::thinking(
         "redacted thinking — opaque block, replayed on the next complete(), not speech.",
     ));
     app.story_push(RenderBlock::agent_message(
@@ -1952,8 +1955,7 @@ fn seed_demo(app: &mut App) {
          to live in a note, a skill, or a named object the index still lists. \
          A paragraph this long must wrap across more than one row. WRAPEND",
     ));
-    // One edit, in both panes, so --demo shows the story card folded next to
-    // the wire card it was built from.
+    // One edit in Activity; Story carries only the reader-facing conversation.
     let demo_edit = json!({
         "ev": "result",
         "tag": "edit",
@@ -1961,10 +1963,6 @@ fn seed_demo(app: &mut App) {
         "body": "    if n < max_turns:\n---\n    if n <= max_turns:",
         "text": "ok",
     });
-    if let Some(card) = story_edit_card(&demo_edit) {
-        let id = app.story.push_block(card);
-        set_wire_mode(&mut app.story, id, DisplayMode::Collapsed);
-    }
     app.call_push_group(PostArgs::new(
         "user",
         1,
@@ -2177,6 +2175,7 @@ fn run(
                         // being gone does not. The story keeps the row.
                         app.story_push(RenderBlock::system(BRIDGE_GONE));
                         app.notify("bridge died");
+                        app.bridge_gone = true;
                         app.running = false;
                         app.turn_started = None;
                         app.ready = true;
@@ -2359,50 +2358,18 @@ fn task_title(task: &str) -> String {
 /// Longest task title kept before eliding.
 const TITLE_CHARS: usize = 52;
 
-fn short_count(n: u64) -> String {
-    if n >= 1000 {
-        format!("{}k", n / 1000)
-    } else {
-        n.to_string()
-    }
-}
-
-/// One `used/limit` fragment out of the child's live budget, e.g. `turn 3/32`.
-fn budget_part(ev: &Value, key: &str, label: &str, short: bool) -> Option<String> {
-    let used = ev
-        .pointer(&format!("/budget/{key}/used"))
-        .and_then(Value::as_u64)?;
-    let limit = ev
-        .pointer(&format!("/budget/{key}/limit"))
-        .and_then(Value::as_u64);
-    let fmt = |n: u64| if short { short_count(n) } else { n.to_string() };
-    Some(match limit {
-        Some(l) if l > 0 => format!("{label} {}/{}", fmt(used), fmt(l)),
-        _ => format!("{label} {}", fmt(used)),
-    })
-}
-
-/// Status suffix for a running or finished child: what it is doing, how far
-/// into its turn budget it is, and how much of its token budget it has spent.
-/// This is what the collapsed spawn row shows instead of a bare turn number.
 fn subagent_status(ev: &Value, head: Option<&str>) -> String {
     let mut parts: Vec<String> = Vec::new();
     if let Some(head) = head.map(str::trim).filter(|s| !s.is_empty()) {
         parts.push(head.to_string());
     }
-    if let Some(turns) = budget_part(ev, "turns", "turn", false) {
-        parts.push(turns);
-    } else {
-        let n = ev.get("turns").and_then(Value::as_u64).unwrap_or(0);
-        if n > 0 {
-            parts.push(format!("turn {n}"));
-        }
-    }
-    if let Some(tokens) = budget_part(ev, "tokens", "", true) {
-        let tokens = tokens.trim();
-        if !tokens.starts_with('0') {
-            parts.push(format!("{tokens} tok"));
-        }
+    if let Some(progress) = ev
+        .get("progress")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && !parts.iter().any(|part| part == s))
+    {
+        parts.push(progress.to_string());
     }
     parts.join(" \u{b7} ")
 }
@@ -2467,8 +2434,8 @@ fn handle_subagent(app: &mut App, ev: &Value) {
                 }
             }
         }
-        // `stopped` is terminal too — a child that hit its wall or token
-        // budget must stop spinning on the parent story.
+        // Parent cancellation and runtime failure are terminal too; no terminal
+        // child may leave a spinner behind on the parent story.
         "done" | "failed" | "stopped" => {
             let secs = ev.get("secs").and_then(Value::as_f64).unwrap_or(0.0);
             let elapsed = Duration::from_secs_f64(secs.max(0.0));
@@ -2547,12 +2514,25 @@ fn handle_child(app: &mut App, ev: &Value) {
             let redacted = ev.get("redacted").and_then(Value::as_bool).unwrap_or(false);
             let delta = ev.get("delta").and_then(Value::as_bool).unwrap_or(false);
             let text = ev.get("text").and_then(Value::as_str).unwrap_or("");
-            apply_thinking(&mut child.story, &mut child.stream, redacted, text, delta);
+            apply_thinking(
+                &mut child.story,
+                &mut child.calls,
+                &mut child.stream,
+                redacted,
+                text,
+                delta,
+            );
         }
         "speech" => {
             let delta = ev.get("delta").and_then(Value::as_bool).unwrap_or(false);
             let text = ev.get("text").and_then(Value::as_str).unwrap_or("");
-            apply_speech(&mut child.story, &mut child.stream, text, delta);
+            apply_speech(
+                &mut child.story,
+                &mut child.calls,
+                &mut child.stream,
+                text,
+                delta,
+            );
         }
         "post" => {
             let n = ev.get("n").and_then(Value::as_u64).unwrap_or(0);
@@ -2561,7 +2541,7 @@ fn handle_child(app: &mut App, ev: &Value) {
             }
         }
         "complete" => {
-            child.stream.finish(&mut child.story);
+            child.stream.finish(&mut child.story, &mut child.calls);
             finish_exec(&mut child.calls, &mut child.exec);
             let n = ev.get("n").and_then(Value::as_u64).unwrap_or(0);
             let origin = ev.get("origin").and_then(Value::as_str).unwrap_or("llm");
@@ -2580,12 +2560,12 @@ fn handle_child(app: &mut App, ev: &Value) {
             }
         }
         "result" => {
-            child.stream.finish(&mut child.story);
+            child.stream.finish(&mut child.story, &mut child.calls);
             apply_result(&mut child.calls, &mut child.exec, ev);
         }
         "turn" => {
-            child.stream.finish(&mut child.story);
-            start_thinking(&mut child.story, &mut child.stream);
+            child.stream.finish(&mut child.story, &mut child.calls);
+            start_thinking(&mut child.calls, &mut child.stream);
         }
         _ => {}
     }
@@ -2649,25 +2629,28 @@ fn handle_event(app: &mut App, ev: Value) {
             let redacted = ev.get("redacted").and_then(Value::as_bool).unwrap_or(false);
             let delta = ev.get("delta").and_then(Value::as_bool).unwrap_or(false);
             let text = ev.get("text").and_then(Value::as_str).unwrap_or("");
-            apply_thinking(&mut app.story, &mut app.stream, redacted, text, delta);
+            apply_thinking(
+                &mut app.story,
+                &mut app.calls,
+                &mut app.stream,
+                redacted,
+                text,
+                delta,
+            );
         }
         "speech" => {
             let delta = ev.get("delta").and_then(Value::as_bool).unwrap_or(false);
             let text = ev.get("text").and_then(Value::as_str).unwrap_or("");
-            apply_speech(&mut app.story, &mut app.stream, text, delta);
+            apply_speech(&mut app.story, &mut app.calls, &mut app.stream, text, delta);
         }
         "result" => {
-            app.stream.finish(&mut app.story);
+            app.stream.finish(&mut app.story, &mut app.calls);
             let phase = ev.get("phase").and_then(Value::as_str).unwrap_or("done");
             if phase != "start" && phase != "delta" {
                 let tag = ev.get("tag").and_then(Value::as_str).unwrap_or("?");
-                // An edit reports itself in the story as a card, so counting it
-                // in the work sentence too would say the same thing twice —
-                // `edit x3` above three cards that name the files.
-                if let Some(card) = story_edit_card(&ev) {
-                    let id = app.story.push_block(card);
-                    set_wire_mode(&mut app.story, id, DisplayMode::Collapsed);
-                } else {
+                // Every edit detail has one home: Activity. Do not duplicate
+                // either its diff card or an `edit xN` work row in Story.
+                if tag != "edit" {
                     let target = call_target(tag, &ev);
                     app.stream.run.call(tag, target);
                     app.stream.run.sync(&mut app.story);
@@ -2715,7 +2698,7 @@ fn handle_event(app: &mut App, ev: Value) {
             app.notify("context folded");
         }
         "complete" => {
-            app.stream.finish(&mut app.story);
+            app.stream.finish(&mut app.story, &mut app.calls);
             finish_exec(&mut app.calls, &mut app.exec);
             let n = ev.get("n").and_then(Value::as_u64).unwrap_or(0);
             let origin = ev.get("origin").and_then(Value::as_str).unwrap_or("llm");
@@ -2740,11 +2723,11 @@ fn handle_event(app: &mut App, ev: Value) {
         }
         "turn" => {
             app.status = "running".into();
-            app.stream.finish(&mut app.story);
-            start_thinking(&mut app.story, &mut app.stream);
+            app.stream.finish(&mut app.story, &mut app.calls);
+            start_thinking(&mut app.calls, &mut app.stream);
         }
         "done" => {
-            app.stream.finish(&mut app.story);
+            app.stream.finish(&mut app.story, &mut app.calls);
             app.stream.run.fold(&mut app.story);
             finish_exec(&mut app.calls, &mut app.exec);
             app.running = false;
@@ -2753,9 +2736,12 @@ fn handle_event(app: &mut App, ev: Value) {
             app.drain_after = !app.queue.is_empty();
         }
         "stopped" => {
-            app.stream.finish(&mut app.story);
+            app.stream.finish(&mut app.story, &mut app.calls);
             finish_exec(&mut app.calls, &mut app.exec);
-            let t = ev.get("text").and_then(Value::as_str).unwrap_or("stopped, saved");
+            let t = ev
+                .get("text")
+                .and_then(Value::as_str)
+                .unwrap_or("stopped, saved");
             app.story_push(RenderBlock::system(t));
             app.running = false;
             app.turn_started = None;
@@ -2776,7 +2762,7 @@ fn handle_event(app: &mut App, ev: Value) {
         // run_turns was still going, so Enter sent a second op:step that fired
         // later, out of order. Only done/stopped end a step.
         "error" => {
-            app.stream.finish(&mut app.story);
+            app.stream.finish(&mut app.story, &mut app.calls);
             finish_exec(&mut app.calls, &mut app.exec);
             let t = ev.get("text").and_then(Value::as_str).unwrap_or("error");
             app.story_push(RenderBlock::system(t));
@@ -3472,13 +3458,15 @@ fn start_step(
         None if app.demo => {
             app.call_push_group(PostArgs::new("user", 0, "demo", "", &json!({}), 0, 0));
         }
-        // No bridge and no demo means the harness process is gone. Say so
-        // where the prompt is, durably — a POST card here would be a lookalike
-        // for a step that cannot happen.
-        None => {
+        // A bridge that died and a prompt typed after it: say so where the
+        // prompt is, durably — a POST card here would be a lookalike for a
+        // step that cannot happen, and a notice lapses in four seconds.
+        None if app.bridge_gone => {
             app.story_push(RenderBlock::system(BRIDGE_GONE));
             app.notify("bridge is gone");
         }
+        // Never attached one. Nothing died, so nothing is announced.
+        None => {}
     }
     Ok(())
 }
@@ -4818,10 +4806,10 @@ fn streaming(app: &App) -> bool {
 }
 
 fn flush_streams(app: &mut App) {
-    app.stream.flush(&mut app.story);
+    app.stream.flush(&mut app.story, &mut app.calls);
     app.exec.flush(&mut app.calls);
     for child in app.children.values_mut() {
-        child.stream.flush(&mut child.story);
+        child.stream.flush(&mut child.story, &mut child.calls);
         child.exec.flush(&mut child.calls);
     }
 }
@@ -4954,10 +4942,14 @@ fn draw(f: &mut Frame, app: &mut App) {
     // whichever session is on screen, so both branches want the same string.
     // The POST cards are off by default, so the pane says so where the switch
     // is: a chip in its own border title, clickable, `p` from the keyboard.
-    let chip = if app.show_posts { "[-posts]" } else { "[+posts]" };
+    let chip = if app.show_posts {
+        "[-posts]"
+    } else {
+        "[+posts]"
+    };
     let calls_title = match app.call_group_pos() {
-        Some((cur, total)) => format!("calls  #{cur}/{total}  {chip}"),
-        None => format!("calls  {chip}"),
+        Some((cur, total)) => format!("Activity  #{cur}/{total}  {chip}"),
+        None => format!("Activity  {chip}"),
     };
     app.calls_chip = title_chip_rect(app.call_area, &calls_title, chip);
     if let (Some(id), true) = (viewing.as_deref(), child_ok) {
@@ -5810,13 +5802,23 @@ fn draw_queue(f: &mut Frame, area: Rect, app: &App) {
     if inner.width == 0 || inner.height == 0 {
         return;
     }
-    f.render_widget(
-        Paragraph::new(app.queue.lines(inner.width, focused)),
-        inner,
-    );
+    f.render_widget(Paragraph::new(app.queue.lines(inner.width, focused)), inner);
 }
 
-
+/// What to call the focused pane in the legend title.
+fn focus_name(focus: Focus) -> &'static str {
+    match focus {
+        Focus::Input => "input",
+        Focus::Story => "story",
+        Focus::Calls => "Activity",
+        Focus::Meter => "meta",
+        Focus::Git => "git",
+        Focus::Files => "files",
+        Focus::PostIn => "POST in",
+        Focus::PostOut => "POST out",
+        Focus::Queue => "queue",
+    }
+}
 
 /// The blank spacer row the composer floats on: one while POST is open, none
 /// when it is collapsed or when an open queue is carrying that row instead.
@@ -5930,15 +5932,18 @@ fn draw_input(f: &mut Frame, area: Rect, app: &mut App) {
 fn pane_keys(focus: Focus) -> (&'static str, &'static [(&'static str, &'static str)]) {
     match focus {
         Focus::Story | Focus::Calls => (
-            "story / calls",
+            "story / Activity",
             &[
                 ("j k", "select a block"),
                 ("h", "collapse it"),
                 ("l", "fold: collapsed / truncated / expanded"),
-                ("enter", "zoom into the viewer (a spawn row opens the child)"),
+                (
+                    "enter",
+                    "zoom into the viewer (a spawn row opens the child)",
+                ),
                 ("ctrl-f", "zoom, without moving the fold"),
-                ("[ ]", "previous / next POST group (calls)"),
-                ("p", "show / hide the POST rows (calls)"),
+                ("[ ]", "previous / next POST group (Activity)"),
+                ("p", "show / hide the POST rows (Activity)"),
                 ("r", "raw text of the selected block"),
                 ("pgup pgdn", "scroll a page"),
                 ("i", "back to the composer"),
@@ -6379,6 +6384,7 @@ fn apply_result(calls: &mut ScrollbackState, exec: &mut ExecStream, ev: &Value) 
 
 fn apply_thinking(
     story: &mut ScrollbackState,
+    activity: &mut ScrollbackState,
     stream: &mut StreamCursor,
     redacted: bool,
     text: &str,
@@ -6386,8 +6392,8 @@ fn apply_thinking(
 ) {
     if redacted {
         stream.finish_speech(story);
-        stream.finish_think(story);
-        story.push_block(RenderBlock::thinking(
+        stream.finish_think(activity);
+        activity.push_block(RenderBlock::thinking(
             "redacted thinking — opaque block, replayed on the next complete(), not speech.",
         ));
         return;
@@ -6397,24 +6403,30 @@ fn apply_thinking(
         if text.is_empty() {
             return;
         }
-        start_thinking(story, stream);
+        start_thinking(activity, stream);
         stream.pending_think.push_str(text);
         return;
     }
     stream.finish_speech(story);
-    stream.finish_think(story);
+    stream.finish_think(activity);
     if !text.trim().is_empty() {
-        story.push_block(RenderBlock::thinking(text));
+        activity.push_block(RenderBlock::thinking(text));
     }
 }
 
-fn apply_speech(story: &mut ScrollbackState, stream: &mut StreamCursor, text: &str, delta: bool) {
+fn apply_speech(
+    story: &mut ScrollbackState,
+    activity: &mut ScrollbackState,
+    stream: &mut StreamCursor,
+    text: &str,
+    delta: bool,
+) {
     if delta {
-        stream.finish_think(story);
+        stream.finish_think(activity);
         stream.speech_raw.push_str(text);
         return;
     }
-    stream.finish_think(story);
+    stream.finish_think(activity);
     stream.finish_speech(story);
     // The story carries prose. A syscall goes to the calls pane, body and all.
     let spoken = strip_syscalls(text);
@@ -7150,21 +7162,6 @@ fn wire_compacted(n: u64, kept: u64, summary: &str) -> RenderBlock {
 /// pushed collapsed, so a turn that rewrites twenty files costs twenty header
 /// rows and not twenty diffs; `l` opens one, Enter zooms it into the viewer.
 ///
-/// This is the same block the wire pane gets, built a second time rather than
-/// shared: the two panes fold independently, and a card that opened in the
-/// story because the reader pressed `l` must not also open on the wire.
-fn story_edit_card(ev: &Value) -> Option<RenderBlock> {
-    if ev.get("tag").and_then(Value::as_str)? != "edit" {
-        return None;
-    }
-    match result_block(ev) {
-        block @ RenderBlock::ToolCall(ToolCallBlock::Edit(_)) => Some(block),
-        // A malformed edit body falls through wire_syscall's `edit` arm as
-        // something else; the story has no use for that shape.
-        _ => None,
-    }
-}
-
 /// Wire card for one XML syscall: the body that ran, then the result.
 fn wire_syscall(tag: &str, body: &str, attrs: &Value, result: &str) -> RenderBlock {
     match tag {
@@ -7518,20 +7515,6 @@ mod tests {
         assert_eq!(app.picker.effort_idx, 1);
         assert_eq!(app.picker.key(KeyCode::Esc), picker::PickerAction::Close);
         assert!(!app.picker.open);
-    }
-
-    fn focus_name(focus: Focus) -> &'static str {
-        match focus {
-            Focus::Input => "input",
-            Focus::Story => "story",
-            Focus::Calls => "calls",
-            Focus::Meter => "meta",
-            Focus::Git => "git",
-            Focus::Files => "files",
-            Focus::PostIn => "POST in",
-            Focus::PostOut => "POST out",
-            Focus::Queue => "queue",
-        }
     }
 
     use super::*;
@@ -7923,38 +7906,28 @@ mod tests {
         assert!(!row.contains("cargo build"), "a command body leaked: {row}");
     }
 
-    /// The two panes as the reader actually sees them: a folded edit card in
-    /// the story that opens into readable before/after rows, and a wire title
-    /// that says which group the cursor is in.
+    /// The demo keeps its edit in Activity, where it opens into readable
+    /// before/after rows beside the wire group counter.
     #[test]
-    fn the_demo_paints_a_folded_edit_and_a_group_counter() {
+    fn the_demo_paints_an_activity_edit_and_a_group_counter() {
         let mut app = App::new();
         seed_demo(&mut app);
         // The POST rows are off by default; this test is about them, so put
         // them back the way the chip does.
         app.toggle_posts();
 
-        let folded = paint(&mut app, 120, 40);
-        // Folded, the card names the file by basename; opened, by full path.
+        assert_eq!(activity_edits(&app).len(), 1, "demo edit missing from Activity");
         assert!(
-            folded.contains("Edit loop.py"),
-            "no story edit card: {folded}"
+            !(0..app.story.len()).any(|i| matches!(
+                app.story.entry(i).map(|e| &e.block),
+                Some(RenderBlock::ToolCall(ToolCallBlock::Edit(_)))
+            )),
+            "demo edit leaked into Story"
         );
+        let painted = paint(&mut app, 120, 40);
         assert!(
-            !folded.contains("if n <= max_turns"),
-            "the card arrived open and spilled its diff into the story: {folded}"
-        );
-        assert!(
-            folded.contains("calls  #3/3"),
-            "the wire title lost its group counter: {folded}"
-        );
-
-        let id = app.story.entry(story_edits(&app)[0]).unwrap().id;
-        set_wire_mode(&mut app.story, id, DisplayMode::Expanded);
-        let open = paint(&mut app, 120, 40);
-        assert!(
-            open.contains("if n < max_turns:") && open.contains("if n <= max_turns:"),
-            "opening the card did not show both sides of the diff: {open}"
+            painted.contains("Activity  #3/3"),
+            "the wire title lost its group counter: {painted}"
         );
     }
 
@@ -8146,83 +8119,38 @@ mod tests {
         })
     }
 
-    fn story_edits(app: &App) -> Vec<usize> {
-        (0..app.story.len())
+    fn activity_edits(app: &App) -> Vec<usize> {
+        (0..app.calls.len())
             .filter(|i| {
                 matches!(
-                    app.story.entry(*i).map(|e| &e.block),
+                    app.calls.entry(*i).map(|e| &e.block),
                     Some(RenderBlock::ToolCall(ToolCallBlock::Edit(_)))
                 )
             })
             .collect()
     }
 
-    /// An edit lands in the story as its own card, folded, the moment the
-    /// result arrives -- not at the end of the turn and not only on the wire.
     #[test]
-    fn an_edit_shows_up_in_the_story_folded_and_live() {
+    fn edits_render_only_in_activity() {
         let mut app = App::new();
         handle_event(&mut app, json!({"ev": "turn", "text": "go"}));
         handle_event(
             &mut app,
-            edit_ev("desmos/loop.py", "if n < max_turns:", "if n <= max_turns:", "ok"),
+            edit_ev("desmos/loop.py", "if old:", "if new:", "ok"),
         );
 
-        let edits = story_edits(&app);
-        assert_eq!(edits.len(), 1, "the edit did not reach the story");
-        let entry = app.story.entry(edits[0]).unwrap();
-        assert_eq!(
-            entry.display_mode,
-            DisplayMode::Collapsed,
-            "a story edit card must arrive folded, or a wide refactor buries the prose",
+        assert!(
+            !(0..app.story.len()).any(|i| matches!(
+                app.story.entry(i).map(|e| &e.block),
+                Some(RenderBlock::ToolCall(ToolCallBlock::Edit(_)))
+            )),
+            "edit diff leaked into Story"
         );
-        // Live: it is there before the turn ends.
-        assert!(!app.running, "sanity: no complete() was sent");
-
-        // And the wire pane still has its own copy -- the story card is a
-        // second block, not a move.
-        let wire = (0..app.calls.len())
-            .filter(|i| {
-                matches!(
-                    app.calls.entry(*i).map(|e| &e.block),
-                    Some(RenderBlock::ToolCall(ToolCallBlock::Edit(_)))
-                )
-            })
-            .count();
-        assert_eq!(wire, 1, "the edit left the wire pane");
+        assert_eq!(activity_edits(&app).len(), 1, "edit missing from Activity");
     }
 
-    /// Folding is per-pane. Opening the story card must not open the wire one:
-    /// they are two blocks, and the reader opened exactly one of them.
     #[test]
-    fn opening_a_story_edit_leaves_the_wire_card_folded() {
-        let mut app = App::new();
-        handle_event(&mut app, json!({"ev": "turn", "text": "go"}));
-        handle_event(&mut app, edit_ev("f.rs", "old", "new", "ok"));
-
-        let sid = app.story.entry(story_edits(&app)[0]).unwrap().id;
-        set_wire_mode(&mut app.story, sid, DisplayMode::Expanded);
-
-        let wire_edit = (0..app.calls.len())
-            .find(|i| {
-                matches!(
-                    app.calls.entry(*i).map(|e| &e.block),
-                    Some(RenderBlock::ToolCall(ToolCallBlock::Edit(_)))
-                )
-            })
-            .expect("wire edit card");
-        assert_eq!(
-            app.calls.entry(wire_edit).unwrap().display_mode,
-            DisplayMode::Collapsed,
-            "opening the story card reached across into the wire pane",
-        );
-    }
-
-    /// Edits carry themselves now, so they must drop out of the work sentence.
-    /// `edit x3` stacked above three cards that name the files is the same
-    /// fact printed twice.
-    #[test]
-    fn edits_do_not_also_count_toward_the_work_row() {
+    fn edits_do_not_create_story_work_rows() {
         let mut app = App::new();
         handle_event(&mut app, json!({"ev": "turn", "text": "go"}));
         for f in ["a.rs", "b.rs", "c.rs"] {
@@ -8232,40 +8160,26 @@ mod tests {
             Some(RenderBlock::System(b)) => Some(b.text.clone()),
             _ => None,
         });
-        assert!(
-            row.is_none(),
-            "three edits produced a work row as well as three cards: {row:?}"
-        );
-        assert_eq!(story_edits(&app).len(), 3, "one card per edit");
-
-        // A non-edit call still earns a row, and the row still ignores edits.
-        for _ in 0..2 {
-            handle_event(
-                &mut app,
-                json!({"ev": "result", "tag": "bash", "body": "cargo test", "text": "ok"}),
-            );
-        }
-        let row = (0..app.story.len())
-            .find_map(|i| match app.story.entry(i).map(|e| &e.block) {
-                Some(RenderBlock::System(b)) => Some(b.text.clone()),
-                _ => None,
-            })
-            .expect("two bash calls are a run");
-        assert!(row.contains("bash"), "row lost the real calls: {row}");
-        assert!(!row.contains("edit"), "edits leaked back into the row: {row}");
+        assert!(row.is_none(), "edits created a Story work row: {row:?}");
+        assert_eq!(activity_edits(&app).len(), 3, "one Activity card per edit");
     }
 
-    /// A failed edit is still the narrative -- it is the turn's whole point
-    /// when it happens -- so it gets a card too, carrying the error.
     #[test]
-    fn a_failed_edit_still_reaches_the_story() {
+    fn failed_edits_stay_in_activity_too() {
         let mut app = App::new();
         handle_event(&mut app, json!({"ev": "turn", "text": "go"}));
         handle_event(
             &mut app,
             edit_ev("f.rs", "missing", "new", "no match for old_string"),
         );
-        assert_eq!(story_edits(&app).len(), 1, "a failed edit vanished");
+        assert_eq!(activity_edits(&app).len(), 1, "failed edit vanished");
+        assert!(
+            !(0..app.story.len()).any(|i| matches!(
+                app.story.entry(i).map(|e| &e.block),
+                Some(RenderBlock::ToolCall(ToolCallBlock::Edit(_)))
+            )),
+            "failed edit leaked into Story"
+        );
     }
 
     /// One call is not a run. A row for a lone grep is worse than silence.
@@ -8281,15 +8195,32 @@ mod tests {
             &mut app,
             json!({"ev": "result", "tag": "grep", "body": "pattern", "text": "hit"}),
         );
-        handle_event(&mut app, json!({"ev": "speech", "delta": true, "text": "Found it."}));
+        handle_event(
+            &mut app,
+            json!({"ev": "speech", "delta": true, "text": "Found it."}),
+        );
         let _ = paint(&mut app, 120, 34);
-        let thoughts = (0..app.story.len())
-            .filter(|i| matches!(
-                app.story.entry(*i).map(|e| &e.block),
-                Some(RenderBlock::Thinking(_))
-            ))
+        let story_thoughts = (0..app.story.len())
+            .filter(|i| {
+                matches!(
+                    app.story.entry(*i).map(|e| &e.block),
+                    Some(RenderBlock::Thinking(_))
+                )
+            })
             .count();
-        assert_eq!(thoughts, 1, "a lone call must not fold the thought away");
+        let activity_thoughts = (0..app.calls.len())
+            .filter(|i| {
+                matches!(
+                    app.calls.entry(*i).map(|e| &e.block),
+                    Some(RenderBlock::Thinking(_))
+                )
+            })
+            .count();
+        assert_eq!(story_thoughts, 0, "thinking leaked into Story");
+        assert_eq!(
+            activity_thoughts, 1,
+            "a lone call must not fold the Activity thought away"
+        );
     }
 
     /// The composer belongs to the story column. The wire column used to stop
@@ -8944,7 +8875,7 @@ mod tests {
         let calls_rows: Vec<usize> = text
             .lines()
             .enumerate()
-            .filter(|(_, l)| l.contains("calls") || l.contains("cache"))
+            .filter(|(_, l)| l.contains("Activity") || l.contains("cache"))
             .map(|(i, _)| i)
             .collect();
         let post_row = row_of(&text, "POST in").expect(&text);
@@ -8993,7 +8924,7 @@ mod tests {
         term.draw(|f| draw(f, &mut app)).unwrap();
         let text = buffer_text(&term);
         assert!(text.contains("story"), "{text}");
-        assert!(text.contains("calls"), "{text}");
+        assert!(text.contains("Activity"), "{text}");
         // A block *stamped* `out`, not the POST card's `out 100` usage column
         // — which is a real number and was only ever absent here because the
         // calls pane used to be clipped a row above it.
@@ -10117,7 +10048,7 @@ mod tests {
     }
 
     #[test]
-    fn a_spawn_row_carries_a_title_and_live_budget_not_the_raw_task() {
+    fn a_spawn_row_carries_a_title_and_live_progress_not_the_raw_task() {
         let mut app = App::new();
         let task = "Audit the desmos repo (/Users/zeus/hub/desmos) for whether these \
                     PYTHON-side todo items are already implemented. For each, answer \
@@ -10148,12 +10079,8 @@ mod tests {
                 "phase": "progress",
                 "id": "cafe",
                 "stage": "executing",
+                "progress": "collected bash evidence",
                 "turns": 12,
-                "budget": {
-                    "turns": {"used": 12, "limit": 32},
-                    "tokens": {"used": 41500, "limit": 100000},
-                    "seconds": {"used": 88.0, "limit": 600.0},
-                },
             }),
         );
         let RenderBlock::Subagent(sb) = &app.story.entry(idx).expect("entry").block else {
@@ -10161,54 +10088,7 @@ mod tests {
         };
         assert_eq!(
             sb.activity_label.as_deref(),
-            Some("executing \u{b7} turn 12/32 \u{b7} 41k/100k tok")
-        );
-    }
-
-    #[test]
-    fn a_budget_stopped_child_stops_spinning() {
-        let mut app = App::new();
-        handle_event(
-            &mut app,
-            json!({
-                "ev": "subagent",
-                "phase": "started",
-                "id": "beef",
-                "agent": "general",
-                "task": "grind forever",
-            }),
-        );
-        handle_event(
-            &mut app,
-            json!({
-                "ev": "subagent",
-                "phase": "stopped",
-                "id": "beef",
-                "stage": "stopped",
-                "stop_reason": "token_budget",
-                "secs": 41.0,
-                "turns": 9,
-                "budget": {
-                    "turns": {"used": 9, "limit": 32},
-                    "tokens": {"used": 100000, "limit": 100000},
-                },
-            }),
-        );
-        let idx = first_subagent(&app).expect("spawn row");
-        let RenderBlock::Subagent(sb) = &app.story.entry(idx).expect("entry").block else {
-            panic!("expected a spawn row");
-        };
-        assert_eq!(
-            sb.activity_label.as_deref(),
-            Some("token_budget \u{b7} turn 9/32 \u{b7} 100k/100k tok")
-        );
-        assert!(
-            (0..app.story.len()).any(|i| matches!(
-                app.story.entry(i).map(|e| &e.block),
-                Some(RenderBlock::Subagent(sb))
-                    if matches!(sb.kind, SubagentBlockKind::Failed { .. })
-            )),
-            "a budget stop must land a terminal row, not spin forever"
+            Some("executing \u{b7} collected bash evidence")
         );
     }
 
@@ -10302,11 +10182,8 @@ mod tests {
                 "phase": "progress",
                 "id": "deadbeef",
                 "stage": "executing",
+                "progress": "collected python evidence",
                 "turns": 3,
-                "budget": {
-                    "turns": {"used": 3, "limit": 32},
-                    "tokens": {"used": 41000, "limit": 100000},
-                },
             }),
         );
         handle_event(
@@ -10363,10 +10240,6 @@ mod tests {
                 "accepted": true,
                 "secs": 1.5,
                 "turns": 3,
-                "budget": {
-                    "turns": {"used": 3, "limit": 32},
-                    "tokens": {"used": 41000, "limit": 100000},
-                },
                 "result": "CHILDONLY last-user cache",
                 "error": "",
             }),
@@ -10378,10 +10251,7 @@ mod tests {
             RenderBlock::Subagent(sb) => {
                 assert!(matches!(sb.kind, SubagentBlockKind::Started));
                 assert_eq!(sb.child_session_id, "deadbeef");
-                assert_eq!(
-                    sb.activity_label.as_deref(),
-                    Some("accepted \u{b7} turn 3/32 \u{b7} 41k/100k tok")
-                );
+                assert_eq!(sb.activity_label.as_deref(), Some("accepted"));
             }
             other => panic!("expected Subagent, got {other:?}"),
         }
@@ -10470,9 +10340,68 @@ mod tests {
         );
         app.set_focus(Focus::PostIn);
         let text = paint(&mut app, 120, 40);
-        assert!(text.contains("LIVEPROBE"), "POST in missing request:\n{text}");
+        assert!(
+            text.contains("LIVEPROBE"),
+            "POST in missing request:\n{text}"
+        );
         assert!(app.post_out.is_empty());
         assert_eq!(app.post_n, 1);
+    }
+
+    #[test]
+    fn live_events_route_conversation_to_story_and_work_to_activity() {
+        let mut app = App::new();
+        start_step(None, &mut app, "inspect routing".into()).unwrap();
+        handle_event(
+            &mut app,
+            json!({"ev": "thinking", "text": "private plan", "delta": false}),
+        );
+        handle_event(
+            &mut app,
+            json!({"ev": "result", "tag": "bash", "body": "pwd", "text": "/tmp"}),
+        );
+        handle_event(
+            &mut app,
+            json!({"ev": "speech", "text": "final answer", "delta": false}),
+        );
+
+        let story_kinds: Vec<&str> = (0..app.story.len())
+            .filter_map(|i| app.story.entry(i))
+            .map(|entry| match &entry.block {
+                RenderBlock::UserPrompt(_) => "prompt",
+                RenderBlock::AgentMessage(_) => "speech",
+                RenderBlock::Thinking(_) => "thinking",
+                _ => "other",
+            })
+            .collect();
+        let activity_kinds: Vec<&str> = (0..app.calls.len())
+            .filter_map(|i| app.calls.entry(i))
+            .map(|entry| match &entry.block {
+                RenderBlock::Thinking(_) => "thinking",
+                RenderBlock::ToolCall(_) => "tool",
+                _ => "other",
+            })
+            .collect();
+
+        assert_eq!(story_kinds, vec!["prompt", "speech"]);
+        assert!(activity_kinds.contains(&"thinking"), "{activity_kinds:?}");
+        assert!(activity_kinds.contains(&"tool"), "{activity_kinds:?}");
+    }
+
+    #[test]
+    fn activity_is_the_rendered_and_focused_pane_name() {
+        let mut app = App::new();
+        app.set_focus(Focus::Calls);
+        let painted = paint(&mut app, 120, 34);
+        assert!(painted.contains("Activity  [+posts]"), "{painted}");
+        assert!(!painted.contains("calls  [+posts]"), "{painted}");
+        assert_eq!(focus_name(Focus::Calls), "Activity");
+
+        app.help = true;
+        let help = paint(&mut app, 120, 34);
+        assert!(help.contains("story / Activity"), "{help}");
+        assert!(help.contains("POST group (Activity)"), "{help}");
+        assert!(!help.contains("story / calls"), "{help}");
     }
 
     #[test]
@@ -10491,8 +10420,8 @@ mod tests {
             json!({"ev": "thinking", "delta": true, "redacted": false, "text": " world"}),
         );
         handle_event(&mut app, json!({"ev": "complete", "n": 1}));
-        let thinks: Vec<String> = (0..app.story.len())
-            .filter_map(|i| match app.story.entry(i).map(|e| &e.block) {
+        let thinks: Vec<String> = (0..app.calls.len())
+            .filter_map(|i| match app.calls.entry(i).map(|e| &e.block) {
                 Some(RenderBlock::Thinking(t)) => Some(t.text()),
                 _ => None,
             })
@@ -10639,6 +10568,7 @@ mod tests {
     fn a_prompt_after_the_bridge_dies_says_so_instead_of_posting() {
         let mut app = App::new();
         assert!(!app.demo);
+        app.bridge_gone = true;
         start_step(None, &mut app, "carry on".into()).unwrap();
         assert!(!app.running, "nothing is running");
         assert_eq!(app.posts.len(), 0, "no POST group for a step that cannot run");
@@ -10705,8 +10635,8 @@ mod tests {
     #[test]
     fn a_held_mention_is_released_when_the_stream_ends() {
         let mut app = App::new();
-        apply_speech(&mut app.story, &mut app.stream, "use the <bash> tool for that", true);
-        app.stream.flush(&mut app.story);
+        apply_speech(&mut app.story, &mut app.calls, &mut app.stream, "use the <bash> tool for that", true);
+        app.stream.flush(&mut app.story, &mut app.calls);
         let held = (0..app.story.len())
             .filter_map(|i| match app.story.entry(i).map(|e| &e.block) {
                 Some(RenderBlock::AgentMessage(m)) => Some(m.text()),
@@ -10715,7 +10645,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("");
         assert!(!held.contains("tool for that"), "printed before the closer could arrive");
-        app.stream.finish(&mut app.story);
+        app.stream.finish(&mut app.story, &mut app.calls);
         let text = (0..app.story.len())
             .filter_map(|i| match app.story.entry(i).map(|e| &e.block) {
                 Some(RenderBlock::AgentMessage(m)) => Some(m.text()),
@@ -11391,7 +11321,7 @@ mod tests {
         app.running = true;
         app.turn_started = Some(Instant::now());
         app.status = "running".into();
-        start_thinking(&mut app.story, &mut app.stream);
+        start_thinking(&mut app.calls, &mut app.stream);
         let text = paint(&mut app, 140, 30);
 
         // Placement, not presence: "thinking" and a spinner painted anywhere on
@@ -11492,16 +11422,12 @@ mod tests {
         app.running = true;
         app.turn_started = Some(Instant::now());
         app.status = "running".into();
-        start_thinking(&mut app.story, &mut app.stream);
+        start_thinking(&mut app.calls, &mut app.stream);
         let _ = paint(&mut app, 140, 30);
         let area = app.turn_cancel.expect("cancel hit area");
         handle_mouse(
             &mut app,
-            click(
-                MouseEventKind::Down(MouseButton::Left),
-                area.x,
-                area.y,
-            ),
+            click(MouseEventKind::Down(MouseButton::Left), area.x, area.y),
         );
         assert!(app.want_stop);
     }

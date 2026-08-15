@@ -342,7 +342,7 @@ def _run_checks() -> None:
         from desmos.dialect import capabilities as _caps
         from desmos import subagent as _sa
         from desmos.loop import RESULT_CLIP as _clip_cap
-        from desmos.subagent_contracts import Budget as _Budget, TaskContract as _TC
+        from desmos.subagent_contracts import TaskContract as _TC
         import inspect as _insp
 
         caps = _caps()
@@ -351,9 +351,11 @@ def _run_checks() -> None:
         # so the name is derived from the module that writes it.
         from desmos.spill import SPILL_DIR as _spill_dir
         assert _spill_dir in caps, "the prompt does not say where a spilled result lands"
-        for _name, _cfg in _sa.AGENTS.items():
+        assert 'Prefer <shell id="main">' in caps
+        assert "5-second default" in caps and "timeout=30 for a build" in caps
+        assert "Use <bash> only for a quick hermetic one-shot" in caps
+        for _name in _sa.AGENTS:
             assert _name in caps, _name
-            assert str(_cfg["max_turns"]) in caps, f"{_name} turn cap not in the prompt"
         # fanout's default agent is not spawn's. The prompt says so because a
         # reader would otherwise assume they match.
         # step()'s turn cap is quoted in the prompt, so the prompt has to be
@@ -368,8 +370,6 @@ def _run_checks() -> None:
         assert "resume" in _insp.signature(_sa.spawn).parameters and "resume" in caps
         for _f in _TC.__dataclass_fields__:
             assert _f in caps, f"TaskContract.{_f} is not described in the prompt"
-        for _f in _Budget.__dataclass_fields__:
-            assert _f in caps, f"Budget.{_f} is not described in the prompt"
         for _n in ("structured_result", "judgment", "spawn", "fanout", "wait", "gather", "status"):
             assert callable(getattr(_sa, _n)), _n
             assert _n in caps, f"prompt names {_n} but subagent does not export it"
@@ -551,8 +551,18 @@ def _run_checks() -> None:
         assert any(s.name == "later" for s in world.skills)
         assert dispatch(world, Block("skill", "", {"name": "later"})).endswith("ok\n")
 
+        from desmos import subagent as reload_subagent
+
+        reload_events = []
+        def reload_emit(ev):
+            reload_events.append(ev)
+
+        reload_subagent.bind(world)
+        reload_subagent.set_emitter(reload_emit)
         dispatch(world, Block("reload_sdk", "", {}))
         assert "reload_sdk" in world.tools
+        assert reload_subagent.PARENT is world, "SDK reload orphaned later subagent spawns"
+        assert reload_subagent._EMIT is reload_emit, "SDK reload dropped child event routing"
 
         blocks = scan('<python>x = 1+1</python>\n<bash>echo hi</bash>')
         assert [b.tag for b in blocks] == ["python", "bash"]
@@ -1478,7 +1488,10 @@ def _run_checks() -> None:
         # persistent shell is the other half: state carries, exit codes come
         # back, and a program that asks a question can be answered -- which is
         # the case a one-shot subprocess cannot express at all.
+        from desmos.shell import DEADLINE as _shell_deadline
         from desmos.shell import close_all as _close_shells, head_tail, strip_ansi
+
+        assert _shell_deadline == 5.0, "the documented shell polling default drifted"
 
         w_sh = new_world(cwd, state_path=None, persist=False, ns={})
         try:

@@ -73,16 +73,6 @@ def _scope(cfg: Any, contract: TaskContract | None) -> str:
         lines.append("Return a cited prose report.")
         return "\n".join(lines)
 
-    budget = contract.budget
-    limits = []
-    if budget.max_turns is not None:
-        limits.append(f"{budget.max_turns} turns")
-    if budget.max_tokens is not None:
-        limits.append(f"{budget.max_tokens} tokens")
-    if budget.wall_seconds is not None:
-        limits.append(f"{budget.wall_seconds:g} seconds wall time")
-    if limits:
-        lines.append("explicit limits: " + ", ".join(limits))
     if contract.allowed_paths:
         lines.append("read paths: " + ", ".join(contract.allowed_paths))
     if contract.write_paths:

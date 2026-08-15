@@ -18,8 +18,8 @@ next `complete()` sees the change. No restart.
 
 ```
 <python>          exec, names persist
-<bash>            one subprocess in cwd, no state kept
-<shell>           persistent pty: cd/env/venv survive, answers prompts
+<bash>            isolated one-shot in cwd, no state kept
+<shell>           preferred persistent pty; 5s read windows, commands survive
 <edit>            unique replace (old --- new)
 <register>        grow a new tag
 <system>          write / delete a catalog note
@@ -36,10 +36,12 @@ next `complete()` sees the change. No restart.
 ```bash
 uv venv && uv pip install -e ".[kernel]"
 source .venv/bin/activate
+git submodule update --init vendor/comet   # only for the optional Comet frontend
 python -m desmos console          # IPython with step and world bound
 python -m desmos tui              # story | calls | input  (needs cargo)
 python -m desmos tui --demo       # same layout, no API key
 python -m desmos tui --grok       # grok-build pager, desmos as ACP agent
+python -m desmos comet            # Comet desktop frontend via ACP
 python -m desmos kernel           # install a Jupyter kernelspec named Desmos
 ```
 
@@ -75,7 +77,9 @@ holding the syscalls that POST produced. The pane title counts them (`#2/5`).
 Arrows still mean fold, so the group step gets its own pair of keys.
 
 `--grok` launches grok-build's pager-bin (`--minimal --no-leader`) with
-`python -m desmos acp` on stdio.
+`python -m desmos acp` on stdio. `desmos comet` builds and launches the
+vendored Comet desktop frontend with Desmos registered as an ACP harness; see
+[the Comet frontend guide](docs/comet-frontend.md) for scope and setup.
 
 `DESMOS_ACP` is our branch inside the committed pager, not upstream, so a sync
 that overwrites it hands `--grok` back to grok's own agent with no compile
