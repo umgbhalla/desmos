@@ -1096,6 +1096,21 @@ def self_check() -> None:
         boom = dispatch(world, Block("python", "print('x' * 9000)\n1/0", {}))
         assert "ZeroDivisionError" in boom, boom[:200]
 
+        # A warning raised while parsing the body must land in the result, not
+        # on the terminal. ast.parse used to run outside the redirect, so the
+        # bytes went to the real fd 2 and painted over the TUI's input box.
+        # Drive dispatch, and watch the real stderr for a leak.
+        import contextlib as _ctx
+        import io as _sio
+        import warnings as _warn
+
+        leak = _sio.StringIO()
+        with _warn.catch_warnings(), _ctx.redirect_stderr(leak):
+            _warn.simplefilter("always")
+            warned = dispatch(world, Block("python", "x = '\\|'\n'done'", {}))
+        assert "SyntaxWarning" in warned, warned[:200]
+        assert leak.getvalue() == "", f"a parse warning escaped to the terminal: {leak.getvalue()!r}"
+
         w_usage.ns["reset"]()
         assert w_usage.messages == []
 

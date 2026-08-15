@@ -54,8 +54,15 @@ def run_python(
     buf = _ChunkWriter(on_chunk)
     ns = world.ns
     try:
-        tree = ast.parse(src)
+        # ast.parse ran outside the redirect, so a warning raised while
+        # *parsing* -- SyntaxWarning for an invalid escape like '\|', or for
+        # `assert(x, y)` -- went to the real fd 2. Under the TUI that is the
+        # terminal: the bytes painted over whatever cell the cursor happened to
+        # be in, usually inside the input box, and nothing scheduled a redraw to
+        # clear them. The model never saw the warning either. Parse inside the
+        # capture, and name the file what the model actually wrote.
         with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+            tree = ast.parse(src, filename="<python>")
             if not tree.body:
                 return "ok"
             *head, last = tree.body
