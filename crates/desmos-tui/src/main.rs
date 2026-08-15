@@ -9350,6 +9350,55 @@ mod tests {
 
 
 
+    /// Every card in the calls pane has one left edge. The bullet sits in the
+    /// gutter and the header text starts two columns in; the body has to start
+    /// there too, or a stack of cards has header text at one column and bodies
+    /// at another and the pane reads as ragged.
+    #[test]
+    fn every_card_body_hangs_under_its_header() {
+        let mut app = App::new();
+        for ev in [
+            json!({"ev":"result","phase":"done","tag":"bash","body":"ls -la crates",
+                   "text":"total 8\ndrwxr-xr-x  desmos-tui\na line long enough that it has to wrap across more than one painted row"}),
+            json!({"ev":"result","phase":"done","tag":"read","attrs":{"path":"a.py"},
+                   "body":"","text":"one\ntwo\nthree"}),
+        ] {
+            handle_event(&mut app, ev);
+        }
+        // Twice: the first paint builds the layout the second one measures.
+        let _ = paint(&mut app, 160, 120);
+        let text = paint(&mut app, 160, 120);
+        // Drop the pane border and the accent gutter; what is left is the
+        // content column, where the bullet and the body both have to line up.
+        let rows: Vec<String> = rows_of(&text, app.call_area)
+            .lines()
+            .skip(1)
+            .map(|l| {
+                l.trim_end()
+                    .trim_end_matches('\u{2502}')
+                    .chars()
+                    .skip(2)
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .take_while(|l| !l.starts_with('\u{2500}'))
+            .filter(|l| !l.is_empty())
+            .collect();
+        let headers = rows.iter().filter(|l| l.starts_with("\u{25c6} ")).count();
+        let bodies = rows.len() - headers;
+        assert!(
+            headers >= 2 && bodies >= 4,
+            "need real cards with real bodies to prove anything: {rows:#?}"
+        );
+        for line in rows.iter().filter(|l| !l.starts_with("\u{25c6} ")) {
+            assert!(
+                line.starts_with("  ") && !line.starts_with("   "),
+                "body row is not hung under the header text: {line:?}\nall rows: {rows:#?}"
+            );
+        }
+    }
+
     /// The meta pane is a meter, not a second calls pane. It used to print the
     /// first line of the running command, so a bash call painted its argv into
     /// the status row -- paths, flags, whatever the body opened with -- and

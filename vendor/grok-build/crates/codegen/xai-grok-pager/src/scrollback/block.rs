@@ -288,8 +288,30 @@ pub fn prepend_bullet(output: &mut BlockOutput, ctx: &BlockContext, bullet: Opti
     };
 
     let bullet_span = Span::styled(format!("{bullet_str} "), Style::default().fg(color));
+    let hang = unicode_width::UnicodeWidthStr::width(bullet_str) + 1;
     first_line.content.spans.insert(0, bullet_span);
     crate::scrollback::types::shift_selection_metadata_for_prefix(first_line, 1);
+
+    // Hang the rest of the block under the header's text.
+    //
+    // The bullet goes on line 0 only, so without this every line below it
+    // starts two columns to the left of the title it belongs to. Stack a few
+    // cards and the pane has no left edge: header text at one column, bodies
+    // at another, and blocks that happen to be one line long agreeing with
+    // neither. This is the one place a bullet is applied, so it is the one
+    // place the indent it implies can be applied — a block cannot forget it,
+    // and there is no per-block rule to drift.
+    if hang == 0 {
+        return;
+    }
+    let pad = Span::raw(" ".repeat(hang));
+    for line in output.lines.iter_mut().skip(1) {
+        if line.content.spans.is_empty() {
+            continue;
+        }
+        line.content.spans.insert(0, pad.clone());
+        crate::scrollback::types::shift_selection_metadata_for_prefix(line, 1);
+    }
 }
 
 /// A stub block that just renders plain text.
