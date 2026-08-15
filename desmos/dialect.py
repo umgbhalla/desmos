@@ -98,11 +98,17 @@ def capabilities() -> str:
             " head, a line range -- instead of paging it back into the transcript. Filtering in"
             " the call itself is still cheaper than spilling and reading back.",
             "subagents: spawn(task, agent=\"general\") returns an id and does not block."
-            " agent is general (edit, 500 turns), explore (researcher, read-only, 500), or review"
-            " (critic, read-only, 300). fanout(tasks) spawns many and defaults to explore, not"
-            " general. wait(*ids, timeout=600) blocks; gather(ids) waits and joins their output;"
-            " status() lists running; result(id) reads one; spawn(resume=id) continues a finished"
-            " run. A child is an isolated World with its own transcript and no persist.",
+            " general/worker use gpt-5.6-sol with edit capability; explore/scout use"
+            " gpt-5.6-luna for read-only reconnaissance; review/reviewer and the read-only"
+            " security and planner roles use sol for advanced judgment; sniffer uses luna for"
+            " quick reproduction/localization. model and thinking are launch overrides."
+            " system_prompt, system_append, user_input, and task_template customize each child."
+            " Turn and token limits default to None and remain explicit Budget controls; wall"
+            " time is the default runaway guard. fanout(tasks) defaults to explore, not general;"
+            " spawn_many(specs) validates a whole batch before concurrent launch."
+            " wait(*ids, timeout=600) blocks; gather(ids) waits and joins their output; status()"
+            " lists running; result(id) reads one; spawn(resume=id) continues a finished run."
+            " A child is an isolated World with its own transcript and no persist.",
             "subagent contracts: spawn also takes a TaskContract instead of a string --"
             " objective, non_goals, deliverable_schema, required_evidence, acceptance_checks,"
             " allowed_tools, allowed_paths, write_paths, dependencies, require_tool_use, and a budget:"

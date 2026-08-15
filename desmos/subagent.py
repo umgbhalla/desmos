@@ -23,8 +23,12 @@ from desmos.subagent_contracts import Judgment, RunResult, TaskContract, judge, 
 
 PERSONAS: dict[str, str] = {
     "terse": "Answer in the fewest words that are still correct. No preamble.",
-    "researcher": "Read widely before concluding. Cite file:line for every claim.",
+    "researcher": "Map evidence before concluding. Cite file:line for every claim.",
+    "builder": "Implement the smallest complete change, run its real entry point, and report artifacts.",
     "critic": "Look for what is wrong, missing, or unproven. Do not praise.",
+    "security": "Threat-model trust boundaries, seek concrete exploit paths, and separate likelihood from impact.",
+    "planner": "Compare viable designs, expose constraints and irreversible choices, then give an ordered plan.",
+    "debugger": "Reproduce first, minimize the failure, localize the first wrong state, and distinguish cause from symptom.",
 }
 
 # capability modes: which tags the child may use
@@ -34,13 +38,28 @@ CAPS: dict[str, tuple[str, ...]] = {
     "full": (),  # empty tuple == inherit everything
 }
 
+# Sol is the default for advanced judgment/implementation; Luna handles cheap,
+# bounded discovery. Every field remains a spawn-time override. The legacy
+# names are aliases so existing callers keep working.
 AGENTS: dict[str, dict[str, Any]] = {
-    # A cap is a deadline, and a child that hits one answers from half a probe
-    # rather than saying it ran out. These are a runaway guard, not a budget:
-    # the real stop is the child deciding it is done.
-    "general": {"capability": "edit", "max_turns": 500},
-    "explore": {"persona": "researcher", "capability": "read", "max_turns": 500},
-    "review": {"persona": "critic", "capability": "read", "max_turns": 300},
+    "general": {"persona": "builder", "capability": "edit", "model": "gpt-5.6-sol", "max_turns": None},
+    "worker": {"persona": "builder", "capability": "edit", "model": "gpt-5.6-sol", "max_turns": None},
+    "explore": {"persona": "researcher", "capability": "read", "model": "gpt-5.6-luna", "max_turns": None},
+    "scout": {"persona": "researcher", "capability": "read", "model": "gpt-5.6-luna", "max_turns": None},
+    "review": {"persona": "critic", "capability": "read", "model": "gpt-5.6-sol", "max_turns": None},
+    "reviewer": {"persona": "critic", "capability": "read", "model": "gpt-5.6-sol", "max_turns": None},
+    "security": {"persona": "security", "capability": "read", "model": "gpt-5.6-sol", "max_turns": None},
+    "planner": {"persona": "planner", "capability": "read", "model": "gpt-5.6-sol", "max_turns": None},
+    "sniffer": {"persona": "debugger", "capability": "read", "model": "gpt-5.6-luna", "max_turns": None},
+}
+
+ROLE_GUIDE: dict[str, str] = {
+    "scout": "fast repository reconnaissance and evidence maps",
+    "worker": "implementation and verification with edit capability",
+    "reviewer": "independent spec, diff, and evidence criticism",
+    "security": "trust-boundary, abuse-case, and vulnerability audit",
+    "planner": "architecture options, constraints, and ordered design plans",
+    "sniffer": "failure reproduction, minimization, and first-wrong-state localization",
 }
 
 
@@ -52,9 +71,16 @@ class EffectiveConfig:
     capability: str = "edit"
     model: str | None = None
     thinking: str | None = None
-    max_turns: int = 500
+    max_turns: int | None = None
     cwd: str | None = None
     context: str = "new"  # new | resumed
+    # Launch-time prompt controls. system_prompt replaces the generated child
+    # prompt; system_append augments it. user_input replaces the rendered task,
+    # while task_template transforms it with a required {task} placeholder.
+    system_prompt: str | None = None
+    system_append: str | None = None
+    user_input: str | None = None
+    task_template: str | None = None
     # None lets legacy free-text tasks infer whether they claim observations.
     # Typed contracts carry their own explicit requirement.
     require_tool_use: bool | None = None
@@ -79,9 +105,13 @@ def resolve(agent: str = "general", **over: Any) -> EffectiveConfig:
         capability=cap,
         model=d.get("model"),
         thinking=d.get("thinking"),
-        max_turns=int(d.get("max_turns", 500)),
+        max_turns=(int(d["max_turns"]) if d.get("max_turns") is not None else None),
         cwd=d.get("cwd"),
         context=d.get("context", "new"),
+        system_prompt=d.get("system_prompt"),
+        system_append=d.get("system_append"),
+        user_input=d.get("user_input"),
+        task_template=d.get("task_template"),
         require_tool_use=(
             bool(d["require_tool_use"])
             if d.get("require_tool_use") is not None
@@ -235,9 +265,26 @@ def _child_world(cfg: EffectiveConfig, parent: Any, contract: TaskContract | Non
         )
     from desmos.subagent_prompt import child_system_prompt
 
-    w.system_override = child_system_prompt(w, cfg, contract)
+    generated = child_system_prompt(w, cfg, contract)
+    w.system_override = cfg.system_prompt if cfg.system_prompt is not None else generated
+    if cfg.system_append:
+        w.system_override = w.system_override.rstrip() + "\n\n" + cfg.system_append.strip()
     w.complete_fn = getattr(parent, "complete_fn", None)
     return w
+
+
+def _user_prompt(run: Run) -> str:
+    """Render the initial child user block from launch-time controls."""
+    rendered_task = (
+        run.contract.prompt()
+        if run.structured and run.contract is not None
+        else run.task
+    )
+    if run.cfg.task_template is not None:
+        if "{task}" not in run.cfg.task_template:
+            raise ValueError("task_template must contain {task}")
+        rendered_task = run.cfg.task_template.format(task=rendered_task)
+    return run.cfg.user_input if run.cfg.user_input is not None else rendered_task
 
 
 def _execute(run: Run, parent: Any) -> None:
@@ -254,9 +301,9 @@ def _execute(run: Run, parent: Any) -> None:
     def should_stop() -> bool:
         if budget is None:
             return False
-        if time.time() - run.started >= budget.wall_seconds:
+        if budget.wall_seconds is not None and time.time() - run.started >= budget.wall_seconds:
             budget_stop[0] = budget_stop[0] or "wall_time_budget"
-        elif _token_total(run.usage) >= budget.max_tokens:
+        elif budget.max_tokens is not None and _token_total(run.usage) >= budget.max_tokens:
             budget_stop[0] = budget_stop[0] or "token_budget"
         return bool(budget_stop[0])
 
@@ -305,11 +352,16 @@ def _execute(run: Run, parent: Any) -> None:
             payload = {k: v for k, v in ev.items() if k != "ev"}
             _emit({"ev": "child", "id": run.id, "kind": kind, **payload})
 
-        prompt = run.contract.prompt() if run.structured and run.contract is not None else run.task
-        max_turns = min(
-            run.cfg.max_turns,
-            budget.max_turns if budget is not None else run.cfg.max_turns,
-        )
+        prompt = _user_prompt(run)
+        limits = [
+            value
+            for value in (
+                run.cfg.max_turns,
+                budget.max_turns if budget is not None else None,
+            )
+            if value is not None
+        ]
+        max_turns = min(limits) if limits else None
         _DEPTH.n = 1
         try:
             out = run_turns(
@@ -330,12 +382,12 @@ def _execute(run: Run, parent: Any) -> None:
             require_tool = _legacy_requires_tool(run.task)
         no_tool_failure = False
         if require_tool and not run.observed_tools and not budget_stop[0]:
-            remaining = max_turns - len(w.log)
+            remaining = None if max_turns is None else max_turns - len(w.log)
             run.steers += 1
             run.stage = "steering"
             run.progress = "no syscall observed; requiring action"
             publish_progress()
-            if remaining > 0:
+            if remaining is None or remaining > 0:
                 _DEPTH.n = 1
                 try:
                     out = run_turns(
@@ -356,7 +408,7 @@ def _execute(run: Run, parent: Any) -> None:
         from desmos.scan import scan
 
         forced_turn_cap = False
-        if scan(out) and not budget_stop[0]:
+        if max_turns is not None and scan(out) and not budget_stop[0]:
             # Preserve the old compatibility behavior: a child that spends its
             # last turn on a tool call gets one toolless chance to summarize.
             forced_turn_cap = True
@@ -463,12 +515,30 @@ def spawn(
     agent: str = "general",
     *,
     resume: str | None = None,
+    model: str | None = None,
+    thinking: str | None = None,
+    system_prompt: str | None = None,
+    system_append: str | None = None,
+    user_input: str | None = None,
+    task_template: str | None = None,
+    max_turns: int | None = None,
+    parent: Any = None,
     **over: Any,
 ) -> str:
     """Start a child immediately after its typed dependencies are accepted."""
     if getattr(_DEPTH, "n", 0) >= 1:
         raise ValueError("subagent depth cap: children cannot spawn")
-    parent = over.pop("parent", None) or _parent()
+    parent = parent or _parent()
+    explicit = {
+        "model": model,
+        "thinking": thinking,
+        "system_prompt": system_prompt,
+        "system_append": system_append,
+        "user_input": user_input,
+        "task_template": task_template,
+        "max_turns": max_turns,
+    }
+    over.update({key: value for key, value in explicit.items() if value is not None})
     structured = isinstance(task, TaskContract)
     contract = task if structured else TaskContract.legacy(str(task))
     for dependency in contract.dependencies:
@@ -481,8 +551,12 @@ def spawn(
             raise ValueError(f"dependency {dependency!r} was not accepted")
 
     cfg = resolve(agent, **over)
-    if structured:
-        cfg.max_turns = min(cfg.max_turns, contract.budget.max_turns)
+    if structured and contract.budget.max_turns is not None:
+        cfg.max_turns = (
+            contract.budget.max_turns
+            if cfg.max_turns is None
+            else min(cfg.max_turns, contract.budget.max_turns)
+        )
     run = Run(
         id=uuid.uuid4().hex[:8],
         task=contract.objective,
@@ -591,9 +665,41 @@ def judgment(rid: str) -> Judgment | None:
     return run.judgment if run is not None else None
 
 
+def spawn_many(specs: list[dict[str, Any]], *, parent: Any = None) -> list[str]:
+    """Validate a batch, then enqueue every child without waiting between them.
+
+    Each item requires ``task`` and may carry any normal spawn override plus
+    ``agent`` and ``resume``. Validation is completed for the whole batch
+    before the first child starts, avoiding a half-launched malformed batch.
+    The shared executor provides bounded real concurrency.
+    """
+    prepared: list[tuple[str | TaskContract, str, str | None, dict[str, Any]]] = []
+    for index, raw in enumerate(specs):
+        if not isinstance(raw, dict):
+            raise TypeError(f"spawn batch item {index} must be an object")
+        item = dict(raw)
+        if "task" not in item:
+            raise ValueError(f"spawn batch item {index} has no task")
+        task = item.pop("task")
+        if not isinstance(task, (str, TaskContract)):
+            raise TypeError(f"spawn batch item {index} task must be text or TaskContract")
+        agent = str(item.pop("agent", "general"))
+        resume = item.pop("resume", None)
+        resolve(agent, **item)
+        prepared.append((task, agent, resume, item))
+    return [
+        spawn(task, agent=agent, resume=resume, parent=parent, **over)
+        for task, agent, resume, over in prepared
+    ]
+
+
 def fanout(tasks: list[str | TaskContract], agent: str = "explore", **over: Any) -> list[str]:
-    """Spawn one child per task. Returns ids in order."""
-    return [spawn(t, agent, **over) for t in tasks]
+    """Spawn one child per task concurrently. Returns ids in input order."""
+    parent = over.pop("parent", None)
+    return spawn_many(
+        [{"task": task, "agent": agent, **over} for task in tasks],
+        parent=parent,
+    )
 
 
 def gather(ids: list[str], timeout: float = 600.0) -> str:

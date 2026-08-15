@@ -74,10 +74,14 @@ def _scope(cfg: Any, contract: TaskContract | None) -> str:
         return "\n".join(lines)
 
     budget = contract.budget
-    lines.append(
-        f"budget: {budget.max_turns} turns, {budget.max_tokens} tokens, "
-        f"{budget.wall_seconds:g} seconds"
+    turns = "unlimited turns" if budget.max_turns is None else f"{budget.max_turns} turns"
+    tokens = "unlimited tokens" if budget.max_tokens is None else f"{budget.max_tokens} tokens"
+    seconds = (
+        "unlimited wall time"
+        if budget.wall_seconds is None
+        else f"{budget.wall_seconds:g} seconds"
     )
+    lines.append(f"budget: {turns}, {tokens}, {seconds}")
     if contract.allowed_paths:
         lines.append("read paths: " + ", ".join(contract.allowed_paths))
     if contract.write_paths:

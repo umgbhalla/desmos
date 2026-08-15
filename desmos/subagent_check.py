@@ -85,6 +85,15 @@ def self_check() -> None:
         subagents.set_emitter(events.append)
         subagents.bind(parent)
         try:
+            defaults = Budget()
+            assert defaults.max_turns is None and defaults.max_tokens is None
+            assert subagents.resolve("worker").model == "gpt-5.6-sol"
+            assert subagents.resolve("scout").model == "gpt-5.6-luna"
+            assert subagents.resolve("security").capability == "read"
+            assert set(subagents.ROLE_GUIDE) == {
+                "scout", "worker", "reviewer", "security", "planner", "sniffer"
+            }
+
             contract = TaskContract(
                 objective="Prove that two plus two is four.",
                 non_goals=("Do not edit files.",),
@@ -94,11 +103,11 @@ def self_check() -> None:
                 allowed_tools=("python",),
                 budget=Budget(max_turns=3, max_tokens=100, wall_seconds=5),
             )
-            rid = subagents.spawn(contract, agent="explore", parent=parent)
+            rid = subagents.spawn(contract, agent="explore", parent=parent, model="claude-opus-5")
             settled = subagents.wait(rid, timeout=5, poll=0.01)[0]
             run = subagents.RUNS[rid]
             assert settled["task"] == contract.objective
-            assert settled["state"] == "done" and settled["stage"] == "accepted"
+            assert settled["state"] == "done" and settled["stage"] == "accepted", settled
             assert settled["stop_reason"] == "completed" and settled["accepted"] is True
             assert settled["budget"]["tokens"] == {"used": 10, "limit": 100}
             assert settled["observed_tools"] == ["python"]
@@ -123,11 +132,11 @@ def self_check() -> None:
                 budget=Budget(max_turns=2, max_tokens=100, wall_seconds=5),
                 dependencies=(rid,),
             )
-            dependent_id = subagents.spawn(dependent, agent="explore", parent=parent)
+            dependent_id = subagents.spawn(dependent, agent="explore", parent=parent, model="claude-opus-5")
             subagents.wait(dependent_id, timeout=5, poll=0.01)
             assert subagents.judgment(dependent_id).accepted is True
 
-            rejected_id = subagents.spawn(contract, agent="explore", parent=parent)
+            rejected_id = subagents.spawn(contract, agent="explore", parent=parent, model="claude-opus-5")
             subagents.wait(rejected_id, timeout=5, poll=0.01)
             rejected = subagents.RUNS[rejected_id]
             assert rejected.state == "done" and rejected.stage == "rejected"
@@ -141,7 +150,7 @@ def self_check() -> None:
                 allowed_tools=("python",),
                 budget=Budget(max_turns=2, max_tokens=5, wall_seconds=5),
             )
-            tiny_id = subagents.spawn(tiny, agent="explore", parent=parent)
+            tiny_id = subagents.spawn(tiny, agent="explore", parent=parent, model="claude-opus-5")
             subagents.wait(tiny_id, timeout=5, poll=0.01)
             tiny_run = subagents.RUNS[tiny_id]
             assert tiny_run.state == "stopped" and tiny_run.stop_reason == "token_budget"
@@ -150,7 +159,7 @@ def self_check() -> None:
             # The observed production failure: narration with zero calls. The
             # controller gives exactly one corrective step, then accepts only
             # because a real syscall/result follows.
-            recovery_id = subagents.spawn("Inspect the repository.", agent="explore", parent=parent)
+            recovery_id = subagents.spawn("Inspect the repository.", agent="explore", parent=parent, model="claude-opus-5")
             subagents.wait(recovery_id, timeout=5, poll=0.01)
             recovery = subagents.RUNS[recovery_id]
             assert recovery.state == "done" and recovery.result.startswith("recovered report")
@@ -162,7 +171,7 @@ def self_check() -> None:
                 for ev in events
             )
 
-            failure_id = subagents.spawn("Inspect but ignore your tools.", agent="explore", parent=parent)
+            failure_id = subagents.spawn("Inspect but ignore your tools.", agent="explore", parent=parent, model="claude-opus-5")
             subagents.wait(failure_id, timeout=5, poll=0.01)
             failure = subagents.RUNS[failure_id]
             assert failure.state == "failed"
@@ -171,6 +180,23 @@ def self_check() -> None:
 
             child = subagents._child_world(subagents.resolve("explore"), parent, contract)
             assert set(child.tools) <= {"python"} and "agents" not in child.tools
+            custom_cfg = subagents.resolve(
+                "planner",
+                model="gpt-5.6-luna",
+                system_prompt="CUSTOM SYSTEM",
+                system_append="CUSTOM APPEND",
+                task_template="wrapped: {task}",
+            )
+            custom_child = subagents._child_world(custom_cfg, parent, contract)
+            assert custom_child.model == "gpt-5.6-luna"
+            assert custom_child.system_override == "CUSTOM SYSTEM\n\nCUSTOM APPEND"
+            custom_run = subagents.Run(
+                id="prompt", task=contract.objective, cfg=custom_cfg,
+                contract=contract, structured=True,
+            )
+            assert subagents._user_prompt(custom_run).startswith("wrapped: Execute this typed task")
+            custom_run.cfg.user_input = "REPLACEMENT USER BLOCK"
+            assert subagents._user_prompt(custom_run) == "REPLACEMENT USER BLOCK"
             parent.model = "gpt-5.6-sol"
             openai_child = subagents._child_world(subagents.resolve("explore"), parent, contract)
             assert "# openai lane" in openai_child.system_override
@@ -185,6 +211,83 @@ def self_check() -> None:
             subagents.PARENT = old_parent
 
 
+def parallel_tool_check() -> None:
+    """The XML-facing batch waits at a barrier, proving both children started."""
+    import threading
+    from desmos.subagent_tool import handle
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        parent = new_world(root, state_path=None, persist=False, ns={})
+        barrier = threading.Barrier(2)
+        seen: list[tuple[str, str, str]] = []
+
+        def complete(model: str, system: str, messages: list[dict[str, Any]], _max: int) -> dict[str, Any]:
+            user = str(messages[-1]["content"])
+            seen.append((model, system, user))
+            barrier.wait(timeout=3)
+            return response("parallel done")
+
+        parent.complete_fn = complete
+        old_dir = subagents.DIR
+        old_parent = subagents.PARENT
+        subagents.DIR = root / "runs"
+        subagents.RUNS.clear()
+        subagents.bind(parent)
+        try:
+            malformed = {
+                "op": "spawn_many",
+                "tasks": [
+                    {"task": "would otherwise start", "agent": "scout"},
+                    {"task": "invalid", "agent": "not-a-role"},
+                ],
+            }
+            try:
+                handle(json.dumps(malformed))
+                raise AssertionError("malformed batch launched")
+            except KeyError:
+                pass
+            assert not subagents.RUNS, "batch validation was not atomic"
+
+            command = {
+                "op": "spawn_many",
+                "tasks": [
+                    {
+                        "task": "alpha",
+                        "agent": "worker",
+                        "model": "gpt-5.6-sol",
+                        "system_prompt": "SYS-A",
+                        "system_append": "APP-A",
+                        "task_template": "TASK::{task}",
+                        "require_tool_use": False,
+                    },
+                    {
+                        "task": "beta",
+                        "agent": "scout",
+                        "model": "gpt-5.6-luna",
+                        "system_prompt": "SYS-B",
+                        "user_input": "USER-B",
+                        "require_tool_use": False,
+                    },
+                ],
+            }
+            launched = json.loads(handle(json.dumps(command)))
+            assert launched["count"] == 2 and len(launched["ids"]) == 2
+            settled = subagents.wait(*launched["ids"], timeout=5, poll=0.01)
+            assert all(row["state"] == "done" for row in settled), settled
+            assert {row[0] for row in seen} == {"gpt-5.6-sol", "gpt-5.6-luna"}
+            assert any(row[1] == "SYS-A\n\nAPP-A" and "TASK::alpha" in row[2] for row in seen)
+            assert any(row[1] == "SYS-B" and "USER-B" in row[2] for row in seen)
+        finally:
+            subagents.wait(timeout=5, poll=0.01)
+            subagents.RUNS.clear()
+            subagents.DIR = old_dir
+            subagents.PARENT = old_parent
+
+
+
+
 if __name__ == "__main__":
     self_check()
+    parallel_tool_check()
     print("subagent contract check ok")

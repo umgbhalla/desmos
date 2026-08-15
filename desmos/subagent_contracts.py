@@ -7,18 +7,21 @@ from typing import Any
 
 @dataclass(frozen=True)
 class Budget:
-    max_turns: int = 32
-    max_tokens: int = 100_000
-    wall_seconds: float = 600.0
+    # Turn and token ceilings are opt-in. Long coding tasks used to die
+    # mid-edit at arbitrary defaults; the parent can still set either guard
+    # explicitly for bounded probes. Wall time remains a default runaway guard.
+    max_turns: int | None = None
+    max_tokens: int | None = None
+    wall_seconds: float | None = 600.0
     max_retries: int = 0
 
     def __post_init__(self) -> None:
-        if self.max_turns < 1:
-            raise ValueError("budget max_turns must be positive")
-        if self.max_tokens < 1:
-            raise ValueError("budget max_tokens must be positive")
-        if self.wall_seconds <= 0:
-            raise ValueError("budget wall_seconds must be positive")
+        if self.max_turns is not None and self.max_turns < 1:
+            raise ValueError("budget max_turns must be positive or None")
+        if self.max_tokens is not None and self.max_tokens < 1:
+            raise ValueError("budget max_tokens must be positive or None")
+        if self.wall_seconds is not None and self.wall_seconds <= 0:
+            raise ValueError("budget wall_seconds must be positive or None")
         if self.max_retries < 0:
             raise ValueError("budget max_retries cannot be negative")
 
@@ -56,7 +59,7 @@ class TaskContract:
             raise ValueError(f"write paths are outside allowed_paths: {outside}")
 
     @classmethod
-    def legacy(cls, task: str, *, max_turns: int = 500) -> TaskContract:
+    def legacy(cls, task: str, *, max_turns: int | None = None) -> TaskContract:
         return cls(objective=task, budget=Budget(max_turns=max_turns))
 
     def prompt(self) -> str:
