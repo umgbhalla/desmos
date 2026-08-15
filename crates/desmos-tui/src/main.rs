@@ -96,6 +96,8 @@ use xai_grok_pager_diff::diff_hunks_from_strings;
 #[cfg(test)]
 use xai_grok_pager::scrollback::blocks::SubagentBlockKind;
 use xai_grok_pager::clipboard::SystemClipboard;
+use xai_grok_pager::scrollback::render::InlineMediaPlacement;
+use xai_grok_pager::terminal::image as gfx;
 use xai_grok_pager::scrollback::{
     DisplayMode, EntryId, RenderBlock, ScratchBuffer, ScrollbackEntry, ScrollbackPane,
     ScrollbackState,
@@ -1029,6 +1031,10 @@ struct App {
     picker: picker::Picker,
     story_scratch: ScratchBuffer,
     calls_scratch: ScratchBuffer,
+    /// Inline-image state: what has been uploaded to the terminal, and where
+    /// this frame wants it drawn. Populated during `draw`, consumed by
+    /// `flush_media` right after the frame lands.
+    media: Media,
     story_sel: ResolvedSelectionModel,
     calls_sel: ResolvedSelectionModel,
     post_n: u64,
@@ -1424,6 +1430,7 @@ impl App {
             picker: picker::Picker::default(),
             story_scratch: ScratchBuffer::new(),
             calls_scratch: ScratchBuffer::new(),
+            media: Media::default(),
             story_sel: ResolvedSelectionModel::default(),
             calls_sel: ResolvedSelectionModel::default(),
             post_n: 0,
@@ -2261,7 +2268,9 @@ fn run(
         }
 
         if dirty {
+            app.media.frame.clear();
             terminal.draw(|f| draw(f, app))?;
+            flush_media(app, &mut io::stdout())?;
             dirty = false;
         }
 
@@ -3510,6 +3519,115 @@ fn image_prompt_text(images: &[String]) -> String {
     names.join(", ")
 }
 
+/// Inline-image bookkeeping for the Kitty graphics protocol.
+///
+/// The scrollback renderer reserves the rows and hands back an
+/// [`InlineMediaPlacement`] per visible image; the pixels are never part of
+/// the ratatui buffer. They are escape sequences written straight to the
+/// terminal after the frame is flushed, which is why this state lives outside
+/// the draw pass: an image is transmitted once per path, then only *placed*
+/// (a ~80 byte escape) on every later frame.
+#[derive(Default)]
+struct Media {
+    /// Kitty image id per file, allocated on first successful transmit.
+    ids: HashMap<PathBuf, u32>,
+    /// Encoded bytes per file, kept so a re-place never re-reads the disk.
+    bytes: HashMap<PathBuf, Vec<u8>>,
+    next_id: u32,
+    /// Ids holding a live placement from the previous frame. Anything that
+    /// scrolls out of view has to be deleted explicitly -- a Kitty placement
+    /// outlives the cells it was drawn over.
+    placed: HashSet<u32>,
+    /// Placements collected during the current draw pass.
+    frame: Vec<InlineMediaPlacement>,
+}
+
+/// A story row for one attached image: the file name, its path, and the
+/// picture underneath. `None` when the path is not a decodable image, in
+/// which case nothing is pushed and the prompt row stands alone.
+fn media_block(path: &str) -> Option<RenderBlock> {
+    use xai_grok_pager::prompt_images::ScrollbackImageRef;
+    ScrollbackImageRef::from_path(path)?;
+    let name = std::path::Path::new(path)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.to_string());
+    Some(RenderBlock::ToolCall(ToolCallBlock::Other(
+        OtherToolCallBlock::new("image", name).with_media_ref(path, false),
+    )))
+}
+
+/// Draw the frame's inline images.
+///
+/// Runs after `terminal.draw`: the placement escapes address screen cells the
+/// frame just painted, and Kitty draws them under (z = -1) the text already
+/// there. The cursor is saved and restored around the batch, because placing
+/// an image moves it and the composer's caret was set by the frame.
+fn flush_media(app: &mut App, out: &mut impl Write) -> io::Result<()> {
+    let frame = std::mem::take(&mut app.media.frame);
+    if !gfx::scrollback_inline_overlay_active() {
+        return Ok(());
+    }
+    let mut esc = String::new();
+    let mut now: HashSet<u32> = HashSet::new();
+    let mut seen: HashSet<PathBuf> = HashSet::new();
+    for p in frame {
+        // `full_rows == 0` is the text-affordance placement the renderer emits
+        // for terminals without graphics: no pixels, just a clickable row.
+        if p.full_rows == 0 || p.info.is_video || !seen.insert(p.info.path.clone()) {
+            continue;
+        }
+        let path = p.info.path.clone();
+        if !app.media.bytes.contains_key(&path) {
+            let Ok(raw) = std::fs::read(&path) else { continue };
+            let Some(ready) = gfx::prepare_overlay_image_bytes(&raw) else {
+                continue;
+            };
+            app.media.bytes.insert(path.clone(), ready);
+        }
+        let known = app.media.ids.get(&path).copied();
+        let id = known.unwrap_or(app.media.next_id + 1);
+        let bytes = &app.media.bytes[&path];
+        if known.is_none() {
+            let Some(t) = gfx::transmit_inline_image(bytes, id) else {
+                continue;
+            };
+            esc.push_str(&t);
+        }
+        let Some(place) = gfx::place_inline_image(
+            bytes,
+            p.info.width,
+            p.info.height,
+            p.screen_rect,
+            p.full_rows,
+            p.top_crop_rows,
+            id,
+            known.is_none(),
+        ) else {
+            continue;
+        };
+        esc.push_str(&place);
+        now.insert(id);
+        if known.is_none() {
+            app.media.next_id = id;
+            app.media.ids.insert(path, id);
+        }
+    }
+    for id in &app.media.placed {
+        if !now.contains(id) {
+            esc.push_str(&gfx::clear_kitty_image(*id));
+        }
+    }
+    app.media.placed = now;
+    if esc.is_empty() {
+        return Ok(());
+    }
+    out.write_all(b"\x1b7")?;
+    out.write_all(esc.as_bytes())?;
+    out.write_all(b"\x1b8")?;
+    out.flush()
+}
+
 fn apply_paste(app: &mut App, text: &str, inline: bool) {
     if app.focus != Focus::Input {
         app.set_focus(Focus::Input);
@@ -3599,6 +3717,13 @@ fn start_step(
     images: Vec<String>,
 ) -> io::Result<()> {
     app.story_push(RenderBlock::user_prompt(&line));
+    // The attachments ride under the prompt that carries them: one row per
+    // image, with the picture itself where the terminal can draw one.
+    for path in &images {
+        if let Some(block) = media_block(path) {
+            app.story_push(block);
+        }
+    }
     app.story.follow_new_turn(None, false);
     if app.viewing.is_some() {
         app.notify("esc to leave session");
@@ -4705,6 +4830,7 @@ fn draw_scrollback(
     focused: bool,
     mouse: Option<(u16, u16)>,
     text: &TextSel,
+    media: &mut Vec<InlineMediaPlacement>,
 ) {
     let theme = Theme::current();
     let border = if focused {
@@ -4743,6 +4869,7 @@ fn draw_scrollback(
         .with_hovered_entry(hover)
         .render_with_scratch(inner, f.buffer_mut(), state, scratch);
     *sel_model = output.selection_model;
+    media.extend(output.inline_media);
     if let Some(sel) = output.selection_box {
         sel.render(f.buffer_mut());
     }
@@ -5080,6 +5207,7 @@ fn draw(f: &mut Frame, app: &mut App) {
             app.focus == Focus::Story,
             app.mouse,
             &child.story_text,
+            &mut app.media.frame,
         );
         draw_scrollback(
             f,
@@ -5092,6 +5220,7 @@ fn draw(f: &mut Frame, app: &mut App) {
             app.focus == Focus::Calls,
             app.mouse,
             &child.calls_text,
+            &mut app.media.frame,
         );
     } else {
         draw_scrollback(
@@ -5105,6 +5234,7 @@ fn draw(f: &mut Frame, app: &mut App) {
             app.focus == Focus::Story,
             app.mouse,
             &app.story_text,
+            &mut app.media.frame,
         );
         draw_scrollback(
             f,
@@ -5117,6 +5247,7 @@ fn draw(f: &mut Frame, app: &mut App) {
             app.focus == Focus::Calls,
             app.mouse,
             &app.calls_text,
+            &mut app.media.frame,
         );
     }
     let n = app.post_n;
@@ -12402,5 +12533,112 @@ mod tests {
             x += tab.label().chars().count() as u16 + 2;
         }
         x
+    }
+
+    // ── inline images ────────────────────────────────────────────────
+
+    /// A 1x1 transparent PNG: small enough to inline, real enough that
+    /// `ScrollbackImageRef::from_path` decodes dimensions off it and the
+    /// Kitty path recognises the magic and transmits it unconverted.
+    const PNG_1X1: &[u8] = &[
+        0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44,
+        0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1F,
+        0x15, 0xC4, 0x89, 0x00, 0x00, 0x00, 0x0A, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9C, 0x63, 0x00,
+        0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00, 0x00, 0x00, 0x00, 0x49,
+        0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+    ];
+
+    fn png_file(name: &str) -> PathBuf {
+        let p = std::env::temp_dir().join(format!("desmos-tui-{name}.png"));
+        std::fs::write(&p, PNG_1X1).unwrap();
+        p
+    }
+
+    #[test]
+    fn media_block_only_for_decodable_images() {
+        let txt = std::env::temp_dir().join("desmos-tui-not-an-image.txt");
+        std::fs::write(&txt, b"words").unwrap();
+        assert!(media_block(txt.to_str().unwrap()).is_none());
+        assert!(media_block("/no/such/file.png").is_none());
+        let png = png_file("block");
+        assert!(media_block(png.to_str().unwrap()).is_some());
+    }
+
+    /// The wiring, not the renderer. An attachment on a prompt has to reach
+    /// the story as a media block, survive a real `draw`, and come back out
+    /// as a placement the flush turns into Kitty escapes -- then be deleted
+    /// once it stops being drawn, or the picture outlives its cells.
+    #[test]
+    fn attached_image_places_then_clears() {
+        let _kitty = gfx::set_protocol_for_test(gfx::GraphicsProtocol::Kitty);
+        let png = png_file("attach");
+        let mut app = App::new();
+        start_step(
+            None,
+            &mut app,
+            "look at this".into(),
+            vec![png.to_string_lossy().into_owned()],
+        )
+        .unwrap();
+
+        app.media.frame.clear();
+        let backend = TestBackend::new(140, 40);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        assert!(
+            !app.media.frame.is_empty(),
+            "draw produced no inline-media placement"
+        );
+
+        let mut out: Vec<u8> = Vec::new();
+        flush_media(&mut app, &mut out).unwrap();
+        let esc = String::from_utf8_lossy(&out).into_owned();
+        assert!(esc.contains("\x1b_Ga=t"), "image was never transmitted");
+        assert!(esc.contains("a=p,i="), "image was never placed");
+        assert_eq!(app.media.placed.len(), 1, "placement not recorded");
+
+        let mut gone: Vec<u8> = Vec::new();
+        flush_media(&mut app, &mut gone).unwrap();
+        let esc = String::from_utf8_lossy(&gone).into_owned();
+        assert!(esc.contains("a=d,d=i,i="), "stale placement never cleared");
+        assert!(app.media.placed.is_empty());
+    }
+
+    /// A `see` card carries the paths it attached, so the Activity pane draws
+    /// the picture the model just looked at. No separate plumbing: the block
+    /// scrapes image paths out of its own output text.
+    #[test]
+    fn a_see_card_renders_its_image() {
+        let _kitty = gfx::set_protocol_for_test(gfx::GraphicsProtocol::Kitty);
+        let png = png_file("see");
+        let p = png.to_string_lossy().into_owned();
+        let card = wire_syscall(
+            "see",
+            &p,
+            &json!({}),
+            &format!("attached 1 image(s): {p} [1KB]"),
+        );
+        let mut app = App::new();
+        app.call_push(card);
+        app.media.frame.clear();
+        let backend = TestBackend::new(140, 40);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        assert!(
+            !app.media.frame.is_empty(),
+            "see card produced no image placement"
+        );
+    }
+
+    /// Without inline graphics nothing is written to the terminal at all --
+    /// the renderer falls back to a text `[Open]` row on its own.
+    #[test]
+    fn no_graphics_writes_no_escapes() {
+        let _none = gfx::set_protocol_for_test(gfx::GraphicsProtocol::None);
+        let mut app = App::new();
+        app.media.frame.clear();
+        let mut out: Vec<u8> = Vec::new();
+        flush_media(&mut app, &mut out).unwrap();
+        assert!(out.is_empty());
     }
 }

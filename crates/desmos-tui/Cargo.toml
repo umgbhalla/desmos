@@ -14,3 +14,8 @@ unicode-width = { workspace = true }
 xai-grok-config = { path = "../../vendor/grok-build/crates/codegen/xai-grok-config" }
 xai-grok-pager = { path = "../../vendor/grok-build/crates/codegen/xai-grok-pager" }
 xai-grok-pager-diff = { path = "../../vendor/grok-build/crates/codegen/xai-grok-pager-diff" }
+
+[dev-dependencies]
+# `set_protocol_for_test` — the inline-image tests have to force a graphics
+# protocol, since a test binary has no terminal to detect one from.
+xai-grok-pager = { path = "../../vendor/grok-build/crates/codegen/xai-grok-pager", features = ["test-support"] }
