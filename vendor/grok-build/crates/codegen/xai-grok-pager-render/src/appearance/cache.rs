@@ -40,6 +40,8 @@ const SIMPLE_MODE_DEFAULT: bool = true;
 const VIM_MODE_DEFAULT: bool = false;
 const SHOW_THINKING_BLOCKS_DEFAULT: bool = true;
 const GROUP_TOOL_VERBS_DEFAULT: bool = true;
+/// One blank row between adjacent entries, as the pager has always drawn.
+const ENTRY_GAP_DEFAULT: u16 = 1;
 /// Collapsed-Edit-blocks rollout flag defaults OFF (legacy expanded diffs).
 const COLLAPSED_EDIT_BLOCKS_DEFAULT: bool = false;
 /// Next-prompt suggestions (tab autocomplete ghost text) default ON.
@@ -320,6 +322,26 @@ pub fn load_show_thinking_blocks() -> bool {
 pub fn set_show_thinking_blocks(enabled: bool) {
     SHOW_THINKING_BLOCKS_CURRENT.with(|c| c.set(enabled));
     SHOW_THINKING_BLOCKS_LOADED.with(|l| l.set(true));
+}
+
+// -- Entry gap ----------------------------------------------------------------
+
+thread_local! {
+    static ENTRY_GAP_CURRENT: Cell<u16> = const { Cell::new(ENTRY_GAP_DEFAULT) };
+}
+
+/// Blank rows left between two adjacent scrollback entries that are not part
+/// of a packed group. One row is right for a chat column where a block is a
+/// paragraph; a host that renders many one-line blocks in a narrow pane pays
+/// it on every one of them, so it is a knob rather than a constant.
+pub fn load_entry_gap() -> u16 {
+    ENTRY_GAP_CURRENT.with(|c| c.get())
+}
+
+/// Replace the cached entry gap. Clamped: more than a couple of blank rows
+/// between entries is not a layout, it is a scroll.
+pub fn set_entry_gap(rows: u16) {
+    ENTRY_GAP_CURRENT.with(|c| c.set(rows.min(2)));
 }
 
 // -- Group tool verbs ---------------------------------------------------------

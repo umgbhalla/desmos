@@ -1278,6 +1278,13 @@ impl App {
         // grok chat; fatal on the wire pane — every POST and <python> stays
         // its own row.
         appearance_cache::set_group_tool_verbs(false);
+        // One blank row after every entry. Grok's chat column is one block per
+        // paragraph, so it costs ~10% there; the story is many one-line blocks
+        // -- a thought, a system row, a tool title -- in a third of the screen,
+        // and a third of the pane was going to gap rows. Every block already
+        // carries an accent column and a bullet, which is what the gap was
+        // saying. `/dense` keeps the row for anyone who wants the air.
+        appearance_cache::set_entry_gap(0);
         self.story.set_appearance(cfg.clone());
         self.calls.set_appearance(cfg.clone());
         for child in self.children.values_mut() {
@@ -9326,6 +9333,37 @@ mod tests {
         assert!(
             narrow > wide,
             "viewer must re-wrap at the new width: narrow={narrow} wide={wide}"
+        );
+    }
+
+
+
+    /// Blank rows are the story's largest single expense: grok gaps every
+    /// entry, which is ~10% of a chat column and was a third of this pane.
+    #[test]
+    fn the_story_does_not_spend_a_third_of_itself_on_blank_rows() {
+        let mut app = App::new();
+        seed_demo(&mut app);
+        // Twice: the first paint builds the layout the second one measures.
+        let _ = paint(&mut app, 140, 120);
+        let text = paint(&mut app, 140, 120);
+        let rows = rows_of(&text, app.traj_area);
+        let all: Vec<&str> = rows.lines().collect();
+        // Drop the pane's own two border rows; a border is not a blank row.
+        let body: Vec<&str> = all[1..all.len() - 1]
+            .iter()
+            .map(|l| l.trim_matches(|c| c == '\u{2502}' || c == ' '))
+            .collect();
+        let last = body
+            .iter()
+            .rposition(|l| !l.is_empty())
+            .expect("story has content");
+        let body = &body[..=last];
+        let blank = body.iter().filter(|l| l.is_empty()).count();
+        assert!(
+            blank * 4 < body.len(),
+            "story is {blank}/{} blank rows; the gap knob is not reaching the layout",
+            body.len()
         );
     }
 

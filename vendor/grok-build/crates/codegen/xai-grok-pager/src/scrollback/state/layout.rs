@@ -1406,7 +1406,7 @@ impl ScrollbackState {
             cache.entries[new_idx - 1].gap_after = if both_groupable && both_collapsed {
                 0
             } else {
-                1
+                crate::appearance::cache::load_entry_gap()
             };
         }
 
@@ -1420,10 +1420,11 @@ impl ScrollbackState {
                 + cache.entries[new_idx - 1].gap_after as usize
         };
 
-        // Append the new entry. It's now the trailing entry, so gap_after = 1.
+        // Append the new entry. It's now the trailing entry, so it takes the
+        // configured gap.
         cache.entries.push(EntryLayoutInfo {
             height,
-            gap_after: 1,
+            gap_after: crate::appearance::cache::load_entry_gap(),
             group_header_count: 0,
             group_collapse_header: false,
             verb_group_header: false,
@@ -1482,7 +1483,7 @@ impl ScrollbackState {
             let height = renderer.estimate_height(entry_area_width);
             cache.entries.push(EntryLayoutInfo {
                 height,
-                gap_after: 1,
+                gap_after: crate::appearance::cache::load_entry_gap(),
                 group_header_count: 0,
                 group_collapse_header: false,
                 verb_group_header: false,
@@ -1556,6 +1557,7 @@ impl ScrollbackState {
         }
 
         let show_thinking = crate::appearance::cache::load_show_thinking_blocks();
+        let gap = crate::appearance::cache::load_entry_gap();
 
         for (i, cached) in cached_entries.iter_mut().enumerate() {
             let (_, a) = entries.get_index(i).unwrap();
@@ -1576,7 +1578,7 @@ impl ScrollbackState {
 
             if j >= n {
                 // Only trailing hidden thinking after `a` (or `a` is last).
-                cached.gap_after = 1;
+                cached.gap_after = gap;
                 continue;
             }
 
@@ -1587,7 +1589,7 @@ impl ScrollbackState {
             cached.gap_after = if both_groupable && both_collapsed {
                 0
             } else {
-                1
+                gap
             };
         }
     }
