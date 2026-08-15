@@ -4714,10 +4714,10 @@ fn input_signal(app: &App) -> Option<InputSignal> {
         Some(TurnActivity::ToolRunning { .. })
     ) {
         Some(InputSignal::Tool)
-    } else if !app.queue.is_empty() {
-        Some(InputSignal::Queued)
     } else if app.running {
         Some(InputSignal::Inference)
+    } else if !app.queue.is_empty() {
+        Some(InputSignal::Queued)
     } else {
         None
     }
@@ -5761,7 +5761,10 @@ fn draw_input(f: &mut Frame, area: Rect, app: &mut App) {
     let signal = input_signal(app);
     let (signal_label, signal_color) = match signal {
         Some(InputSignal::Inference) => (Some("Inference".to_string()), theme.accent_assistant),
-        Some(InputSignal::Queued) => (Some(format!("Queued {}", app.queue.len())), theme.accent_user),
+        // No count here. The queue pane above already titles itself "Queue N"
+        // and lists every item; repeating the number on the composer border put
+        // "Queue 1" and "Queued 1" one row apart.
+        Some(InputSignal::Queued) => (Some("Queued".to_string()), theme.accent_user),
         Some(InputSignal::Tool) => (Some("Tool".to_string()), theme.accent_tool),
         None => (
             None,
@@ -11305,11 +11308,24 @@ mod tests {
             "the live composer border did not pulse"
         );
 
+        // Queued is what the composer says when nothing is running -- and it
+        // carries no count, because the queue pane owns that number.
         let mut queued = App::new();
-        queued.running = true;
         queued.queue.push("next prompt".into());
         let (queued_text, queued_color, _) = paint_input_state(&mut queued, 140, 30);
-        assert!(rows_of(&queued_text, queued.input_area).contains("Queued 1"));
+        let queued_rows = rows_of(&queued_text, queued.input_area);
+        assert!(queued_rows.contains("Queued"), "{queued_rows}");
+        assert!(!queued_rows.contains("Queued 1"), "composer duplicates the queue count:\n{queued_rows}");
+
+        // A queued follow-up must not hide what the turn is actually doing.
+        let mut busy = App::new();
+        busy.running = true;
+        busy.turn_started = Some(Instant::now());
+        start_thinking(&mut busy.calls, &mut busy.stream);
+        busy.queue.push("next prompt".into());
+        let (busy_text, _, _) = paint_input_state(&mut busy, 140, 30);
+        let busy_rows = rows_of(&busy_text, busy.input_area);
+        assert!(busy_rows.contains("Inference") && !busy_rows.contains("Queued"), "{busy_rows}");
 
         let mut tool = App::new();
         tool.running = true;
