@@ -7,7 +7,8 @@
 //! wire, so git becomes a tabbed pane of its own and the editor slot becomes a
 //! read-only file view under it.
 //!
-//! Both panes start closed. `git` shells out on a worker thread — the UI
+//! Both panes start open — a pane you have to know about before you can see
+//! it is a pane nobody sees. `git` shells out on a worker thread — the UI
 //! thread must never wait on a repository that is packing or on a network
 //! remote — and the file view reads a bounded prefix, since a pane six rows
 //! tall has no use for the other 40k lines of a lockfile.
