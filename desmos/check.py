@@ -380,6 +380,10 @@ def self_check() -> None:
         # A mermaid line-break tag in a diagram label is markup, not a call.
         assert scan(fence + 'mermaid\nA["a<br/>b"] --> B\n' + fence) == []
         assert scan("name it `<traj>` or bare") == []
+        # A span opens on one backtick and closes on one: the ``` inside it is
+        # content. This exact line dispatched a stray <br> before the fix.
+        assert scan("the string `'" + fence + r"\n<br/>\n" + fence + "<python>1</python>`") == []
+        assert [b.tag for b in scan("see `<traj>` then\n<python>1</python>")] == ["python"]
         # A fence inside a syscall body must not mask the calls after it.
         masked = scan('<python>s = "' + fence + '"</python>\n<bash>ls</bash>')
         assert [b.tag for b in masked] == ["python", "bash"], masked

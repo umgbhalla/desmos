@@ -15,9 +15,9 @@ ATTR = re.compile(r'([A-Za-z_][\w.-]*)\s*=\s*"([^"]*)"')
 # A fence opener: up to three spaces of indent, then three or more backticks
 # or tildes, then an optional info string.
 FENCE = re.compile(r"^[ \t]{0,3}(`{3,}|~{3,})[^\n]*$", re.M)
-# An inline code span, confined to one line so an unbalanced backtick in prose
-# can never swallow the rest of the message.
-CODE_SPAN = re.compile(r"`+[^`\n]*`+")
+# Inline spans are matched by backtick run length in `_in_code_span`, the same
+# way the TUI's `inline_code_spans` does it. A regex cannot: a span opened by
+# one backtick may contain longer runs, and only an equal-length run closes it.
 
 
 def _fence_span(text: str, pos: int) -> tuple[int, int] | None:
@@ -39,13 +39,41 @@ def _fence_span(text: str, pos: int) -> tuple[int, int] | None:
 
 
 def _in_code_span(text: str, at: int) -> int | None:
-    """End of the inline code span containing `at`, if there is one."""
+    """End of the inline code span containing `at`, if there is one.
+
+    A span opens on a run of n backticks and closes on the next run of exactly
+    n, so ``` inside a single-backtick span is content, not a delimiter. An
+    unclosed opener spans to end of line -- bounded damage, and it is what the
+    renderer already does, so what is displayed and what dispatches agree.
+    """
     start = text.rfind("\n", 0, at) + 1
     end = text.find("\n", at)
     line = text[start:] if end < 0 else text[start:end]
-    for m in CODE_SPAN.finditer(line):
-        if m.start() <= at - start < m.end():
-            return start + m.end()
+    col = at - start
+    i = 0
+    while i < len(line):
+        if line[i] != "`":
+            i += 1
+            continue
+        n = 0
+        while i + n < len(line) and line[i + n] == "`":
+            n += 1
+        j, close = i + n, None
+        while j < len(line):
+            if line[j] == "`":
+                m = 0
+                while j + m < len(line) and line[j + m] == "`":
+                    m += 1
+                if m == n:
+                    close = j + m
+                    break
+                j += m
+            else:
+                j += 1
+        stop = close if close is not None else len(line)
+        if i <= col < stop:
+            return start + stop
+        i = stop
     return None
 
 
