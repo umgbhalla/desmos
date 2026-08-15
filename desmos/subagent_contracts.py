@@ -7,12 +7,11 @@ from typing import Any
 
 @dataclass(frozen=True)
 class Budget:
-    # Turn and token ceilings are opt-in. Long coding tasks used to die
-    # mid-edit at arbitrary defaults; the parent can still set either guard
-    # explicitly for bounded probes. Wall time remains a default runaway guard.
+    # Every ceiling is opt-in. Guidance reminders keep a long run aligned
+    # without killing it mid-tool-call or before it can write the deliverable.
     max_turns: int | None = None
     max_tokens: int | None = None
-    wall_seconds: float | None = 600.0
+    wall_seconds: float | None = None
     max_retries: int = 0
 
     def __post_init__(self) -> None:

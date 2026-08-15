@@ -103,8 +103,10 @@ def capabilities() -> str:
             " security and planner roles use sol for advanced judgment; sniffer uses luna for"
             " quick reproduction/localization. model and thinking are launch overrides."
             " system_prompt, system_append, user_input, and task_template customize each child."
-            " Turn and token limits default to None and remain explicit Budget controls; wall"
-            " time is the default runaway guard. fanout(tasks) defaults to explore, not general;"
+            " Turn, token, and wall-time limits all default to None and remain explicit opt-in"
+            " Budget controls. guidance_every_turns defaults to 8, is configurable per launch,"
+            " and re-anchors long runs without stopping them; guidance_reminder overrides its text."
+            " fanout(tasks) defaults to explore, not general;"
             " spawn_many(specs) validates a whole batch before concurrent launch."
             " wait(*ids, timeout=600) blocks; gather(ids) waits and joins their output; status()"
             " lists running; result(id) reads one; spawn(resume=id) continues a finished run."
@@ -214,9 +216,9 @@ _OPENAI = "\n".join(
         " A string task returns prose you then have to trust.",
         "Close with the outcome in the first sentence. Then separate what you verified by running"
         " it from what you are inferring, and name anything still unproven.",
-        "A turn that is nothing but syscalls is complete and correct. Write no text after the last"
-        " closing tag -- the sentence of intent goes before the calls, and the outcome goes in the"
-        " turn after the results arrive. If you have nothing to say, say nothing.",
+        "A response that only calls `syscall` is complete and correct. Write no assistant text"
+        " after that call -- the sentence of intent goes before it, and the outcome goes in the"
+        " next turn after the results arrive. If you have nothing to say, say nothing.",
     ]
 )
 

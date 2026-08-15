@@ -1,8 +1,8 @@
 # Subagent launch policy
 
 Subagents are isolated child worlds. The parent owns the task, model, prompt
-blocks, allowed tools, budget, acceptance checks, and integration decision.
-Children cannot spawn children.
+blocks, allowed tools, optional explicit limits, acceptance checks, guidance,
+and integration decision. Children cannot spawn children.
 
 ## Models and roles
 
@@ -21,11 +21,19 @@ launch can override `model` and `thinking`.
 
 ## Limits
 
-Turn and token ceilings are off by default. They are arbitrary cutoffs for a
-coding task and commonly stop a child midway through an edit. A typed
-`Budget` can still set `max_turns` or `max_tokens` for a bounded probe.
-`wall_seconds` remains a default runaway guard and can also be changed or set
-to `None`.
+Turn, token, and wall-time ceilings are all off by default. They are arbitrary
+cutoffs for a coding task and commonly stop a child midway through an edit or
+before its final report. A typed `Budget` can still opt into `max_turns`,
+`max_tokens`, or `wall_seconds` for an intentionally bounded probe.
+
+## Guidance reminders
+
+Long runs are re-anchored every eight turns by default without stopping them.
+Set `guidance_every_turns` on a launch to choose another interval; zero
+disables reminders. `guidance_reminder` replaces the generated reminder text.
+The generated reminder preserves collected evidence, repeats the objective,
+acceptance checks, deliverable, and non-goals, and tells the child how to end
+with the complete deliverable.
 
 ## Prompt controls
 
@@ -35,6 +43,8 @@ A launch can independently set:
 - `system_append`: append project-specific instructions to that prompt.
 - `task_template`: transform the rendered task; it must contain `{task}`.
 - `user_input`: replace the complete initial user block.
+- `guidance_every_turns`: set the re-anchoring interval; zero disables it.
+- `guidance_reminder`: replace the generated re-anchoring message.
 
 `user_input` has final precedence over `task_template`. Typed contracts remain
 the recommended task input because the parent judge can verify their declared

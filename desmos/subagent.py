@@ -81,6 +81,9 @@ class EffectiveConfig:
     system_append: str | None = None
     user_input: str | None = None
     task_template: str | None = None
+    # Re-anchor long runs without imposing a ceiling. Zero/None disables.
+    guidance_every_turns: int | None = 8
+    guidance_reminder: str | None = None
     # None lets legacy free-text tasks infer whether they claim observations.
     # Typed contracts carry their own explicit requirement.
     require_tool_use: bool | None = None
@@ -98,6 +101,9 @@ def resolve(agent: str = "general", **over: Any) -> EffectiveConfig:
     cap = d.get("capability", "edit")
     if cap not in CAPS:
         raise KeyError(f"unknown capability {cap!r}; have {sorted(CAPS)}")
+    guidance_every = d.get("guidance_every_turns", 8)
+    if guidance_every is not None and int(guidance_every) < 0:
+        raise ValueError("guidance_every_turns must be non-negative or None")
     return EffectiveConfig(
         agent=agent,
         persona=persona,
@@ -112,6 +118,8 @@ def resolve(agent: str = "general", **over: Any) -> EffectiveConfig:
         system_append=d.get("system_append"),
         user_input=d.get("user_input"),
         task_template=d.get("task_template"),
+        guidance_every_turns=(int(guidance_every) if guidance_every else None),
+        guidance_reminder=d.get("guidance_reminder"),
         require_tool_use=(
             bool(d["require_tool_use"])
             if d.get("require_tool_use") is not None
@@ -141,6 +149,7 @@ class Run:
     ended: float = 0.0
     retries: int = 0
     steers: int = 0
+    guidance_reminders: int = 0
     observed_tools: list[str] = field(default_factory=list)
     run_result: RunResult | None = None
     judgment: Judgment | None = None
@@ -165,6 +174,7 @@ class Run:
             "secs": self.secs,
             "turns": self.turns,
             "steers": self.steers,
+            "guidance_reminders": self.guidance_reminders,
             "observed_tools": list(self.observed_tools),
             "budget": {
                 "turns": {"used": self.turns, "limit": budget.max_turns if budget else self.cfg.max_turns},
@@ -287,6 +297,28 @@ def _user_prompt(run: Run) -> str:
     return run.cfg.user_input if run.cfg.user_input is not None else rendered_task
 
 
+def _guidance_prompt(run: Run) -> str:
+    """Concise re-anchor for a child that is still working after N turns."""
+    if run.cfg.guidance_reminder:
+        return run.cfg.guidance_reminder
+    lines = [
+        "Task guidance reminder: continue from the evidence already collected; do not restart.",
+        f"Objective: {run.task}",
+    ]
+    if run.contract is not None:
+        if run.contract.acceptance_checks:
+            lines.append("Acceptance checks still to satisfy:")
+            lines.extend(f"- {check}" for check in run.contract.acceptance_checks)
+        lines.append(f"Required deliverable: {run.contract.deliverable_schema}")
+        if run.contract.non_goals:
+            lines.append("Stay outside these non-goals:")
+            lines.extend(f"- {item}" for item in run.contract.non_goals)
+    lines.append(
+        "Use tools for remaining evidence. When complete, stop calling tools and return the entire final deliverable."
+    )
+    return "\n".join(lines)
+
+
 def _execute(run: Run, parent: Any) -> None:
     from desmos.loop import run_turns
 
@@ -331,7 +363,9 @@ def _execute(run: Run, parent: Any) -> None:
         def child_event(ev: dict[str, Any]) -> None:
             kind = ev.get("ev")
             if kind == "turn":
-                run.turns = int(ev.get("n") or run.turns)
+                # run_turns resets its local n for each guidance segment; the
+                # child log is the stable cumulative turn count.
+                run.turns = len(w.log) + 1
                 run.stage = "executing"
                 run.progress = f"model turn {run.turns}"
                 publish_progress()
@@ -352,6 +386,8 @@ def _execute(run: Run, parent: Any) -> None:
             payload = {k: v for k, v in ev.items() if k != "ev"}
             _emit({"ev": "child", "id": run.id, "kind": kind, **payload})
 
+        from desmos.scan import scan
+
         prompt = _user_prompt(run)
         limits = [
             value
@@ -362,18 +398,50 @@ def _execute(run: Run, parent: Any) -> None:
             if value is not None
         ]
         max_turns = min(limits) if limits else None
-        _DEPTH.n = 1
-        try:
-            out = run_turns(
-                w,
-                prompt,
-                max_turns=max_turns,
-                quiet=True,
-                on_event=child_event,
-                should_stop=should_stop,
-            )
-        finally:
-            _DEPTH.n = 0
+        started_at_turn = len(w.log)
+
+        def run_aligned(first_prompt: str) -> str:
+            """Run to completion, inserting guidance between bounded segments."""
+            next_prompt = first_prompt
+            out = ""
+            while True:
+                used = len(w.log) - started_at_turn
+                remaining = None if max_turns is None else max_turns - used
+                if remaining is not None and remaining <= 0:
+                    return out
+                interval = run.cfg.guidance_every_turns
+                segment = remaining
+                if interval is not None:
+                    segment = interval if segment is None else min(interval, segment)
+
+                _DEPTH.n = 1
+                try:
+                    out = run_turns(
+                        w,
+                        next_prompt,
+                        max_turns=segment,
+                        quiet=True,
+                        on_event=child_event,
+                        should_stop=should_stop,
+                    )
+                finally:
+                    _DEPTH.n = 0
+
+                if budget_stop[0] or not scan(out):
+                    return out
+                used = len(w.log) - started_at_turn
+                if max_turns is not None and used >= max_turns:
+                    return out
+                if interval is None:
+                    return out
+
+                run.guidance_reminders += 1
+                run.stage = "guidance"
+                run.progress = f"task guidance reminder {run.guidance_reminders}"
+                publish_progress()
+                next_prompt = _guidance_prompt(run)
+
+        out = run_aligned(prompt)
         if run.structured and run.contract is not None:
             require_tool = run.contract.require_tool_use
         elif run.cfg.require_tool_use is not None:
@@ -404,8 +472,6 @@ def _execute(run: Run, parent: Any) -> None:
                     _DEPTH.n = 0
             if not run.observed_tools:
                 no_tool_failure = True
-
-        from desmos.scan import scan
 
         forced_turn_cap = False
         if max_turns is not None and scan(out) and not budget_stop[0]:
@@ -521,6 +587,8 @@ def spawn(
     system_append: str | None = None,
     user_input: str | None = None,
     task_template: str | None = None,
+    guidance_every_turns: int | None = None,
+    guidance_reminder: str | None = None,
     max_turns: int | None = None,
     parent: Any = None,
     **over: Any,
@@ -536,6 +604,8 @@ def spawn(
         "system_append": system_append,
         "user_input": user_input,
         "task_template": task_template,
+        "guidance_every_turns": guidance_every_turns,
+        "guidance_reminder": guidance_reminder,
         "max_turns": max_turns,
     }
     over.update({key: value for key, value in explicit.items() if value is not None})

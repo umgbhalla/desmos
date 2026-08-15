@@ -86,10 +86,21 @@ def self_check() -> None:
         subagents.bind(parent)
         try:
             defaults = Budget()
-            assert defaults.max_turns is None and defaults.max_tokens is None
+            assert (
+                defaults.max_turns is None
+                and defaults.max_tokens is None
+                and defaults.wall_seconds is None
+            )
             assert subagents.resolve("worker").model == "gpt-5.6-sol"
             assert subagents.resolve("scout").model == "gpt-5.6-luna"
             assert subagents.resolve("security").capability == "read"
+            assert subagents.resolve("scout").guidance_every_turns == 8
+            assert subagents.resolve("scout", guidance_every_turns=0).guidance_every_turns is None
+            try:
+                subagents.resolve("scout", guidance_every_turns=-1)
+                raise AssertionError("negative guidance interval accepted")
+            except ValueError:
+                pass
             assert set(subagents.ROLE_GUIDE) == {
                 "scout", "worker", "reviewer", "security", "planner", "sniffer"
             }
@@ -203,6 +214,42 @@ def self_check() -> None:
             assert "# anthropic lane" not in openai_child.system_override
             assert list((root / "runs").glob("*.json"))
             assert not responses, f"unused fake responses: {len(responses)}"
+
+            reminder_responses = [
+                tool_call(),
+                tool_call(),
+                response("finished after the reminder"),
+            ]
+            reminder_inputs: list[str] = []
+
+            def complete_with_reminder(
+                _model: str, _system: str, messages: list[dict[str, Any]], _max: int
+            ) -> dict[str, Any]:
+                content = messages[-1].get("content", "")
+                reminder_inputs.append(content if isinstance(content, str) else json.dumps(content))
+                return reminder_responses.pop(0)
+
+            parent.complete_fn = complete_with_reminder
+            reminder_id = subagents.spawn(
+                "Inspect the repository and report.",
+                agent="explore",
+                parent=parent,
+                model="claude-opus-5",
+                guidance_every_turns=2,
+            )
+            subagents.wait(reminder_id, timeout=5, poll=0.01)
+            reminder_run = subagents.RUNS[reminder_id]
+            assert reminder_run.state == "done", reminder_run.brief()
+            assert reminder_run.turns == 3 and reminder_run.guidance_reminders == 1
+            assert reminder_run.result == "finished after the reminder"
+            assert any("Task guidance reminder:" in item for item in reminder_inputs)
+            assert any(
+                ev.get("id") == reminder_id
+                and ev.get("stage") == "guidance"
+                and ev.get("progress") == "task guidance reminder 1"
+                for ev in events
+            )
+            assert not reminder_responses
         finally:
             subagents.wait(timeout=5, poll=0.01)
             subagents.RUNS.clear()
@@ -259,6 +306,8 @@ def parallel_tool_check() -> None:
                         "system_prompt": "SYS-A",
                         "system_append": "APP-A",
                         "task_template": "TASK::{task}",
+                        "guidance_every_turns": 3,
+                        "guidance_reminder": "KEEP ALPHA",
                         "require_tool_use": False,
                     },
                     {
@@ -278,6 +327,9 @@ def parallel_tool_check() -> None:
             assert {row[0] for row in seen} == {"gpt-5.6-sol", "gpt-5.6-luna"}
             assert any(row[1] == "SYS-A\n\nAPP-A" and "TASK::alpha" in row[2] for row in seen)
             assert any(row[1] == "SYS-B" and "USER-B" in row[2] for row in seen)
+            alpha = subagents.RUNS[launched["ids"][0]]
+            assert alpha.cfg.guidance_every_turns == 3
+            assert alpha.cfg.guidance_reminder == "KEEP ALPHA"
         finally:
             subagents.wait(timeout=5, poll=0.01)
             subagents.RUNS.clear()
