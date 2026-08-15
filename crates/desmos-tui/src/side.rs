@@ -265,10 +265,25 @@ impl GitPane {
     }
 }
 
+/// Every read this pane makes, with the index left alone.
+///
+/// `git status` refreshes the index and takes `.git/index.lock` to write the
+/// refreshed stat cache back. This pane polls after every syscall, so that
+/// lock landed on top of the agent's own `git commit` — twice in one session —
+/// and the commit died with "Unable to create '.git/index.lock'". The pane is
+/// a reader; it has no business locking anything. `--no-optional-locks` is
+/// git's own answer, and it is a global flag, so it goes before the subcommand.
+fn git_argv(args: &[&str]) -> Vec<String> {
+    let mut argv = vec!["--no-optional-locks".to_string()];
+    argv.extend(args.iter().map(|a| a.to_string()));
+    argv
+}
+
 fn git(cwd: &Path, args: &[&str]) -> Result<String, String> {
     let out = Command::new("git")
-        .args(args)
+        .args(git_argv(args))
         .current_dir(cwd)
+        .env("GIT_OPTIONAL_LOCKS", "0")
         .output()
         .map_err(|e| e.to_string())?;
     if !out.status.success() {
@@ -571,6 +586,26 @@ impl FilePane {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The pane is a reader. `git status` refreshes the index and takes
+    /// `.git/index.lock` to write the refreshed stat cache back, so this pane —
+    /// which polls after every syscall — put that lock on top of the agent's own
+    /// `git commit` twice in one session and killed it. The flag is global, so
+    /// it must precede the subcommand; appended after `status`, git rejects it
+    /// as an unknown option.
+    #[test]
+    fn pane_reads_never_take_the_index_lock() {
+        let argv = git_argv(&["status", "--porcelain", "-b"]);
+        assert_eq!(argv[0], "--no-optional-locks", "{argv:?}");
+        assert_eq!(argv[1], "status", "the flag must precede the subcommand");
+        for cmd in [
+            vec!["log", "--oneline", "-1"],
+            vec!["diff", "--stat"],
+            vec!["rev-parse", "HEAD"],
+        ] {
+            assert_eq!(git_argv(&cmd)[0], "--no-optional-locks", "{cmd:?}");
+        }
+    }
 
     /// A forced read behind one already in flight used to be dropped on the
     /// floor. That is the `git commit` case: the commit's own read never runs,
