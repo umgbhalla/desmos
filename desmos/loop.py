@@ -544,6 +544,7 @@ def run_turns(
     max_total_tokens: int | None = None,
     has_input: Callable[[], bool] | None = None,
     on_continue: Callable[[int], str | None] | None = None,
+    images: list[str] | None = None,
 ) -> str:
     """Run a step to its end, and always say how it ended.
 
@@ -585,6 +586,7 @@ def run_turns(
             max_total_tokens=max_total_tokens,
             has_input=has_input,
             on_continue=on_continue,
+            images=images,
             budget_hit=hit,
         )
     finally:
@@ -610,6 +612,7 @@ def _run_turns(
     max_total_tokens: int | None = None,
     has_input: Callable[[], bool] | None = None,
     on_continue: Callable[[int], str | None] | None = None,
+    images: list[str] | None = None,
     budget_hit: list[str] | None = None,
 ) -> str:
     def emit(ev: dict[str, Any]) -> None:
@@ -636,6 +639,25 @@ def _run_turns(
         return f"[stopped by the user after turn {n}]"
 
     world.messages.append({"role": "user", "content": header(world) + "\n\n" + prompt})
+    # Images the composer attached to this prompt. vision.attach appends its
+    # blocks to the most recent user message, which is the one just pushed, so
+    # the picture arrives with the sentence about it instead of one turn later.
+    # A bad path is a note in that same message, never an exception: losing the
+    # whole step because one screenshot moved is not a trade worth making.
+    if images:
+        from desmos import vision
+
+        try:
+            note = vision.attach(world, *images)
+        except Exception as exc:  # noqa: BLE001 - any failure is a note
+            note = f"[image attach failed: {exc}]"
+            content = world.messages[-1]["content"]
+            if isinstance(content, str):
+                world.messages[-1]["content"] = [{"type": "text", "text": content}]
+            world.messages[-1]["content"].append({"type": "text", "text": note})
+            emit({"ev": "error", "text": note})
+        else:
+            emit({"ev": "attached", "text": note})
     last = ""
     n = 0
     while max_turns is None or n < max_turns:

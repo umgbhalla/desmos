@@ -124,6 +124,11 @@ def serve(cwd: Path) -> int:
         try:
             if op == "step":
                 text = str(msg.get("text") or "")
+                # The composer sends the paths of its image chips alongside the
+                # line. They were being dropped here: the pane said "attached
+                # 2 image(s)" and the model got the file names as prose.
+                raw = msg.get("images") or []
+                images = [str(p) for p in raw if str(p).strip()]
                 if not text.strip():
                     _emit({"ev": "error", "text": "empty prompt"})
                     continue
@@ -139,6 +144,7 @@ def serve(cwd: Path) -> int:
                     on_event=_emit,
                     should_stop=cancel.is_set,
                     has_input=lambda: not inbox.empty(),
+                    images=images,
                 )
                 _emit(_snapshot(world))
             elif op == "snapshot":
