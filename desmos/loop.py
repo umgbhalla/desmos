@@ -919,6 +919,10 @@ def reload_sdk(world: World | None = None) -> str:
         "desmos.subagent",
         "desmos.generations",
         "desmos.auth",
+        # Ahead of desmos.openai, which binds names out of it at import time.
+        # Left to the derived pass, `from desmos.complete import ...` ran
+        # against the stale module and reload_sdk died on the new name.
+        "desmos.complete",
         "desmos.openai",
         "desmos.settings",
         "desmos.complete",
