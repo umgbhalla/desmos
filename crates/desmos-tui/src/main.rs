@@ -920,6 +920,9 @@ struct App {
     post_out_n: u64,
     queue: QueryQueue,
     send_now: bool,
+    /// Slot a queued row was lifted from for editing, so Enter puts it back
+    /// where it was instead of at the end of the queue.
+    queue_edit: Option<usize>,
     drain_after: bool,
     children: HashMap<String, ChildSess>,
     viewing: Option<String>,
@@ -1236,6 +1239,7 @@ impl App {
             post_out_n: 0,
             queue: QueryQueue::default(),
             send_now: false,
+            queue_edit: None,
             drain_after: false,
             children: HashMap::new(),
             viewing: None,
@@ -2905,8 +2909,24 @@ fn handle_key(
             }
             KeyCode::Char('d') | KeyCode::Backspace | KeyCode::Delete => {
                 app.queue.remove_selected();
+                app.queue_edit = None;
                 if app.queue.is_empty() {
                     app.set_focus(Focus::Input);
+                }
+            }
+            // Drop was the only thing you could do to a queued row, so fixing a
+            // typo in one meant deleting it and typing the whole thing again.
+            // `e` lifts it into the composer instead; the slot is remembered so
+            // Enter puts it back where it was.
+            KeyCode::Char('e') => {
+                if let Some(idx) = app.queue.selected
+                    && let Some(item) = app.queue.remove_selected()
+                {
+                    app.prompt.clear();
+                    app.prompt.insert_str(&item.text);
+                    app.queue_edit = Some(idx);
+                    app.set_focus(Focus::Input);
+                    app.notify(format!("editing #{} — enter puts it back", idx + 1));
                 }
             }
             KeyCode::Enter => return send_now(bridge, app),
@@ -3163,12 +3183,20 @@ fn start_step(
 fn submit_prompt(mut bridge: Option<&mut Bridge>, app: &mut App) -> io::Result<bool> {
     let line = app.prompt.to_send();
     if line.trim().is_empty() {
+        // Emptying a row you lifted out of the queue is how you delete it. The
+        // row is already gone; say so, and do not fall through to send-now,
+        // which would fire some other row you never selected.
+        if let Some(idx) = app.queue_edit.take() {
+            app.notify(format!("dropped #{}", idx + 1));
+            return Ok(false);
+        }
         if app.running || !app.queue.is_empty() {
             return send_now(bridge, app);
         }
         return Ok(false);
     }
     app.prompt.clear();
+    let slot = app.queue_edit.take();
     if line == "/quit" || line == "/exit" {
         return Ok(true);
     }
@@ -3250,6 +3278,7 @@ fn submit_prompt(mut bridge: Option<&mut Bridge>, app: &mut App) -> io::Result<b
         app.post_n = 0;
         app.post_out_n = 0;
         app.queue.clear();
+        app.queue_edit = None;
         app.send_now = false;
         app.notify("transcript cleared");
     } else if line == "/reload" {
@@ -3261,8 +3290,17 @@ fn submit_prompt(mut bridge: Option<&mut Bridge>, app: &mut App) -> io::Result<b
         return Ok(false);
     }
     if app.running {
-        app.queue.push(line);
-        app.notify(format!("queued #{}", app.queue.len()));
+        let pos = match slot {
+            Some(idx) => {
+                app.queue.insert_at(idx, line);
+                idx + 1
+            }
+            None => {
+                app.queue.push(line);
+                app.queue.len()
+            }
+        };
+        app.notify(format!("queued #{pos}"));
         return Ok(false);
     }
     start_step(bridge, app, line)?;
@@ -7948,6 +7986,68 @@ mod tests {
         let max = total.saturating_sub(vp as usize);
         assert_eq!(off, max.min(off));
         assert!(off <= max, "calls offset {off} > max {max}");
+    }
+
+    /// Drop used to be the only thing you could do to a queued row, so a typo
+    /// meant deleting it and retyping the whole thing. `e` lifts it into the
+    /// composer and Enter puts it back in the slot it left -- not at the end,
+    /// which would be a reorder nobody asked for.
+    #[test]
+    fn e_edits_a_queued_row_and_enter_returns_it_to_its_slot() {
+        let mut app = App::new();
+        app.running = true;
+        for q in ["first", "middel one", "third"] {
+            app.queue.push(q.into());
+        }
+        app.queue.selected = Some(1);
+        app.set_focus(Focus::Queue);
+        let key = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE);
+        handle_key(None, &mut app, key('e')).unwrap();
+        assert_eq!(app.queue.len(), 2, "the row is lifted out while you edit it");
+        assert_eq!(app.prompt.to_send(), "middel one");
+        assert_eq!(app.focus, Focus::Input, "editing happens in the composer");
+        // Fix the typo and send it back.
+        app.prompt.clear();
+        app.prompt.insert_str("middle one");
+        handle_key(
+            None,
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )
+        .unwrap();
+        let rows: Vec<String> = app.queue.iter().map(|q| q.text.clone()).collect();
+        assert_eq!(rows, vec!["first", "middle one", "third"]);
+        assert!(app.queue_edit.is_none(), "the slot is spent once it is used");
+        assert_eq!(app.story.len(), 0, "editing a queued row runs no turn");
+    }
+
+    /// Emptying the composer while editing is the delete. It must not fall
+    /// through to send-now, which fires whichever row happens to be selected.
+    #[test]
+    fn emptying_an_edited_row_drops_it_and_fires_nothing() {
+        let mut app = App::new();
+        app.running = true;
+        app.queue.push("keep me".into());
+        app.queue.push("kill me".into());
+        app.queue.selected = Some(1);
+        app.set_focus(Focus::Queue);
+        handle_key(
+            None,
+            &mut app,
+            KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE),
+        )
+        .unwrap();
+        app.prompt.clear();
+        handle_key(
+            None,
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )
+        .unwrap();
+        let rows: Vec<String> = app.queue.iter().map(|q| q.text.clone()).collect();
+        assert_eq!(rows, vec!["keep me"]);
+        assert!(!app.send_now, "an emptied edit is a delete, not a send-now");
+        assert!(app.queue_edit.is_none());
     }
 
     #[test]

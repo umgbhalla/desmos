@@ -99,6 +99,20 @@ impl QueryQueue {
         }
     }
 
+    /// Put a row back at `idx`, clamped to the end.
+    ///
+    /// The editor lifts a row out of the queue and into the composer. When it
+    /// comes back it belongs in the slot it left — a row that jumps to the back
+    /// because you fixed a typo in it is a reorder you did not ask for.
+    pub fn insert_at(&mut self, idx: usize, text: String) -> u64 {
+        let id = self.next_id;
+        self.next_id += 1;
+        let idx = idx.min(self.items.len());
+        self.items.insert(idx, QueuedQuery { id, text });
+        self.selected = Some(idx);
+        id
+    }
+
     /// Pull `idx` to the front so send-now fires that row.
     pub fn rotate_to_front(&mut self, idx: usize) {
         if idx == 0 || idx >= self.items.len() {
