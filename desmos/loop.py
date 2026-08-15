@@ -21,6 +21,7 @@ from desmos.dispatch import dispatch
 from desmos.generations import ensure_gen1, evolve, rollback
 from desmos.persist import load, save
 from desmos.scan import clip, scan
+from desmos.spill import spill
 from desmos.types import Block, Tool, World
 
 
@@ -40,10 +41,11 @@ def format_results(results: list[tuple[Block, str]]) -> str:
 RESULT_CLIP = 6000
 
 
-def format_result_message(results: list[tuple[Block, str]]) -> str:
+def format_result_message(results: list[tuple[Block, str]], cwd: Path | None = None) -> str:
     parts = []
     for b, r in results:
-        parts.append(f'<result tag="{b.tag}">{clip(r, RESULT_CLIP)}</result>')
+        body = spill(r, RESULT_CLIP, tag=b.tag, cwd=cwd)
+        parts.append(f'<result tag="{b.tag}">{body}</result>')
     return "\n\n".join(parts)
 
 
@@ -465,7 +467,9 @@ def _run_turns(
         # model's next context showed its own tags with no outcome and no
         # marker that they had been executed.
         if results:
-            world.messages.append({"role": "user", "content": format_result_message(results)})
+            world.messages.append(
+                {"role": "user", "content": format_result_message(results, world.cwd)}
+            )
         if done or stopped():
             if stopped():
                 # A stop left no trace in the transcript, so the next step read

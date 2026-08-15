@@ -9,7 +9,8 @@ from desmos.edit import apply_edit, parse_edit_body
 from desmos.exec import register_tag, run_bash, run_python
 from desmos.generations import evolve, rollback
 from desmos.persist import save
-from desmos.scan import clip
+from desmos.const import RESULT_CAP
+from desmos.spill import spill
 from desmos.types import Block, World
 
 
@@ -103,7 +104,12 @@ def dispatch(
         known = ", ".join(sorted(world.tools) or sorted(FROZEN))
         return f"unknown tag <{block.tag}> — not a syscall. Known: {known}. Speak without XML when done."
     try:
-        return clip(str(_invoke(tool.handler, block.body, block.attrs)))
+        return spill(
+            str(_invoke(tool.handler, block.body, block.attrs)),
+            RESULT_CAP,
+            tag=block.tag,
+            cwd=world.cwd,
+        )
     except Exception:
         return traceback.format_exc()
 

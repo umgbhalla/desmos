@@ -12,8 +12,8 @@ import traceback
 from pathlib import Path
 from typing import Any, Callable
 
-from desmos.const import BASH_TIMEOUT, FROZEN
-from desmos.scan import clip
+from desmos.const import BASH_TIMEOUT, FROZEN, RESULT_CAP
+from desmos.spill import spill
 from desmos.types import Tool, World
 
 OnChunk = Callable[[str], None]
@@ -72,11 +72,17 @@ def run_python(
                 val = eval(compile(ast.Expression(last.value), "<python>", "eval"), ns)
                 out = buf.getvalue()
                 extra = "" if val is None else repr(val)
-                return clip((out + extra).strip() or "ok")
+                return spill((out + extra).strip() or "ok", RESULT_CAP, tag="python", cwd=world.cwd)
             exec(compile(ast.Module([last], []), "<python>", "exec"), ns)
-        return clip(buf.getvalue().strip() or "ok")
+        return spill(buf.getvalue().strip() or "ok", RESULT_CAP, tag="python", cwd=world.cwd)
     except Exception:
-        return clip((buf.getvalue() + traceback.format_exc()).strip(), keep="tail")
+        return spill(
+            (buf.getvalue() + traceback.format_exc()).strip(),
+            RESULT_CAP,
+            tag="python",
+            cwd=world.cwd,
+            keep="tail",
+        )
 
 
 # How long to keep reading after the command itself exits. Long enough to
@@ -189,10 +195,10 @@ def run_bash(
         proc.stdout.close()
     out = b"".join(parts).decode("utf-8", errors="replace")
     if timed_out:
-        return clip(f"timeout after {limit}s\n{out}".strip(), keep="tail")
+        return spill(f"timeout after {limit}s\n{out}".strip(), RESULT_CAP, tag="bash", cwd=cwd, keep="tail")
     if proc.returncode:
-        return clip(f"exit {proc.returncode}\n{out}".strip(), keep="tail")
-    return clip(out.strip() or "ok")
+        return spill(f"exit {proc.returncode}\n{out}".strip(), RESULT_CAP, tag="bash", cwd=cwd, keep="tail")
+    return spill(out.strip() or "ok", RESULT_CAP, tag="bash", cwd=cwd)
 
 
 def callable_from_source(world: World, source: str, name: str) -> Callable[..., Any]:

@@ -266,6 +266,10 @@ def self_check() -> None:
 
         caps = _caps()
         assert str(_clip_cap) in caps, "prompt quotes a result cap loop.py does not apply"
+        # Over the cap the output goes to disk. The prompt names that directory,
+        # so the name is derived from the module that writes it.
+        from desmos.spill import SPILL_DIR as _spill_dir
+        assert _spill_dir in caps, "the prompt does not say where a spilled result lands"
         for _name, _cfg in _sa.AGENTS.items():
             assert _name in caps, _name
             assert str(_cfg["max_turns"]) in caps, f"{_name} turn cap not in the prompt"
@@ -732,6 +736,43 @@ def self_check() -> None:
         )
         assert "ONE" in bash_out and "TWO" in bash_out
         assert any("ONE" in c for c in chunks)
+
+        # A result too big for the transcript is not thrown away any more: the
+        # whole output goes to a file and the result opens with that path plus
+        # what to do with it. Driven through the real syscall and the real
+        # gate below it -- run_bash for the source, format_result_message for
+        # what the model actually reads -- so an unwired spill fails here.
+        from desmos.const import RESULT_CAP as _cap
+        from desmos.loop import RESULT_CLIP as _clip2, format_result_message as _fmt
+        from desmos.spill import MARK as _mark, SPILL_DIR as _dir
+
+        out_dir = cwd / _dir
+        big = run_bash(f"seq 1 {_cap}", cwd, timeout=30)
+        first = big.splitlines()[0]
+        assert first.startswith("\u2026[") and _mark in first, first[:200]
+        spilled = sorted(out_dir.glob("*.txt"))
+        assert len(spilled) == 1, spilled
+        assert first.split(_mark, 1)[1].split(" ", 1)[0] == str(spilled[0].relative_to(cwd))
+        whole = spilled[0].read_text(encoding="utf-8")
+        assert whole.splitlines()[-1] == str(_cap), "the file is not the whole output"
+        assert len(whole) > len(big), "the spill file is no bigger than the result"
+        # The gate below it must reuse that file, not write a second copy of
+        # the head it was handed.
+        msg = _fmt([(Block("bash", "seq", {}), big)], cwd)
+        assert _mark in msg, msg[:200]
+        assert len(sorted(out_dir.glob("*.txt"))) == 1, "the same output spilled twice"
+        assert len(msg) < _clip2 + 400, len(msg)
+        # A result that reached the gate without passing an exec cap -- a
+        # handler's return, a shell drain -- has to spill there instead.
+        raw = "x" * (_clip2 + 500)
+        msg2 = _fmt([(Block("shell", "", {}), raw)], cwd)
+        assert _mark in msg2, msg2[:200]
+        after = sorted(out_dir.glob("*.txt"))
+        assert len(after) == 2, after
+        assert after[1].read_text(encoding="utf-8") == raw, "the gate spilled a trimmed copy"
+        # Under the cap nothing is written and nothing is added.
+        assert run_bash("printf hi", cwd) == "hi"
+        assert len(sorted(out_dir.glob("*.txt"))) == 2, "a small result spilled"
 
         live_order: list[str] = []
 

@@ -92,8 +92,11 @@ def capabilities() -> str:
             "batching: several tags in one turn all run, in the order you wrote them, and every"
             " result comes back in the same reply. Batch independent calls instead of spending a"
             " turn each. A call that needs an earlier result waits for the next turn.",
-            "results are clipped at 6000 chars per call, with the dropped count marked. Filter in"
-            " the call -- grep, head, a slice -- rather than dumping and losing the tail.",
+            "results are capped at 6000 chars per call, but nothing is thrown away: over the cap"
+            " the whole output is written to .desmos/out/NNNN-<tag>.txt and the result opens with"
+            " a pointer line naming that file. Read the part you need out of it -- grep, sed,"
+            " head, a line range -- instead of paging it back into the transcript. Filtering in"
+            " the call itself is still cheaper than spilling and reading back.",
             "subagents: spawn(task, agent=\"general\") returns an id and does not block."
             " agent is general (edit, 500 turns), explore (researcher, read-only, 500), or review"
             " (critic, read-only, 300). fanout(tasks) spawns many and defaults to explore, not"
