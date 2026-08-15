@@ -370,17 +370,45 @@ def turn(
                 }
             )
     # No syscalls usually means the model finished. It also looks exactly like
-    # a reply the endpoint cut off mid-tag: scan() drops an unterminated block,
-    # so `<bash>ls` with no closing tag parses to nothing. stop_reason is the
-    # only thing that tells the two apart, and it was written to world.log and
-    # read by nobody. A cut-off turn is not a finished one.
-    cut = resp.get("stop_reason") in {"max_tokens", "refusal"}
-    if cut and not blocks:
-        note = f"[reply was cut short: {resp.get('stop_reason')} — continue from where it stopped]"
+    # a reply that was cut off mid-tag: scan() drops an unterminated block, so
+    # `<bash>ls` with no closing tag parses to nothing. stop_reason is the only
+    # thing that tells the two apart, and it was written to world.log and read
+    # by nobody. A cut-off turn is not a finished one.
+    #
+    # Every way a reply can end early belongs here, not just the endpoint's
+    # two. A stop sequence firing means generation was guillotined the instant
+    # it began impersonating the harness, and the degeneration guard means it
+    # was cut mid-repetition -- both leave exactly the same silent, empty,
+    # apparently-finished turn. They need opposite advice, though: a truncated
+    # reply should be resumed, and a reply that was stopped for going wrong
+    # must not be.
+    reason = resp.get("stop_reason")
+    if reason in CUT_REASONS and not blocks:
+        note = f"[{CUT_REASONS[reason]}]"
         messages.append({"role": "user", "content": note})
         fire({"ev": "error", "n": n, "text": note})
         return speech, results, False, assistant
     return speech, results, not blocks, assistant
+
+
+# Why a reply ended early, and what to tell the model about it. The first two
+# were cut by the endpoint and should be resumed from where they stopped. The
+# last two were cut by this harness precisely because the text was going
+# wrong, so "continue" is the one instruction that must not be given.
+CUT_REASONS = {
+    "max_tokens": "reply was cut short: max_tokens — continue from where it stopped",
+    "refusal": "reply was cut short: refusal — nothing was dispatched",
+    "stop_sequence": (
+        "generation was stopped: you began writing a result block or a user turn. "
+        "Those are the harness speaking, never you. Emit the syscall and stop — the "
+        "real result arrives on the next turn"
+    ),
+    "degenerate_repetition": (
+        "generation was stopped: the output fell into a repetition loop and the "
+        "stuck tail was discarded. Do not continue that text. Write the next step "
+        "fresh and briefly"
+    ),
+}
 
 
 def _commit_step(world: World, prompt: str, last: str) -> None:

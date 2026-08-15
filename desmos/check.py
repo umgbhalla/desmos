@@ -1515,6 +1515,39 @@ def _run_checks() -> None:
         assert any("cut short" in str(m.get("content")) for m in w_cut.messages), w_cut.messages
         assert any(e.get("ev") == "error" and "cut short" in e.get("text", "") for e in cut_evs)
 
+        # The two reasons this harness cuts a reply itself look identical to
+        # the endpoint's: an empty, apparently-finished turn. They were not in
+        # the set, so a generation guillotined the instant it started forging a
+        # result block reported a clean finish and the model was never told.
+        # They also need the opposite advice -- text that was stopped for going
+        # wrong must not be resumed.
+        for reason, want in (
+            ("stop_sequence", "result block"),
+            ("degenerate_repetition", "repetition loop"),
+        ):
+            w_s = new_world(cwd, state_path=None, persist=False, ns={})
+            n_s = {"n": 0}
+
+            def stopped(_m, _s, _msgs, _mt, _n=n_s, _r=reason):
+                _n["n"] += 1
+                if _n["n"] == 1:
+                    return {
+                        "content": [{"type": "text", "text": "here is what I found"}],
+                        "stop_reason": _r,
+                        "usage": {},
+                    }
+                return {"content": [{"type": "text", "text": "done"}], "usage": {}}
+
+            w_s.complete_fn = stopped
+            s_evs: list[dict] = []
+            _run(w_s, "go wrong", quiet=True, on_event=s_evs.append)
+            assert n_s["n"] == 2, f"{reason} must not end the step"
+            notes = [str(m.get("content")) for m in w_s.messages if m.get("role") == "user"]
+            assert any(want in x for x in notes), (reason, notes)
+            assert any(e.get("ev") == "error" for e in s_evs), reason
+            # never tell a reply that was stopped for going wrong to continue
+            assert not any("continue from where" in x for x in notes), (reason, notes)
+
         # Hitting the cap is not finishing either.
         w_cap = new_world(cwd, state_path=None, persist=False, ns={})
         w_cap.complete_fn = lambda *_: {
