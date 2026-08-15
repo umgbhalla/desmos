@@ -23,6 +23,12 @@ OnChunk = Callable[[str], None]
 ShouldStop = Callable[[], bool]
 
 
+# redirect_stdout and redirect_stderr replace process-global objects. Concurrent
+# Python tools would otherwise restore each other's writers out of order and
+# leak ordinary text onto the bridge's NDJSON stdout.
+_PYTHON_STDIO_LOCK = threading.RLock()
+
+
 class _ChunkWriter(io.TextIOBase):
     """Capture stdout/stderr and forward each write to the TUI."""
 
@@ -160,7 +166,7 @@ def run_python(
             # to be in, usually inside the input box, and nothing scheduled a
             # redraw to clear them. The model never saw the warning either.
             # Parse inside the capture, and name the file what the model wrote.
-            with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+            with _PYTHON_STDIO_LOCK, contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
                 tree = ast.parse(src, filename="<python>")
                 if not tree.body:
                     return "ok"

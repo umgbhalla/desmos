@@ -174,6 +174,46 @@ def _run_checks() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         cwd = Path(tmp)
         world = new_world(cwd, state_path=cwd / "harness.json")
+
+        # redirect_stdout mutates process-global sys.stdout. Parallel subagents
+        # can run Python tools on different threads, so without serialization
+        # one tool restores stdout while another still owns it. The remaining
+        # print then leaks raw text onto the bridge's NDJSON wire.
+        import threading as _threading
+        import time as _time
+        from desmos.exec import run_python as _run_python
+
+        _first = _threading.Event()
+        _outputs: dict[str, str] = {}
+        _wa = new_world(cwd, state_path=None, persist=False, ns={})
+        _wb = new_world(cwd, state_path=None, persist=False, ns={})
+
+        def _python_a() -> None:
+            _outputs["a"] = _run_python(
+                "import time\nprint('A-first')\ntime.sleep(0.08)\nprint('A-last')",
+                _wa,
+                on_chunk=lambda _s: _first.set(),
+            )
+
+        def _python_b() -> None:
+            _outputs["b"] = _run_python(
+                "import time\nprint('B-first')\ntime.sleep(0.15)\nprint('B-last')",
+                _wb,
+            )
+
+        _ta = _threading.Thread(target=_python_a)
+        _tb = _threading.Thread(target=_python_b)
+        _ta.start()
+        assert _first.wait(1), "first Python tool never reached stdout"
+        _tb.start()
+        _ta.join(1)
+        _tb.join(1)
+        assert not _ta.is_alive() and not _tb.is_alive(), "serialized Python tools wedged"
+        assert _outputs == {
+            "a": "A-first\nA-last",
+            "b": "B-first\nB-last",
+        }, _outputs
+
         from desmos.complete import cached_payload
         from desmos.const import ABI
 
