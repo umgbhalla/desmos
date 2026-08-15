@@ -72,8 +72,8 @@ def result_content(
 
 _BUILTIN_DOCS = (
     ("python", "exec Python in the persistent kernel"),
-    ("bash", "run a shell command in cwd — one subprocess, no state kept"),
-    ("shell", "persistent pty shell: id= names the session, cd/env/venv survive, answers prompts; timeout=, interrupt=1, close=1"),
+    ("bash", "isolated one-shot command in cwd — no state kept; use only when reset is useful"),
+    ("shell", "preferred persistent pty: id= names the session, state/processes survive; default timeout=5 is a read window, not a kill; interrupt=1, close=1"),
     ("edit", "replace one occurrence: path= and body old\\n---\\nnew"),
     ("register", "install a tag: name= and doc=, body is def handle"),
     ("system", "write or delete a system note (name=, optional delete=1)"),

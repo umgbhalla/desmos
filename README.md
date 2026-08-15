@@ -18,8 +18,8 @@ next `complete()` sees the change. No restart.
 
 ```
 <python>          exec, names persist
-<bash>            one subprocess in cwd, no state kept
-<shell>           persistent pty: cd/env/venv survive, answers prompts
+<bash>            isolated one-shot in cwd, no state kept
+<shell>           preferred persistent pty; 5s read windows, commands survive
 <edit>            unique replace (old --- new)
 <register>        grow a new tag
 <system>          write / delete a catalog note

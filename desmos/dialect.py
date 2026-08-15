@@ -135,9 +135,13 @@ def capabilities() -> str:
             " from that hook replaces the syscall result and the call never runs.",
             "<edit> also accepts old_str= and new_str= as attributes when the body form is awkward.",
             "state: <python> calls share one kernel -- a name bound in one is there in the next,"
-            " this turn and later turns. <bash> calls do not: each is a fresh subprocess in cwd, so"
-            " a cd or an export in one is gone by the next. Chain shell state inside a single"
-            " <bash>, not across several.",
+            " this turn and later turns. Prefer <shell id=\"main\"> for command work: its cwd,"
+            " environment, interactive process, and unfinished build survive across calls."
+            " Its timeout is only the read window, never a task estimate or process kill. Use the"
+            " 5-second default for probes and polling, timeout=15 for a quiet test, timeout=30 for"
+            " a build, and timeout=60 only for a known quiet heavyweight command; when it reports"
+            " still running, poll the same shell instead of starting another command. Use <bash>"
+            " only for a quick hermetic one-shot where a fresh subprocess is the point.",
             "a failing call does not stop the ones after it. Every tag in the turn runs, and you get"
             " every result. If a later call only makes sense when an earlier one succeeded, put it"
             " in the next turn instead.",

@@ -273,6 +273,9 @@ def self_check() -> None:
         # so the name is derived from the module that writes it.
         from desmos.spill import SPILL_DIR as _spill_dir
         assert _spill_dir in caps, "the prompt does not say where a spilled result lands"
+        assert 'Prefer <shell id="main">' in caps
+        assert "5-second default" in caps and "timeout=30 for a build" in caps
+        assert "Use <bash> only for a quick hermetic one-shot" in caps
         for _name in _sa.AGENTS:
             assert _name in caps, _name
         # fanout's default agent is not spawn's. The prompt says so because a
@@ -1238,7 +1241,10 @@ def self_check() -> None:
         # persistent shell is the other half: state carries, exit codes come
         # back, and a program that asks a question can be answered -- which is
         # the case a one-shot subprocess cannot express at all.
+        from desmos.shell import DEADLINE as _shell_deadline
         from desmos.shell import close_all as _close_shells, head_tail, strip_ansi
+
+        assert _shell_deadline == 5.0, "the documented shell polling default drifted"
 
         w_sh = new_world(cwd, state_path=None, persist=False, ns={})
         try:
