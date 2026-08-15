@@ -2768,7 +2768,10 @@ fn handle_event(app: &mut App, ev: Value) {
             app.running = false;
             app.turn_started = None;
             app.status = "idle".into();
-            app.drain_after = app.send_now && !app.queue.is_empty();
+            // A stop ends only the active step. Follow-ups already queued are
+            // still explicit user requests and must self-feed exactly as they
+            // do after a normal `done`; deleting a queue row is how to cancel it.
+            app.drain_after = !app.queue.is_empty();
         }
         // The harness explaining itself. Not speech (that is the model) and not
         // an error, so it must not touch running state.
@@ -9416,6 +9419,27 @@ mod tests {
             ),
             "the drained row is the turn that starts"
         );
+    }
+
+    #[test]
+    fn stopped_returns_idle_and_drains_existing_queue() {
+        let mut app = App::new();
+        app.running = true;
+        app.status = "stopping".into();
+        app.queue.push("run after the stop".into());
+
+        handle_event(&mut app, json!({"ev": "stopped", "text": "stopped, saved"}));
+        assert!(!app.running);
+        assert_eq!(app.status, "idle");
+        assert!(app.drain_after, "a queued request was stranded by stopped");
+
+        app.drain_after = false;
+        try_drain(None, &mut app).unwrap();
+        assert!(app.queue.is_empty());
+        assert!(matches!(
+            app.story.entry(app.story.len() - 1).map(|entry| &entry.block),
+            Some(RenderBlock::UserPrompt(_))
+        ));
     }
 
     #[test]

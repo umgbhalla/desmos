@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import traceback
 from datetime import datetime, timezone
 from pathlib import Path
@@ -70,6 +71,34 @@ def malformed_call_note(raw: str, stray: list[str]) -> str:
         f" nothing else; {detail}. Every tag must be opened and closed, and a body must never"
         " contain its own closing tag (build it by concatenation instead). Send the call again.]"
     )
+
+
+def normalize_syscall_input(value: Any) -> tuple[str, str | None]:
+    """Normalize only unambiguous custom-tool input collections.
+
+    Responses custom tools normally return one string. Some clients expose the
+    same commands as an array of strings, and a model can also place that array
+    in the custom string as JSON. Structural commas become newlines; prose or
+    non-string entries remain an error so validation stays atomic.
+    """
+    if isinstance(value, list):
+        if all(isinstance(part, str) for part in value):
+            return "\n".join(value), None
+        return repr(value), "syscall input arrays may contain only strings"
+    if not isinstance(value, str):
+        return repr(value), "syscall input must be a string or an array of strings"
+
+    stripped = value.strip()
+    if stripped.startswith("[") and stripped.endswith("]"):
+        try:
+            parsed = json.loads(stripped)
+        except ValueError:
+            return value, None
+        if isinstance(parsed, list):
+            if all(isinstance(part, str) for part in parsed):
+                return "\n".join(parsed), None
+            return value, "syscall input arrays may contain only strings"
+    return value, None
 
 
 def syscall_call(assistant: list[dict[str, Any]]) -> dict[str, Any] | None:
@@ -307,13 +336,25 @@ def turn(
     recoverable = False
     call = syscall_call(assistant)
     if call:
-        raw = call.get("input") or ""
+        raw, shape_error = normalize_syscall_input(call.get("input") or "")
+        # The next Responses request replays the provider item verbatim. Keep
+        # that replay schema-valid even when this client exposed input as an
+        # array or the model encoded a JSON array inside the custom string.
+        call["input"] = raw
+        provider_call = call.get("openai")
+        if isinstance(provider_call, dict) and provider_call.get("type") == "custom_tool_call":
+            provider_call["input"] = raw
         spans = scan_spans(raw)
-        stray: list[str] = []
+        stray: list[str] = [shape_error] if shape_error else []
         cursor = 0
-        for _, start, end in spans:
-            if raw[cursor:start].strip():
-                stray.append(raw[cursor:start])
+        for index, (_, start, end) in enumerate(spans):
+            gap = raw[cursor:start]
+            # Whitespace always separates calls. A comma is also a separator,
+            # but only between two complete calls — never as leading/trailing
+            # punctuation that could hide malformed input.
+            invalid = gap.strip() if index == 0 else gap.strip(" \t\r\n,")
+            if invalid:
+                stray.append(gap)
             cursor = end
         if raw[cursor:].strip():
             stray.append(raw[cursor:])

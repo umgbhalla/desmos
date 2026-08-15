@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any
@@ -124,11 +125,69 @@ def self_check() -> None:
         assert "ns:" in envelope and "live_marker: list, len=2" in envelope, envelope
         assert envelope.count(task) == 1, envelope
 
+    # Custom input is normally one string, but accept an array of command
+    # strings and both whitespace/comma separators between complete commands.
+    # Validation remains all-or-nothing after normalization.
+    from desmos.loop import run_turns
+
+    command_a = "<python>array_a = 1</python>"
+    command_b = "<python>array_b = 2</python>"
+    accepted_inputs: list[Any] = [
+        [command_a, command_b],
+        json.dumps([command_a, command_b]),
+        command_a + " \n " + command_b,
+        command_a + ", " + command_b,
+    ]
+    for case, supplied in enumerate(accepted_inputs):
+        with TemporaryDirectory() as td:
+            cwd = Path(td)
+            world = new_world(cwd, state_path=cwd / f"array-{case}.sqlite3", ns={})
+            world.model = "gpt-5.6-sol"
+            replies = 0
+
+            def complete_array(
+                _model: str,
+                _system: str,
+                _messages: list[dict[str, Any]],
+                _max: int,
+                value: Any = supplied,
+            ) -> dict[str, Any]:
+                nonlocal replies
+                replies += 1
+                if replies == 1:
+                    provider_call = {
+                        "type": "custom_tool_call",
+                        "name": "syscall",
+                        "call_id": f"array_call_{case}",
+                        "input": value,
+                    }
+                    return {
+                        "content": [{**provider_call, "openai": provider_call}],
+                        "usage": {},
+                    }
+                return {"content": [{"type": "text", "text": "array recovered"}], "usage": {}}
+
+            world.complete_fn = complete_array
+            assert run_turns(world, "array input", quiet=True) == "array recovered"
+            assert (world.ns.get("array_a"), world.ns.get("array_b")) == (1, 2), supplied
+            outputs = [
+                block
+                for message in world.messages
+                if message.get("role") == "user" and isinstance(message.get("content"), list)
+                for block in message["content"]
+                if block.get("type") == "custom_tool_call_output"
+            ]
+            assert len(outputs) == 1 and outputs[0]["call_id"] == f"array_call_{case}", outputs
+            replayed_calls = [
+                item for item in to_input(world.messages) if item.get("type") == "custom_tool_call"
+            ]
+            assert len(replayed_calls) == 1, replayed_calls
+            assert isinstance(replayed_calls[0].get("input"), str), replayed_calls
+            assert command_a in replayed_calls[0]["input"] and command_b in replayed_calls[0]["input"]
+
     # A malformed custom-tool payload is still a valid provider call and must
     # receive one typed output. Nothing inside the mixed payload may run, and
     # the loop must continue so the model can issue a corrected call.
-    from desmos.loop import run_turns
-
     with TemporaryDirectory() as td:
         cwd = Path(td)
         world = new_world(cwd, state_path=cwd / "recover.sqlite3", ns={"live_marker": [1, 2]})
