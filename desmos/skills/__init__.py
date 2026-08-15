@@ -163,11 +163,45 @@ def _xml(text: str) -> str:
     return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
 
 
-def load_skill_body(skill: Skill) -> str:
+def _skill_dialect(model: str) -> tuple[str, str] | None:
+    """Return the optional model-specific skill overlay.
+
+    Skill dialects are deliberately exact-model families rather than provider
+    defaults. A skill that has no measured model-specific failure stays shared.
+    """
+
+    value = (model or "").strip().lower()
+    if value == "gpt-5.6" or value.startswith("gpt-5.6-"):
+        return "GPT-5.6", "gpt-5.6.md"
+    if value == "claude-opus-5" or value.startswith("claude-opus-5-"):
+        return "Claude Opus 5", "claude-opus-5.md"
+    return None
+
+
+def load_skill_body(skill: Skill, model: str = "") -> str:
     try:
-        return skill.file_path.read_text(encoding="utf-8")
+        core = skill.file_path.read_text(encoding="utf-8")
     except OSError as exc:
         return f"could not read {skill.file_path}: {exc}"
+
+    selected = _skill_dialect(model)
+    if selected is None or skill.file_path.name != "SKILL.md":
+        return core
+    label, filename = selected
+    overlay_path = skill.file_path.parent / "dialects" / filename
+    if not overlay_path.exists():
+        return core
+    try:
+        overlay = overlay_path.read_text(encoding="utf-8").strip()
+    except OSError as exc:
+        return (
+            core.rstrip()
+            + f"\n\n# Model dialect overlay: {label}\n"
+            + f"Could not read {overlay_path}: {exc}\n"
+        )
+    if not overlay:
+        return core
+    return core.rstrip() + f"\n\n# Model dialect overlay: {label}\n" + overlay + "\n"
 
 
 def bind_python_skill(ns: dict[str, Any], skill: Skill) -> Any | None:

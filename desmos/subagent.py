@@ -546,6 +546,23 @@ def _execute(run: Run, parent: Any) -> None:
             }
         )
 
+def _contract_for(
+    task: str | TaskContract,
+    simple: dict[str, Any] | None = None,
+) -> tuple[TaskContract, bool]:
+    if simple is None:
+        return (task, True) if isinstance(task, TaskContract) else (TaskContract.legacy(str(task)), False)
+    if isinstance(task, TaskContract):
+        raise ValueError("simple scope cannot be combined with a TaskContract")
+    if not isinstance(simple, dict):
+        raise TypeError("simple scope must be an object")
+    allowed = {"paths", "write", "checks", "tools", "depends", "evidence"}
+    unknown = sorted(set(simple) - allowed)
+    if unknown:
+        raise ValueError(f"unknown simple scope fields: {unknown}")
+    return TaskContract.simple(str(task), **simple), True
+
+
 def spawn(
     task: str | TaskContract,
     agent: str = "general",
@@ -559,6 +576,7 @@ def spawn(
     task_template: str | None = None,
     guidance_every_turns: int | None = None,
     guidance_reminder: str | None = None,
+    simple: dict[str, Any] | None = None,
     parent: Any = None,
     _register_pending: bool = True,
     **over: Any,
@@ -578,8 +596,7 @@ def spawn(
         "guidance_reminder": guidance_reminder,
     }
     over.update({key: value for key, value in explicit.items() if value is not None})
-    structured = isinstance(task, TaskContract)
-    contract = task if structured else TaskContract.legacy(str(task))
+    contract, structured = _contract_for(task, simple)
     for dependency in contract.dependencies:
         prior = RUNS.get(dependency)
         if prior is None:
@@ -758,11 +775,14 @@ def spawn_many(specs: list[dict[str, Any]], *, parent: Any = None) -> list[str]:
         task = item.pop("task")
         if not isinstance(task, (str, TaskContract)):
             raise TypeError(f"spawn batch item {index} task must be text or TaskContract")
+        simple = item.pop("simple", None)
+        contract, structured = _contract_for(task, simple)
+        normalized: str | TaskContract = contract if structured else task
         agent = str(item.pop("agent", "general"))
         resume = item.pop("resume", None)
         cfg = resolve(agent, **item)
-        _scoped_tags(cfg.capability, task if isinstance(task, TaskContract) else None)
-        prepared.append((task, agent, resume, item))
+        _scoped_tags(cfg.capability, contract if structured else None)
+        prepared.append((normalized, agent, resume, item))
     parent = parent or _parent()
     ids = [
         spawn(

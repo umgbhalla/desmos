@@ -24,6 +24,7 @@ class TaskContract:
     write_paths: tuple[str, ...] = ()
     dependencies: tuple[str, ...] = ()
     require_tool_use: bool = True
+    compact: bool = False
 
     def __post_init__(self) -> None:
         if not self.objective.strip():
@@ -40,6 +41,31 @@ class TaskContract:
     def legacy(cls, task: str) -> TaskContract:
         return cls(objective=task)
 
+    @classmethod
+    def simple(
+        cls,
+        objective: str,
+        *,
+        paths: tuple[str, ...] | list[str] = (),
+        write: tuple[str, ...] | list[str] = (),
+        checks: tuple[str, ...] | list[str] = (),
+        tools: tuple[str, ...] | list[str] = (),
+        depends: tuple[str, ...] | list[str] = (),
+        evidence: tuple[str, ...] | list[str] = (),
+    ) -> TaskContract:
+        """Build a judged contract without repeating the full schema vocabulary."""
+
+        return cls(
+            objective=objective,
+            allowed_paths=tuple(paths),
+            write_paths=tuple(write),
+            acceptance_checks=tuple(checks),
+            allowed_tools=tuple(tools),
+            dependencies=tuple(depends),
+            required_evidence=tuple(evidence),
+            compact=True,
+        )
+
     def prompt(self) -> str:
         payload = {
             "objective": self.objective,
@@ -53,6 +79,21 @@ class TaskContract:
             "dependencies": list(self.dependencies),
             "require_tool_use": self.require_tool_use,
         }
+        if self.compact:
+            payload = {
+                key: value
+                for key, value in payload.items()
+                if value not in ([], (), "", False)
+            }
+            return (
+                "Execute this compact judged task. Stay inside its scope.\n"
+                + json.dumps(payload, separators=(",", ":"), sort_keys=True)
+                + "\nReturn only JSON with keys summary, claims, artifacts, changed_paths, "
+                "checks, failures, unresolved. Each claim is {text,evidence}; each check is "
+                "{name,passed,evidence}; each evidence item is {kind,reference,detail}. "
+                "Use empty arrays where needed. Every claim and passed check needs observed evidence."
+            )
+
         result_shape = {
             "summary": "human-readable summary",
             "claims": [

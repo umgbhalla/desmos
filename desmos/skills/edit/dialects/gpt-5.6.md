@@ -1,0 +1,1 @@
+Use the unique replacement operation directly; do not answer with a proposed patch when the user asked for an edit. Preserve the requested artifact's full scope even when keeping commentary short. After the result, verify the changed behavior with the smallest independent check.

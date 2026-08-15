@@ -111,10 +111,11 @@ def capabilities() -> str:
             " wait(*ids, timeout=600) blocks; gather(ids) waits and joins their output; status()"
             " lists running; result(id) reads one; spawn(resume=id) continues a finished run."
             " A child is an isolated World with its own transcript and no persist.",
-            "subagent contracts: spawn also takes a TaskContract instead of a string --"
-            " objective, non_goals, deliverable_schema, required_evidence, acceptance_checks,"
-            " allowed_tools, allowed_paths, write_paths, dependencies, and require_tool_use."
-            " Under a contract"
+            "subagent contracts: for routine bounded work, pass task text plus"
+            " simple={paths, write, checks, tools, depends, evidence}; it expands to a compact judged"
+            " contract. Use TaskContract directly for high-risk or unusual work -- objective,"
+            " non_goals, deliverable_schema, required_evidence, acceptance_checks, allowed_tools,"
+            " allowed_paths, write_paths, dependencies, and require_tool_use. Under either contract"
             " structured_result(id) returns a typed RunResult and judgment(id) returns"
             " accepted/rejected with reasons. The judge scores the declarations against what the"
             " parent observed at runtime, so a child cannot pass by asserting it passed; a"
@@ -216,8 +217,9 @@ _OPENAI = "\n".join(
         " Inspection and a plan are discovery, not completion.",
         "Decide reversible, low-impact things yourself. Ask first when an action is hard to undo,"
         " or when it is costly, public, or exposes data.",
-        "When you spawn, give the child a TaskContract with acceptance_checks and write_paths."
-        " A string task returns prose you then have to trust.",
+        "When you spawn routine bounded work, use the compact simple contract with paths, write"
+        " scope, and checks. Reserve the full TaskContract schema for high-risk or unusual work."
+        " A bare string task returns prose you then have to trust.",
         "Close with the outcome in the first sentence. Then separate what you verified by running"
         " it from what you are inferring, and name anything still unproven.",
         "A response that only calls `syscall` is complete and correct. Write no assistant text"

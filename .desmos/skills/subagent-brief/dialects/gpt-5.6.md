@@ -1,0 +1,1 @@
+Prefer the minimum contract that makes the result falsifiable: objective, paths, write scope, and concrete acceptance checks. Do not repeat the same requirement across objective, evidence, schema, and checks. Put the verdict and decisive evidence first.

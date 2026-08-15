@@ -1,0 +1,1 @@
+Keep the patch to the one requested replacement. Do not widen it into cleanup or a neighboring refactor. Run one relevant verification after the edit; do not add a second review pass unless the first check fails.

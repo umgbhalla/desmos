@@ -1,0 +1,1 @@
+Return the finished visual, not a plan for one. Choose one representation and preserve every relationship needed to answer the question. If an artifact is requested, create it and verify that it opens before reporting completion.

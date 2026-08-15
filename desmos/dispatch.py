@@ -163,7 +163,7 @@ def dispatch(
         skill = next((s for s in world.skills if s.name == name), None)
         if skill is None:
             return f"unknown skill {name!r}"
-        return load_skill_body(skill)
+        return load_skill_body(skill, world.model)
     if block.tag == "reload":
         from desmos.loop import reload
 
