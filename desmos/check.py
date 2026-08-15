@@ -254,6 +254,9 @@ def self_check() -> None:
         assert family("codex-mini") == "openai"
         assert family("") == "anthropic", "unknown model falls back to anthropic"
         assert dialect("claude-opus-5") != dialect("gpt-5.6-sol"), "one block cannot serve both"
+        assert "implementation and verification" in dialect("gpt-5.6-sol"), (
+            "the OpenAI lane can stop after inspection on an implementation request"
+        )
 
         # The prompt states facts about the subagent layer. Every one of them is
         # derived here from the live objects, so a signature change fails the
@@ -452,6 +455,66 @@ def self_check() -> None:
         world2 = new_world(cwd, state_path=cwd / "harness.json")
         assert "echo" in world2.tools
         assert world2.notes["style"] == "prefer tests"
+        assert (cwd / "harness.json").read_bytes().startswith(b"SQLite format 3")
+        import sqlite3 as _sqlite3
+
+        with _sqlite3.connect(cwd / "harness.json") as _db:
+            assert _db.execute("SELECT COUNT(*) FROM sessions").fetchone()[0] == 1
+            assert _db.execute("PRAGMA foreign_key_check").fetchall() == []
+
+        # A legacy snapshot imports exactly once and remains available as a backup.
+        import json as _json
+        legacy_path = cwd / "legacy-state.json"
+        legacy_path.write_text(
+            _json.dumps(
+                {
+                    "notes": {"legacy": "kept"},
+                    "tools": {},
+                    "docs": {},
+                    "prior": [{"prompt": "old", "speech": "answer"}],
+                    "generation": 3,
+                    "gen_reason": "legacy import",
+                    "thinking": "high",
+                    "messages": [{"role": "user", "content": "before sqlite"}],
+                }
+            ),
+            encoding="utf-8",
+        )
+        legacy_world = new_world(cwd, state_path=legacy_path)
+        assert legacy_world.notes["legacy"] == "kept"
+        assert legacy_world.messages == [{"role": "user", "content": "before sqlite"}]
+        assert legacy_world.generation == 3
+        assert legacy_path.read_bytes().startswith(b"SQLite format 3")
+        assert (cwd / "legacy-state.json.migrated").is_file()
+        legacy_again = new_world(cwd, state_path=legacy_path)
+        assert legacy_again.notes["legacy"] == "kept"
+
+        # The production default migrates .desmos/harness.json to harness.sqlite3.
+        default_root = cwd / "default-migration"
+        default_legacy = default_root / ".desmos" / "harness.json"
+        default_legacy.parent.mkdir(parents=True)
+        default_legacy.write_text(_json.dumps({"notes": {"default": "imported"}}), encoding="utf-8")
+        default_world = new_world(default_root)
+        assert default_world.notes["default"] == "imported"
+        assert (default_root / ".desmos" / "harness.sqlite3").is_file()
+        assert (default_root / ".desmos" / "harness.json.migrated").is_file()
+
+        # Corruption is backed up and reported instead of masquerading as empty state.
+        corrupt_path = cwd / "corrupt-state.sqlite3"
+        corrupt_path.write_bytes(b"not a database")
+        import warnings as _warnings
+
+        with _warnings.catch_warnings(record=True) as _seen_warnings:
+            _warnings.simplefilter("always")
+            corrupt_world = new_world(cwd, state_path=corrupt_path)
+        assert any("corrupt harness database" in str(item.message) for item in _seen_warnings)
+        assert list(cwd.glob("corrupt-state.sqlite3.corrupt*"))
+        assert corrupt_path.read_bytes().startswith(b"SQLite format 3")
+        assert corrupt_world.messages == []
+
+        disabled_path = cwd / "disabled.sqlite3"
+        new_world(cwd, state_path=disabled_path, persist=False)
+        assert not disabled_path.exists()
 
         def fake_complete(model, system, messages, max_tokens):
             blob = __import__("json").dumps(messages)
@@ -1238,8 +1301,8 @@ def self_check() -> None:
         assert "agents" not in child.tools
         child.notes["pwn"] = "from-child"
         save_world(child)
-        on_disk = __import__("json").loads((cwd / "harness-iso.json").read_text(encoding="utf-8"))
-        assert "pwn" not in on_disk.get("notes", {})
+        reloaded_parent = new_world(cwd, state_path=cwd / "harness-iso.json")
+        assert "pwn" not in reloaded_parent.notes
         unknown = wait("nope")
         assert unknown[0]["state"] == "unknown"
         import desmos.subagent as S

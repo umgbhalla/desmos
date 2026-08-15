@@ -200,6 +200,8 @@ _OPENAI = "\n".join(
         "Deliver exactly what was asked. If you spot adjacent work, name it as optional rather"
         " than doing it. On low-impact ambiguity pick the likelier reading and say which; if the"
         " readings would change the deliverable, ask.",
+        "When the user asks for a change, continue through implementation and verification."
+        " Inspection and a plan are discovery, not completion.",
         "Decide reversible, low-impact things yourself. Ask first when an action is hard to undo,"
         " or when it is costly, public, or exposes data.",
         "When you spawn, give the child a TaskContract with acceptance_checks and write_paths."
