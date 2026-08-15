@@ -4962,8 +4962,12 @@ fn draw(f: &mut Frame, app: &mut App) {
     // it, so it reads as a card rather than one more stacked pane. Once POST is
     // fully collapsed that row is only dead
     // space between story and input, so the composer gives it back. An open
-    // queue is the top card of the same group and owns the spacer itself.
-    let queue_h = if queue_h > 0 { queue_h + 1 } else { 0 };
+    // queue is the top card of the same group and owns the spacer itself --
+    // including the giving back, which it did not do: with POST collapsed the
+    // queue kept its float and left two blank rows under the story, its own
+    // border and then the spacer.
+    let queue_float = u16::from(queue_h > 0 && app.layout.post_h > 0);
+    let queue_h = if queue_h > 0 { queue_h + queue_float } else { 0 };
     let float_rows = input_float_rows(app);
     // Grow with what is typed, up to half the column. The old ceiling of ten
     // rows existed to leave a legend band matching it opposite; there is no
@@ -5028,12 +5032,12 @@ fn draw(f: &mut Frame, app: &mut App) {
     app.post_out_area = posts[1];
     // The card, not the slot: the float row above it is not part of the queue,
     // so a click there does nothing and the row arithmetic below stays honest.
-    app.queue_area = if left[2].height > 1 {
+    app.queue_area = if queue_float > 0 && left[2].height > 1 {
         Rect {
             x: left[2].x,
-            y: left[2].y.saturating_add(1),
+            y: left[2].y.saturating_add(queue_float),
             width: left[2].width,
-            height: left[2].height.saturating_sub(1),
+            height: left[2].height.saturating_sub(queue_float),
         }
     } else {
         left[2]
@@ -7860,6 +7864,34 @@ mod tests {
         assert!(
             left.trim_start().starts_with('\u{250c}'),
             "the collapsed POST left a blank row above the composer: {left:?}",
+        );
+    }
+
+    /// The rule the composer follows for a collapsed POST is the group's, not
+    /// the composer's: an open queue is the top card, so it is the one that has
+    /// to give the float row back. It did not, and a collapsed POST left the
+    /// story's bottom border and then a blank spacer above the queue.
+    #[test]
+    fn a_collapsed_post_leaves_no_spacer_above_the_queue() {
+        let mut app = App::new();
+        app.layout.post_h = 0;
+        app.queue.push("a follow-up".into());
+        let text = paint(&mut app, 100, 30);
+        let rows: Vec<&str> = text.lines().collect();
+
+        assert_eq!(
+            app.traj_area.y + app.traj_area.height,
+            app.queue_area.y,
+            "a layout row survived between story and queue",
+        );
+        let top = app.queue_area.y as usize;
+        let left: String = rows[top]
+            .chars()
+            .take(app.queue_area.width as usize)
+            .collect();
+        assert!(
+            left.trim_start().starts_with('\u{250c}'),
+            "blank row above the queue with POST collapsed: {left:?}",
         );
     }
 
