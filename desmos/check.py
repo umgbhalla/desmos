@@ -1750,6 +1750,75 @@ def self_check() -> None:
         assert back[0]["content"][0]["type"] == "input_text"
         assert reasoning_item in back, back
         assert msg_item in back, back
+
+        call_item = {
+            "id": "ct_1",
+            "type": "custom_tool_call",
+            "status": "completed",
+            "call_id": "call_1",
+            "name": "syscall",
+            "input": "<python>OPENAI_SYSCALL_EVAL = 40 + 2\nprint(OPENAI_SYSCALL_EVAL)</python>",
+        }
+        call_resp = {
+            "role": "assistant",
+            "model": "gpt-5.6-sol",
+            "content": _oai._blocks_from_items([call_item]),
+            "usage": {},
+            "stop_reason": "end_turn",
+        }
+        kept_call = _ac(call_resp)
+        assert text_of(call_resp) == "", "typed syscall input is not assistant speech"
+        assert kept_call[0]["input"].endswith("</python>")
+        replay = _oai.to_input(
+            [
+                {"role": "assistant", "content": kept_call},
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "custom_tool_call_output",
+                            "call_id": "call_1",
+                            "output": '<result tag="python">42</result>',
+                        }
+                    ],
+                },
+            ]
+        )
+        assert replay == [
+            call_item,
+            {
+                "type": "custom_tool_call_output",
+                "call_id": "call_1",
+                "output": '<result tag="python">42</result>',
+            },
+        ], replay
+        tools = _oai.payload_for("gpt-5.6-sol", "system", [], 100)["tools"]
+        assert len(tools) == 1 and tools[0]["type"] == "custom" and tools[0]["name"] == "syscall"
+
+        final_resp = {
+            "role": "assistant",
+            "model": "gpt-5.6-sol",
+            "content": [{"type": "text", "text": "done"}],
+            "usage": {},
+            "stop_reason": "end_turn",
+        }
+        replies = iter([call_resp, final_resp])
+        w_call = new_world(cwd, persist=False, ns={})
+        w_call.model = "gpt-5.6-sol"
+        w_call.complete_fn = lambda *_args: next(replies)
+        from desmos.loop import run_turns as _run_openai
+
+        assert _run_openai(w_call, "calculate", max_turns=3, quiet=True) == "done"
+        assert w_call.ns["OPENAI_SYSCALL_EVAL"] == 42
+        typed_results = [
+            b
+            for m in w_call.messages
+            if m.get("role") == "user" and isinstance(m.get("content"), list)
+            for b in m["content"]
+            if isinstance(b, dict) and b.get("type") == "custom_tool_call_output"
+        ]
+        assert typed_results[0]["call_id"] == "call_1" and ">42<" in typed_results[0]["output"]
+
         # sol splits a turn into a commentary preamble and a final_answer, and
         # some models stream reasoning verbatim rather than as a summary. Both
         # events were unhandled: the thinking pane stayed empty while reasoning
@@ -1802,9 +1871,6 @@ def self_check() -> None:
         assert [b.tag for b in scan(sol_tail)] == ["bash"], "the call still dispatches"
         assert _residue("<usage/>") == "" and _residue("just prose") == ""
         assert _residue("prose before <usage/>") == "", "only what follows the last call counts"
-        assert "closing tag" in dialect("gpt-5.6-sol"), (
-            "the openai lane must license a syscall-only turn or it invents filler prose"
-        )
 
         # An attached screenshot has to survive the crossing. Anthropic's block
         # shape goes in, Responses' flat data-URL input_image comes out -- the
