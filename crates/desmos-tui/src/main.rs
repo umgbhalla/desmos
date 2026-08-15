@@ -694,18 +694,16 @@ const RUN_MIN_CALLS: usize = 2;
 /// the keystroke that caused it, short enough that it is never stale chrome.
 const NOTICE_TTL: Duration = Duration::from_secs(4);
 
+/// An empty composer should invite a real prompt rather than collapse to a
+/// two-line text slot. It can still shrink on short terminals and grows up to
+/// half the Story column once the text needs more room.
+const COMPOSER_DEFAULT_ROWS: u16 = 8;
 /// What the story says once the harness process is gone: once where it died,
 /// and again under any prompt typed afterwards. Nothing in this session can
 /// run again — the transcript on disk is the harness's, and it stopped where
 /// the kernel stopped.
 const BRIDGE_GONE: &str = "the harness process is gone. nothing further runs in this session; \
                            quit and start it again to continue from the saved transcript.";
-
-/// Blank rows held back at the foot of the story. The pane follows its tail,
-/// so without them a streaming thought grows and folds against the border and
-/// the whole column jumps. The wire pane keeps none: nothing there collapses
-/// under the reader while it is being written.
-const STORY_PAD_BOTTOM: u16 = 2;
 
 impl WorkRun {
     /// Take the repo state the git pane read on its worker thread. Called as
@@ -4909,10 +4907,11 @@ fn draw(f: &mut Frame, app: &mut App) {
     // rows existed to leave a legend band matching it opposite; there is no
     // legend now, and a long prompt is worth more rows than a short story is.
     let cap = (body[0].height / 2).saturating_sub(3).max(2);
-    let prompt_rows = app.prompt.display_rows(inner_w).clamp(2, cap);
+    let default_rows = COMPOSER_DEFAULT_ROWS.min(cap);
+    let prompt_rows = app.prompt.display_rows(inner_w).clamp(default_rows, cap);
     let input_h = (2 + float_rows + prompt_rows)
         .min(f.area().height.saturating_sub(8 + queue_h))
-        .max(4 + float_rows);
+        .max(2 + float_rows + default_rows);
     let bottom_h = queue_h + input_h;
     let post_h = app
         .layout
@@ -5012,7 +5011,7 @@ fn draw(f: &mut Frame, app: &mut App) {
             app.focus == Focus::Story,
             app.mouse,
             &child.story_text,
-            STORY_PAD_BOTTOM,
+            0,
         );
         draw_scrollback(
             f,
@@ -5039,7 +5038,7 @@ fn draw(f: &mut Frame, app: &mut App) {
             app.focus == Focus::Story,
             app.mouse,
             &app.story_text,
-            STORY_PAD_BOTTOM,
+            0,
         );
         draw_scrollback(
             f,
@@ -9771,11 +9770,11 @@ mod tests {
         assert!(!cfg.scrollback.blocks.prompt.vpad, "a prompt does not need two blank rows");
         assert!(!cfg.turn_status.gap);
 
-        // And it reaches the frame: an idle composer holds five rows, not six,
-        // and the row it gives up goes to the story pane above it.
+        // And it reaches the frame: an idle composer exposes eight text rows,
+        // plus its border and the floating spacer above the card.
         let mut app = App::new();
         let _ = paint(&mut app, 140, 34);
-        assert_eq!(app.input_area.height, 5, "idle composer: {:?}", app.input_area);
+        assert_eq!(app.input_area.height, 11, "idle composer: {:?}", app.input_area);
         assert_eq!(
             app.traj_area.y + app.traj_area.height + app.layout.post_h,
             app.input_area.y,
@@ -11011,53 +11010,19 @@ mod tests {
         );
     }
 
-    /// The story follows its tail, so the newest block lands on the border and
-    /// every row a streaming thought gains or loses drags the whole column.
-    /// A reserved floor keeps the live block off the frame. The rows have to
-    /// be held back *before* layout, or the viewport still ends at the border
-    /// and the pad is only a lie told after the fact.
+    /// Thinking now streams in Activity, so Story no longer reserves two blank
+    /// rows beneath its tail. Both scrollbacks may use their full inner height.
     #[test]
-    fn the_story_reserves_a_floor_the_wire_does_not() {
+    fn story_and_activity_use_their_full_viewports() {
         let mut app = App::new();
         seed_demo(&mut app);
-        // Short enough that the story overflows: a pane with room to spare
-        // ends in blank rows whether or not anything reserved them.
         let _ = paint(&mut app, 140, 44);
-        let text = paint(&mut app, 140, 44);
-        let strip = |r: Rect| -> Vec<String> {
-            let rows = rows_of(&text, r);
-            let all: Vec<&str> = rows.lines().collect();
-            all[1..all.len() - 1]
-                .iter()
-                .map(|l| l.trim_matches(|c| c == '\u{2502}' || c == ' ').to_string())
-                .collect()
-        };
-        let body = strip(app.traj_area);
-        let pad = STORY_PAD_BOTTOM as usize;
-        assert!(body.len() > pad + 1, "story pane too short to measure");
-        assert!(
-            body[body.len() - pad..].iter().all(|l| l.is_empty()),
-            "the story spent its reserved floor: {:?}",
-            &body[body.len() - pad - 1..]
-        );
-        assert!(
-            !body[body.len() - pad - 1].is_empty(),
-            "story never reached its floor, so the pad proves nothing: {body:?}"
-        );
-        // The reservation is geometry, not paint: the story's viewport is
-        // short by the pad, the wire's is not. Asserting on blank rows alone
-        // would pass on a pane that simply had room to spare.
+        let _ = paint(&mut app, 140, 44);
+
         let (_, story_vp, _) = app.story.scroll_info();
-        let (_, wire_vp, _) = app.calls.scroll_info();
-        // Literal 2, not STORY_PAD_BOTTOM: written against the constant this
-        // assertion follows any value the constant takes, including zero, and
-        // proves only that arithmetic works.
-        assert_eq!(
-            story_vp,
-            app.traj_area.height - 2 - 2,
-            "the story viewport did not give up its floor"
-        );
-        assert_eq!(wire_vp, app.call_area.height - 2, "the wire pane reserved a floor");
+        let (_, activity_vp, _) = app.calls.scroll_info();
+        assert_eq!(story_vp, app.traj_area.height - 2);
+        assert_eq!(activity_vp, app.call_area.height - 2);
     }
 
     /// Blank rows are the story's largest single expense: grok gaps every
