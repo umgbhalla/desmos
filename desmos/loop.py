@@ -556,7 +556,7 @@ def _run_turns(
             return f"[stopped: {hit[0]} after turn {n}]"
         return f"[stopped by the user after turn {n}]"
 
-    world.messages.append({"role": "user", "content": header(world, prompt) + "\n\n" + prompt})
+    world.messages.append({"role": "user", "content": header(world) + "\n\n" + prompt})
     last = ""
     n = 0
     while max_turns is None or n < max_turns:

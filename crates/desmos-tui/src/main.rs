@@ -999,6 +999,9 @@ struct App {
     /// Slash completion for the composer. Recomputed on every keystroke that
     /// changes the line, so it never has to be dismissed explicitly.
     slash: slash::Slash,
+    /// Theme active before the completion list began previewing. `None` means
+    /// there is no preview transaction to roll back.
+    theme_preview_origin: Option<ThemeKind>,
     generation: String,
     running: bool,
     turn_started: Option<Instant>,
@@ -1397,6 +1400,7 @@ impl App {
             thinking: String::new(),
             model_pending: None,
             slash: slash::Slash::default(),
+            theme_preview_origin: None,
             generation: String::new(),
             running: false,
             turn_started: None,
@@ -2880,6 +2884,44 @@ fn apply_picker(
     Ok(false)
 }
 
+fn resolved_theme(name: &str) -> Option<ThemeKind> {
+    ThemeKind::from_name(name).map(|kind| {
+        if kind.is_auto() {
+            theme_cache::resolve_initial_theme()
+        } else {
+            kind
+        }
+    })
+}
+
+/// Keep theme completion transactional: selection paints immediately, while
+/// leaving the list without accepting restores the theme active on entry.
+fn sync_theme_preview(app: &mut App) {
+    let selected = app
+        .slash
+        .is_theme_values()
+        .then(|| app.slash.selected_text())
+        .flatten()
+        .and_then(resolved_theme);
+    if let Some(kind) = selected {
+        if app.theme_preview_origin.is_none() {
+            app.theme_preview_origin = Some(Theme::current_kind());
+        }
+        if Theme::current_kind() != kind {
+            theme_cache::set(kind);
+            app.apply_grok_settings();
+        }
+    } else if let Some(origin) = app.theme_preview_origin.take() {
+        theme_cache::set(origin);
+        app.apply_grok_settings();
+    }
+}
+
+fn update_slash(app: &mut App) {
+    app.slash.update(&app.prompt.to_send(), &app.picker);
+    sync_theme_preview(app);
+}
+
 fn handle_key(
     mut bridge: Option<&mut Bridge>,
     app: &mut App,
@@ -2914,10 +2956,12 @@ fn handle_key(
         match key.code {
             KeyCode::Up => {
                 app.slash.move_sel(-1);
+                sync_theme_preview(app);
                 return Ok(false);
             }
             KeyCode::Down => {
                 app.slash.move_sel(1);
+                sync_theme_preview(app);
                 return Ok(false);
             }
             // Tab always completes. Enter only completes when there is
@@ -2933,11 +2977,23 @@ fn handle_key(
                 if let Some(line) = app.slash.accept() {
                     app.prompt.clear();
                     app.prompt.insert_str(&line);
-                    app.slash.update(&app.prompt.to_send(), &app.picker);
+                    update_slash(app);
                 }
                 return Ok(false);
             }
             KeyCode::Enter => {
+                // A theme row is already a complete choice: Enter commits the
+                // preview and runs the local command in one step. Other lists
+                // keep their ordinary completion semantics.
+                if app.slash.is_theme_values()
+                    && let Some(line) = app.slash.accept()
+                {
+                    app.prompt.clear();
+                    app.prompt.insert_str(&line);
+                    app.slash.close();
+                    app.theme_preview_origin = None;
+                    return submit_prompt(bridge.as_deref_mut(), app);
+                }
                 // Send anything that already runs. "Would accepting change the
                 // line" was the wrong question: /model takes an argument, so
                 // accept() appended a space, so Enter completed instead of
@@ -2952,7 +3008,7 @@ fn handle_key(
                     if line != typed {
                         app.prompt.clear();
                         app.prompt.insert_str(&line);
-                        app.slash.update(&app.prompt.to_send(), &app.picker);
+                        update_slash(app);
                         return Ok(false);
                     }
                     app.slash.close();
@@ -2962,6 +3018,7 @@ fn handle_key(
             }
             KeyCode::Esc => {
                 app.slash.close();
+                sync_theme_preview(app);
                 return Ok(false);
             }
             _ => {}
@@ -3411,7 +3468,7 @@ fn handle_key(
     // One recompute after any edit, rather than a call at each of the dozen
     // sites that can change the line. A line that stopped being a command
     // closes the list on its own.
-    app.slash.update(&app.prompt.to_send(), &app.picker);
+    update_slash(app);
     Ok(false)
 }
 
@@ -3788,11 +3845,16 @@ fn handle_mouse(app: &mut App, m: MouseEvent) {
     let on_git = hit(app.git_area, m.column, m.row);
     let on_files = hit(app.files_area, m.column, m.row);
     let on_meta = hit(app.cache.area, m.column, m.row);
+    let on_slash = slash_popup_area(app.input_area, app)
+        .is_some_and(|area| hit(area, m.column, m.row));
 
     match m.kind {
         MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
             let up = matches!(m.kind, MouseEventKind::ScrollUp);
-            if on_calls {
+            if on_slash && app.slash.open {
+                app.slash.move_sel(if up { -1 } else { 1 });
+                sync_theme_preview(app);
+            } else if on_calls {
                 wheel_scroll(app.calls_scroll(), up, 3);
             } else if on_story {
                 wheel_scroll(app.story_scroll(), up, 3);
@@ -4889,12 +4951,13 @@ fn draw(f: &mut Frame, app: &mut App) {
         ])
         .split(f.area());
 
-    // Two cells of gutter each side of the card, then its own border.
-    let inner_w = body[0].width.saturating_sub(4);
+    // The composer frame shares the Story column edges; only its own border is
+    // removed when measuring wrapped text.
+    let inner_w = body[0].width.saturating_sub(2);
     let queue_h = app.queue.display_height();
     // The composer floats over the column while POST is open: a blank row above
-    // it and a cell of gutter each side, so it reads as a card rather than one
-    // more stacked pane. Once POST is fully collapsed that row is only dead
+    // it, so it reads as a card rather than one more stacked pane. Once POST is
+    // fully collapsed that row is only dead
     // space between story and input, so the composer gives it back. An open
     // queue is the top card of the same group and owns the spacer itself.
     let queue_h = if queue_h > 0 { queue_h + 1 } else { 0 };
@@ -4964,9 +5027,9 @@ fn draw(f: &mut Frame, app: &mut App) {
     // so a click there does nothing and the row arithmetic below stays honest.
     app.queue_area = if left[2].height > 1 {
         Rect {
-            x: left[2].x.saturating_add(1),
+            x: left[2].x,
             y: left[2].y.saturating_add(1),
-            width: left[2].width.saturating_sub(2),
+            width: left[2].width,
             height: left[2].height.saturating_sub(1),
         }
     } else {
@@ -5817,9 +5880,9 @@ fn draw_input(f: &mut Frame, area: Rect, app: &mut App) {
     // touch; with POST collapsed it disappears entirely.
     let float = input_float_rows(app);
     let card = Rect {
-        x: area.x.saturating_add(1),
+        x: area.x,
         y: area.y.saturating_add(float),
-        width: area.width.saturating_sub(2),
+        width: area.width,
         height: area.height.saturating_sub(float),
     };
     let prefix = " ";
@@ -6112,6 +6175,28 @@ fn draw_help(f: &mut Frame, app: &App) {
     f.render_widget(Paragraph::new(lines), inner);
 }
 
+fn slash_popup_area(input: Rect, app: &App) -> Option<Rect> {
+    let verdict = slash::verdict(&app.prompt.to_send(), &app.picker);
+    if !app.slash.open && matches!(verdict, slash::Verdict::NotACommand) {
+        return None;
+    }
+    let rows = app.slash.items.len().min(8);
+    let note = !matches!(
+        verdict,
+        slash::Verdict::Ready | slash::Verdict::NotACommand
+    );
+    let h = rows as u16 + if note { 3 } else { 2 };
+    if input.width < 12 || input.y < h {
+        return None;
+    }
+    Some(Rect {
+        x: input.x,
+        y: input.y.saturating_sub(h),
+        width: input.width.min(88),
+        height: h,
+    })
+}
+
 /// The completion list, above the composer, plus the verdict on what is
 /// typed. The verdict is the point: a bad model id used to be discoverable
 /// only by sending it and reading an error a step later.
@@ -6133,15 +6218,8 @@ fn draw_slash(f: &mut Frame, input: Rect, app: &App) {
         slash::Verdict::NotACommand => ("", String::new(), theme.text_secondary),
     };
     let rows = app.slash.items.len().min(8);
-    let h = rows as u16 + if note.is_empty() { 2 } else { 3 };
-    if input.width < 12 || input.y < h {
+    let Some(area) = slash_popup_area(input, app) else {
         return;
-    }
-    let area = Rect {
-        x: input.x,
-        y: input.y.saturating_sub(h),
-        width: input.width.min(88),
-        height: h,
     };
     // The popup floats over the story pane. Without wiping the cells first the
     // text underneath shows through wherever a suggestion is shorter than the
@@ -7667,8 +7745,8 @@ mod tests {
     }
 
     /// The queue and the composer are one stack of cards, not two panes with
-    /// a gap. The composer floats -- a blank row above it, a cell of gutter
-    /// each side -- and when the queue is open that float belongs to the
+    /// a gap. The composer floats on a blank row above it, and when the queue
+    /// is open that float belongs to the
     /// queue, so the two boxes touch and share a left edge. It used to be the
     /// composer's own, which put the blank row *between* them and left the
     /// queue running a column wider on both sides.
@@ -8301,6 +8379,13 @@ mod tests {
         let text = paint(&mut app, 140, 34);
         assert_eq!(app.input_area.x, app.traj_area.x, "composer left edge");
         assert_eq!(app.input_area.width, app.traj_area.width, "composer width");
+        let top = app.input_area.y + input_float_rows(&app);
+        let row = text.lines().nth(top as usize).unwrap_or_default();
+        assert_eq!(
+            row.find('\u{250c}'),
+            Some(app.traj_area.x as usize),
+            "painted composer frame is inset from Story: {row:?}"
+        );
         assert!(
             app.input_area.width + 20 < 140,
             "composer still spans the frame: {:?}",
@@ -9655,6 +9740,66 @@ mod tests {
         assert!(!s.open);
     }
 
+    #[test]
+    fn theme_completion_previews_then_rolls_back_or_commits() {
+        let _pin = theme_lock();
+        let saved = Theme::current_kind();
+        let mut app = App::new();
+        theme_cache::set(ThemeKind::OscuraMidnight);
+        app.apply_grok_settings();
+        app.set_focus(Focus::Input);
+
+        for c in "/theme ".chars() {
+            handle_key(None, &mut app, press(KeyCode::Char(c))).unwrap();
+        }
+        assert_eq!(
+            Theme::current_kind(),
+            ThemeKind::GrokNight,
+            "opening the values must preview the highlighted row"
+        );
+        let _ = paint(&mut app, 100, 30);
+        let popup = slash_popup_area(app.input_area, &app).expect("theme popup");
+        handle_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::ScrollDown,
+                column: popup.x + 1,
+                row: popup.y + 1,
+                modifiers: KeyModifiers::NONE,
+            },
+        );
+        assert_eq!(
+            Theme::current_kind(),
+            ThemeKind::TokyoNight,
+            "wheel navigation must preview the row it selects"
+        );
+        handle_key(None, &mut app, press(KeyCode::Esc)).unwrap();
+        assert_eq!(
+            Theme::current_kind(),
+            ThemeKind::OscuraMidnight,
+            "Escape must restore the theme active before preview"
+        );
+
+        app.prompt.clear();
+        update_slash(&mut app);
+        for c in "/theme ".chars() {
+            handle_key(None, &mut app, press(KeyCode::Char(c))).unwrap();
+        }
+        handle_key(None, &mut app, press(KeyCode::Down)).unwrap();
+        handle_key(None, &mut app, press(KeyCode::Enter)).unwrap();
+        assert_eq!(
+            Theme::current_kind(),
+            ThemeKind::TokyoNight,
+            "Enter must keep the highlighted preview"
+        );
+        assert!(!app.slash.open);
+        assert!(app.prompt.to_send().is_empty());
+        assert!(app.theme_preview_origin.is_none());
+
+        theme_cache::set(saved);
+        app.apply_grok_settings();
+    }
+
     /// Enter accepted unconditionally, so a command taking no argument could
     /// never be sent: /reset left one suggestion, accepting it produced the
     /// line already typed, the list matched again, and Enter looped there.
@@ -10101,7 +10246,7 @@ mod tests {
             app.input_area
         );
         let expected_x = app.input_area.x
-            + 2 // floating gutter, then the box's own border
+            + 1 // the box's own border; the old outer gutter is gone
             + UnicodeWidthStr::width(" ") as u16
             + UnicodeWidthStr::width("hi") as u16;
         assert_eq!(pos.x, expected_x, "caret not at end of prompt");
@@ -11620,7 +11765,7 @@ mod tests {
             app.input_area.height
         );
         // Every row it claims to need must be a row it actually got.
-        let inner_w = app.input_area.width.saturating_sub(4);
+        let inner_w = app.input_area.width.saturating_sub(2);
         let want = app.prompt.display_rows(inner_w);
         assert!(
             app.input_area.height >= want + 3,

@@ -3,9 +3,8 @@ from __future__ import annotations
 import inspect
 from pathlib import Path
 
-from desmos.const import ABI, HIDDEN_NS, PRIOR_KEEP
+from desmos.const import ABI, HIDDEN_NS
 from desmos.persist import state_file
-from desmos.scan import clip
 from desmos.types import World
 
 
@@ -145,15 +144,9 @@ def system_prompt(world: World) -> str:
     return ABI + "\n\n" + catalog(world)
 
 
-def header(world: World, task: str) -> str:
-    lines = [f"generation: {world.generation} ({world.gen_reason})", f"cwd: {world.cwd}", ns_index(world)]
-    if world.prior:
-        lines.append("prior steps:")
-        for i, item in enumerate(world.prior[-PRIOR_KEEP:], 1):
-            lines.append(f"  {i}. user: {clip(item['prompt'], 240)}")
-            lines.append(f"     you: {clip(item['speech'], 400)}")
-    lines.append(f"prompt: {task}")
-    return "\n".join(lines)
+def header(world: World) -> str:
+    """Dynamic per-step context not already present in the system runtime/history."""
+    return ns_index(world)
 
 
 def memory_block(world: World, budget: int = 2000) -> str:

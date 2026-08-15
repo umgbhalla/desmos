@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Any
 
 from desmos.openai import to_input
@@ -89,6 +91,38 @@ def self_check() -> None:
     # A properly answered call must not gain a second output.
     once = to_input([_call("call_e", py_call), _output("call_e", "ok")])
     assert _kinds(once).count("custom_tool_call_output") == 1, once
+
+    # Exercise the normal step entry point and then the actual Responses input
+    # conversion. History is already in world.messages, while runtime facts are
+    # already in the system prompt; only live namespace shape belongs beside
+    # the current task.
+    from desmos.loop import bind_step, new_world
+
+    task = "CURRENT_TASK_UNIQUE_7d39"
+    with TemporaryDirectory() as td:
+        cwd = Path(td)
+        world = new_world(cwd, state_path=cwd / "state.sqlite3", ns={"live_marker": [1, 2]})
+        world.model = "gpt-5.6-sol"
+        world.prior = [{"prompt": "OLD_TASK_SHOULD_NOT_RECAP", "speech": "OLD_REPLY_SHOULD_NOT_RECAP"}]
+        payloads: list[list[dict[str, Any]]] = []
+
+        def complete_once(_model: str, _system: str, messages: list[dict[str, Any]], _max: int) -> dict[str, Any]:
+            payloads.append(to_input(messages))
+            return {"content": [{"type": "text", "text": "done"}], "usage": {}}
+
+        world.complete_fn = complete_once
+        bind_step(world)
+        assert world.ns["step"](task).strip() == "done"
+
+        assert len(payloads) == 1, payloads
+        wire = str(payloads[0])
+        assert wire.count(task) == 1, wire
+        assert "prior steps:" not in wire and "OLD_TASK_SHOULD_NOT_RECAP" not in wire, wire
+        envelope = world.messages[0]["content"]
+        assert "generation:" not in envelope and "cwd:" not in envelope, envelope
+        assert "prior steps:" not in envelope and "prompt:" not in envelope, envelope
+        assert "ns:" in envelope and "live_marker: list, len=2" in envelope, envelope
+        assert envelope.count(task) == 1, envelope
 
     print("openai input check ok")
 

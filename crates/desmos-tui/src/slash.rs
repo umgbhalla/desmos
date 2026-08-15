@@ -221,6 +221,15 @@ impl Slash {
         self.sel = (((self.sel as i32 + by) % n + n) % n) as usize;
     }
 
+    /// True only for the theme argument list, not the `/theme` command row.
+    pub fn is_theme_values(&self) -> bool {
+        self.open && self.head == "/theme "
+    }
+
+    pub fn selected_text(&self) -> Option<&str> {
+        self.items.get(self.sel).map(|item| item.text.as_str())
+    }
+
     /// The whole composer line after accepting the highlighted entry. A
     /// command that takes an argument keeps the trailing space, so the next
     /// keystroke lands in the argument and the list refills with its values.
