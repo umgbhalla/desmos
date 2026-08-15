@@ -36,8 +36,6 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
-from desmos import pending
-
 # Output the shell produced but nobody will read. Keeping both ends matters:
 # the head is what the command echoed and started doing, the tail is the error
 # or the prompt it is sitting at. Dropping either loses the half that mattered.
@@ -279,6 +277,12 @@ class Shell:
             if self.monitoring:
                 return
             self.monitoring = True
+        # The monitor hands the finished command to the pending queue -- the
+        # same upward seam kernel/loop.py uses for resume, function-level for
+        # the same reason: kernel code must not import the agents layer at
+        # module scope.
+        from desmos.agents import pending
+
         pending.register(
             world,
             f"shell {name}",
