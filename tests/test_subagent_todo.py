@@ -4,7 +4,7 @@ from pathlib import Path
 
 from desmos.dispatch import dispatch
 from desmos.loop import new_world, seed_builtins
-from desmos.subagent import _child_world, resolve
+from desmos.agents.subagent import _child_world, resolve
 from desmos.subagent_contracts import TaskContract
 from desmos.types import Block, Tool
 

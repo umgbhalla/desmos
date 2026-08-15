@@ -3,7 +3,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-import desmos.subagent as S
+import desmos.agents.subagent as S
 from desmos.loop import new_world
 from desmos.subagent_contracts import TaskContract
 
@@ -52,7 +52,7 @@ class SimpleSubagentContractTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             parent = new_world(Path(tmp), state_path=None, ns={}, persist=False)
             with patch.object(S._POOL, "submit", return_value=None), patch(
-                "desmos.pending.register", return_value=None
+                "desmos.agents.pending.register", return_value=None
             ):
                 run_id = S.spawn(
                     "inspect",

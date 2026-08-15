@@ -153,3 +153,23 @@ Spans-on-result, edit line, repo claim, and `parent`+`depth` on
 
 No check may assert that a string exists in prose. Every added check must
 fail when its fix is reverted — prove it, then restore.
+
+## Decision record: PyO3
+
+Embedding Python in the TUI binary: no. Track 3 is detachability (the kernel
+outlives its viewers) and the process boundary is fault isolation (a panic in
+the vendored render stack must not kill the kernel, its ptys, or in-flight
+subagents). The GIL is not the reason — the render loop never calls Python.
+
+Rust extension modules into Python: held open with a tripwire. The one
+candidate is a shared scanner crate (parity by construction for the last
+duplicated rule, at the cost of the scanner leaving the live-editable RSI
+surface). Promotion condition: if the paint-from-events or conformance suite
+catches a story/wire mirroring violation AFTER Phase 3's reconcile design has
+landed, the scanner moves to crates/desmos-scan (PyO3 to the kernel, path dep
+to the TUI, scan.py the facade over it). Not before: the worst historical
+scan bugs were scanner-wrong, not parity — one implementation would have been
+consistently wrong, and the golden fixtures are the defense either way.
+Events stay untyped on the Python side by design (the vocabulary is
+model-growable); the typed Rust enum is a conformance instrument, not a
+constructor.

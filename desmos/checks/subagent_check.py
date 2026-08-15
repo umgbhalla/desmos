@@ -5,7 +5,7 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
-import desmos.subagent as subagents
+import desmos.agents.subagent as subagents
 from desmos.loop import new_world
 from desmos.subagent_contracts import TaskContract
 
@@ -242,7 +242,7 @@ def parallel_tool_check() -> None:
     """The XML-facing batch waits at a barrier, proving both children started."""
     import threading
     from desmos import pending
-    from desmos.subagent_tool import handle
+    from desmos.agents.subagent_tool import handle
 
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)

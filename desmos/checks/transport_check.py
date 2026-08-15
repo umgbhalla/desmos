@@ -6,7 +6,7 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
-import desmos.complete as complete
+import desmos.transport.complete as complete
 
 
 class Response:
