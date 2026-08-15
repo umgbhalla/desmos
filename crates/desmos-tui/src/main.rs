@@ -2057,6 +2057,110 @@ fn wait_ready(bridge: Option<&mut Bridge>, app: &mut App) {
     }
 }
 
+/// Compact one-line title for a spawn: first non-empty line, parenthesised
+/// asides (usually an absolute path) dropped, first sentence only, capped so
+/// the live status suffix still fits on a normal-width story pane.
+fn task_title(task: &str) -> String {
+    let first = task
+        .lines()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or("")
+        .trim();
+    let mut flat = String::new();
+    let mut depth = 0usize;
+    for ch in first.chars() {
+        match ch {
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            _ if depth == 0 => flat.push(ch),
+            _ => {}
+        }
+    }
+    let flat = flat.split_whitespace().collect::<Vec<_>>().join(" ");
+    let stop = flat.find(". ").map(|i| i + 1).unwrap_or(flat.len());
+    let mut title = flat[..stop].trim().trim_end_matches('.').trim().to_string();
+    if title.chars().count() > TITLE_CHARS {
+        title = title
+            .chars()
+            .take(TITLE_CHARS - 1)
+            .collect::<String>()
+            .trim_end()
+            .to_string();
+        title.push('\u{2026}');
+    }
+    title
+}
+
+/// Longest task title kept before eliding.
+const TITLE_CHARS: usize = 52;
+
+fn short_count(n: u64) -> String {
+    if n >= 1000 {
+        format!("{}k", n / 1000)
+    } else {
+        n.to_string()
+    }
+}
+
+/// One `used/limit` fragment out of the child's live budget, e.g. `turn 3/32`.
+fn budget_part(ev: &Value, key: &str, label: &str, short: bool) -> Option<String> {
+    let used = ev
+        .pointer(&format!("/budget/{key}/used"))
+        .and_then(Value::as_u64)?;
+    let limit = ev
+        .pointer(&format!("/budget/{key}/limit"))
+        .and_then(Value::as_u64);
+    let fmt = |n: u64| if short { short_count(n) } else { n.to_string() };
+    Some(match limit {
+        Some(l) if l > 0 => format!("{label} {}/{}", fmt(used), fmt(l)),
+        _ => format!("{label} {}", fmt(used)),
+    })
+}
+
+/// Status suffix for a running or finished child: what it is doing, how far
+/// into its turn budget it is, and how much of its token budget it has spent.
+/// This is what the collapsed spawn row shows instead of a bare turn number.
+fn subagent_status(ev: &Value, head: Option<&str>) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(head) = head.map(str::trim).filter(|s| !s.is_empty()) {
+        parts.push(head.to_string());
+    }
+    if let Some(turns) = budget_part(ev, "turns", "turn", false) {
+        parts.push(turns);
+    } else {
+        let n = ev.get("turns").and_then(Value::as_u64).unwrap_or(0);
+        if n > 0 {
+            parts.push(format!("turn {n}"));
+        }
+    }
+    if let Some(tokens) = budget_part(ev, "tokens", "", true) {
+        let tokens = tokens.trim();
+        if !tokens.starts_with('0') {
+            parts.push(format!("{tokens} tok"));
+        }
+    }
+    parts.join(" \u{b7} ")
+}
+
+/// How a finished child is labelled: the judge's verdict when there is one,
+/// otherwise the stop reason, otherwise the terminal stage.
+fn subagent_verdict(ev: &Value) -> String {
+    if let Some(accepted) = ev.get("accepted").and_then(Value::as_bool) {
+        return if accepted { "accepted" } else { "rejected" }.to_string();
+    }
+    for key in ["stop_reason", "stage", "phase"] {
+        if let Some(v) = ev
+            .get(key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            return v.to_string();
+        }
+    }
+    String::new()
+}
+
 fn handle_subagent(app: &mut App, ev: &Value) {
     let phase = ev.get("phase").and_then(Value::as_str).unwrap_or("");
     let id = ev.get("id").and_then(Value::as_str).unwrap_or("");
@@ -2077,24 +2181,30 @@ fn handle_subagent(app: &mut App, ev: &Value) {
                 .and_then(Value::as_str)
                 .filter(|s| !s.is_empty())
                 .map(str::to_string);
-            let block = SubagentBlock::started(task, id, agent, persona, None, model, true);
+            let title = task_title(task);
+            let block = SubagentBlock::started(&title, id, agent, persona, None, model, true);
             let eid = app.story.push_block(RenderBlock::Subagent(block));
             app.story.set_last_running(true);
-            app.ensure_child(id, task).parent_entry = Some(eid);
+            app.ensure_child(id, &title).parent_entry = Some(eid);
         }
         "progress" => {
-            let turns = ev.get("turns").and_then(Value::as_u64).unwrap_or(0);
+            let stage = ev.get("stage").and_then(Value::as_str);
+            let label = subagent_status(ev, stage);
             let eid = app.children.get(id).and_then(|c| c.parent_entry);
             if let Some(eid) = eid {
                 if let Some(entry) = app.story.get_by_id_mut(eid) {
                     if let RenderBlock::Subagent(ref mut sb) = entry.block {
-                        sb.activity_label = Some(format!("turn {turns}"));
-                        entry.invalidate_cache();
+                        if !label.is_empty() {
+                            sb.activity_label = Some(label);
+                            entry.invalidate_cache();
+                        }
                     }
                 }
             }
         }
-        "done" | "failed" => {
+        // `stopped` is terminal too — a child that hit its wall or token
+        // budget must stop spinning on the parent story.
+        "done" | "failed" | "stopped" => {
             let secs = ev.get("secs").and_then(Value::as_f64).unwrap_or(0.0);
             let elapsed = Duration::from_secs_f64(secs.max(0.0));
             let err = ev
@@ -2105,6 +2215,19 @@ fn handle_subagent(app: &mut App, ev: &Value) {
             let eid = app.children.get(id).and_then(|c| c.parent_entry);
             if let Some(eid) = eid {
                 app.story.finish_running(eid);
+                // The spawn row keeps rendering its activity label after it
+                // stops running, so retire it with the verdict and what the
+                // child actually spent rather than a stale mid-flight turn.
+                let verdict = subagent_verdict(ev);
+                let label = subagent_status(ev, Some(&verdict));
+                if let Some(entry) = app.story.get_by_id_mut(eid) {
+                    if let RenderBlock::Subagent(ref mut sb) = entry.block {
+                        if !label.is_empty() {
+                            sb.activity_label = Some(label);
+                            entry.invalidate_cache();
+                        }
+                    }
+                }
             }
             let desc = eid
                 .and_then(|eid| app.story.get_by_id(eid))
@@ -8466,6 +8589,102 @@ mod tests {
         assert!(!reversed, "caret still painted while story is focused");
     }
 
+    #[test]
+    fn a_spawn_row_carries_a_title_and_live_budget_not_the_raw_task() {
+        let mut app = App::new();
+        let task = "Audit the desmos repo (/Users/zeus/hub/desmos) for whether these \
+                    PYTHON-side todo items are already implemented. For each, answer \
+                    DONE / PARTIAL / NOT DONE with file:line evidence.";
+        handle_event(
+            &mut app,
+            json!({
+                "ev": "subagent",
+                "phase": "started",
+                "id": "cafe",
+                "agent": "explore",
+                "task": task,
+            }),
+        );
+        let idx = first_subagent(&app).expect("spawn row");
+        let RenderBlock::Subagent(sb) = &app.story.entry(idx).expect("entry").block else {
+            panic!("expected a spawn row");
+        };
+        assert_eq!(
+            sb.description,
+            "Audit the desmos repo for whether these PYTHON-side\u{2026}"
+        );
+
+        handle_event(
+            &mut app,
+            json!({
+                "ev": "subagent",
+                "phase": "progress",
+                "id": "cafe",
+                "stage": "executing",
+                "turns": 12,
+                "budget": {
+                    "turns": {"used": 12, "limit": 32},
+                    "tokens": {"used": 41500, "limit": 100000},
+                    "seconds": {"used": 88.0, "limit": 600.0},
+                },
+            }),
+        );
+        let RenderBlock::Subagent(sb) = &app.story.entry(idx).expect("entry").block else {
+            panic!("expected a spawn row");
+        };
+        assert_eq!(
+            sb.activity_label.as_deref(),
+            Some("executing \u{b7} turn 12/32 \u{b7} 41k/100k tok")
+        );
+    }
+
+    #[test]
+    fn a_budget_stopped_child_stops_spinning() {
+        let mut app = App::new();
+        handle_event(
+            &mut app,
+            json!({
+                "ev": "subagent",
+                "phase": "started",
+                "id": "beef",
+                "agent": "general",
+                "task": "grind forever",
+            }),
+        );
+        handle_event(
+            &mut app,
+            json!({
+                "ev": "subagent",
+                "phase": "stopped",
+                "id": "beef",
+                "stage": "stopped",
+                "stop_reason": "token_budget",
+                "secs": 41.0,
+                "turns": 9,
+                "budget": {
+                    "turns": {"used": 9, "limit": 32},
+                    "tokens": {"used": 100000, "limit": 100000},
+                },
+            }),
+        );
+        let idx = first_subagent(&app).expect("spawn row");
+        let RenderBlock::Subagent(sb) = &app.story.entry(idx).expect("entry").block else {
+            panic!("expected a spawn row");
+        };
+        assert_eq!(
+            sb.activity_label.as_deref(),
+            Some("token_budget \u{b7} turn 9/32 \u{b7} 100k/100k tok")
+        );
+        assert!(
+            (0..app.story.len()).any(|i| matches!(
+                app.story.entry(i).map(|e| &e.block),
+                Some(RenderBlock::Subagent(sb))
+                    if matches!(sb.kind, SubagentBlockKind::Failed { .. })
+            )),
+            "a budget stop must land a terminal row, not spin forever"
+        );
+    }
+
     fn first_subagent(app: &App) -> Option<usize> {
         (0..app.story.len()).find(|&i| {
             matches!(
@@ -8496,7 +8715,12 @@ mod tests {
                 "ev": "subagent",
                 "phase": "progress",
                 "id": "deadbeef",
+                "stage": "executing",
                 "turns": 3,
+                "budget": {
+                    "turns": {"used": 3, "limit": 32},
+                    "tokens": {"used": 41000, "limit": 100000},
+                },
             }),
         );
         handle_event(
@@ -8549,8 +8773,14 @@ mod tests {
                 "ev": "subagent",
                 "phase": "done",
                 "id": "deadbeef",
+                "stage": "accepted",
+                "accepted": true,
                 "secs": 1.5,
                 "turns": 3,
+                "budget": {
+                    "turns": {"used": 3, "limit": 32},
+                    "tokens": {"used": 41000, "limit": 100000},
+                },
                 "result": "CHILDONLY last-user cache",
                 "error": "",
             }),
@@ -8562,7 +8792,10 @@ mod tests {
             RenderBlock::Subagent(sb) => {
                 assert!(matches!(sb.kind, SubagentBlockKind::Started));
                 assert_eq!(sb.child_session_id, "deadbeef");
-                assert_eq!(sb.activity_label.as_deref(), Some("turn 3"));
+                assert_eq!(
+                    sb.activity_label.as_deref(),
+                    Some("accepted \u{b7} turn 3/32 \u{b7} 41k/100k tok")
+                );
             }
             other => panic!("expected Subagent, got {other:?}"),
         }
