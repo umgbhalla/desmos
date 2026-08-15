@@ -6781,6 +6781,12 @@ fn in_code(spans: &[(usize, usize)], i: usize) -> bool {
     spans.iter().any(|&(a, z)| i >= a && i < z)
 }
 
+/// Tags whose body is executed verbatim, and the only ones the closing-tag
+/// quoting heuristic applies to. The port of `scan.py::_QUOTED_BODY`, and it
+/// has to stay the same set: widen it and prose bodies vanish from the story
+/// on an apostrophe, narrow it and a quoted `</bash>` truncates a command.
+const QUOTED_BODY: [&str; 4] = ["python", "bash", "shell", "register"];
+
 /// One tag the way `scan.py::scan_spans` sees it.
 struct TagHit {
     /// Offset of the `<`.
@@ -6854,12 +6860,19 @@ fn next_tag(text: &str, from: usize, spans: &[(usize, usize)]) -> Option<TagHit>
         // string, which is `scan_spans`'s rule and its reason: the only closer
         // a model writes early is one it quoted (`echo "</bash>"`), and
         // stopping there truncates the body and runs half the program.
+        //
+        // Only for `QUOTED_BODY` tags, exactly as in scan.py. A commit message
+        // is prose, and prose has apostrophes: "the TUI's stripper" opens a
+        // quote that never closes, so every closer after it reads as quoted,
+        // the call reads as unterminated, and the whole message lands in the
+        // story pane. scan.py learned this at the cost of three lost commits.
+        let quoted_body = QUOTED_BODY.contains(&name);
         let mut at = open_end;
         loop {
             let Some((cs, ce)) = find_close(text, name, at) else {
                 return Some(TagHit { start, open_end, end: None });
             };
-            if in_string(&text[open_end..cs]) {
+            if quoted_body && in_string(&text[open_end..cs]) {
                 at = ce;
                 continue;
             }
@@ -11141,6 +11154,32 @@ mod tests {
             strip_syscalls("it ends with </python:X> ok"),
             "it ends with </python:X> ok"
         );
+    }
+
+    /// The quoting heuristic is for bodies that get executed. A commit message
+    /// is prose, and prose has apostrophes: one in "the TUI's stripper" opened
+    /// a quote that never closed, so every closer after it read as quoted, the
+    /// call read as unterminated, and the whole message was painted into the
+    /// story. scan.py restricts the heuristic to `_QUOTED_BODY` for exactly
+    /// this reason, at the cost of three lost commits; this is that set.
+    ///
+    /// `desmos/scan.py::scan_spans` on each input, run for real:
+    ///     commit with apostrophes -> [('commit', 0, 101)]  dispatched
+    ///     todo with an apostrophe -> [('todo', 0, 30)]     dispatched
+    ///     edit with apostrophes   -> [('edit', 0, 43)]     dispatched
+    ///     quoted closer in bash   -> [('bash', 0, 27)]     body not truncated
+    #[test]
+    fn prose_bodies_are_stripped_through_an_apostrophe() {
+        let msg = "the TUI's stripper looked for a bare closer, and scan.py's rule disagreed";
+        let src = format!("<commit add=\"a.rs\">{msg}</commit>");
+        assert_eq!(strip_syscalls(&src), "", "commit body leaked");
+        assert_eq!(strip_syscalls("<todo>x 1\ndon't drop it</todo>"), "");
+        assert_eq!(
+            strip_syscalls("<edit path=\"a\">it's old\n---\nit's new</edit>"),
+            ""
+        );
+        // Executed bodies keep the heuristic: a quoted closer does not end one.
+        assert_eq!(strip_syscalls("<bash>echo \"</bash>\"</bash>"), "");
     }
 
     /// The story must strip exactly what the dispatcher ran, or a call shows
