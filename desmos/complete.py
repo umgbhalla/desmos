@@ -411,6 +411,14 @@ def apply_stream_event(
             block["text"] = (block.get("text") or "") + chunk
             if chunk and on_event is not None:
                 on_event({"kind": "text_delta", "text": chunk})
+            seen = block.get("text") or ""
+            marks = state.setdefault("_degen_checked", {})
+            if len(seen) - marks.get(idx, 0) >= DEGEN_CHECK_EVERY:
+                marks[idx] = len(seen)
+                cut = degenerate_cut(seen)
+                if cut is not None:
+                    block["text"] = seen[:cut]
+                    state["degenerate"] = True
         elif dtype == "signature_delta":
             block["signature"] = (block.get("signature") or "") + (delta.get("signature") or "")
         else:
@@ -490,6 +498,8 @@ def read_sse(
             apply_stream_event(state, ev, on_event)
 
     for line in lines:
+        if state.get("degenerate"):
+            break
         if should_stop is not None and should_stop():
             break
         if isinstance(line, bytes):
@@ -510,9 +520,57 @@ def read_sse(
     # last syscall has no closing tag, scan() skips unterminated blocks, the
     # turn reports done, and a dropped socket gets committed as the step's
     # result. Ctrl+C is the one legitimate early exit, so it is not an error.
+    if state.get("degenerate"):
+        # Not an error: the reply up to the cut is real, and whatever syscalls
+        # it opened still dispatch. Only the stuck tail is dropped.
+        msg = assemble_message(state)
+        msg["stop_reason"] = "degenerate_repetition"
+        return msg
     if not saw_stop and not (should_stop is not None and should_stop()):
         raise RuntimeError("Anthropic stream ended before message_stop")
     return assemble_message(state)
+
+
+# A decoder can fall into a repetition attractor and emit the same short unit
+# until the connection dies. One session took 43,815 copies of "url": 220KB
+# painted into the story pane a line at a time, appended to the transcript,
+# and carried into every later POST until compaction folded it away. Nothing
+# caught it because it was ordinary assistant speech. Catch it in the stream.
+# Sized against false positives, not against reaction time. Truncating real
+# output is worse than painting eighty junk lines, so the bar is eight
+# identical copies filling 384 characters -- a sentence repeated four times is
+# someone making a point, eight is a stuck decoder.
+DEGEN_WINDOW = 384
+DEGEN_MAX_PERIOD = 48
+DEGEN_MIN_REPEATS = 8
+DEGEN_CHECK_EVERY = 64
+
+
+def degenerate_cut(text: str) -> int | None:
+    """Index where a repetition attractor begins, or None.
+
+    Only the tail is examined: if the last DEGEN_WINDOW characters are a whole
+    number of copies of one unit no longer than DEGEN_MAX_PERIOD, walk back
+    through the earlier text to the first copy and return that index. Text
+    before the cut is whatever the model wrote before it got stuck, and is
+    kept.
+    """
+    if len(text) < DEGEN_WINDOW:
+        return None
+    tail = text[-DEGEN_WINDOW:]
+    for period in range(1, DEGEN_MAX_PERIOD + 1):
+        repeats = DEGEN_WINDOW // period
+        if repeats < DEGEN_MIN_REPEATS:
+            break
+        unit = tail[-period:]
+        span = period * repeats
+        if unit * repeats != text[-span:]:
+            continue
+        cut = len(text) - span
+        while cut - period >= 0 and text[cut - period : cut] == unit:
+            cut -= period
+        return cut
+    return None
 
 
 def _pad_blocks(state: dict[str, Any], idx: int) -> None:

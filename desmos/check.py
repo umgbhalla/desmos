@@ -924,7 +924,12 @@ def _run_checks() -> None:
                 data = str(block.get("data") or "")
         assert data == "[redacted]" or data == ""
 
-        from desmos.complete import apply_stream_event, assemble_message, read_sse
+        from desmos.complete import (
+            apply_stream_event,
+            assemble_message,
+            degenerate_cut,
+            read_sse,
+        )
 
         stream_state: dict = {"message": {}, "blocks": []}
         stream_deltas: list[dict] = []
@@ -1048,6 +1053,51 @@ def _run_checks() -> None:
         except RuntimeError as exc:
             assert "message_stop" in str(exc), exc
         assert "two" not in text_of(sse_stop)
+        # A decoder stuck in a repetition attractor is ordinary assistant
+        # speech, so nothing downstream filters it: one session streamed 43,815
+        # copies of "url" into the story pane and the transcript. The stream
+        # must cut itself off, keep the real prefix, and stop feeding the pane.
+        painted: list[str] = []
+        degen_lines = [
+            'data: {"type":"message_start","message":{"role":"assistant"}}',
+            "",
+            'data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}',
+            "",
+            'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"a real sentence before it got stuck."}}',
+            "",
+        ]
+        for _ in range(400):
+            degen_lines.append(
+                'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"url\\n\\n"}}'
+            )
+            degen_lines.append("")
+        degen_lines += ['data: {"type":"message_stop"}', ""]
+        degen = read_sse(
+            degen_lines,
+            on_event=lambda d: painted.append(d.get("text", ""))
+            if d.get("kind") == "text_delta"
+            else None,
+        )
+        degen_text = text_of(degen)
+        assert "a real sentence before it got stuck." in degen_text, degen_text[:200]
+        assert degen.get("stop_reason") == "degenerate_repetition", degen.get("stop_reason")
+        assert degen_text.count("url") <= 8, degen_text.count("url")
+        # and the pane must stop receiving, not merely have the tail trimmed
+        # after the fact -- an append-only pane has no retraction.
+        assert len(painted) <= 80, len(painted)
+        # No false positive on ordinary prose, nor on a phrase a writer
+        # genuinely repeats for effect. Cutting real output is worse than
+        # painting a few junk lines, so the bar is eight identical copies.
+        prose = (
+            "Sizing this guard is a tradeoff between reaction time and the risk "
+            "of truncating output that the model actually meant to write, and "
+            "the second cost is by far the larger of the two in an append-only "
+            "pane where nothing can be retracted once it has been painted."
+        )
+        assert degenerate_cut(prose) is None
+        assert degenerate_cut("short") is None
+        assert degenerate_cut("Never again. " * 4) is None
+        assert degenerate_cut("Never again. " * 40) is not None
 
         from desmos.complete import iter_sse_lines
         from desmos.exec import run_bash
