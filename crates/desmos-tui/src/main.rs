@@ -41,10 +41,23 @@ mod slash;
 
 /// The theme cache is process-global and cargo runs tests on threads. Any test
 /// that reads or writes it takes this first, in any module of this binary.
+///
+/// Taking it also installs the theme, once. `theme_cache::current_kind` seeds
+/// itself lazily from `~/.grok/config.toml` and falls back to grok's GrokNight
+/// when that names no theme, while `App::new` installs desmos's own default —
+/// so whichever ran first decided the answer. A test could read `GrokNight`
+/// from an untouched cache, have another thread's `App::new` install
+/// `OscuraMidnight` a microsecond later, and then render its rows under a
+/// palette that no longer matched the one it had asserted against. Seeding
+/// here settles `LOADED` before the guard is handed out, which kills the lazy
+/// path for the rest of the process; every later write is the same value.
 #[cfg(test)]
 fn theme_lock() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    static SEED: std::sync::Once = std::sync::Once::new();
+    let guard = LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    SEED.call_once(|| theme_cache::set(initial_theme()));
+    guard
 }
 
 use std::borrow::Cow;
@@ -485,6 +498,10 @@ impl StreamCursor {
 
     fn flush_speech(&mut self, story: &mut ScrollbackState) {
         let shown = spoken_prefix(&self.speech_raw);
+        self.show_speech(story, shown);
+    }
+
+    fn show_speech(&mut self, story: &mut ScrollbackState, shown: String) {
         if shown.trim().is_empty() && self.speech.is_none() {
             self.speech_shown = shown;
             return;
@@ -542,7 +559,14 @@ impl StreamCursor {
     }
 
     fn finish_speech(&mut self, story: &mut ScrollbackState) {
-        self.flush_speech(story);
+        // Nothing is in flight once the stream is over, so release what
+        // `spoken_prefix` held back: an opener whose closer never arrived is a
+        // mention, not a call, and the kernel is about to dispatch nothing for
+        // it. Without this pass the hold is never lifted -- `speech_raw` is
+        // cleared three lines down -- and the tail of the message is printed
+        // in neither pane.
+        let shown = strip_syscalls(&self.speech_raw).trim_start().to_string();
+        self.show_speech(story, shown);
         if let Some(id) = self.speech.take() {
             story.finish_running(id);
         }
@@ -654,10 +678,14 @@ struct WorkRun {
     /// The row itself, once the run has earned one. Rewritten in place as the
     /// run grows, so it never moves and never stacks.
     row: Option<EntryId>,
-    /// The row a fold just closed: its id, its sentence, and the HEAD the run
-    /// opened on. Held until one more git read lands, because the tail written
-    /// at the fold came from a snapshot older than the run's last syscall.
-    settled: Option<(EntryId, String, Option<String>)>,
+    /// Generation of the first git read that will see what the run's last
+    /// syscall did — [`side::GitPane::poll`]'s answer, taken at the result.
+    fresh_gen: u64,
+    /// The row a fold just closed: its id, its sentence, the HEAD the run
+    /// opened on, and the read generation its tail is owed. Held until a read
+    /// that old lands, because the tail written at the fold came from a
+    /// snapshot older than the run's last syscall.
+    settled: Option<(EntryId, String, Option<String>, u64)>,
 }
 
 /// Below this a run is not worth a row: the collapsed thought already says
@@ -749,21 +777,35 @@ impl WorkRun {
     fn fold(&mut self, story: &mut ScrollbackState) {
         self.sync(story);
         if let Some(id) = self.row {
-            self.settled = Some((id, work_sentence(&self.segs), self.head_at_start.clone()));
+            self.settled = Some((
+                id,
+                work_sentence(&self.segs),
+                self.head_at_start.clone(),
+                self.fresh_gen,
+            ));
         }
         self.reset();
     }
 
-    /// Rewrite the folded row's tail from a git read that landed after it.
+    /// Rewrite the folded row's tail from a git read that saw the run's last
+    /// syscall.
     ///
     /// This is the `git commit` case: the run's last syscall moves HEAD, prose
     /// starts a fraction of a second later and folds the row from the snapshot
     /// that preceded the commit, and without this the reader is left with
-    /// "· 4 files dirty" over a run that committed.
+    /// "· 4 files dirty" over a run that committed. Waiting on the generation
+    /// rather than on "the next read to land" is the difference between fixing
+    /// that and printing a second pre-commit answer: when the commit landed
+    /// behind a read already in flight, the next snapshot to arrive is the one
+    /// that started too early.
     fn settle(&mut self, story: &mut ScrollbackState, git: &side::GitPane) {
-        let Some((id, sentence, head)) = self.settled.take() else {
+        let Some((id, sentence, head, need)) = self.settled.take() else {
             return;
         };
+        if git.snap_gen() < need {
+            self.settled = Some((id, sentence, head, need));
+            return;
+        }
         let Some(entry) = story.get_by_id_mut(id) else {
             return;
         };
@@ -776,6 +818,7 @@ impl WorkRun {
     }
 
     fn reset(&mut self) {
+        self.fresh_gen = 0;
         self.segs.clear();
         self.thoughts.clear();
         self.head_at_start = None;
@@ -2162,12 +2205,18 @@ fn run(
             }
             last_anim = Instant::now();
         }
-        // Polled whether or not the pane is on screen: the work row's git tail
-        // reads the same snapshot, and it is a worker thread on a 4s timer.
-        app.git.poll(false);
+        // Polled whether or not the pane is on screen, because the work row's
+        // git tail reads the same snapshot — but only while there is a reader
+        // for it. A collapsed pane over an idle session wants no timer at all:
+        // three `git` subprocesses every four seconds, forever, on a tree
+        // where a status call is a quarter second of disk.
+        if app.layout.git_h > 0 || app.running || app.stream.run.settled.is_some() {
+            app.git.poll(false);
+        }
         if app.git.drain() {
-            // The run that just folded gets its tail from this read; the live
-            // one gets its next sync from it.
+            // The row a fold left owing takes its tail from this read if this
+            // is the read it was waiting on; the live run gets its next sync
+            // from it either way.
             app.stream.run.settle(&mut app.story, &app.git);
             app.stream.run.note_repo(&app.git);
             dirty = true;
@@ -2176,7 +2225,8 @@ fn run(
             dirty = true;
         }
         // Cache TTL burns down while nothing else is live; one repaint a
-        // second is enough for the bar and keeps idle CPU at zero otherwise.
+        // second is enough for the bar, and there is nothing else asking for a
+        // frame once the git timer above has gone quiet.
         let cache_live = app.cache.left().is_some();
         if cache_live && last_cache.elapsed() >= Duration::from_secs(1) {
             dirty = true;
@@ -2625,9 +2675,10 @@ fn handle_event(app: &mut App, ev: Value) {
                 // A syscall just ran against this checkout. Start the read now
                 // rather than waiting out the pane's timer: the run folds as
                 // soon as prose starts, and the tail it prints is whatever has
-                // landed by then. The pending guard keeps this to one read in
-                // flight however fast the calls arrive.
-                app.git.poll(true);
+                // landed by then. One read at a time however fast the calls
+                // arrive — `poll` answers with the generation that will see
+                // this call's work, and `settle` holds the row for it.
+                app.stream.run.fresh_gen = app.git.poll(true);
             }
             apply_result(&mut app.calls, &mut app.exec, &ev);
         }
@@ -3173,7 +3224,9 @@ fn handle_key(
             // move along it. Going *in* is Enter, which lands in the file pane.
             KeyCode::Char(']') | KeyCode::Right => app.git.next_tab(1),
             KeyCode::Char('[') | KeyCode::Left => app.git.next_tab(-1),
-            KeyCode::Char('r') => app.git.poll(true),
+            KeyCode::Char('r') => {
+                app.git.poll(true);
+            }
             KeyCode::Char('i') => app.set_focus(Focus::Input),
             KeyCode::Enter | KeyCode::Char('l') => {
                 // Opening a row is what fills the file pane, so open that pane
@@ -5765,7 +5818,8 @@ fn draw_queue(f: &mut Frame, area: Rect, app: &App) {
 
 
 
-/// What to call the focused pane in the legend title.
+/// The blank spacer row the composer floats on: one while POST is open, none
+/// when it is collapsed or when an open queue is carrying that row instead.
 fn input_float_rows(app: &App) -> u16 {
     u16::from(app.queue.is_empty() && app.layout.post_h > 0)
 }
@@ -6167,7 +6221,15 @@ fn draw_paste_preview(f: &mut Frame, input: Rect, body: &str, on_chip: bool) {
 }
 
 fn spoken_prefix(text: &str) -> String {
-    let spans = code_spans(text);
+    let (spans, open_fence) = code_spans(text);
+    // Mid-stream an open fence is still a code block: its closer is one of the
+    // things the stream has not delivered yet. Masking it keeps a half-written
+    // `<div` in a fenced HTML sample from stalling the render, and the tail
+    // released by `finish_speech` is the one that follows `scan.py`.
+    let mut live = spans.clone();
+    if let Some(f) = open_fence {
+        live.push((f, text.len()));
+    }
     // A call whose closer has not arrived yet is a syscall in flight. Hold
     // everything from its `<` back: the alternative is that the body streams
     // into the story as prose, and it stays there, because by the time the
@@ -6177,33 +6239,30 @@ fn spoken_prefix(text: &str) -> String {
     // markers alone is right for prose about markup and wrong for a command.
     let mut cut = text.len();
     let mut i = 0usize;
-    while let Some(rel) = text[i..].find('<') {
-        let start = i + rel;
-        if in_code(&spans, start) || !looks_like_tag_start(&text[start..]) {
-            i = start + 1;
-            continue;
-        }
-        let Some(gt) = text[start..].find('>') else {
-            cut = start; // opener still being typed
-            break;
-        };
-        let open_end = start + gt + 1;
-        let inner = &text[start + 1..open_end - 1];
-        let name = inner
-            .trim_end_matches('/')
-            .split_whitespace()
-            .next()
-            .unwrap_or("");
-        if name.is_empty() || inner.trim_end().ends_with('/') || name.starts_with('/') {
-            i = open_end;
-            continue;
-        }
-        match text[open_end..].find(&format!("</{name}>")) {
-            Some(rel_end) => i = open_end + rel_end + name.len() + 3,
+    while let Some(hit) = next_tag(text, i, &live) {
+        match hit.end {
+            Some(end) => i = end,
             None => {
-                cut = start; // body still arriving
+                cut = hit.start; // opener still being typed, or body still arriving
                 break;
             }
+        }
+    }
+    // Under an open fence the two readings differ, and only for a tag the
+    // kernel would run: if the fence closes it is code, and if it never closes
+    // `scan.py` dispatches it. Nobody can tell which yet, so hold there rather
+    // than print a call and retract it a frame later -- a retraction that
+    // cannot be taken back once the chunk is in a live block. A tag with no
+    // closer needs no hold *yet* -- but mid-stream "no closer" only means it
+    // has not arrived. Streaming past it printed the raw call, and when the
+    // closer landed the cut moved backwards, so `shown` no longer began with
+    // what was already drawn: flush_speech finished the stale block and opened
+    // a second one, leaving the truncated copy in the story for good. Holding
+    // at the first tag start costs nothing -- a fenced sample stalls at the `<`
+    // until the fence closes either way.
+    if let Some(f) = open_fence {
+        if let Some(hit) = next_tag(text, f, &spans) {
+            cut = cut.min(hit.start);
         }
     }
     // A call that opens the turn leaves the prose behind it beginning with the
@@ -6364,20 +6423,28 @@ fn apply_speech(story: &mut ScrollbackState, stream: &mut StreamCursor, text: &s
     }
 }
 
-/// Byte ranges of `text` that are literal code: fenced blocks (fence lines
-/// included) and inline backtick spans. XML stripping must leave these alone,
-/// or `<div>` inside a fenced HTML sample silently vanishes from the story.
+/// Byte ranges of `text` that are literal code -- fenced blocks (fence lines
+/// included), inline backtick spans, indented blocks -- and, separately, the
+/// offset of a fence that never closed. XML stripping must leave the ranges
+/// alone, or `<div>` inside a fenced HTML sample silently vanishes from the
+/// story.
 ///
-/// An unterminated fence runs to the end of `text`. That is the streaming
-/// case and the whole point: while a code block is still open, everything
-/// after the opening fence is code.
-fn code_spans(text: &str) -> Vec<(usize, usize)> {
+/// An unterminated fence is deliberately *not* one of the ranges.
+/// `scan.py::_fence_span` returns None for it and says why: masking to end of
+/// text would drop every syscall written after one stray backtick run. So the
+/// kernel really does dispatch `<bash>ls</bash>` sitting under an unclosed
+/// fence, and if the story masked it the call would be run *and* printed raw
+/// as prose. Its offset comes back separately because the streaming caller has
+/// one more thing to decide with it: mid-stream, that fence may simply be
+/// waiting for a closer that has not arrived yet.
+fn code_spans(text: &str) -> (Vec<(usize, usize)>, Option<usize>) {
     fn run(s: &str, c: char) -> usize {
         s.chars().take_while(|&x| x == c).count()
     }
 
     let mut spans: Vec<(usize, usize)> = Vec::new();
-    let mut fence: Option<(char, usize, usize)> = None;
+    // fence char, opener length, start offset, and how many spans predate it.
+    let mut fence: Option<(char, usize, usize, usize)> = None;
     let mut off = 0usize;
 
     for line in text.split_inclusive('\n') {
@@ -6387,12 +6454,15 @@ fn code_spans(text: &str) -> Vec<(usize, usize)> {
         let mut fenced_line = false;
 
         match fence {
-            Some((fc, flen, start)) => {
-                fenced_line = true;
+            Some((fc, flen, start, mark)) => {
                 let n = run(trimmed, fc);
                 if first == Some(fc) && n >= flen && trimmed[n..].trim().is_empty() {
+                    // Closed. The block is one span, and the backtick runs
+                    // recorded inside it were never inline spans of their own.
+                    spans.truncate(mark);
                     spans.push((start, off + line.len()));
                     fence = None;
+                    fenced_line = true;
                 }
             }
             None => {
@@ -6400,24 +6470,26 @@ fn code_spans(text: &str) -> Vec<(usize, usize)> {
                     let fc = first.unwrap();
                     let n = run(trimmed, fc);
                     if n >= 3 {
-                        fence = Some((fc, n, off));
+                        fence = Some((fc, n, off, spans.len()));
                         fenced_line = true;
                     }
                 }
             }
         }
 
+        // Interior lines are measured for inline spans as they go, because a
+        // fence that never closes leaves them exactly that: ordinary lines
+        // whose backticks still open and close spans, the way `scan.py` reads
+        // them once `_fence_span` has declined to mask anything.
         if !fenced_line {
             inline_code_spans(line, off, &mut spans);
         }
         off += line.len();
     }
 
-    if let Some((_, _, start)) = fence {
-        spans.push((start, text.len()));
-    }
+    let open = fence.map(|(_, _, start, _)| start);
     spans.extend(indented_spans(text));
-    spans
+    (spans, open)
 }
 
 /// Leading-whitespace width with tabs expanded to the next multiple of four,
@@ -6595,32 +6667,40 @@ fn in_code(spans: &[(usize, usize)], i: usize) -> bool {
     spans.iter().any(|&(a, z)| i >= a && i < z)
 }
 
-/// Strip whole syscalls from prose -- markers *and* bodies.
+/// One tag the way `scan.py::scan_spans` sees it.
+struct TagHit {
+    /// Offset of the `<`.
+    start: usize,
+    /// Offset just past the `>` of the opener.
+    open_end: usize,
+    /// End of the whole call, or None when no closer ever arrived. The kernel
+    /// does not half-dispatch a cut-off reply -- `scan_spans` skips such an
+    /// opener entirely -- so None means "this is prose", not "this is a call".
+    end: Option<usize>,
+}
+
+/// The next syscall in `text` at or after `from`, skipping `spans`.
 ///
-/// Deleting the markers alone is not enough: it leaves the command behind as
-/// if someone had said it. The command is not prose; it belongs to the calls
-/// pane, which already renders it as a card.
+/// This is the single place the story decides what ran, and it answers exactly
+/// what `scan.py::scan_spans` answers, because the two disagreeing is visible:
+/// strip something the kernel left inert and the text is in neither pane, keep
+/// something the kernel ran and it is raw prose in the story *and* a card in
+/// the calls pane.
 ///
-/// Structure decides, not a list of names: an opener with a matching closer is
-/// a syscall whatever it is called, which means a tag registered later needs no
-/// change here. A bare mention with no closer is left alone, so naming a tool
-/// mid-sentence still reads.
-fn strip_syscalls(text: &str) -> String {
-    let spans = code_spans(text);
-    let mut out = String::new();
-    let mut i = 0usize;
-    while i < text.len() {
-        let Some(rel) = text[i..].find('<') else { break };
+/// Not a call, and therefore skipped as ordinary text: a lone `</bash>`
+/// (`TAG_OPEN` cannot match one, so the kernel never sees a tag there) and a
+/// `<>` with no name.
+fn next_tag(text: &str, from: usize, spans: &[(usize, usize)]) -> Option<TagHit> {
+    let mut i = from;
+    while let Some(rel) = text[i..].find('<') {
         let start = i + rel;
-        out.push_str(&text[i..start]);
-        if in_code(&spans, start) {
-            out.push('<');
+        if in_code(spans, start) || !looks_like_tag_start(&text[start..]) {
             i = start + 1;
             continue;
         }
         let Some(gt) = text[start..].find('>') else {
-            out.push_str(&text[start..]);
-            return out;
+            // Still being typed; there is no tag until the `>` lands.
+            return Some(TagHit { start, open_end: text.len(), end: None });
         };
         let open_end = start + gt + 1;
         let inner = &text[start + 1..open_end - 1];
@@ -6630,16 +6710,117 @@ fn strip_syscalls(text: &str) -> String {
             .split_whitespace()
             .next()
             .unwrap_or("");
-        let selfclose = inner.trim_end().ends_with('/');
-        if name.is_empty() || selfclose || name.starts_with('/') {
+        if name.is_empty() || name.starts_with('/') {
             i = open_end;
             continue;
         }
-        // A matching closer makes this a call: drop the body with it.
-        let close = format!("</{name}>");
-        match text[open_end..].find(&close) {
-            Some(rel_end) => i = open_end + rel_end + close.len(),
-            None => i = open_end,
+        if inner.trim_end().ends_with('/') {
+            return Some(TagHit { start, open_end, end: Some(open_end) });
+        }
+        // The body ends at the first closer that is not inside a quoted
+        // string, which is `scan_spans`'s rule and its reason: the only closer
+        // a model writes early is one it quoted (`echo "</bash>"`), and
+        // stopping there truncates the body and runs half the program.
+        let mut at = open_end;
+        loop {
+            let Some((cs, ce)) = find_close(text, name, at) else {
+                return Some(TagHit { start, open_end, end: None });
+            };
+            if in_string(&text[open_end..cs]) {
+                at = ce;
+                continue;
+            }
+            return Some(TagHit { start, open_end, end: Some(ce) });
+        }
+    }
+    None
+}
+
+/// `</name>` at or after `from`, allowing the space `scan.py`'s closer regex
+/// allows (`</name\s*>`). Returns the range the closer occupies.
+fn find_close(text: &str, name: &str, from: usize) -> Option<(usize, usize)> {
+    let pat = format!("</{name}");
+    let mut i = from;
+    while let Some(rel) = text[i..].find(&pat) {
+        let s = i + rel;
+        let rest = &text[s + pat.len()..];
+        let ws = rest.len() - rest.trim_start().len();
+        if rest[ws..].starts_with('>') {
+            return Some((s, s + pat.len() + ws + 1));
+        }
+        i = s + pat.len();
+    }
+    None
+}
+
+/// Does `body` end inside an unclosed quote? The port of `scan.py::_in_string`,
+/// and it decides where a syscall body ends. Bash and Python agree on the part
+/// that matters: a run of `'` or `"` opens, the same run closes, a backslash
+/// escapes the next character inside a double quote, and a triple run swallows
+/// the closing tag a docstring happens to mention.
+fn in_string(body: &str) -> bool {
+    let b = body.as_bytes();
+    let n = b.len();
+    let mut i = 0usize;
+    while i < n {
+        if b[i] == b'\\' {
+            i += 2;
+            continue;
+        }
+        if b[i] != b'"' && b[i] != b'\'' {
+            i += 1;
+            continue;
+        }
+        let run = if b[i..].starts_with(b"\"\"\"") || b[i..].starts_with(b"'''") {
+            3
+        } else {
+            1
+        };
+        let quote = &b[i..i + run];
+        let mut j = i + run;
+        while j < n {
+            if b[j] == b'\\' && run == 1 && quote[0] == b'"' {
+                j += 2;
+                continue;
+            }
+            if b[j..].starts_with(quote) {
+                break;
+            }
+            j += 1;
+        }
+        if j >= n {
+            return true; // opened and never closed: everything after is string
+        }
+        i = j + run;
+    }
+    false
+}
+
+/// Strip whole syscalls from prose -- markers *and* bodies.
+///
+/// Deleting the markers alone is not enough: it leaves the command behind as
+/// if someone had said it. The command is not prose; it belongs to the calls
+/// pane, which already renders it as a card.
+///
+/// Structure decides, not a list of names: an opener with a matching closer is
+/// a syscall whatever it is called, which means a tag registered later needs no
+/// change here. A bare mention with no closer is left alone -- marker and all,
+/// because the kernel leaves it alone too -- so naming a tool mid-sentence
+/// still reads.
+fn strip_syscalls(text: &str) -> String {
+    let (spans, _) = code_spans(text);
+    let mut out = String::new();
+    let mut i = 0usize;
+    while let Some(hit) = next_tag(text, i, &spans) {
+        out.push_str(&text[i..hit.start]);
+        match hit.end {
+            Some(end) => i = end,
+            None => {
+                // Inert to the dispatcher, so it stays visible here or it is
+                // in neither pane.
+                out.push_str(&text[hit.start..hit.open_end]);
+                i = hit.open_end;
+            }
         }
     }
     out.push_str(&text[i..]);
@@ -10409,18 +10590,175 @@ mod tests {
 
     #[test]
     fn open_fence_is_never_treated_as_markup() {
-        let live = "here:\n```python\nif a < b:\n    print('<hi>')\n";
+        // A `<` that cannot open a tag never stalls anything, fence or no fence.
+        let live = "here:\n```python\nif a < b:\n    total = a + b\n";
         assert_eq!(spoken_prefix(live), live);
+        // A tag under a fence that has not closed yet is the one case where the
+        // two readings differ: if the fence closes it is code, and if it never
+        // closes the kernel dispatches it. Mid-stream nobody knows which, so it
+        // is held -- printing it and retracting it a frame later is what left a
+        // truncated copy of the block in the story for good.
+        let held = "here:\n```python\nprint('<hi>')\n";
+        assert_eq!(spoken_prefix(held), "here:\n```python\nprint('");
+        // The hold lasts exactly as long as the fence is open.
+        let closed = "here:\n```python\nprint('<hi>')\n```\ndone";
+        assert_eq!(spoken_prefix(closed), closed);
     }
+
+    /// A folded work row is owed one git read: the one that saw its last
+    /// syscall. Rewriting it from whichever snapshot arrives first prints a
+    /// second pre-commit answer, because the read already in flight when the
+    /// commit landed started before it.
+    #[test]
+    fn a_folded_row_waits_for_the_read_that_saw_its_last_call() {
+        let mut app = App::new();
+        app.stream.run.call("bash", None);
+        app.stream.run.call("bash", None);
+        // No read has landed at all, so the pane's generation is 0.
+        assert_eq!(app.git.snap_gen(), 0);
+        app.stream.run.fresh_gen = 7;
+        app.stream.run.fold(&mut app.story);
+        assert!(app.stream.run.settled.is_some(), "fold owes a row");
+        app.stream.run.settle(&mut app.story, &app.git);
+        assert!(
+            app.stream.run.settled.is_some(),
+            "settled on a snapshot that predates the call it is reporting"
+        );
+        // A run whose calls forced no read is owed nothing and closes at once.
+        app.stream.run.call("read", None);
+        app.stream.run.call("read", None);
+        app.stream.run.fold(&mut app.story);
+        app.stream.run.settle(&mut app.story, &app.git);
+        assert!(app.stream.run.settled.is_none());
+    }
+
+    /// A dead harness is not a step. The old no-bridge branch pushed a POST
+    /// card labelled "demo" under the prompt, so the reader saw a request go
+    /// out and no answer ever come back.
+    #[test]
+    fn a_prompt_after_the_bridge_dies_says_so_instead_of_posting() {
+        let mut app = App::new();
+        assert!(!app.demo);
+        start_step(None, &mut app, "carry on".into()).unwrap();
+        assert!(!app.running, "nothing is running");
+        assert_eq!(app.posts.len(), 0, "no POST group for a step that cannot run");
+        let last = app.story.entry(app.story.len() - 1).map(|e| e.block.clone());
+        assert!(
+            matches!(last, Some(RenderBlock::System(ref b)) if b.text == BRIDGE_GONE),
+            "the story must carry the death under the prompt, not a 4s notice: {last:?}"
+        );
+    }
+
+    /// A fence with no closer masks nothing, because `scan.py::_fence_span`
+    /// masks nothing: the call after a stray backtick run is dispatched for
+    /// real. Masking it here printed it raw in the story *and* ran it.
+    ///
+    /// Each expectation is `desmos/scan.py::scan_spans` on the same input, run
+    /// for real:
+    ///     open ```bash then a call -> [('bash', 26, 41)] dispatched
+    ///     bare ``` then a call     -> [('bash',  6, 21)] dispatched
+    ///     bare ~~~ then a call     -> [('bash',  6, 21)] dispatched
+    ///     closed fence round it    -> []                 inert
+    ///     open fence, inline span  -> []                 inert
 
     #[test]
-    fn code_spans_covers_open_fence_to_end() {
-        let src = "a\n```\nb\n";
-        let spans = code_spans(src);
-        assert_eq!(spans.len(), 1, "{spans:?}");
-        assert_eq!(spans[0].1, src.len(), "open fence must run to EOF");
+    fn an_unclosed_fence_hides_nothing_from_the_story() {
+        let ran = |src: &str| !strip_syscalls(src).contains("<bash>");
+        assert!(ran("here:\n```bash\ngit status\n\n<bash>ls</bash>\n"), "stray info fence");
+        assert!(ran("a\n```\n<bash>ls</bash>\n"), "stray backtick fence");
+        assert!(ran("a\n~~~\n<bash>ls</bash>\n"), "stray tilde fence");
+        assert!(!ran("here:\n```bash\n<bash>ls</bash>\n```\ndone\n"), "closed fence");
+        // The fence never closes, so its lines are ordinary lines again --
+        // including their backticks, which is the only reason this one is
+        // inert to the kernel.
+        assert!(!ran("a\n```\nuse `<bash>ls</bash>` here\n"), "inline span under a stray fence");
     }
 
+    /// While the fence is open nobody can tell a stray fence from one whose
+    /// closer is still in flight, so a call under it is held rather than
+    /// printed and retracted -- a retraction the story cannot make, the chunk
+    /// having already been appended to a live block.
+    #[test]
+    fn a_call_under_a_live_fence_is_held_not_printed() {
+        let live = "here:\n```bash\ngit status\n\n<bash>ls</bash>\n";
+        let shown = spoken_prefix(live);
+        assert!(!shown.contains("<bash>"), "leaked into the story: {shown:?}");
+        assert_eq!(shown, "here:\n```bash\ngit status\n\n");
+    }
+
+    /// `scan_spans` on both of these is `[]`: an opener with no closer is
+    /// skipped, and `TAG_OPEN` cannot match a lone closer at all. Nothing is
+    /// dispatched, so nothing may be deleted -- text eaten here is text in
+    /// neither pane.
+    #[test]
+    fn an_inert_mention_keeps_its_markers() {
+        assert_eq!(strip_syscalls("use the <bash> tool for that"), "use the <bash> tool for that");
+        assert_eq!(strip_syscalls("that ends with </bash> ok"), "that ends with </bash> ok");
+        // A lone closer is not a call, so it does not stall the stream either.
+        assert_eq!(spoken_prefix("that ends with </bash> ok"), "that ends with </bash> ok");
+    }
+
+    /// The stream holds a bare `<bash>` back in case its closer is still
+    /// coming. When the message ends without one the kernel dispatches
+    /// nothing, so the hold has to be released or the tail of the sentence is
+    /// printed nowhere.
+    #[test]
+    fn a_held_mention_is_released_when_the_stream_ends() {
+        let mut app = App::new();
+        apply_speech(&mut app.story, &mut app.stream, "use the <bash> tool for that", true);
+        app.stream.flush(&mut app.story);
+        let held = (0..app.story.len())
+            .filter_map(|i| match app.story.entry(i).map(|e| &e.block) {
+                Some(RenderBlock::AgentMessage(m)) => Some(m.text()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("");
+        assert!(!held.contains("tool for that"), "printed before the closer could arrive");
+        app.stream.finish(&mut app.story);
+        let text = (0..app.story.len())
+            .filter_map(|i| match app.story.entry(i).map(|e| &e.block) {
+                Some(RenderBlock::AgentMessage(m)) => Some(m.text()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("");
+        assert_eq!(text.trim(), "use the <bash> tool for that");
+    }
+
+    /// `scan_spans('<bash>echo "</bash>"</bash>')` is one call over the whole
+    /// string: the body ends at the first closer that is not quoted. Stopping
+    /// at the quoted one left `"</bash>` behind as prose while the kernel ran
+    /// the whole command.
+    #[test]
+    fn a_quoted_closer_does_not_end_the_body() {
+        assert_eq!(strip_syscalls("<bash>echo \"</bash>\"</bash>"), "");
+        assert_eq!(strip_syscalls("<python>print(\"</python>\")\nx = 1</python>"), "");
+        // `scan_spans('<bash>ls</bash >')` -> one call: the closer regex is
+        // `</name\s*>`.
+        assert_eq!(strip_syscalls("<bash>ls</bash >"), "");
+    }
+
+    /// The story must strip exactly what the dispatcher ran, or a call shows
+    /// up in both panes in two shapes (raw tag as prose plus its card) or in
+    /// neither (an inert sample eaten as if it had run).
+    ///
+    /// Each expectation below is `desmos/scan.py::scan_spans` on the same
+    /// input, run for real:
+    ///     stray backtick   -> [('bash', 6, 21)]  dispatched
+    ///     4-space indent   -> []                 inert
+    ///     list + 6 spaces  -> []                 inert
+    ///     list + 4 spaces  -> [('bash', 12, 27)] dispatched
+    ///     closed inline    -> []                 inert
+    #[test]
+    fn strip_syscalls_agrees_with_the_dispatcher_on_what_ran() {
+        let ran = |src: &str| !strip_syscalls(src).contains("<bash>");
+        assert!(ran("a ` b <bash>ls</bash> done"), "stray backtick is not a span");
+        assert!(!ran("text:\n\n    <bash>ls</bash>\n\nmore"), "indented code");
+        assert!(!ran("- item\n\n      <bash>ls</bash>\n\nmore"), "indented in a list");
+        assert!(ran("- item\n\n    <bash>ls</bash>\n\nmore"), "list item's own paragraph");
+        assert!(!ran("use `<bash>ls</bash>` here"), "closed inline span");
+    }
 
     fn first_speech(app: &App) -> Option<usize> {
         (0..app.story.len()).find(|&i| {
