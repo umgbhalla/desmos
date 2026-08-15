@@ -457,10 +457,10 @@ impl StreamCursor {
         self.think.is_some() || self.speech.is_some()
     }
 
-    fn flush(&mut self, story: &mut ScrollbackState) {
+    fn flush(&mut self, story: &mut ScrollbackState, activity: &mut ScrollbackState) {
         if let Some(id) = self.think {
             if !self.pending_think.is_empty() {
-                story.push_chunk_to_thinking(id, &self.pending_think);
+                activity.push_chunk_to_thinking(id, &self.pending_think);
                 self.pending_think.clear();
             }
         }
@@ -534,14 +534,11 @@ impl StreamCursor {
         self.speech_shown.clear();
     }
 
-    fn finish(&mut self, story: &mut ScrollbackState) {
-        self.finish_think(story);
+    fn finish(&mut self, story: &mut ScrollbackState, activity: &mut ScrollbackState) {
+        self.finish_think(activity);
         self.finish_speech(story);
     }
 }
-
-
-
 
 /// What a call was aimed at, when that is structural rather than payload.
 ///
@@ -679,8 +676,9 @@ impl WorkRun {
         });
     }
 
-    fn thought(&mut self, id: EntryId, elapsed_ms: Option<i64>) {
-        self.thoughts.push(id);
+    fn thought(&mut self, _id: EntryId, elapsed_ms: Option<i64>) {
+        // Thinking lives in Activity now, so the Story work-run summary must
+        // not retain or remove an entry id from a different scrollback.
         self.segs
             .push(Seg::Thought(elapsed_ms.unwrap_or(0).max(0) as u64));
     }
@@ -1797,10 +1795,10 @@ fn seed_demo(app: &mut App) {
     app.story_push(RenderBlock::user_prompt(
         "look around the kernel\nand list what you can grow",
     ));
-    app.story_push(RenderBlock::thinking(
+    app.call_push(RenderBlock::thinking(
         "cwd is mine. peek ns, then fire the smallest probe.",
     ));
-    app.story_push(RenderBlock::thinking(
+    app.call_push(RenderBlock::thinking(
         "redacted thinking — opaque block, replayed on the next complete(), not speech.",
     ));
     app.story_push(RenderBlock::agent_message(
@@ -2343,12 +2341,25 @@ fn handle_child(app: &mut App, ev: &Value) {
             let redacted = ev.get("redacted").and_then(Value::as_bool).unwrap_or(false);
             let delta = ev.get("delta").and_then(Value::as_bool).unwrap_or(false);
             let text = ev.get("text").and_then(Value::as_str).unwrap_or("");
-            apply_thinking(&mut child.story, &mut child.stream, redacted, text, delta);
+            apply_thinking(
+                &mut child.story,
+                &mut child.calls,
+                &mut child.stream,
+                redacted,
+                text,
+                delta,
+            );
         }
         "speech" => {
             let delta = ev.get("delta").and_then(Value::as_bool).unwrap_or(false);
             let text = ev.get("text").and_then(Value::as_str).unwrap_or("");
-            apply_speech(&mut child.story, &mut child.stream, text, delta);
+            apply_speech(
+                &mut child.story,
+                &mut child.calls,
+                &mut child.stream,
+                text,
+                delta,
+            );
         }
         "post" => {
             let n = ev.get("n").and_then(Value::as_u64).unwrap_or(0);
@@ -2357,7 +2368,7 @@ fn handle_child(app: &mut App, ev: &Value) {
             }
         }
         "complete" => {
-            child.stream.finish(&mut child.story);
+            child.stream.finish(&mut child.story, &mut child.calls);
             finish_exec(&mut child.calls, &mut child.exec);
             let n = ev.get("n").and_then(Value::as_u64).unwrap_or(0);
             let origin = ev.get("origin").and_then(Value::as_str).unwrap_or("llm");
@@ -2376,12 +2387,12 @@ fn handle_child(app: &mut App, ev: &Value) {
             }
         }
         "result" => {
-            child.stream.finish(&mut child.story);
+            child.stream.finish(&mut child.story, &mut child.calls);
             apply_result(&mut child.calls, &mut child.exec, ev);
         }
         "turn" => {
-            child.stream.finish(&mut child.story);
-            start_thinking(&mut child.story, &mut child.stream);
+            child.stream.finish(&mut child.story, &mut child.calls);
+            start_thinking(&mut child.calls, &mut child.stream);
         }
         _ => {}
     }
@@ -2441,15 +2452,22 @@ fn handle_event(app: &mut App, ev: Value) {
             let redacted = ev.get("redacted").and_then(Value::as_bool).unwrap_or(false);
             let delta = ev.get("delta").and_then(Value::as_bool).unwrap_or(false);
             let text = ev.get("text").and_then(Value::as_str).unwrap_or("");
-            apply_thinking(&mut app.story, &mut app.stream, redacted, text, delta);
+            apply_thinking(
+                &mut app.story,
+                &mut app.calls,
+                &mut app.stream,
+                redacted,
+                text,
+                delta,
+            );
         }
         "speech" => {
             let delta = ev.get("delta").and_then(Value::as_bool).unwrap_or(false);
             let text = ev.get("text").and_then(Value::as_str).unwrap_or("");
-            apply_speech(&mut app.story, &mut app.stream, text, delta);
+            apply_speech(&mut app.story, &mut app.calls, &mut app.stream, text, delta);
         }
         "result" => {
-            app.stream.finish(&mut app.story);
+            app.stream.finish(&mut app.story, &mut app.calls);
             let phase = ev.get("phase").and_then(Value::as_str).unwrap_or("done");
             if phase != "start" && phase != "delta" {
                 let tag = ev.get("tag").and_then(Value::as_str).unwrap_or("?");
@@ -2496,7 +2514,7 @@ fn handle_event(app: &mut App, ev: Value) {
             app.notify("context folded");
         }
         "complete" => {
-            app.stream.finish(&mut app.story);
+            app.stream.finish(&mut app.story, &mut app.calls);
             finish_exec(&mut app.calls, &mut app.exec);
             let n = ev.get("n").and_then(Value::as_u64).unwrap_or(0);
             let origin = ev.get("origin").and_then(Value::as_str).unwrap_or("llm");
@@ -2521,11 +2539,11 @@ fn handle_event(app: &mut App, ev: Value) {
         }
         "turn" => {
             app.status = "running".into();
-            app.stream.finish(&mut app.story);
-            start_thinking(&mut app.story, &mut app.stream);
+            app.stream.finish(&mut app.story, &mut app.calls);
+            start_thinking(&mut app.calls, &mut app.stream);
         }
         "done" => {
-            app.stream.finish(&mut app.story);
+            app.stream.finish(&mut app.story, &mut app.calls);
             app.stream.run.fold(&mut app.story);
             finish_exec(&mut app.calls, &mut app.exec);
             app.running = false;
@@ -2534,9 +2552,12 @@ fn handle_event(app: &mut App, ev: Value) {
             app.drain_after = !app.queue.is_empty();
         }
         "stopped" => {
-            app.stream.finish(&mut app.story);
+            app.stream.finish(&mut app.story, &mut app.calls);
             finish_exec(&mut app.calls, &mut app.exec);
-            let t = ev.get("text").and_then(Value::as_str).unwrap_or("stopped, saved");
+            let t = ev
+                .get("text")
+                .and_then(Value::as_str)
+                .unwrap_or("stopped, saved");
             app.story_push(RenderBlock::system(t));
             app.running = false;
             app.turn_started = None;
@@ -2552,7 +2573,7 @@ fn handle_event(app: &mut App, ev: Value) {
             }
         }
         "error" => {
-            app.stream.finish(&mut app.story);
+            app.stream.finish(&mut app.story, &mut app.calls);
             finish_exec(&mut app.calls, &mut app.exec);
             let t = ev.get("text").and_then(Value::as_str).unwrap_or("error");
             app.story_push(RenderBlock::system(t));
@@ -4585,10 +4606,10 @@ fn streaming(app: &App) -> bool {
 }
 
 fn flush_streams(app: &mut App) {
-    app.stream.flush(&mut app.story);
+    app.stream.flush(&mut app.story, &mut app.calls);
     app.exec.flush(&mut app.calls);
     for child in app.children.values_mut() {
-        child.stream.flush(&mut child.story);
+        child.stream.flush(&mut child.story, &mut child.calls);
         child.exec.flush(&mut child.calls);
     }
 }
@@ -4715,10 +4736,14 @@ fn draw(f: &mut Frame, app: &mut App) {
     // whichever session is on screen, so both branches want the same string.
     // The POST cards are off by default, so the pane says so where the switch
     // is: a chip in its own border title, clickable, `p` from the keyboard.
-    let chip = if app.show_posts { "[-posts]" } else { "[+posts]" };
+    let chip = if app.show_posts {
+        "[-posts]"
+    } else {
+        "[+posts]"
+    };
     let calls_title = match app.call_group_pos() {
-        Some((cur, total)) => format!("calls  #{cur}/{total}  {chip}"),
-        None => format!("calls  {chip}"),
+        Some((cur, total)) => format!("Activity  #{cur}/{total}  {chip}"),
+        None => format!("Activity  {chip}"),
     };
     app.calls_chip = title_chip_rect(app.call_area, &calls_title, chip);
     if let (Some(id), true) = (viewing.as_deref(), child_ok) {
@@ -5571,20 +5596,15 @@ fn draw_queue(f: &mut Frame, area: Rect, app: &App) {
     if inner.width == 0 || inner.height == 0 {
         return;
     }
-    f.render_widget(
-        Paragraph::new(app.queue.lines(inner.width, focused)),
-        inner,
-    );
+    f.render_widget(Paragraph::new(app.queue.lines(inner.width, focused)), inner);
 }
-
-
 
 /// What to call the focused pane in the legend title.
 fn focus_name(focus: Focus) -> &'static str {
     match focus {
         Focus::Input => "input",
         Focus::Story => "story",
-        Focus::Calls => "calls",
+        Focus::Calls => "Activity",
         Focus::Meter => "meta",
         Focus::Git => "git",
         Focus::Files => "files",
@@ -5704,15 +5724,18 @@ fn draw_input(f: &mut Frame, area: Rect, app: &mut App) {
 fn pane_keys(focus: Focus) -> (&'static str, &'static [(&'static str, &'static str)]) {
     match focus {
         Focus::Story | Focus::Calls => (
-            "story / calls",
+            "story / Activity",
             &[
                 ("j k", "select a block"),
                 ("h", "collapse it"),
                 ("l", "fold: collapsed / truncated / expanded"),
-                ("enter", "zoom into the viewer (a spawn row opens the child)"),
+                (
+                    "enter",
+                    "zoom into the viewer (a spawn row opens the child)",
+                ),
                 ("ctrl-f", "zoom, without moving the fold"),
-                ("[ ]", "previous / next POST group (calls)"),
-                ("p", "show / hide the POST rows (calls)"),
+                ("[ ]", "previous / next POST group (Activity)"),
+                ("p", "show / hide the POST rows (Activity)"),
                 ("r", "raw text of the selected block"),
                 ("pgup pgdn", "scroll a page"),
                 ("i", "back to the composer"),
@@ -6148,6 +6171,7 @@ fn apply_result(calls: &mut ScrollbackState, exec: &mut ExecStream, ev: &Value) 
 
 fn apply_thinking(
     story: &mut ScrollbackState,
+    activity: &mut ScrollbackState,
     stream: &mut StreamCursor,
     redacted: bool,
     text: &str,
@@ -6155,8 +6179,8 @@ fn apply_thinking(
 ) {
     if redacted {
         stream.finish_speech(story);
-        stream.finish_think(story);
-        story.push_block(RenderBlock::thinking(
+        stream.finish_think(activity);
+        activity.push_block(RenderBlock::thinking(
             "redacted thinking — opaque block, replayed on the next complete(), not speech.",
         ));
         return;
@@ -6166,24 +6190,30 @@ fn apply_thinking(
         if text.is_empty() {
             return;
         }
-        start_thinking(story, stream);
+        start_thinking(activity, stream);
         stream.pending_think.push_str(text);
         return;
     }
     stream.finish_speech(story);
-    stream.finish_think(story);
+    stream.finish_think(activity);
     if !text.trim().is_empty() {
-        story.push_block(RenderBlock::thinking(text));
+        activity.push_block(RenderBlock::thinking(text));
     }
 }
 
-fn apply_speech(story: &mut ScrollbackState, stream: &mut StreamCursor, text: &str, delta: bool) {
+fn apply_speech(
+    story: &mut ScrollbackState,
+    activity: &mut ScrollbackState,
+    stream: &mut StreamCursor,
+    text: &str,
+    delta: bool,
+) {
     if delta {
-        stream.finish_think(story);
+        stream.finish_think(activity);
         stream.speech_raw.push_str(text);
         return;
     }
-    stream.finish_think(story);
+    stream.finish_think(activity);
     stream.finish_speech(story);
     // The story carries prose. A syscall goes to the calls pane, body and all.
     let spoken = strip_syscalls(text);
@@ -7421,7 +7451,7 @@ mod tests {
         );
         let painted = paint(&mut app, 120, 40);
         assert!(
-            painted.contains("calls  #3/3"),
+            painted.contains("Activity  #3/3"),
             "the wire title lost its group counter: {painted}"
         );
     }
@@ -7690,15 +7720,32 @@ mod tests {
             &mut app,
             json!({"ev": "result", "tag": "grep", "body": "pattern", "text": "hit"}),
         );
-        handle_event(&mut app, json!({"ev": "speech", "delta": true, "text": "Found it."}));
+        handle_event(
+            &mut app,
+            json!({"ev": "speech", "delta": true, "text": "Found it."}),
+        );
         let _ = paint(&mut app, 120, 34);
-        let thoughts = (0..app.story.len())
-            .filter(|i| matches!(
-                app.story.entry(*i).map(|e| &e.block),
-                Some(RenderBlock::Thinking(_))
-            ))
+        let story_thoughts = (0..app.story.len())
+            .filter(|i| {
+                matches!(
+                    app.story.entry(*i).map(|e| &e.block),
+                    Some(RenderBlock::Thinking(_))
+                )
+            })
             .count();
-        assert_eq!(thoughts, 1, "a lone call must not fold the thought away");
+        let activity_thoughts = (0..app.calls.len())
+            .filter(|i| {
+                matches!(
+                    app.calls.entry(*i).map(|e| &e.block),
+                    Some(RenderBlock::Thinking(_))
+                )
+            })
+            .count();
+        assert_eq!(story_thoughts, 0, "thinking leaked into Story");
+        assert_eq!(
+            activity_thoughts, 1,
+            "a lone call must not fold the Activity thought away"
+        );
     }
 
     /// The composer belongs to the story column. The wire column used to stop
@@ -8353,7 +8400,7 @@ mod tests {
         let calls_rows: Vec<usize> = text
             .lines()
             .enumerate()
-            .filter(|(_, l)| l.contains("calls") || l.contains("cache"))
+            .filter(|(_, l)| l.contains("Activity") || l.contains("cache"))
             .map(|(i, _)| i)
             .collect();
         let post_row = row_of(&text, "POST in").expect(&text);
@@ -8402,7 +8449,7 @@ mod tests {
         term.draw(|f| draw(f, &mut app)).unwrap();
         let text = buffer_text(&term);
         assert!(text.contains("story"), "{text}");
-        assert!(text.contains("calls"), "{text}");
+        assert!(text.contains("Activity"), "{text}");
         // A block *stamped* `out`, not the POST card's `out 100` usage column
         // — which is a real number and was only ever absent here because the
         // calls pane used to be clipped a row above it.
@@ -9806,9 +9853,68 @@ mod tests {
         );
         app.set_focus(Focus::PostIn);
         let text = paint(&mut app, 120, 40);
-        assert!(text.contains("LIVEPROBE"), "POST in missing request:\n{text}");
+        assert!(
+            text.contains("LIVEPROBE"),
+            "POST in missing request:\n{text}"
+        );
         assert!(app.post_out.is_empty());
         assert_eq!(app.post_n, 1);
+    }
+
+    #[test]
+    fn live_events_route_conversation_to_story_and_work_to_activity() {
+        let mut app = App::new();
+        start_step(None, &mut app, "inspect routing".into()).unwrap();
+        handle_event(
+            &mut app,
+            json!({"ev": "thinking", "text": "private plan", "delta": false}),
+        );
+        handle_event(
+            &mut app,
+            json!({"ev": "result", "tag": "bash", "body": "pwd", "text": "/tmp"}),
+        );
+        handle_event(
+            &mut app,
+            json!({"ev": "speech", "text": "final answer", "delta": false}),
+        );
+
+        let story_kinds: Vec<&str> = (0..app.story.len())
+            .filter_map(|i| app.story.entry(i))
+            .map(|entry| match &entry.block {
+                RenderBlock::UserPrompt(_) => "prompt",
+                RenderBlock::AgentMessage(_) => "speech",
+                RenderBlock::Thinking(_) => "thinking",
+                _ => "other",
+            })
+            .collect();
+        let activity_kinds: Vec<&str> = (0..app.calls.len())
+            .filter_map(|i| app.calls.entry(i))
+            .map(|entry| match &entry.block {
+                RenderBlock::Thinking(_) => "thinking",
+                RenderBlock::ToolCall(_) => "tool",
+                _ => "other",
+            })
+            .collect();
+
+        assert_eq!(story_kinds, vec!["prompt", "speech"]);
+        assert!(activity_kinds.contains(&"thinking"), "{activity_kinds:?}");
+        assert!(activity_kinds.contains(&"tool"), "{activity_kinds:?}");
+    }
+
+    #[test]
+    fn activity_is_the_rendered_and_focused_pane_name() {
+        let mut app = App::new();
+        app.set_focus(Focus::Calls);
+        let painted = paint(&mut app, 120, 34);
+        assert!(painted.contains("Activity  [+posts]"), "{painted}");
+        assert!(!painted.contains("calls  [+posts]"), "{painted}");
+        assert_eq!(focus_name(Focus::Calls), "Activity");
+
+        app.help = true;
+        let help = paint(&mut app, 120, 34);
+        assert!(help.contains("story / Activity"), "{help}");
+        assert!(help.contains("POST group (Activity)"), "{help}");
+        assert!(!help.contains("story / calls"), "{help}");
     }
 
     #[test]
@@ -9827,8 +9933,8 @@ mod tests {
             json!({"ev": "thinking", "delta": true, "redacted": false, "text": " world"}),
         );
         handle_event(&mut app, json!({"ev": "complete", "n": 1}));
-        let thinks: Vec<String> = (0..app.story.len())
-            .filter_map(|i| match app.story.entry(i).map(|e| &e.block) {
+        let thinks: Vec<String> = (0..app.calls.len())
+            .filter_map(|i| match app.calls.entry(i).map(|e| &e.block) {
                 Some(RenderBlock::Thinking(t)) => Some(t.text()),
                 _ => None,
             })
@@ -10575,7 +10681,7 @@ mod tests {
         app.running = true;
         app.turn_started = Some(Instant::now());
         app.status = "running".into();
-        start_thinking(&mut app.story, &mut app.stream);
+        start_thinking(&mut app.calls, &mut app.stream);
         let text = paint(&mut app, 140, 30);
 
         // Placement, not presence: "thinking" and a spinner painted anywhere on
@@ -10676,16 +10782,12 @@ mod tests {
         app.running = true;
         app.turn_started = Some(Instant::now());
         app.status = "running".into();
-        start_thinking(&mut app.story, &mut app.stream);
+        start_thinking(&mut app.calls, &mut app.stream);
         let _ = paint(&mut app, 140, 30);
         let area = app.turn_cancel.expect("cancel hit area");
         handle_mouse(
             &mut app,
-            click(
-                MouseEventKind::Down(MouseButton::Left),
-                area.x,
-                area.y,
-            ),
+            click(MouseEventKind::Down(MouseButton::Left), area.x, area.y),
         );
         assert!(app.want_stop);
     }
