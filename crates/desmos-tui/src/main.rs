@@ -996,8 +996,6 @@ struct App {
     ready: bool,
     /// Click on grok `[stop]` — applied in the event loop with the bridge.
     want_stop: bool,
-    last_activity: Option<TurnActivity>,
-    activity_started_at: Option<Instant>,
     turn_cancel: Option<Rect>,
     status: String,
     /// The last thing worth telling the user, and when. `status` alone was
@@ -1393,8 +1391,6 @@ impl App {
             turn_started: None,
             ready: false,
             want_stop: false,
-            last_activity: None,
-            activity_started_at: None,
             turn_cancel: None,
             status: "idle".into(),
             notice: None,
@@ -4743,8 +4739,7 @@ struct ActivityLine {
     label: String,
     /// None when idle: an idle spinner is a lie about work in flight.
     spin: Option<String>,
-    phase: Option<Duration>,
-    turn: Option<Duration>,
+    elapsed: Option<Duration>,
     subagents: usize,
 }
 
@@ -4773,12 +4768,7 @@ fn activity_line(app: &App, activity: &Option<TurnActivity>) -> ActivityLine {
     ActivityLine {
         label,
         spin,
-        phase: if running {
-            app.activity_started_at.map(|t| t.elapsed())
-        } else {
-            None
-        },
-        turn: if running {
+        elapsed: if running {
             app.turn_started.map(|t| t.elapsed())
         } else {
             None
@@ -4876,11 +4866,6 @@ fn draw(f: &mut Frame, app: &mut App) {
     }
 
     let activity = current_turn_activity(app);
-    if activity.as_ref() != app.last_activity.as_ref() {
-        app.last_activity = activity.clone();
-        app.activity_started_at = Some(Instant::now());
-    }
-
     // Columns first, because the composer wraps at the story column's width and
     // not the terminal's. Measuring against the whole frame under-counted rows
     // by the width of the wire column, so a paragraph overflowed a box that had
@@ -5688,18 +5673,11 @@ fn draw_meta(
                 })
                 .add_modifier(Modifier::BOLD),
         ));
-        if let Some(p) = act.phase {
+        if let Some(elapsed) = act.elapsed {
             spans.push(label("  "));
             spans.push(Span::styled(
-                human_secs(p.as_millis() as u64),
+                human_secs(elapsed.as_millis() as u64),
                 Style::default().fg(theme.text_secondary),
-            ));
-        }
-        if let Some(t) = act.turn {
-            spans.push(label(" / "));
-            spans.push(Span::styled(
-                human_secs(t.as_millis() as u64),
-                Style::default().fg(theme.gray),
             ));
         }
         if act.subagents > 0 {
@@ -11331,7 +11309,7 @@ mod tests {
     fn activity_lives_in_the_meta_pane_and_stop_on_the_composer() {
         let mut app = App::new();
         app.running = true;
-        app.turn_started = Some(Instant::now());
+        app.turn_started = Some(Instant::now() - Duration::from_secs(5));
         app.status = "running".into();
         start_thinking(&mut app.calls, &mut app.stream);
         let text = paint(&mut app, 140, 30);
@@ -11349,6 +11327,23 @@ mod tests {
             frames.iter().any(|f| meta.contains(*f)),
             "meta must spin a grok braille frame:\n{meta}"
         );
+        let thinking_row = meta
+            .lines()
+            .find(|line| line.contains("thinking"))
+            .expect("thinking activity row");
+        assert!(thinking_row.contains("5."), "turn duration missing: {thinking_row}");
+        assert!(!thinking_row.contains('/'), "two competing clocks remain: {thinking_row}");
+
+        // Changing phase must not restart the one main-agent activity clock.
+        app.stream.speech_raw.push_str("answering");
+        let responding = paint(&mut app, 140, 30);
+        let responding_meta = rows_of(&responding, app.cache.area);
+        let responding_row = responding_meta
+            .lines()
+            .find(|line| line.contains("responding"))
+            .expect("responding activity row");
+        assert!(responding_row.contains("5."), "phase reset the duration: {responding_row}");
+        assert!(!responding_row.contains('/'), "two competing clocks remain: {responding_row}");
 
         // [stop] rides the composer's own top edge now.
         let top = rows_of(
