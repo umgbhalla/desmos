@@ -7917,6 +7917,30 @@ mod tests {
     }
 
 
+    /// User prompts go through the real story renderer with stronger weight.
+    /// A terminal has fixed-size cells, so bold is the native larger-type
+    /// hierarchy; this catches an inert vendor-only style change.
+    #[test]
+    fn user_prompt_is_bold_in_the_story_pane() {
+        let mut app = App::new();
+        app.prompt.insert_str("make me larger");
+        submit_prompt(None, &mut app).unwrap();
+
+        let backend = TestBackend::new(100, 28);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let text = buffer_text(&term);
+        let y = row_of(&text, "make me larger").expect("user prompt was not rendered") as u16;
+        let row = text.lines().nth(y as usize).unwrap();
+        let x = row.find("make me larger").unwrap() as u16;
+        assert!(
+            term.backend().buffer()[(x, y)]
+                .modifier
+                .contains(Modifier::BOLD),
+            "the real story path rendered user input at normal weight",
+        );
+    }
+
     /// Only the focused pane draws a visible frame. The border cells stay put
     /// so the geometry never jumps on Tab -- they are painted in the pane
     /// background instead, which is the difference this asserts.

@@ -225,21 +225,18 @@ impl UserPromptBlock {
         }
     }
 
-    /// Prefix/body/skill styles. Bold only when `terminal_native` (minimal mode).
+    /// Prefix/body/skill styles. User input stays bold in every display mode:
+    /// terminals cannot change font size per block, so weight is the native
+    /// way to give the user's words stronger hierarchy without rewriting them.
     /// Cyan pointer when `accent_user` is Reset so OSC 12 leaves the host cursor alone.
-    fn prompt_styles(theme: &Theme, terminal_native: bool) -> (Style, Style, Style) {
+    fn prompt_styles(theme: &Theme, _terminal_native: bool) -> (Style, Style, Style) {
         let prefix_color = match theme.accent_user {
             ratatui::style::Color::Reset => ratatui::style::Color::Cyan,
             c => c,
         };
-        let mut prefix_style = theme.fg(prefix_color);
-        let mut text_style = theme.fg(theme.text_primary);
-        let mut skill_style = theme.fg(theme.accent_skill);
-        if terminal_native {
-            prefix_style = prefix_style.add_modifier(Modifier::BOLD);
-            text_style = text_style.add_modifier(Modifier::BOLD);
-            skill_style = skill_style.add_modifier(Modifier::BOLD);
-        }
+        let prefix_style = theme.fg(prefix_color).add_modifier(Modifier::BOLD);
+        let text_style = theme.fg(theme.text_primary).add_modifier(Modifier::BOLD);
+        let skill_style = theme.fg(theme.accent_skill).add_modifier(Modifier::BOLD);
         (prefix_style, text_style, skill_style)
     }
 
@@ -1088,24 +1085,22 @@ mod tests {
     }
 
     #[test]
-    fn user_prompt_bold_only_in_minimal() {
+    fn user_prompt_is_bold_in_every_display_mode() {
         let theme = Theme::current();
-        let (prefix, body, skill) = UserPromptBlock::prompt_styles(&theme, true);
-        assert!(prefix.add_modifier.contains(Modifier::BOLD));
-        assert!(body.add_modifier.contains(Modifier::BOLD));
-        assert!(skill.add_modifier.contains(Modifier::BOLD));
-
-        let (prefix, body, skill) = UserPromptBlock::prompt_styles(&theme, false);
-        assert!(!prefix.add_modifier.contains(Modifier::BOLD));
-        assert!(!body.add_modifier.contains(Modifier::BOLD));
-        assert!(!skill.add_modifier.contains(Modifier::BOLD));
+        for terminal_native in [true, false] {
+            let (prefix, body, skill) =
+                UserPromptBlock::prompt_styles(&theme, terminal_native);
+            assert!(prefix.add_modifier.contains(Modifier::BOLD));
+            assert!(body.add_modifier.contains(Modifier::BOLD));
+            assert!(skill.add_modifier.contains(Modifier::BOLD));
+        }
 
         // Default unit-test env is fullscreen (lock off).
         let block = UserPromptBlock::new("hello");
         let lines = block.wrap_prompt_lines(80, None, true, false);
         let spans = &lines[0].content.spans;
-        assert!(!spans[0].style.add_modifier.contains(Modifier::BOLD));
-        assert!(!spans[1].style.add_modifier.contains(Modifier::BOLD));
+        assert!(spans[0].style.add_modifier.contains(Modifier::BOLD));
+        assert!(spans[1].style.add_modifier.contains(Modifier::BOLD));
     }
 
     /// Pure band logic (no global `terminal_native_lock` — that races other
