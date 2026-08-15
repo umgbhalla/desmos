@@ -36,6 +36,7 @@ mod json_tree;
 mod picker;
 mod prompt;
 mod queue;
+mod session;
 mod side;
 mod slash;
 
@@ -1012,6 +1013,8 @@ struct App {
     post_req: Value,
     post_resp: Value,
     post_inspect: Option<PostInspect>,
+    /// New/resume choice shown only when a saved transcript exists.
+    session_picker: session::SessionPicker,
     /// Onboarding / settings overlay. Modal when open.
     picker: picker::Picker,
     story_scratch: ScratchBuffer,
@@ -1404,6 +1407,7 @@ impl App {
             post_req: json!({}),
             post_resp: json!({}),
             post_inspect: None,
+            session_picker: session::SessionPicker::default(),
             picker: picker::Picker::default(),
             story_scratch: ScratchBuffer::new(),
             calls_scratch: ScratchBuffer::new(),
@@ -2097,6 +2101,9 @@ fn main() -> io::Result<()> {
         Some(Bridge::spawn(&python, &cwd)?)
     };
     let mut app = App::new();
+    if !demo {
+        app.session_picker = session::SessionPicker::discover(&PathBuf::from(&cwd));
+    }
     if demo {
         app.demo = true;
         seed_demo(&mut app);
@@ -2799,6 +2806,37 @@ fn on_ctrl_c(bridge: Option<&mut Bridge>, app: &mut App) -> io::Result<bool> {
 
 /// Turn a picker decision into a bridge op. The picker never sends anything
 /// itself; this is the only place a choice becomes a request.
+fn apply_session_choice(
+    mut bridge: Option<&mut Bridge>,
+    app: &mut App,
+    choice: session::Choice,
+) -> io::Result<()> {
+    app.story = ScrollbackState::new();
+    app.calls = ScrollbackState::new();
+    app.apply_grok_settings();
+    match choice {
+        session::Choice::New => {
+            // The bridge owns persistence; reset through its public operation
+            // instead of moving the SQLite database out from under it.
+            if let Some(b) = bridge.as_mut() {
+                b.send(&json!({"op": "reset"}))?;
+            }
+            app.notify("new session");
+        }
+        session::Choice::Resume => {
+            let turns = app.session_picker.resumed_turns().to_vec();
+            for turn in turns {
+                app.story_push(RenderBlock::user_prompt(turn.prompt));
+                if !turn.speech.trim().is_empty() {
+                    app.story_push(RenderBlock::agent_message(turn.speech));
+                }
+            }
+            app.notify("transcript resumed");
+        }
+    }
+    Ok(())
+}
+
 fn apply_picker(
     mut bridge: Option<&mut Bridge>,
     app: &mut App,
@@ -2838,6 +2876,14 @@ fn handle_key(
 ) -> io::Result<bool> {
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
         return on_ctrl_c(bridge.as_deref_mut(), app);
+    }
+    // A saved transcript must be accepted or replaced before either the model
+    // picker or the panes receive input.
+    if app.session_picker.open {
+        if let Some(choice) = app.session_picker.key(key.code) {
+            apply_session_choice(bridge.as_deref_mut(), app, choice)?;
+        }
+        return Ok(false);
     }
     // The picker is modal on purpose. On a fresh machine there is no session
     // behind it to type into, so it has to win before any pane sees the key.
@@ -5062,9 +5108,10 @@ fn draw(f: &mut Frame, app: &mut App) {
     if app.help {
         draw_help(f, app);
     }
-    // Last, so it covers everything: on a fresh machine there is no session
-    // behind it, and when reopened it is the only thing being interacted with.
-    if app.picker.open {
+    // Last, so startup cannot accidentally expose an interactive transcript.
+    if app.session_picker.open {
+        app.session_picker.render(f);
+    } else if app.picker.open {
         let area = f.area();
         let buf = f.buffer_mut();
         app.picker.render(buf, area);
@@ -11720,6 +11767,55 @@ mod tests {
             took < Duration::from_millis(500),
             "16 results took {took:?} — the event path is forking a process again"
         );
+    }
+
+    #[test]
+    fn choosing_new_creates_an_empty_visual_session() {
+        let mut app = App::new();
+        app.ready = true;
+        app.story_push(RenderBlock::user_prompt("old prompt"));
+        app.session_picker = session::SessionPicker::with_turns(vec![session::Turn {
+            prompt: "old prompt".into(),
+            speech: "old answer".into(),
+        }]);
+
+        apply_session_choice(None, &mut app, session::Choice::New).unwrap();
+
+        let screen = paint(&mut app, 100, 30);
+        assert!(!screen.contains("old prompt"), "new session retained history:\n{screen}");
+    }
+
+    #[test]
+    fn choosing_resume_rebuilds_saved_turns_in_the_story() {
+        let mut app = App::new();
+        app.ready = true;
+        app.session_picker = session::SessionPicker::with_turns(vec![session::Turn {
+            prompt: "saved question".into(),
+            speech: "saved answer".into(),
+        }]);
+
+        apply_session_choice(None, &mut app, session::Choice::Resume).unwrap();
+
+        let screen = paint(&mut app, 100, 30);
+        assert!(screen.contains("saved question"), "prompt was not resumed:\n{screen}");
+        assert!(screen.contains("saved answer"), "answer was not resumed:\n{screen}");
+    }
+
+    #[test]
+    fn rendered_entry_point_wires_picker_enter_to_resume() {
+        let mut app = App::new();
+        app.ready = true;
+        app.session_picker = session::SessionPicker::with_turns(vec![session::Turn {
+            prompt: "entry point question".into(),
+            speech: "entry point answer".into(),
+        }]);
+
+        let picker = paint(&mut app, 100, 30);
+        assert!(picker.contains("Resume transcript"), "startup picker not rendered:\n{picker}");
+        handle_key(None, &mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)).unwrap();
+        let resumed = paint(&mut app, 100, 30);
+        assert!(resumed.contains("entry point question"), "Enter was not wired to resume:\n{resumed}");
+        assert!(!resumed.contains("Continue where you left off?"));
     }
 
     /// The x of a tab label in the git title strip, laid out as `draw_git` does.
