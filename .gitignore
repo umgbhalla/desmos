@@ -54,5 +54,3 @@ venv/
 .idea/
 .vscode/
 
-# termctrl raw recordings (large, re-derivable)
-captures/*.termctrl

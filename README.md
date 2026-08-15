@@ -140,8 +140,6 @@ While a step runs, `Enter` queues a follow-up instead of interrupting; an empty
 desmos registered as an ACP harness — see
 [docs/comet-frontend.md](docs/comet-frontend.md).
 
-Recording clips of any of this: [docs/demos.md](docs/demos.md).
-
 ## Two providers
 
 Anthropic and OpenAI, one transcript, switchable mid-session.
@@ -272,7 +270,6 @@ Vulnerabilities: [SECURITY.md](SECURITY.md) — never a public issue.
 | [subagents.md](docs/subagents.md) | contracts, fan-out, judgment |
 | [comet-frontend.md](docs/comet-frontend.md) | the optional desktop frontend |
 | [openai-prompt-cache-audit.md](docs/openai-prompt-cache-audit.md) | measured cache behaviour |
-| [demos.md](docs/demos.md) | recording the TUI |
 
 `AGENTS.md` (symlinked as `CLAUDE.md`) is the instruction file for coding agents
 run against this repo.
