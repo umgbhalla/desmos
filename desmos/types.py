@@ -42,6 +42,9 @@ class World:
     generation: int = 1
     gen_reason: str = "gen-1"
     persist: bool = True
+    # Replaces the generated system prompt for this world. Subagents set it;
+    # loop.py reads it through getattr, which is why it was never declared.
+    system_override: str | None = None
     # True while run_turns owns this world. bind_step publishes step/reset into
     # the kernel, so a <python> block can call them from inside a turn -- and a
     # nested run appends its whole exchange before the outer assistant message

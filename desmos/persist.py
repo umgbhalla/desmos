@@ -3,10 +3,12 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import tempfile
+import traceback
 import warnings
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from desmos.const import FROZEN, PRIOR_KEEP
 from desmos.exec import callable_from_source
@@ -16,6 +18,94 @@ SCHEMA_VERSION = 1
 SESSION_ID = "default"
 DB_FILENAME = "harness.sqlite3"
 LEGACY_FILENAME = "harness.json"
+KEEP_MESSAGES = 80
+
+
+def atomic_write(path: Path, text: str) -> None:
+    """Unique temp in the destination directory, then replace.
+
+    A temp named after the destination (`records.jsonl.tmp`) is one file for
+    every desmos process in the repo: two writers interleave into it and both
+    replace, so the survivor is a splice of two states.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        # mkstemp is 0600, which narrows every file that goes through here:
+        # a rewrite would drop the mode someone already set, and a first write
+        # would land private where the plain open() this replaced left umask
+        # (MEMORY.md is meant to be read by humans, including a second account
+        # sharing the checkout). There is no getumask, so read it by setting it.
+        if path.exists():
+            os.chmod(tmp, path.stat().st_mode & 0o777)
+        else:
+            mask = os.umask(0)
+            os.umask(mask)
+            os.chmod(tmp, 0o666 & ~mask)
+        os.replace(tmp, path)
+    except BaseException:
+        Path(tmp).unlink(missing_ok=True)
+        raise
+
+
+def turn_aligned(
+    messages: list[dict[str, Any]], keep: int = KEEP_MESSAGES
+) -> list[dict[str, Any]]:
+    """Keep the last `keep`, then widen backwards until the head is a user turn.
+
+    Anthropic rejects a payload whose first message is an assistant turn, so a
+    flat count is not safe to persist. Widening is the only direction allowed:
+    a version of this that searched *forward* for a boundary cut a 124-message
+    transcript to one message, because the pair it looked for -- two user
+    messages in a row -- only occurs where `_run_turns` appends a stop note or
+    a max_turns note after a result, which is the tail of a step, not its head.
+    A step's real head, the user message carrying `header(world, prompt)`, is
+    not distinguishable from a `<result>` by role or content shape, so this
+    lands on whichever user message is nearest, and never drops below `keep`.
+    """
+    if not messages:
+        return []
+    start = max(0, len(messages) - keep)
+    while start > 0 and messages[start].get("role") != "user":
+        start -= 1
+    if messages[start].get("role") != "user":
+        # The whole transcript opens on an assistant turn: nothing to widen
+        # into, so skip forward to the first user message instead.
+        for i, item in enumerate(messages):
+            if item.get("role") == "user":
+                return messages[i:]
+        return []
+    return messages[start:]
+
+
+def _broken_handler(name: str, detail: str) -> Callable[..., str]:
+    def handler(*_a: Any, **_k: Any) -> str:
+        return f"<{name}> failed to load from stored source:\n{detail}"
+
+    return handler
+
+
+def load_grown(world: World, name: str, doc: str, source: str) -> Tool:
+    """Compile a stored tool, or keep it as a handler that reports the failure.
+
+    This used to `continue` on a bad compile, and the next save() rebuilds the
+    tools table from world.tools -- so a grown tool whose import went stale was
+    deleted, source and all, by the very reload that noticed. Keep the row and
+    fail at the call, the way register_tag already returns the traceback.
+    """
+    try:
+        fn: Callable[..., Any] = callable_from_source(world, source, name)
+    except Exception:
+        detail = traceback.format_exc()
+        warnings.warn(
+            f"grown tool <{name}> failed to load: {detail.strip().splitlines()[-1]}",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        fn = _broken_handler(name, detail)
+    return Tool(name=name, doc=doc, source=source, handler=fn)
 
 
 def state_file(world: World) -> Path:
@@ -171,7 +261,7 @@ def _data_from_world(world: World) -> dict[str, Any]:
         "generation": world.generation,
         "gen_reason": world.gen_reason,
         "thinking": world.thinking,
-        "messages": world.messages[-80:],
+        "messages": turn_aligned(world.messages),
     }
 
 
@@ -269,11 +359,7 @@ def _apply_data(world: World, data: dict[str, Any]) -> None:
             doc = spec.get("doc") or f"user tag <{name}>"
             if not isinstance(source, str) or not isinstance(doc, str):
                 continue
-            try:
-                fn = callable_from_source(world, source, name)
-            except Exception:
-                continue
-            world.tools[name] = Tool(name=name, doc=doc, source=source, handler=fn)
+            world.tools[name] = load_grown(world, name, doc, source)
     raw_prior = data.get("prior")
     if isinstance(raw_prior, list):
         world.prior = [
@@ -291,13 +377,17 @@ def _apply_data(world: World, data: dict[str, Any]) -> None:
         world.thinking = data["thinking"].strip()
     raw_msgs = data.get("messages")
     if isinstance(raw_msgs, list):
-        world.messages = [
-            {"role": item["role"], "content": item["content"]}
-            for item in raw_msgs[-80:]
-            if isinstance(item, dict)
-            and item.get("role") in {"user", "assistant"}
-            and isinstance(item.get("content"), (str, list))
-        ]
+        # Align after the role filter, not before: a dropped junk row shifts
+        # every boundary test that ran ahead of it.
+        world.messages = turn_aligned(
+            [
+                {"role": item["role"], "content": item["content"]}
+                for item in raw_msgs
+                if isinstance(item, dict)
+                and item.get("role") in {"user", "assistant"}
+                and isinstance(item.get("content"), (str, list))
+            ]
+        )
 
 
 def _read_data(conn: sqlite3.Connection) -> dict[str, Any] | None:

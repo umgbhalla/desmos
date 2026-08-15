@@ -242,6 +242,27 @@ def _persist(run: Run) -> None:
 _DEPTH = threading.local()
 
 
+def _scoped_tags(capability: str, contract: TaskContract | None) -> set[str] | None:
+    """Tags the child may run: capability ∩ contract. None means every tag.
+
+    Raises when the two share nothing. An empty scope is not a strict child,
+    it is a child with no syscalls at all: its prompt lists none while still
+    demanding one, so the run can only end in no_tool_evidence. Spawn-time is
+    where that is cheap to say; the model discovering it costs a real run.
+    """
+    allowed: set[str] | None = set(CAPS[capability]) or None
+    if contract is not None and contract.allowed_tools:
+        permitted = set(contract.allowed_tools)
+        allowed = permitted if allowed is None else allowed & permitted
+        if not allowed:
+            raise ValueError(
+                f"contract allowed_tools {sorted(permitted)} share no tag with capability "
+                f"{capability!r} ({', '.join(sorted(CAPS[capability]))}): the child would "
+                "have no syscalls"
+            )
+    return allowed
+
+
 def _child_world(cfg: EffectiveConfig, parent: Any, contract: TaskContract | None = None):
     from desmos.loop import new_world, seed_builtins
 
@@ -251,16 +272,30 @@ def _child_world(cfg: EffectiveConfig, parent: Any, contract: TaskContract | Non
     seed_builtins(w)
     w.model = cfg.model or parent.model
     w.thinking = cfg.thinking or parent.thinking
-    allowed = CAPS[cfg.capability]
-    if allowed:
+    allowed = _scoped_tags(cfg.capability, contract)
+    if allowed is not None:
+        from desmos.dispatch import set_scope
+
+        # The prune keeps the child's prompt truthful (subagent_prompt reads
+        # w.tools) and keeps evidence counting honest. set_scope is what
+        # actually enforces the scope: dispatch answers the frozen tags without
+        # consulting w.tools, and install_resources -- which runs at the top of
+        # every turn, not only on <reload> -- refills that dict from disk.
         for name in list(w.tools):
             if name not in allowed:
                 del w.tools[name]
-    if contract is not None and contract.allowed_tools:
-        permitted = set(contract.allowed_tools)
-        for name in list(w.tools):
-            if name not in permitted:
-                del w.tools[name]
+        set_scope(w, allowed)
+    # Not cleanup: <agents> is how a world reaches spawn(). It is a grown tool,
+    # not a frozen tag, so this pop only holds for the world as built --
+    # install_resources re-registers extension and skill tools from cwd at the
+    # top of every turn, and it is an extension that supplies <agents>.
+    # What holds afterwards is the scope for a scoped child ('agents' is in no
+    # CAPS entry) and, for an unscoped 'full' child, the depth cap: _DEPTH.n is
+    # 1 for the whole run_turns call in the child's worker thread, so an
+    # in-thread spawn() raises there. The cap is thread-local, so a child that
+    # starts its own thread or shells out to a new process is past it -- which
+    # is why the pop and the cap are both kept, and why anyone handing 'full'
+    # an explicit tag set must leave 'agents' out of it.
     w.tools.pop("agents", None)
     if cfg.persona_instructions:
         w.notes["persona"] = cfg.persona_instructions
@@ -617,10 +652,21 @@ def spawn(
             raise ValueError(f"unknown dependency {dependency!r}")
         if prior.state in {"pending", "running"}:
             raise ValueError(f"dependency {dependency!r} has not settled")
-        if prior.judgment is None or not prior.judgment.accepted:
-            raise ValueError(f"dependency {dependency!r} was not accepted")
+        if prior.structured:
+            if prior.judgment is None or not prior.judgment.accepted:
+                raise ValueError(f"dependency {dependency!r} was not accepted")
+        elif prior.state != "done":
+            # A legacy child is never judged -- judgment is only set on the
+            # structured branch -- so demanding a verdict made every dependency
+            # on a plain spawn() fail. Finishing cleanly is its whole verdict.
+            raise ValueError(
+                f"dependency {dependency!r} did not finish: {prior.state}/{prior.stop_reason}"
+            )
 
     cfg = resolve(agent, **over)
+    # Raises on a contract whose tool scope and capability do not overlap, here
+    # rather than in the pool thread that would otherwise build the world.
+    _scoped_tags(cfg.capability, contract if structured else None)
     if structured and contract.budget.max_turns is not None:
         cfg.max_turns = (
             contract.budget.max_turns
@@ -709,12 +755,18 @@ def _parent() -> Any:
         return PARENT
     from desmos.loop import new_world
 
-    return new_world(Path.cwd())
+    # An unbound parent is a fallback, not a session. The persist=True default
+    # loaded and saved cwd/.desmos/harness.sqlite3 -- a child process writing
+    # the real harness's state.
+    return new_world(Path.cwd(), state_path=None, persist=False)
 
 
 def wait(*ids: str, timeout: float = 600.0, poll: float = 0.5) -> list[dict[str, Any]]:
     """Block until the named runs settle (all of them if none named)."""
-    targets = list(ids) or list(RUNS)
+    with _LOCK:
+        # spawn() inserts under _LOCK; iterating RUNS unlocked raised
+        # "dictionary changed size during iteration" mid-fanout.
+        targets = list(ids) or list(RUNS)
     deadline = time.time() + timeout
     while time.time() < deadline:
         pending = [i for i in targets if i in RUNS and RUNS[i].state in ("pending", "running")]
@@ -723,15 +775,24 @@ def wait(*ids: str, timeout: float = 600.0, poll: float = 0.5) -> list[dict[str,
         time.sleep(poll)
     out = []
     for i in targets:
-        if i in RUNS:
-            out.append(RUNS[i].brief())
-        else:
-            out.append({"id": i, "agent": "", "state": "unknown", "secs": 0.0, "turns": 0, "out": ""})
+        run = RUNS.get(i)
+        # A synthetic Run, not a hand-written literal: the unknown branch used
+        # to return six keys while every sibling was a full brief(), so a caller
+        # reading w["budget"] KeyErrored on exactly the case it exists for.
+        out.append(
+            run.brief()
+            if run is not None
+            else Run(id=i, task="", cfg=EffectiveConfig(agent=""), state="unknown", stage="unknown").brief()
+        )
     return out
 
 
 def status() -> list[dict[str, Any]]:
-    return [r.brief() for r in RUNS.values()]
+    with _LOCK:
+        runs = list(RUNS.values())
+    # brief() outside the lock: it reads time.time() and copies lists, and
+    # spawn() must not queue behind a TUI status render.
+    return [r.brief() for r in runs]
 
 
 def result(rid: str) -> str:
@@ -771,7 +832,8 @@ def spawn_many(specs: list[dict[str, Any]], *, parent: Any = None) -> list[str]:
             raise TypeError(f"spawn batch item {index} task must be text or TaskContract")
         agent = str(item.pop("agent", "general"))
         resume = item.pop("resume", None)
-        resolve(agent, **item)
+        cfg = resolve(agent, **item)
+        _scoped_tags(cfg.capability, task if isinstance(task, TaskContract) else None)
         prepared.append((task, agent, resume, item))
     return [
         spawn(task, agent=agent, resume=resume, parent=parent, **over)
@@ -791,4 +853,11 @@ def fanout(tasks: list[str | TaskContract], agent: str = "explore", **over: Any)
 def gather(ids: list[str], timeout: float = 600.0) -> str:
     """Wait, then concatenate each child's final answer."""
     wait(*ids, timeout=timeout)
-    return "\n\n".join(f"--- {i} [{RUNS[i].cfg.agent}] ---\n{result(i)}" for i in ids)
+    # RUNS[i] KeyErrored on an id that never existed; result() already answers
+    # "<unknown id>". Loop over ids, not over wait()'s briefs: wait() with no
+    # ids means every run, which would turn gather([]) into "dump everything".
+    parts = []
+    for i in ids:
+        run = RUNS.get(i)
+        parts.append(f"--- {i} [{run.cfg.agent if run else 'unknown'}] ---\n{result(i)}")
+    return "\n\n".join(parts)

@@ -36,13 +36,15 @@ next `complete()` sees the change. No restart.
 ```bash
 uv venv && uv pip install -e ".[kernel]"
 source .venv/bin/activate
-./scripts/vendor-setup.sh         # clone vendor/grok-build at the pinned rev + apply patches/
 python -m desmos console          # IPython with step and world bound
-python -m desmos tui              # story | calls | input  (needs cargo + vendor/grok-build)
+python -m desmos tui              # story | calls | input  (needs cargo)
 python -m desmos tui --demo       # same layout, no API key
 python -m desmos tui --grok       # grok-build pager, desmos as ACP agent
 python -m desmos kernel           # install a Jupyter kernelspec named Desmos
 ```
+
+The harness itself is stdlib-only — `dependencies = []`. The `kernel` extra is
+just IPython.
 
 Default TUI, left column then right:
 
@@ -54,16 +56,19 @@ queue        follow-ups stacked while a step runs (hidden when empty)
 input        the composer
 
 calls        the wire: complete() cards and every syscall with body + result
-meta         context bar, cache hit, spend
 git          status / branches / log, tabbed
 files        the file the git cursor points at, or the filesystem
-keys         what the focused pane's keys do
+meta         bottom-right: the turn row (spinner, phase/turn elapsed, live
+             subagent count), ctx bar, cache read-vs-write, cost,
+             model/effort/gen, theme
 ```
 
 `ctrl+p` opens the settings picker (provider, model, effort). `ctrl+g` and
-`ctrl+b` toggle the git and file panes. Tab cycles panes; in every pane the
-arrows mean the same thing — up/down moves the cursor, left/right drives that
-pane's second axis (fold, tab, directory, order).
+`ctrl+b` toggle the git and file panes. Tab cycles panes, skipping any that is
+collapsed to zero rows; in every pane the arrows mean the same thing — up/down
+moves the cursor, left/right drives that pane's second axis (fold, tab,
+directory, order). `?` in any pane but the composer floats that pane's key
+cheatsheet.
 
 In calls, `[` and `]` step whole groups — one group per `complete()` POST,
 holding the syscalls that POST produced. The pane title counts them (`#2/5`).
@@ -72,9 +77,9 @@ Arrows still mean fold, so the group step gets its own pair of keys.
 `--grok` launches grok-build's pager-bin (`--minimal --no-leader`) with
 `python -m desmos acp` on stdio.
 
-`vendor/grok-build` is gitignored, but `patches/` is not: `DESMOS_ACP` is our
-patch on the vendored pager, not upstream. Run `scripts/vendor-setup.sh` after
-any vendor pull or the ACP bridge goes missing with no compile error.
+`DESMOS_ACP` is our branch inside the committed pager, not upstream, so a sync
+that overwrites it hands `--grok` back to grok's own agent with no compile
+error; `python -m desmos check` asserts it is still there.
 
 Ordinary cells stay Python. `step("...")` is the agent. Syscall results
 append as user-role `<result>` blocks on the same transcript (Pi-style).
@@ -85,6 +90,32 @@ The agent updates itself: write a skill or a note, then `<reload/>`. After
 editing the SDK: `<reload_sdk/>` (or `reload_sdk()` in a cell) reimports
 `desmos.*` and rebinds `step` without restarting IPython. New ABI/loop apply
 on the next `complete()`.
+
+### Building the TUI
+
+Only the TUI needs Rust. `rust-toolchain.toml` pins **1.97.1**, and the pager's
+build scripts need a proto compiler (`brew install protobuf`, or
+`protobuf-compiler` on Debian). `.cargo/config.toml` forces
+`PROTOC=scripts/protoc` — a wrapper that resolves to a real absolute file so
+cargo's `rerun-if-changed` stays stable; a bare PATH `protoc` makes cargo
+rebuild the whole pager graph on every launch.
+
+`python -m desmos tui` hashes our sources and reuses `target/release/desmos-tui`
+unless those bytes changed, so only the first launch is the slow one.
+`vendor/grok-build` is committed, but a cold build still fetches two git deps
+(the `async-openai` patch and `nucleo`) — it is not an offline build.
+
+### Auth
+
+```bash
+export ANTHROPIC_API_KEY=...       # anthropic: environment only
+python -m desmos auth login        # openai: browser + PKCE to localhost:1455
+python -m desmos auth login --device
+python -m desmos auth status       # which providers are usable
+```
+
+OpenAI credentials land in `~/.desmos/auth.json` (`DESMOS_AUTH` moves it). An
+existing Codex CLI login at `~/.codex/auth.json` is read as-is.
 
 ## Two providers
 
@@ -117,7 +148,9 @@ everything before it. desmos never rewrites history locally; a fold paints a
 `FOLD` card on the wire pane.
 
 `ANTHROPIC_API_KEY` comes from the environment. Never commit it.
-`DESMOS_MODEL` overrides the default (`claude-opus-5`).
+`DESMOS_MODEL` picks the model for `desmos run` and `inverted.py` (default
+`claude-opus-5`). The TUI does not consult it: `~/.desmos/settings.json` wins,
+and a machine with no settings file opens the picker.
 `DESMOS_THINKING` is the effort floor (`low` by default). Opus 5 uses adaptive
 thinking; older Claude 4 models use a token budget plus interleaved thinking.
 On OpenAI the same dial becomes `reasoning.effort`.
@@ -132,8 +165,12 @@ python inverted.py --check
 python inverted.py "task"
 ```
 
-State lands in `.desmos/harness.json` (gitignored): grown tools, notes, prior
-steps. Traces go under `runs/`.
+Both entry points take the same defaults (`--max-tokens`, `--max-turns`,
+`--max-total-tokens`).
+
+State lands in `.desmos/harness.sqlite3` (gitignored): grown tools, notes, prior
+steps. The chat is append-only inside a session, but only its tail is carried
+across a restart, and `reset()` clears it outright. Traces go under `runs/`.
 
 ## Skills and extensions (Pi / Prime grain)
 
@@ -150,6 +187,11 @@ module) are imported into the kernel.
 ~/.agents/skills/          # shared with other harnesses
 .agents/skills/
 ```
+
+The two `~` roots are machine-global and shared with every other harness on the
+box. Every `SKILL.md` found under any of these puts its name and description in
+`<available_skills>` on every POST, so a skill dropped there by something else
+is one desmos pays for too.
 
 **Extensions** — `load(api)` Python files. They can `api.register_tool` or
 `api.on("before_dispatch", …)`.

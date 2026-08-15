@@ -13726,6 +13726,7 @@ dependencies = [
  "anstyle-syntect",
  "html-escape",
  "linkify",
+ "pretty_assertions",
  "pulldown-cmark",
  "ratatui",
  "supports-color",

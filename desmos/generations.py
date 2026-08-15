@@ -6,9 +6,8 @@ from pathlib import Path
 from typing import Any
 
 from desmos.const import FROZEN, PRIOR_KEEP
-from desmos.exec import callable_from_source
-from desmos.persist import save, state_file
-from desmos.types import Tool, World
+from desmos.persist import atomic_write, load_grown, save, state_file
+from desmos.types import World
 
 
 def gen_dir(world: World) -> Path:
@@ -31,10 +30,14 @@ def grown_snapshot(world: World) -> dict[str, Any]:
     }
 
 
-def write_generation(world: World) -> Path:
+def write_generation(world: World) -> Path | None:
+    # A subagent runs in the parent's cwd with persist=False. Ungated, its
+    # <evolve> wrote .desmos/generations/NNNN.json into the parent's repo --
+    # save() refused, this did not.
+    if not world.persist:
+        return None
     path = gen_dir(world) / f"{world.generation:04d}.json"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(grown_snapshot(world), indent=2), encoding="utf-8")
+    atomic_write(path, json.dumps(grown_snapshot(world), indent=2))
     return path
 
 
@@ -56,11 +59,7 @@ def apply_snapshot(world: World, data: dict[str, Any]) -> None:
             doc = spec.get("doc") or f"user tag <{name}>"
             if not isinstance(source, str) or not isinstance(doc, str):
                 continue
-            try:
-                fn = callable_from_source(world, source, name)
-            except Exception:
-                continue
-            world.tools[name] = Tool(name=name, doc=doc, source=source, handler=fn)
+            world.tools[name] = load_grown(world, name, doc, source)
             grown_names.add(name)
     for name in list(world.tools):
         if not world.tools[name].frozen and name not in grown_names:
@@ -76,9 +75,11 @@ def apply_snapshot(world: World, data: dict[str, Any]) -> None:
 def evolve(world: World, reason: str = "") -> str:
     world.generation += 1
     world.gen_reason = reason or f"gen-{world.generation}"
-    write_generation(world)
+    wrote = write_generation(world)
     save(world)
-    return f"generation {world.generation}: {world.gen_reason}"
+    line = f"generation {world.generation}: {world.gen_reason}"
+    # Say it. A silent no-op here reads as a snapshot the model can roll back to.
+    return line if wrote else line + " (not snapshotted: non-persistent world)"
 
 
 def rollback(world: World, n: int) -> str:
@@ -92,8 +93,12 @@ def rollback(world: World, n: int) -> str:
     if not isinstance(data, dict):
         return "rollback failed: bad snapshot"
     apply_snapshot(world, data)
-    world.generation = n
-    world.gen_reason = str(data.get("reason") or f"gen-{n}")
+    # Rewinding the counter made the next <evolve> write n+1 over a snapshot
+    # that already existed -- and what it overwrote was the state you had just
+    # rolled back from, so <rollback n> afterwards replayed the abandoned work.
+    # A generation number is a snapshot id; it only goes up.
+    world.generation = max(world.generation, n)
+    world.gen_reason = f"rolled back to {n}: {data.get('reason') or f'gen-{n}'}"
     save(world)
     return f"rolled back to generation {n}"
 

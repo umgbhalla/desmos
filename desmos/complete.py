@@ -202,10 +202,17 @@ def assistant_content(resp: dict[str, Any]) -> list[dict[str, Any]]:
             blocks.append(item)
         elif kind == "text":
             text = raw.get("text") or ""
-            if text:
+            provider_item = raw.get("openai") if isinstance(raw.get("openai"), dict) else None
+            # An empty text block carrying a provider item is not empty speech:
+            # it is a Responses item this harness does not render (a
+            # function_call, its output, a web search). Dropped here it never
+            # reached to_input, while the reasoning item that produced it did --
+            # and Responses 400s on a reasoning item replayed without its
+            # required following item, which poisons the rest of the session.
+            if text or provider_item:
                 item = {"type": "text", "text": text}
-                if isinstance(raw.get("openai"), dict):
-                    item["openai"] = raw["openai"]
+                if provider_item:
+                    item["openai"] = provider_item
                 blocks.append(item)
     return blocks or [{"type": "text", "text": ""}]
 
@@ -632,14 +639,21 @@ def complete(
         headers=headers,
         method="POST",
     )
+    # The payload this response actually came from; it does not change between
+    # stream attempts. The kernel used to re-read the LAST global after
+    # complete() returned, which a subagent POST from the thread pool could
+    # overwrite in between, putting another agent's request on this wire card.
+    sent = redact_wire(payload)
     for stream_attempt in range(STREAM_RETRIES):
         try:
             with _open_with_retry(req, on_event=on_event, should_stop=should_stop) as resp:
-                return read_sse(
+                out = read_sse(
                     iter_sse_lines(resp),
                     on_event=on_event,
                     should_stop=should_stop,
                 )
+                out["_request"] = sent
+                return out
         except AnthropicStreamError as exc:
             final = stream_attempt == STREAM_RETRIES - 1
             if not exc.retryable or exc.had_output or final:

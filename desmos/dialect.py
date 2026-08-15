@@ -25,19 +25,18 @@ catalog never said out loud. Both families need it; neither infers it.
 
 from typing import Any
 
-# Every id the codex CLI offers today starts with "gpt" — gpt-5.6-sol /
-# -terra / -luna, gpt-daybreak-blue-latest, gpt-5.5, gpt-5.4(-mini),
-# gpt-5.3-codex-spark. The bare family names are here too because
-# DESMOS_MODEL takes any string and people write the alias, not the id.
-# No o1/o3/o4: those were a guess, and a two-character substring is the
-# wrong thing to route a whole prompt dialect on.
-OPENAI_MARKERS = ("gpt", "sol", "terra", "luna", "daybreak", "codex")
-
 
 def family(model: str) -> str:
-    """Which prompt dialect a model wants. Anthropic is the default."""
-    name = (model or "").lower()
-    return "openai" if any(t in name for t in OPENAI_MARKERS) else "anthropic"
+    """Which prompt dialect a model wants. Anthropic is the default.
+
+    Routing and dialect answer from one predicate. This file used to keep its
+    own marker list, and the two disagreed both ways: DESMOS_MODEL=sol got
+    OpenAI dialect prose on a body POSTed to api.anthropic.com, and o3-mini got
+    Anthropic prose on a Responses request.
+    """
+    from desmos.openai import is_openai  # function-level, matching settings.provider_of
+
+    return "openai" if is_openai(model) else "anthropic"
 
 
 def growth() -> str:

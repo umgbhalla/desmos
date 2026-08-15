@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 import urllib.error
 import urllib.request
@@ -24,7 +25,7 @@ import uuid
 from typing import Any, Callable, Iterable
 
 from desmos import auth
-from desmos.complete import COMPACT_BLOCK, _open_with_retry, iter_sse_lines, log_payload
+from desmos.complete import COMPACT_BLOCK, _open_with_retry, iter_sse_lines, log_payload, redact_wire
 
 # The ABI was written for a model that emits XML in prose. A Responses model
 # defaults to assuming it has real function tools, so without this it narrates
@@ -81,9 +82,24 @@ MODELS = ("gpt-5.6-sol", "gpt-5.6-luna", "gpt-5.6-terra")
 EFFORTS = ("low", "medium", "high", "xhigh", "max")
 
 
+# Aliases are here because DESMOS_MODEL takes any string and people write
+# "sol", not "gpt-5.6-sol". This is the one predicate: dialect.family and
+# settings.provider_of both call it. They used to answer separately, and
+# DESMOS_MODEL=sol put OpenAI dialect prose on a body sent to
+# api.anthropic.com while is_openai routed it to Anthropic. Prefixes for the
+# o-series, because a two-character substring is the wrong thing to route a
+# whole prompt dialect on.
+OPENAI_PREFIXES = ("gpt-", "o3", "o4", "codex-")
+OPENAI_ALIASES = frozenset({"gpt", "sol", "terra", "luna", "daybreak", "codex"})
+
+
 def is_openai(model: str) -> bool:
     name = (model or "").lower()
-    return name.startswith(("gpt-", "o3", "o4", "codex-"))
+    if name.startswith(OPENAI_PREFIXES):
+        return True
+    # Whole words, not substrings: dialect.py matched "sol" anywhere in the id,
+    # which routes anything containing "console" or "resolve" to OpenAI.
+    return bool(OPENAI_ALIASES.intersection(re.split(r"[^a-z0-9]+", name)))
 
 
 def effort_of(thinking: str | None) -> str:
@@ -245,6 +261,13 @@ def payload_for(
         "include": ["reasoning.encrypted_content"],
         "max_output_tokens": max_tokens,
         "text": {"verbosity": "medium"},
+        # No stop-sequence equivalent here: the Responses body has no `stop` and
+        # no `stop_sequences` (`stop` was a Chat Completions field and did not
+        # carry over), so the Anthropic guard in complete.cached_payload has no
+        # analogue. It is fenced differently instead -- a syscall is a typed
+        # custom_tool_call, so the tag is not prose the model can keep writing
+        # past into a result it wrote itself, and CONTRACT says so in words for
+        # the case where it tries.
         "tools": [
             {
                 "type": "custom",
@@ -506,8 +529,6 @@ def headers_for(cred: auth.Credential) -> tuple[str, dict[str, str]]:
 
 def unsupported_field(detail: str) -> str | None:
     """The parameter name in an 'Unsupported parameter: x' style 400, if any."""
-    import re
-
     for pat in (
         r"[Uu]nsupported parameter:?\s*'?([A-Za-z0-9_.]+)",
         r"[Uu]nknown parameter:?\s*'?([A-Za-z0-9_.]+)",
@@ -515,8 +536,47 @@ def unsupported_field(detail: str) -> str | None:
     ):
         m = re.search(pat, detail)
         if m:
-            return m.group(1).split(".")[0]
+            # The character class includes '.', so an unquoted name at the end
+            # of a sentence captures the full stop too. Strip it, but keep the
+            # interior dots: the path is the thing being dropped.
+            return m.group(1).strip(".")
     return None
+
+
+def _drop_field(body: dict[str, Any], path: str) -> bool:
+    """Remove what the 400 named, most precisely first. True if anything went.
+
+    'reasoning.summary' names the summary, not the reasoning object. Popping
+    the parent turned a complaint about the summary into thinking switched off
+    for the rest of the session, while the meta pane went on reporting the
+    configured effort.
+
+    But not every name resolves to a dict leaf, and a name that does not must
+    not be fatal. 'reasoning.encrypted_content' is an entry in the `include`
+    list, so it lives under no `reasoning` key at all -- and dropping
+    `reasoning` would leave the entry in place for the next attempt to 400 on
+    again. Deeper or indexed names ('reasoning.summary.kind',
+    'context_management.0.type') resolve to nothing either. Those fall back to
+    the coarse top-level pop, which is what kept the session alive before.
+    """
+    parts = path.split(".")
+    node: Any = body
+    for p in parts[:-1]:
+        if not isinstance(node, dict) or p not in node:
+            node = None
+            break
+        node = node[p]
+    if isinstance(node, dict) and parts[-1] in node:
+        node.pop(parts[-1])
+        return True
+    for key, val in body.items():
+        if isinstance(val, list) and path in val:
+            body[key] = [v for v in val if v != path]
+            return True
+    if parts[0] in body:
+        body.pop(parts[0])
+        return True
+    return False
 
 
 def complete(
@@ -536,8 +596,11 @@ def complete(
     # Measured against the live Codex backend, A/B/A on one warm prefix: with
     # prompt_cache_key the response reports cached_tokens 0, without it 2816
     # of 3254. The key is a routing hint on api.openai.com and a cache miss
-    # here, so it only goes out on the API-key endpoint.
-    if cred.kind != "api_key":
+    # here, so it only goes out on the API-key endpoint. Keyed off the url that
+    # headers_for already picked, not off cred.kind: the old test was
+    # `kind != "api_key"`, a kind auth.py has never produced, so the key was
+    # suppressed on both endpoints and the measurement above was moot.
+    if url != API_URL:
         cache_key = None
     body = payload_for(
         model,
@@ -551,26 +614,46 @@ def complete(
     log_payload(body, [])
     dropped: list[str] = []
     for _ in range(6):
+        # The body the drop loop below may still edit, frozen per attempt. The
+        # kernel used to re-read the complete.LAST global after this returned,
+        # which a subagent POST from the thread pool could overwrite in between,
+        # putting another agent's request on this call's wire card.
+        sent = redact_wire(body)
         req = urllib.request.Request(url, data=json.dumps(body).encode(), headers=headers, method="POST")
         try:
             # Same retry the Anthropic path uses. This loop only ever retried a
             # 400 naming an unsupported field, so a 429 -- routine on a plan --
             # or any 5xx raised straight out and killed the whole step.
             with _open_with_retry(req, on_event=on_event, should_stop=should_stop) as resp:
-                return read_sse(
+                out = read_sse(
                     iter_sse_lines(resp), model, on_event=on_event, should_stop=should_stop
                 )
+                out["_request"] = sent
+                return out
         except urllib.error.HTTPError as e:
             detail = e.read().decode("utf-8", "replace")
             # The two endpoints do not accept the same body -- the Codex backend
             # rejects max_output_tokens, for one -- and the accepted set moves.
             # Drop exactly the field it names and try again; a session that
             # keeps working beats a correct-looking request that 400s.
+            # `tools` is a prefix test so a complaint about "tools.0.name"
+            # cannot amputate the syscall tool and leave the model unable to act.
             field = unsupported_field(detail)
-            if e.code == 400 and field and field != "tools" and field in body:
-                body.pop(field, None)
+            if e.code == 400 and field and not field.startswith("tools") and _drop_field(body, field):
                 dropped.append(field)
                 log_payload(body, [])
+                # Dropping a field is a silent downgrade otherwise: a 400 naming
+                # reasoning.summary used to leave the session with no thinking
+                # while the meta pane still reported the configured effort.
+                if on_event is not None:
+                    on_event(
+                        {
+                            "kind": "retry",
+                            "attempt": len(dropped),
+                            "delay": 0.0,
+                            "reason": f"OpenAI 400: dropped {field}",
+                        }
+                    )
                 continue
             note = f" (dropped {', '.join(dropped)})" if dropped else ""
             raise RuntimeError(f"OpenAI HTTP {e.code}{note}: {detail[:2000]}") from e

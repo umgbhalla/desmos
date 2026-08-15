@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import ast
 import contextlib
+import ctypes
 import io
 import os
 import select
 import signal
 import subprocess
+import threading
 import time
 import traceback
 from pathlib import Path
@@ -42,11 +44,76 @@ class _ChunkWriter(io.TextIOBase):
         return self.buf.getvalue()
 
 
+# A <python> block runs on the harness's own thread, so `while True: pass` did
+# not hang a call, it hung the kernel: the deadline nobody set never arrived,
+# the TUI's stop button set a flag nothing was reading, and there is no prompt
+# left to press ctrl-C at. Long enough that real work is never cut short.
+PYTHON_TIMEOUT = 300.0
+# How often the watchdog re-throws. Once is not enough: a bare `except:` around
+# the wedged line swallows the first one, and then it is wedged again.
+_WATCH_TICK = 0.05
+
+
+class PythonStopped(BaseException):
+    """Thrown into a <python> block that outran its deadline or was cancelled.
+
+    BaseException, like the ctrl-C it stands in for. As an Exception, an
+    ordinary `try: ... except Exception: pass` inside the block caught every
+    throw and went straight back round the loop -- the abort was swallowed by
+    defensive code that was not even trying to resist it.
+    """
+
+
+@contextlib.contextmanager
+def _watchdog(should_stop: ShouldStop | None, timeout: float) -> Any:
+    """Raise PythonStopped into this thread once it has run too long.
+
+    An async exception lands on an arbitrary bytecode boundary, so a block cut
+    this way can leave half-done state. That is the price against a kernel that
+    never comes back, and it is only paid after we have decided to abort. It
+    also cannot reach into a C call: `time.sleep(300)` runs its full 300s and
+    reports the stop when it returns. Nothing short of a subprocess can, and a
+    subprocess is a different tag -- <python> exists to touch world.ns.
+    """
+    tid = ctypes.c_ulong(threading.get_ident())
+    setexc = ctypes.pythonapi.PyThreadState_SetAsyncExc
+    reason: list[str] = []
+    finished = threading.Event()
+
+    def watch() -> None:
+        deadline = time.monotonic() + timeout
+        while not finished.wait(_WATCH_TICK):
+            if not reason:
+                if should_stop is not None and should_stop():
+                    reason.append("cancelled")
+                elif time.monotonic() >= deadline:
+                    reason.append(f"timed out after {timeout:g}s")
+                else:
+                    continue
+            setexc(tid, ctypes.py_object(PythonStopped))
+
+    watcher = threading.Thread(target=watch, daemon=True)
+    watcher.start()
+    try:
+        yield reason
+    finally:
+        finished.set()
+        try:
+            watcher.join()
+        finally:
+            # The last re-arm can land just after join() returns, so the clear
+            # has to run on that path too -- otherwise the kernel gets a
+            # PythonStopped one call later, out of nowhere.
+            setexc(tid, None)
+
+
 def run_python(
     body: str,
     world: World,
     *,
     on_chunk: OnChunk | None = None,
+    should_stop: ShouldStop | None = None,
+    timeout: float | None = None,
 ) -> str:
     src = body.strip()
     if not src:
@@ -54,27 +121,37 @@ def run_python(
     buf = _ChunkWriter(on_chunk)
     ns = world.ns
     try:
-        # ast.parse ran outside the redirect, so a warning raised while
-        # *parsing* -- SyntaxWarning for an invalid escape like '\|', or for
-        # `assert(x, y)` -- went to the real fd 2. Under the TUI that is the
-        # terminal: the bytes painted over whatever cell the cursor happened to
-        # be in, usually inside the input box, and nothing scheduled a redraw to
-        # clear them. The model never saw the warning either. Parse inside the
-        # capture, and name the file what the model actually wrote.
-        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
-            tree = ast.parse(src, filename="<python>")
-            if not tree.body:
-                return "ok"
-            *head, last = tree.body
-            if head:
-                exec(compile(ast.Module(head, []), "<python>", "exec"), ns)
-            if isinstance(last, ast.Expr):
-                val = eval(compile(ast.Expression(last.value), "<python>", "eval"), ns)
-                out = buf.getvalue()
-                extra = "" if val is None else repr(val)
-                return spill((out + extra).strip() or "ok", RESULT_CAP, tag="python", cwd=world.cwd)
-            exec(compile(ast.Module([last], []), "<python>", "exec"), ns)
+        with _watchdog(should_stop, PYTHON_TIMEOUT if timeout is None else timeout) as stopped:
+            # ast.parse ran outside the redirect, so a warning raised while
+            # *parsing* -- SyntaxWarning for an invalid escape like '\|', or for
+            # `assert(x, y)` -- went to the real fd 2. Under the TUI that is the
+            # terminal: the bytes painted over whatever cell the cursor happened
+            # to be in, usually inside the input box, and nothing scheduled a
+            # redraw to clear them. The model never saw the warning either.
+            # Parse inside the capture, and name the file what the model wrote.
+            with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+                tree = ast.parse(src, filename="<python>")
+                if not tree.body:
+                    return "ok"
+                *head, last = tree.body
+                if head:
+                    exec(compile(ast.Module(head, []), "<python>", "exec"), ns)
+                if isinstance(last, ast.Expr):
+                    val = eval(compile(ast.Expression(last.value), "<python>", "eval"), ns)
+                    out = buf.getvalue()
+                    extra = "" if val is None else repr(val)
+                    return spill((out + extra).strip() or "ok", RESULT_CAP, tag="python", cwd=world.cwd)
+                exec(compile(ast.Module([last], []), "<python>", "exec"), ns)
         return spill(buf.getvalue().strip() or "ok", RESULT_CAP, tag="python", cwd=world.cwd)
+    except PythonStopped:
+        why = stopped[0] if stopped else "stopped"
+        return spill(
+            f"{buf.getvalue()}\n[python {why} — the block was cut here]".strip(),
+            RESULT_CAP,
+            tag="python",
+            cwd=world.cwd,
+            keep="tail",
+        )
     except Exception:
         return spill(
             (buf.getvalue() + traceback.format_exc()).strip(),
@@ -204,14 +281,22 @@ def run_bash(
 def callable_from_source(world: World, source: str, name: str) -> Callable[..., Any]:
     local: dict[str, Any] = {}
     exec(compile(source, f"<register:{name}>", "exec"), world.ns, local)
-    fn = local.get("handle") or world.ns.get("handle")
+    # Only what this source defined. The fallback used to be
+    # `world.ns.get("handle")`, so one <python> block that left a top-level
+    # `handle` in the namespace got registered under every later tag name --
+    # and the tag still answered "registered <greet>" while dispatching the
+    # older function. A body that defines nothing registered that too.
+    fn = local.get(name) or local.get("handle")
     if not callable(fn):
         for v in local.values():
             if callable(v):
                 fn = v
                 break
     if not callable(fn):
-        raise ValueError("no callable handle")
+        raise ValueError(
+            f"<register name={name!r}> body defined no function; write "
+            f"`def {name}(body, **attrs): ...` or `def handle(body, **attrs): ...`"
+        )
     world.ns[f"handle_{name}"] = fn
     return fn
 

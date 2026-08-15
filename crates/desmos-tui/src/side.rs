@@ -64,6 +64,13 @@ struct GitSnap {
     branches: Vec<GitRow>,
     log: Vec<GitRow>,
     error: Option<String>,
+    /// Every changed file porcelain named, not just the `CAP` rows kept. The
+    /// work row prints this count, and "199 files dirty" in a tree of 300 is
+    /// wrong rather than merely abbreviated.
+    dirty: usize,
+    /// A read finished. The default snapshot has no rows either, and a caller
+    /// asking for the dirty count must not read "not read yet" as "clean".
+    read: bool,
 }
 
 pub struct GitPane {
@@ -101,6 +108,22 @@ impl GitPane {
 
     pub fn error(&self) -> Option<&str> {
         self.snap.error.as_deref()
+    }
+
+    /// Short HEAD sha from the last read — `git log --oneline` starts at HEAD.
+    /// None until a read has landed, or in a repo with no commits.
+    pub fn head(&self) -> Option<&str> {
+        self.snap
+            .log
+            .first()
+            .map(|r| r.mark.as_str())
+            .filter(|s| !s.is_empty())
+    }
+
+    /// Files with changes at the last read, None until one has landed. Counts
+    /// what porcelain reported, not the `CAP` rows the pane kept.
+    pub fn dirty(&self) -> Option<usize> {
+        self.snap.read.then_some(self.snap.dirty)
     }
 
     pub fn rows(&self) -> &[GitRow] {
@@ -219,12 +242,16 @@ fn read_repo(cwd: &Path) -> GitSnap {
             return snap;
         }
     };
-    for line in porcelain.lines().take(CAP) {
+    for line in porcelain.lines() {
         if let Some(head) = line.strip_prefix("## ") {
             snap.branch = head.split_whitespace().next().unwrap_or(head).to_string();
             continue;
         }
         if line.len() < 4 {
+            continue;
+        }
+        snap.dirty += 1;
+        if snap.status.len() >= CAP {
             continue;
         }
         let (mark, rest) = line.split_at(2);
@@ -257,6 +284,7 @@ fn read_repo(cwd: &Path) -> GitSnap {
             });
         }
     }
+    snap.read = true;
     snap
 }
 

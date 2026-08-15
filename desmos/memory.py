@@ -2,13 +2,12 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import re
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from desmos.persist import state_file
+from desmos.persist import atomic_write, state_file
 from desmos.types import World
 
 RECORDS_SUBDIR = "memories"
@@ -50,13 +49,6 @@ def _now() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
 
-def _atomic_write(path: Path, text: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(text, encoding="utf-8")
-    os.replace(tmp, path)
-
-
 def _clean(value: str) -> str:
     return " ".join(value.split())
 
@@ -93,7 +85,7 @@ def _load_records(root: Path) -> list[dict[str, Any]]:
 
 def _write_records(root: Path, records: list[dict[str, Any]]) -> None:
     text = "".join(json.dumps(item, ensure_ascii=False, sort_keys=True) + "\n" for item in records)
-    _atomic_write(records_path(root), text)
+    atomic_write(records_path(root), text)
 
 
 def _legacy_records(text: str) -> list[dict[str, Any]]:
@@ -159,7 +151,7 @@ def _ensure_records(world: World) -> tuple[Path, list[dict[str, Any]]]:
     if legacy.exists():
         backup = root / RECORDS_SUBDIR / LEGACY_FILENAME
         if not backup.exists():
-            _atomic_write(backup, legacy.read_text(encoding="utf-8"))
+            atomic_write(backup, legacy.read_text(encoding="utf-8"))
     _write_records(root, records)
     _rebuild(root, records)
     return root, records
@@ -208,8 +200,8 @@ def _handbook(records: list[dict[str, Any]]) -> str:
 
 
 def _rebuild(root: Path, records: list[dict[str, Any]]) -> None:
-    _atomic_write(summary_path(root), _summary(records))
-    _atomic_write(handbook_path(root), _handbook(records))
+    atomic_write(summary_path(root), _summary(records))
+    atomic_write(handbook_path(root), _handbook(records))
 
 
 def prompt_summary(world: World, budget: int = SUMMARY_BUDGET) -> str:

@@ -17,6 +17,8 @@ from __future__ import annotations
 import base64
 import json
 import os
+import tempfile
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -135,11 +137,22 @@ def write_auth_file(path: Path, tokens: dict[str, Any], *, keep: dict[str, Any] 
     body["tokens"] = tokens
     body["last_refresh"] = time.strftime("%Y-%m-%dT%H:%M:%S.000000Z", time.gmtime())
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".json.tmp")
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w") as f:
-        json.dump(body, f, indent=2)
-    os.replace(tmp, path)
+    # Unique temp, same discipline as the trajectory writer. A fixed
+    # ".json.tmp" meant two concurrent writers renamed each other's file out
+    # from under themselves, and the losers died with FileNotFoundError out of
+    # os.replace -- which killed the subagent turns that were only refreshing a
+    # token. mkstemp already creates the file 0600.
+    fd, tmp = tempfile.mkstemp(prefix=".auth-", suffix=".tmp", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(body, f, indent=2)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
     os.chmod(path, 0o600)
 
 
@@ -177,6 +190,11 @@ def _post_form(url: str, form: dict[str, str], timeout: int = 30) -> dict[str, A
         raise NeedsAuth(f"OpenAI token endpoint {e.code}: {body[:400]}") from e
 
 
+# ponytail: in-process lock only; a Codex CLI refreshing the same auth.json
+# concurrently still races. Per-file flock if that turns up.
+_REFRESH_LOCK = threading.Lock()
+
+
 def refresh_tokens(refresh_token: str) -> dict[str, Any]:
     """Trade a refresh token for a new pair. The refresh token rotates."""
     out = _post_form(
@@ -210,21 +228,37 @@ def _credential_from_file(path: Path, *, allow_refresh: bool = True) -> Credenti
         plan=plan_type(access),
     )
     if cred.expired() and allow_refresh and tokens.get("refresh_token"):
-        fresh = refresh_tokens(tokens["refresh_token"])
-        tokens["access_token"] = fresh["access_token"]
-        tokens["refresh_token"] = fresh.get("refresh_token") or tokens["refresh_token"]
-        if fresh.get("id_token"):
-            tokens["id_token"] = fresh["id_token"]
-        tokens["account_id"] = account_id(fresh["access_token"]) or tokens.get("account_id")
-        write_auth_file(path, tokens, keep={k: v for k, v in data.items() if k != "tokens"})
+        with _REFRESH_LOCK:
+            # Four subagent threads reach here at once holding the same refresh
+            # token, and it rotates: the losers POSTed a token the server had
+            # already retired and then stamped their dead pair over the
+            # winner's file. Re-read under the lock and take the winner's.
+            data = read_auth_file(path) or data
+            tokens = dict(data.get("tokens") or tokens)
+            exp = token_expiry(tokens.get("access_token") or "")
+            if (exp is None or exp - 300 <= time.time()) and tokens.get("refresh_token"):
+                fresh = refresh_tokens(tokens["refresh_token"])
+                tokens["access_token"] = fresh["access_token"]
+                tokens["refresh_token"] = fresh.get("refresh_token") or tokens["refresh_token"]
+                if fresh.get("id_token"):
+                    tokens["id_token"] = fresh["id_token"]
+                tokens["account_id"] = account_id(fresh["access_token"]) or tokens.get("account_id")
+                write_auth_file(path, tokens, keep={k: v for k, v in data.items() if k != "tokens"})
+        # The tokens above came off disk a second time, so the access token the
+        # first read validated is no longer guaranteed to be there: a writer
+        # racing us can leave a tokens dict that is truthy but has no
+        # access_token, and there is then nothing to hand back.
+        access = tokens.get("access_token") or ""
+        if not access:
+            return None
         cred = Credential(
             provider="openai",
             kind="oauth",
-            token=tokens["access_token"],
-            account_id=tokens.get("account_id"),
-            expires=token_expiry(tokens["access_token"]),
+            token=access,
+            account_id=account_id(access) or tokens.get("account_id"),
+            expires=token_expiry(access),
             source=str(path),
-            plan=plan_type(tokens["access_token"]),
+            plan=plan_type(access),
         )
     return cred
 

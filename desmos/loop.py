@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import traceback
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
@@ -197,6 +198,16 @@ def turn(
             should_stop=should_stop,
         )
         req = dict(LAST.get("payload") or {})
+    # The card must show the payload this call actually sent. Re-reading the
+    # complete.LAST global after the round trip raced the subagent pool: a child
+    # POST landing between our POST and this line put the child's system prompt
+    # and messages on the parent's log entry and complete card. The pop matters
+    # too -- redact_wire(resp) goes into world.log["response"] and straight out
+    # on the complete event, so leaving _request there would nest the whole
+    # outgoing payload inside the response card.
+    sent = resp.pop("_request", None)
+    if sent:
+        req = dict(sent)
     speech = text_of(resp)
     assistant = assistant_content(resp)
     world.log.append(
@@ -210,6 +221,15 @@ def turn(
             "response": redact_wire(resp),
         }
     )
+    if len(world.log) > 1:
+        # Only the newest entry's wire bodies are ever read -- by the complete
+        # event three lines below, and by nothing else in the process. Keeping
+        # every payload made world.log quadratic: 60 turns over a 490KB
+        # transcript held 16MB of duplicated request and response. The full wire
+        # history lives in the trajectory files, which prune themselves.
+        # Entries stay: spent_from indexes this list and check reads log[-2].
+        world.log[-2].pop("request", None)
+        world.log[-2].pop("response", None)
     # Durable before anything runs. This used to be appended by the caller
     # after the dispatch loop, so a crash or a kill during a <bash> lost the
     # assistant turn that ordered it: the side effect had happened and the
@@ -303,12 +323,21 @@ def turn(
                         }
                     )
 
-            r = dispatch(
-                world,
-                b,
-                on_chunk=on_chunk,
-                should_stop=should_stop,
-            )
+            try:
+                r = dispatch(
+                    world,
+                    b,
+                    on_chunk=on_chunk,
+                    should_stop=should_stop,
+                )
+            except Exception:  # noqa: BLE001
+                # A raising syscall unwound the whole turn and took the results
+                # of the syscalls before it with it: `results` is local here, so
+                # a <bash> that had already run lost its output and the
+                # transcript was left ordering a tag with no outcome. An
+                # ambiguous <edit> body did exactly this. A failure is this
+                # tag's result, like every other failure in this system.
+                r = traceback.format_exc()
             results.append((b, r))
             fire(
                 {
@@ -341,11 +370,23 @@ def _commit_step(world: World, prompt: str, last: str) -> None:
 
 
 def _spent_tokens(world: World, since: int) -> int:
-    """Prompt + completion tokens billed by this step so far."""
+    """Tokens billed by this step so far, cached reads included.
+
+    Both providers report the cached bulk of a prompt outside input_tokens, so
+    counting only the fresh tokens made this a ceiling on cache misses: with a
+    warm prefix a 50k budget ran 20 turns and 2.4M billed tokens without
+    firing. The ceiling is in tokens, not dollars -- do not discount a cache
+    read to its price here.
+    """
     total = 0
     for entry in world.log[since:]:
         usage = entry.get("usage") or {}
-        for key in ("input_tokens", "output_tokens"):
+        for key in (
+            "input_tokens",
+            "output_tokens",
+            "cache_read_input_tokens",
+            "cache_creation_input_tokens",
+        ):
             value = usage.get(key)
             if isinstance(value, int):
                 total += value
@@ -451,9 +492,6 @@ def _run_turns(
         if hit:
             return f"[stopped: {hit[0]} after turn {n}]"
         return f"[stopped by the user after turn {n}]"
-
-    # Tag handlers reach the wire through here.
-    world.emit = emit
 
     world.messages.append({"role": "user", "content": header(world, prompt) + "\n\n" + prompt})
     last = ""
@@ -617,6 +655,20 @@ def reset_transcript(world: World) -> str:
     return f"transcript cleared ({n} messages)"
 
 
+#: Modules whose globals ARE live state, so re-executing the file destroys it.
+_RELOAD_SKIP = {
+    # _BY_WORLD is every in-flight async task. Reload drops them and
+    # pending.count(world) then reports 0 in the middle of a step.
+    "desmos.pending",
+    # _WIRE is bound to the real stdout at import on purpose. Rebinding it
+    # during a <python> syscall -- where sys.stdout is exec's chunk writer --
+    # feeds every event back into itself.
+    "desmos.bridge",
+    # Its module body is `raise SystemExit(main())`.
+    "desmos.__main__",
+}
+
+
 def reload_sdk(world: World | None = None) -> str:
     """Reimport desmos.* then rebind. Safe from the kernel or <reload_sdk/> after editing the SDK."""
     import importlib
@@ -626,10 +678,18 @@ def reload_sdk(world: World | None = None) -> str:
     for name in list(sys.modules):
         if name == "edit" or name.startswith("desmos_skill_"):
             del sys.modules[name]
+    # This list only exists to put a module ahead of the ones that bind its
+    # names at import time (`from X import Y`). Everything else in the package
+    # is derived below, because as a hand list it fell behind: dialect, spill,
+    # shell, vision, acp and subagent_tool were never reloaded, and a stale
+    # desmos.dialect leaves the system prompt on the old source until the
+    # process restarts -- the one failure this tag exists to prevent.
     order = [
         "desmos.const",
         "desmos.types",
         "desmos.scan",
+        "desmos.dialect",
+        "desmos.spill",
         "desmos.edit",
         "desmos.exec",
         "desmos.persist",
@@ -649,11 +709,17 @@ def reload_sdk(world: World | None = None) -> str:
         "desmos.loop",
         "desmos.ext",
         "desmos.cli",
-        "desmos",
-        "inverted",
     ]
+    ordered = set(order)
+    names = [n for n in order if n in sys.modules]
+    names += sorted(
+        n
+        for n in list(sys.modules)
+        if n.startswith("desmos.") and n not in ordered and n not in _RELOAD_SKIP
+    )
+    names += [n for n in ("desmos", "inverted") if n in sys.modules]
     reloaded = []
-    for name in order:
+    for name in names:
         mod = sys.modules.get(name)
         if mod is None:
             continue

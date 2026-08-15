@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import traceback
+import weakref
 from inspect import signature
-from typing import Any, Callable
+from typing import Any, Callable, Iterable
 
 from desmos.const import FROZEN
 from desmos.edit import apply_edit, parse_edit_body
@@ -12,6 +13,38 @@ from desmos.persist import save
 from desmos.const import RESULT_CAP
 from desmos.spill import spill
 from desmos.types import Block, World
+
+# Which tags a scoped world may run, keyed by id(world). It lives here and not
+# on the World because bind_step publishes the World into the world's own ns:
+# as an attribute, `world.allowed_tags = None` from one <python> line turned
+# off the gate that <python> line was under, and the <edit> refused a moment
+# earlier then went through.
+#
+# This is a scope rail, not a sandbox. Every capability grants <python> and
+# <bash>, and both can write any file and import any desmos module, so nothing
+# here contains a determined child in-process. What it does contain is the
+# harness-level tags -- <system>, <evolve>, <rollback>, <register>,
+# <reload_sdk> -- which a scoped child now cannot reach by emitting them.
+#
+# globals().get: reload_sdk re-executes this module in its own namespace, so a
+# fresh {} on this line would unscope every child running in a pool thread at
+# that moment. finalize drops the entry when the world dies, so a recycled
+# id() cannot scope an unrelated later world.
+_SCOPES: dict[int, frozenset[str]] = globals().get("_SCOPES", {})
+
+
+def set_scope(world: World, tags: Iterable[str] | None) -> None:
+    """Restrict `world` to `tags`. None means every tag, as for the kernel."""
+    if tags is None:
+        _SCOPES.pop(id(world), None)
+        return
+    _SCOPES[id(world)] = frozenset(tags)
+    weakref.finalize(world, _SCOPES.pop, id(world), None)
+
+
+def scope_of(world: World) -> frozenset[str] | None:
+    """The tags `world` may run, or None if it is unscoped."""
+    return _SCOPES.get(id(world))
 
 
 def set_system(world: World, body: str, name: str, delete: bool) -> str:
@@ -43,6 +76,19 @@ def dispatch(
     on_chunk: Callable[[str], None] | None = None,
     should_stop: Callable[[], bool] | None = None,
 ) -> str:
+    # Before the hooks and before the frozen chain: a denied tag must not reach
+    # third-party code and must not run. Refuse in prose, never raise -- a raise
+    # here kills the child's turn instead of teaching it what it may call.
+    # Only tags that exist are refused: telling a child that hallucinated <grep>
+    # it is "outside your scope" says the tag is real and withheld, and costs it
+    # the unknown-tag answer below, which is where "speak when done" lives.
+    scope = scope_of(world)
+    if scope is not None and block.tag not in scope:
+        if block.tag in FROZEN or block.tag in world.tools:
+            return (
+                f"<{block.tag}> is outside this agent's scope. "
+                f"Allowed: {', '.join(sorted(scope)) or 'none'}."
+            )
     for hook in world.hooks.get("before_dispatch", []):
         verdict = hook(world, block)
         if isinstance(verdict, str):

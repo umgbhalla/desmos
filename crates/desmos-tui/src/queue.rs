@@ -129,6 +129,13 @@ impl QueryQueue {
         self.selected = None;
     }
 
+    /// Rows scrolled off the top of the pane. A click needs the same number
+    /// the renderer skips, and re-typing the cap at the hit-test is how the
+    /// two drift apart.
+    pub fn visible_skip(&self) -> usize {
+        self.items.len().saturating_sub(MAX_VISIBLE)
+    }
+
     pub fn display_height(&self) -> u16 {
         if self.items.is_empty() {
             0
@@ -140,7 +147,7 @@ impl QueryQueue {
     pub fn lines(&self, width: u16, focused: bool) -> Vec<Line<'static>> {
         let theme = Theme::current();
         let w = width.max(8) as usize;
-        let skip = self.items.len().saturating_sub(MAX_VISIBLE);
+        let skip = self.visible_skip();
         self.items
             .iter()
             .enumerate()

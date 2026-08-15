@@ -35,7 +35,7 @@ desmos is an inverted harness. The kernel owns the loop. `complete()` is a gland
 - Frozen ABI: `desmos/const.py` (`ABI`, `FROZEN`). Do not casually rewrite the brainstem.
 - Live catalog + `# runtime`: `desmos/catalog.py`. System prompt is ABI + catalog. It must explain how the system actually works (panes, wire calls, markdown, cache, reload, ACP). A path dump is not an explanation.
 - Loop: `desmos/loop.py`. `step` / `turn` / `run_turns`. `new_world(persist=False)` for children. `reload_sdk` reimports without wiping ns / notes / messages.
-- Transcript: append-only. Syscall output arrives as user-role `<result>` blocks. Never emit a result block in model speech. Never restate the task into the transcript.
+- Transcript: append-only within a session — nothing already sent is rewritten or reordered. Syscall output arrives as user-role `<result>` blocks. Never emit a result block in model speech. Never restate the task into the transcript. Two exceptions exist and both are explicit: what survives a process restart is the tail persist keeps, not the whole chat, and `reset()` / the TUI reset op drops the chat outright so a poisoned turn cannot train the next one. A server-side fold is not a local rewrite — the provider's own compaction block replaces the prefix.
 - Cache (Pi / Anthropic): ABI system block, catalog system block, last **user** only. Do not move the breakpoint onto the assistant.
 - Thinking: Opus 5 is adaptive (`thinking: {type:adaptive}` + `output_config.effort`). Default effort is `low`. Older Claude 4 uses a token budget + interleaved beta. Do not fake thinking blocks.
 - Subagents: isolated `World`, `persist=False`, depth cap, persona/capability. Unknown wait ids must not KeyError. Turn-cap must salvage, not vanish.
@@ -52,7 +52,7 @@ These happened. They were rejected. Do not recreate them.
 | Homemade inline viewport / copied `xai-ratatui-inline` as "the TUI" | Three-pane `desmos-tui`: middle = turn story, right = wire calls, bottom = input |
 | Same text on the story pane and the calls pane | Story is grok `UserPrompt` / `Thinking` / `AgentMessage`. Calls are grok `ToolCall` for `complete()` and syscalls. Do not mirror. Do not stamp everything `out`. |
 | `md_lines` pulldown-cmark walker in `crates/desmos-tui` | `crates/xai-grok-markdown` (vendored grok-build crate) via `StreamingMarkdownRenderer::finish` + Syntect Tokyo Night + grok `md_style` colors. Do not put the walker back. |
-| Fake persist / child writing parent `harness.json` | `persist=False`, `state_path=None` |
+| Fake persist / child writing the parent's harness state | `persist=False`, `state_path=None` |
 | Fake `<result>` in assistant speech | Dispatcher-owned user `<result>` only |
 | Self-closing tags the scanner missed | `scan.py` must see `<tag/>` |
 | Trajectory race via `len(dir)+1` | Unique names, atomic replace |
@@ -64,8 +64,10 @@ The pulldown walker is gone. Do not put it back.
 
 - Default TUI is `python -m desmos tui` → `crates/desmos-tui` hosting grok-build `ScrollbackState` / `ScrollbackPane`. Story = UserPrompt / Thinking / AgentMessage. Calls = ToolCall. Tab/j/k/h/l, click select, double-click fold. Needs `vendor/grok-build`. Do not flatten blocks to an `out` label.
 - `--grok` attaches grok-build's pager (`--minimal --no-leader`) with `python -m desmos acp` on stdio. ACP is NDJSON JSON-RPC 2.0, not Content-Length.
-- `vendor/grok-build` is a gitignored analysis clone. Do not commit it. Do not vendor a half-copy of one crate and call that "using grok-build."
-- Our changes to vendored crates live in `patches/`, applied by `scripts/vendor-setup.sh` (pinned rev in that script). `python -m desmos check` asserts the clone sits at the pin with every patch applied — silent when there is no clone, loud when there is one and it disagrees. Never leave a vendor edit only in the working tree — it is gitignored, so it dies on the next clone with no compile error. Re-run the script after any vendor pull, and refresh the patch (`git -C vendor/grok-build diff > patches/NNNN-*.patch`) after any vendor edit.
+- `vendor/grok-build` is committed source, not a clone and not a setup step. A fresh clone must build `cargo build -p desmos-tui` without fetching it. Do not vendor a half-copy of one crate and call that "using grok-build," and do not re-gitignore it: a `path = ` dep that is on your disk and not in the repo compiles here and breaks for whoever clones next, with no compile error anywhere to say so.
+- A change to a vendored crate is an ordinary commit in `vendor/`. There is no patch series, so nothing will re-apply it for you: **an edit you leave unstaged is an edit that only exists on your machine**, and the build stays green while it does. Stage the vendor files in the same commit as the code that needs them.
+- `python -m desmos check` guards exactly two things here. `_check_path_deps_tracked` asks git — not the filesystem — whether every `path = ` dep in the root `Cargo.toml` is tracked; it exists because a bare `build/` in a global gitignore once swallowed `crates/build/xai-proto-build`. `_check_vendor_patch` asserts the vendored pager still carries our DESMOS_ACP branch (`std::env::var("DESMOS_ACP")` in `acp/mod.rs`, `pub async fn spawn_stdio_acp` in `acp/spawn.rs`), because pulling upstream over that file compiles fine and silently hands `--grok` back to grok's own in-process agent.
+- The TUI build is hash-gated and PROTOC-pinned: `python -m desmos tui` hashes our sources and only shells out to cargo when they moved, and `.cargo/config.toml` forces `PROTOC=scripts/protoc` so the pager graph does not rebuild every launch. Do not bypass the wrapper or bolt RUSTFLAGS onto that path.
 - A vendored crate is only ownable in `crates/` if every vendored consumer names it `{ workspace = true }` — our root `[workspace.dependencies]` then redirects it (this is how `xai-grok-markdown` works). Crates reached by a hard `path = "../..."` (`xai-grok-pager-diff`, `-render`, `xai-grok-paths`) cannot be redirected, and their types cross the pager API, so a local copy will not typecheck.
 - Do not hide syscalls from the human. The right pane exists so the wire is visible.
 - `<edit>` is the one syscall that also gets a story card, folded, pushed the moment the result lands (`story_edit_card`). It is the narrative, not just wire traffic. Edits are therefore excluded from the work-run sentence — do not add them back, that prints `edit ×3` above three cards naming the files. Every other tag stays wire-only.
@@ -110,4 +112,4 @@ to break it is to edit prose, delete it.
 
 ## Git
 
-Stage explicit paths. Never `git add -A`. Do not sweep someone else's in-progress TUI/ACP into a commit about tags. Do not commit `.desmos/`, keys, or `vendor/`.
+Stage explicit paths. Never `git add -A`. Do not sweep someone else's in-progress TUI/ACP into a commit about tags. Do not commit `.desmos/`, keys, or `runs/`. `vendor/` is committed on purpose — see above.

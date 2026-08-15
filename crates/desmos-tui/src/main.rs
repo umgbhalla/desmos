@@ -39,6 +39,15 @@ mod queue;
 mod side;
 mod slash;
 
+/// The theme cache is process-global and cargo runs tests on threads. Any test
+/// that reads or writes it takes this first, in any module of this binary.
+#[cfg(test)]
+fn theme_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::PathBuf;
@@ -85,7 +94,6 @@ use xai_grok_pager::scrollback::{
     },
 };
 use xai_grok_pager::acp::tracker::{TurnActivity, WaitingReason};
-use xai_grok_pager::app::agent::AgentState;
 use xai_grok_pager::input::is_mod_enter;
 use xai_grok_pager::theme::{Theme, ThemeKind, cache as theme_cache};
 use xai_grok_pager::util;
@@ -340,6 +348,14 @@ impl PaneLayout {
     }
 
     fn path() -> Option<PathBuf> {
+        // The pane tests paint an App::new() and assert which panes got rows,
+        // so they have to run against the default layout. Without this, a
+        // developer (or CI) whose cwd holds a saved .desmos/tui.json with
+        // post_h/git_h/files_h at 0 fails ten of them: the panes the test
+        // expects to be painted are the ones that human collapsed.
+        if cfg!(test) {
+            return None;
+        }
         let cwd = std::env::current_dir().ok()?;
         Some(cwd.join(".desmos").join("tui.json"))
     }
@@ -580,45 +596,27 @@ fn call_target(tag: &str, ev: &Value) -> Option<String> {
     None
 }
 
-/// `git rev-parse --short HEAD`, or None outside a repo.
-///
-/// Called once per run, at the first syscall, never from the render path.
-fn git_head() -> Option<String> {
-    let out = std::process::Command::new("git")
-        .args(["rev-parse", "--short", "HEAD"])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    (!s.is_empty()).then_some(s)
-}
-
 /// What the repo looks like at the seam, where prose starts.
 ///
 /// A run of invisible work is worth reading precisely because it changed
 /// something on disk, and the reader should not have to go look. A moved HEAD
 /// is the headline; otherwise the dirty count is.
-fn git_tail(head_at_start: Option<&str>) -> Option<String> {
-    let head = git_head();
-    if let (Some(before), Some(now)) = (head_at_start, head.as_deref()) {
+///
+/// Read from the git pane's background snapshot. This used to fork
+/// `git rev-parse` plus `git status --porcelain` on the UI thread, from a
+/// function called after every syscall result and every finished thought —
+/// 0.28s warm per status call in this repo, seconds of frozen frame in a
+/// burst. The snapshot is stale by as much as one read, so a syscall result
+/// forces a fresh one and [`WorkRun::settle`] rewrites the row when it lands:
+/// the run's last call is usually the one that mattered, and `fold` runs the
+/// moment prose starts, well before the pane's own 4s timer comes round.
+fn git_tail(git: &side::GitPane, head_at_start: Option<&str>) -> Option<String> {
+    if let (Some(before), Some(now)) = (head_at_start, git.head()) {
         if before != now {
             return Some(format!("\u{00b7} committed {now}"));
         }
     }
-    let out = std::process::Command::new("git")
-        .args(["status", "--porcelain"])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let dirty = String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .filter(|l| !l.trim().is_empty())
-        .count();
-    match dirty {
+    match git.dirty()? {
         0 => Some("\u{00b7} tree clean".into()),
         1 => Some("\u{00b7} 1 file dirty".into()),
         n => Some(format!("\u{00b7} {n} files dirty")),
@@ -647,11 +645,19 @@ struct WorkRun {
     segs: Vec<Seg>,
     /// Thought blocks to fold away once the row replaces them.
     thoughts: Vec<EntryId>,
-    /// HEAD when the run's first call landed, to spot a commit at the seam.
+    /// HEAD when the run opened, to spot a commit at the seam.
     head_at_start: Option<String>,
+    /// The repo tail for this run, built from the git pane's background
+    /// snapshot as events arrive. `sync` cannot reach the pane — it is called
+    /// from deep inside the stream cursor — and it must not shell out itself.
+    tail: Option<String>,
     /// The row itself, once the run has earned one. Rewritten in place as the
     /// run grows, so it never moves and never stacks.
     row: Option<EntryId>,
+    /// The row a fold just closed: its id, its sentence, and the HEAD the run
+    /// opened on. Held until one more git read lands, because the tail written
+    /// at the fold came from a snapshot older than the run's last syscall.
+    settled: Option<(EntryId, String, Option<String>)>,
 }
 
 /// Below this a run is not worth a row: the collapsed thought already says
@@ -662,6 +668,13 @@ const RUN_MIN_CALLS: usize = 2;
 /// the keystroke that caused it, short enough that it is never stale chrome.
 const NOTICE_TTL: Duration = Duration::from_secs(4);
 
+/// What the story says once the harness process is gone: once where it died,
+/// and again under any prompt typed afterwards. Nothing in this session can
+/// run again — the transcript on disk is the harness's, and it stopped where
+/// the kernel stopped.
+const BRIDGE_GONE: &str = "the harness process is gone. nothing further runs in this session; \
+                           quit and start it again to continue from the saved transcript.";
+
 /// Blank rows held back at the foot of the story. The pane follows its tail,
 /// so without them a streaming thought grows and folds against the border and
 /// the whole column jumps. The wire pane keeps none: nothing there collapses
@@ -669,10 +682,20 @@ const NOTICE_TTL: Duration = Duration::from_secs(4);
 const STORY_PAD_BOTTOM: u16 = 2;
 
 impl WorkRun {
-    fn call(&mut self, tag: &str, target: Option<String>) {
-        if self.head_at_start.is_none() {
-            self.head_at_start = git_head();
+    /// Take the repo state the git pane read on its worker thread. Called as
+    /// events arrive, which is where `app.git` is reachable.
+    fn note_repo(&mut self, git: &side::GitPane) {
+        // Until the run makes its first syscall nothing it did can have moved
+        // HEAD, so every read that lands before then is a better "before" than
+        // the one held. Pinning the first snapshot instead blamed this run for
+        // a commit another terminal made in the previous refresh window.
+        if self.calls() == 0 {
+            self.head_at_start = git.head().map(str::to_string);
         }
+        self.tail = git_tail(git, self.head_at_start.as_deref());
+    }
+
+    fn call(&mut self, tag: &str, target: Option<String>) {
         self.segs.push(Seg::Call {
             tag: tag.to_string(),
             target,
@@ -703,11 +726,7 @@ impl WorkRun {
         if self.calls() < RUN_MIN_CALLS {
             return;
         }
-        let mut line = work_sentence(&self.segs);
-        if let Some(tail) = git_tail(self.head_at_start.as_deref()) {
-            line.push_str("  ");
-            line.push_str(&tail);
-        }
+        let line = row_line(&work_sentence(&self.segs), self.tail.as_deref());
         for id in self.thoughts.drain(..) {
             story.remove_entry(id);
         }
@@ -725,17 +744,52 @@ impl WorkRun {
     }
 
     /// Close the run at the seam, just before prose starts. The last sync
-    /// catches the final call and whatever git says about it.
+    /// catches the final call; what git says about it is usually still in
+    /// flight, so the row is handed to `settle` for one more read.
     fn fold(&mut self, story: &mut ScrollbackState) {
         self.sync(story);
+        if let Some(id) = self.row {
+            self.settled = Some((id, work_sentence(&self.segs), self.head_at_start.clone()));
+        }
         self.reset();
+    }
+
+    /// Rewrite the folded row's tail from a git read that landed after it.
+    ///
+    /// This is the `git commit` case: the run's last syscall moves HEAD, prose
+    /// starts a fraction of a second later and folds the row from the snapshot
+    /// that preceded the commit, and without this the reader is left with
+    /// "· 4 files dirty" over a run that committed.
+    fn settle(&mut self, story: &mut ScrollbackState, git: &side::GitPane) {
+        let Some((id, sentence, head)) = self.settled.take() else {
+            return;
+        };
+        let Some(entry) = story.get_by_id_mut(id) else {
+            return;
+        };
+        entry.block = RenderBlock::system(row_line(
+            &sentence,
+            git_tail(git, head.as_deref()).as_deref(),
+        ));
+        story.mark_structurally_dirty(id);
+        story.mark_height_dirty(id);
     }
 
     fn reset(&mut self) {
         self.segs.clear();
         self.thoughts.clear();
         self.head_at_start = None;
+        self.tail = None;
         self.row = None;
+    }
+}
+
+/// The work row as it is written: the sentence, then the repo tail if there
+/// is one. Two spaces, because the tail already opens with its own `·`.
+fn row_line(sentence: &str, tail: Option<&str>) -> String {
+    match tail {
+        Some(t) => format!("{sentence}  {t}"),
+        None => sentence.to_string(),
     }
 }
 
@@ -841,6 +895,10 @@ struct ChildSess {
     /// own, so it needs its own index — sharing the parent's would step the
     /// cursor to entries that are not in this pane.
     posts: PostRows,
+    /// Hand-folded cards in *this* pane. EntryIds are handed out per
+    /// ScrollbackState from 1, so a set shared with the parent pinned card #1
+    /// in every session at once.
+    wire_manual: HashSet<EntryId>,
 }
 
 /// Grok text selection for one scrollback (drag, persist, double-click word).
@@ -976,6 +1034,11 @@ struct App {
     git_area: Rect,
     files_area: Rect,
     layout: PaneLayout,
+    /// `--demo`: canned events, no harness behind the composer. Without it a
+    /// missing bridge means the harness died, and the two must not paint the
+    /// same, or a dead session answers a prompt with a POST card labelled
+    /// "demo" and then sits there.
+    demo: bool,
 }
 
 /// Prompt-cache window for the meter under the calls pane.
@@ -1153,7 +1216,49 @@ impl CacheMeter {
         self.chunks = chunks;
     }
 
+    /// Session totals only. A subagent's POST spends real money against a
+    /// different transcript, so it bills here without touching the last-call
+    /// meters -- feeding those would paint someone else's context and TTL over
+    /// the bars that describe this conversation.
+    fn bill(&mut self, usage: &Value, model: &str) {
+        let n = |k: &str| usage.get(k).and_then(Value::as_u64).unwrap_or(0);
+        let read = n("cache_read_input_tokens");
+        let write = n("cache_creation_input_tokens");
+        let fresh = n("input_tokens");
+        let out = n("output_tokens");
+
+        let hour = usage
+            .get("cache_creation")
+            .and_then(|c| c.get("ephemeral_1h_input_tokens"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let write_5m = write.saturating_sub(hour);
+
+        let (in_rate, out_rate) = model_price(model);
+        let m = 1_000_000.0;
+        let cost = (fresh as f64 * in_rate
+            + read as f64 * in_rate * 0.1
+            + write_5m as f64 * in_rate * 1.25
+            + hour as f64 * in_rate * 2.0
+            + out as f64 * out_rate)
+            / m;
+        // Uncached, those read tokens would have been fresh input.
+        let saved = read as f64 * in_rate * 0.9 / m;
+
+        self.calls += 1;
+        if read > 0 {
+            self.warm += 1;
+        }
+        self.read_total += read;
+        self.write_total += write;
+        self.fresh_total += fresh;
+        self.out_total += out;
+        self.spent += cost;
+        self.saved += saved;
+    }
+
     fn observe(&mut self, usage: &Value, model: &str) {
+        self.bill(usage, model);
         self.window = model_window(model);
         let n = |k: &str| usage.get(k).and_then(Value::as_u64).unwrap_or(0);
         self.read = n("cache_read_input_tokens");
@@ -1166,34 +1271,6 @@ impl CacheMeter {
             .and_then(|c| c.get("ephemeral_1h_input_tokens"))
             .and_then(Value::as_u64)
             .unwrap_or(0);
-        let write_5m = self.write.saturating_sub(hour);
-
-        let (in_rate, out_rate) = model_price(model);
-        let m = 1_000_000.0;
-        let cost = (self.fresh as f64 * in_rate
-            + self.read as f64 * in_rate * 0.1
-            + write_5m as f64 * in_rate * 1.25
-            + hour as f64 * in_rate * 2.0
-            + self.out as f64 * out_rate)
-            / m;
-        // Uncached, those read tokens would have been fresh input.
-        let saved = self.read as f64 * in_rate * 0.9 / m;
-
-        self.calls += 1;
-        if self.read > 0 {
-            self.warm += 1;
-        }
-        self.read_total += self.read;
-        self.write_total += self.write;
-        self.fresh_total += self.fresh;
-        self.out_total += self.out;
-        self.spent += cost;
-        self.saved += saved;
-
-        // Prompt size for this call -- everything the model had to read before
-        // it could answer. Recorded before the cold-call early return below, so
-        // the trend does not silently skip uncached turns.
-        let ctx = self.read + self.write + self.fresh;
 
         if self.read == 0 && self.write == 0 {
             return;
@@ -1323,6 +1400,7 @@ impl App {
             git_area: Rect::default(),
             files_area: Rect::default(),
             layout: PaneLayout::load(),
+            demo: false,
         };
         app.apply_grok_settings();
         app
@@ -1382,6 +1460,7 @@ impl App {
                     story_text: TextSel::default(),
                     calls_text: TextSel::default(),
                     posts: PostRows::default(),
+                    wire_manual: HashSet::new(),
                 },
             );
         }
@@ -1514,6 +1593,16 @@ impl App {
             }
         }
         (&mut self.calls, &mut self.posts)
+    }
+
+    /// The wire pane on screen and the hand-fold set that belongs to it.
+    fn calls_and_manual(&mut self) -> (&mut ScrollbackState, &mut HashSet<EntryId>) {
+        if let Some(id) = self.viewing.clone() {
+            if let Some(c) = self.children.get_mut(&id) {
+                return (&mut c.calls, &mut c.wire_manual);
+            }
+        }
+        (&mut self.calls, &mut self.wire_manual)
     }
 
     fn calls_and_posts_ref(&self) -> (&ScrollbackState, &PostRows) {
@@ -1968,6 +2057,7 @@ fn main() -> io::Result<()> {
     };
     let mut app = App::new();
     if demo {
+        app.demo = true;
         seed_demo(&mut app);
     }
 
@@ -2019,6 +2109,7 @@ fn run(
     let mut last_cache = Instant::now();
     loop {
         let mut more = false;
+        let mut died = false;
         if let Some(b) = bridge.as_mut() {
             let mut n = 0;
             loop {
@@ -2034,14 +2125,28 @@ fn run(
                     }
                     Err(TryRecvError::Empty) => break,
                     Err(TryRecvError::Disconnected) => {
+                        // try_recv on a closed, drained channel returns
+                        // Disconnected forever. Without this break the drain
+                        // loop spun at 100% and never reached draw or
+                        // event::poll, so a crashed child froze the frame with
+                        // Ctrl+C unreadable.
+                        // A notice lapses after four seconds; the harness
+                        // being gone does not. The story keeps the row.
+                        app.story_push(RenderBlock::system(BRIDGE_GONE));
                         app.notify("bridge died");
                         app.running = false;
                         app.turn_started = None;
                         app.ready = true;
                         dirty = true;
+                        died = true;
+                        break;
                     }
                 }
             }
+        }
+        if died {
+            // Drop the dead handle, or the next pass re-notifies every 80ms.
+            bridge = None;
         }
 
         if app.drain_after && !app.running {
@@ -2057,17 +2162,21 @@ fn run(
             }
             last_anim = Instant::now();
         }
-        // Cache TTL burns down while nothing else is live; one repaint a
-        // second is enough for the bar and keeps idle CPU at zero otherwise.
-        if app.layout.git_h > 0 {
-            app.git.poll(false);
-        }
+        // Polled whether or not the pane is on screen: the work row's git tail
+        // reads the same snapshot, and it is a worker thread on a 4s timer.
+        app.git.poll(false);
         if app.git.drain() {
+            // The run that just folded gets its tail from this read; the live
+            // one gets its next sync from it.
+            app.stream.run.settle(&mut app.story, &app.git);
+            app.stream.run.note_repo(&app.git);
             dirty = true;
         }
         if expire_notice(app) {
             dirty = true;
         }
+        // Cache TTL burns down while nothing else is live; one repaint a
+        // second is enough for the bar and keeps idle CPU at zero otherwise.
         let cache_live = app.cache.left().is_some();
         if cache_live && last_cache.elapsed() >= Duration::from_secs(1) {
             dirty = true;
@@ -2372,6 +2481,14 @@ fn handle_child(app: &mut App, ev: &Value) {
     }
     let kind = ev.get("kind").and_then(Value::as_str).unwrap_or("");
     app.ensure_child(id, "");
+    // A subagent's tokens are billed to the same key, so they belong in the
+    // money row — they were spent and shown nowhere. Totals only: the context
+    // and TTL bars describe the parent's transcript, not this child's.
+    if kind == "complete" {
+        let usage = ev.get("usage").cloned().unwrap_or(json!({}));
+        let model = ev.get("model").and_then(Value::as_str).unwrap_or("?");
+        app.cache.bill(&usage, model);
+    }
     let mut last_post: Option<(u64, Value, Value)> = None;
     let shown = app.show_posts;
     let child = app.children.get_mut(id).expect("child");
@@ -2435,6 +2552,10 @@ fn handle_child(app: &mut App, ev: &Value) {
 
 fn handle_event(app: &mut App, ev: Value) {
     let kind = ev.get("ev").and_then(Value::as_str).unwrap_or("");
+    // The work row's repo tail, taken here because this is where the git pane
+    // is reachable. sync() is called from inside the stream cursor and used to
+    // fork git itself, on this thread, once per result and per thought.
+    app.stream.run.note_repo(&app.git);
     match kind {
         "picker" => app.picker.observe(&ev),
         "login" => {
@@ -2501,6 +2622,12 @@ fn handle_event(app: &mut App, ev: Value) {
                     app.stream.run.call(tag, target);
                     app.stream.run.sync(&mut app.story);
                 }
+                // A syscall just ran against this checkout. Start the read now
+                // rather than waiting out the pane's timer: the run folds as
+                // soon as prose starts, and the tail it prints is whatever has
+                // landed by then. The pending guard keeps this to one read in
+                // flight however fast the calls arrive.
+                app.git.poll(true);
             }
             apply_result(&mut app.calls, &mut app.exec, &ev);
         }
@@ -2592,14 +2719,16 @@ fn handle_event(app: &mut App, ev: Value) {
                 app.story_push(RenderBlock::system(t));
             }
         }
+        // Not a terminator. loop.py fires this for a reply the endpoint cut
+        // short and keeps looping, and the reader thread synthesises one for
+        // any unparseable NDJSON line. Clearing running here read as idle while
+        // run_turns was still going, so Enter sent a second op:step that fired
+        // later, out of order. Only done/stopped end a step.
         "error" => {
             app.stream.finish(&mut app.story);
             finish_exec(&mut app.calls, &mut app.exec);
             let t = ev.get("text").and_then(Value::as_str).unwrap_or("error");
             app.story_push(RenderBlock::system(t));
-            app.running = false;
-            app.turn_started = None;
-            app.status = "error".into();
         }
         _ => {}
     }
@@ -2898,12 +3027,16 @@ fn handle_key(
             return Ok(false);
         }
         KeyCode::Esc => {
-            if app.story_text.persist.take().is_some()
-                || app.calls_text.persist.take().is_some()
-                || app.children.values_mut().any(|c| {
-                    c.story_text.persist.take().is_some() || c.calls_text.persist.take().is_some()
-                })
-            {
+            // Accumulate, never short-circuit: `||` and `any` stopped at the
+            // first pane that had a selection, so with a highlight on both the
+            // story and the wire, Esc cleared one per press.
+            let mut cleared = app.story_text.persist.take().is_some();
+            cleared |= app.calls_text.persist.take().is_some();
+            for c in app.children.values_mut() {
+                cleared |= c.story_text.persist.take().is_some();
+                cleared |= c.calls_text.persist.take().is_some();
+            }
+            if cleared {
                 return Ok(false);
             }
             if app.viewing.take().is_some() {
@@ -3176,11 +3309,16 @@ fn handle_key(
 
 /// Tab skips panes the layout has collapsed to nothing.
 fn pane_open(app: &App) -> impl Fn(Focus) -> bool + use<> {
+    // The rects draw actually assigned, not the heights the layout asked for.
+    // A short terminal clamps a requested pane to zero rows, and Tab used to
+    // land on it anyway — j/k then went to a pane with nothing on screen. This
+    // is the same ground truth the mouse hit-tests use, and one frame is
+    // always painted before the first key is read.
     let queue = !app.queue.is_empty();
-    let post = app.layout.post_h > 0;
-    let meter = app.layout.meter_h > 0;
-    let git = app.layout.git_h > 0;
-    let files = app.layout.files_h > 0;
+    let post = app.post_in_area.height > 0;
+    let meter = app.cache.area.height > 0;
+    let git = app.git_area.height > 0;
+    let files = app.files_area.height > 0;
     move |f| match f {
         Focus::Queue => queue,
         Focus::PostIn | Focus::PostOut => post,
@@ -3269,13 +3407,25 @@ fn start_step(
         app.notify("esc to leave session");
         return Ok(());
     }
-    if let Some(b) = bridge.as_mut() {
-        app.running = true;
-        app.turn_started = Some(Instant::now());
-        app.status = "running".into();
-        b.send(&json!({"op": "step", "text": line}))?;
-    } else {
-        app.call_push_group(PostArgs::new("user", 0, "demo", "", &json!({}), 0, 0));
+    match bridge.as_mut() {
+        Some(b) => {
+            app.running = true;
+            app.turn_started = Some(Instant::now());
+            app.status = "running".into();
+            b.send(&json!({"op": "step", "text": line}))?;
+        }
+        // --demo drives the same pane with canned events; its POST card is
+        // what a step looks like there.
+        None if app.demo => {
+            app.call_push_group(PostArgs::new("user", 0, "demo", "", &json!({}), 0, 0));
+        }
+        // No bridge and no demo means the harness process is gone. Say so
+        // where the prompt is, durably — a POST card here would be a lookalike
+        // for a step that cannot happen.
+        None => {
+            app.story_push(RenderBlock::system(BRIDGE_GONE));
+            app.notify("bridge is gone");
+        }
     }
     Ok(())
 }
@@ -3531,8 +3681,7 @@ fn handle_mouse(app: &mut App, m: MouseEvent) {
                 app.set_focus(Focus::Queue);
                 if app.queue_area.height > 2 {
                     let row = m.row.saturating_sub(app.queue_area.y.saturating_add(1)) as usize;
-                    let skip = app.queue.len().saturating_sub(6);
-                    let idx = skip + row;
+                    let idx = app.queue.visible_skip() + row;
                     if idx < app.queue.len() {
                         app.queue.selected = Some(idx);
                     }
@@ -4466,16 +4615,6 @@ fn tick_scrollbacks(app: &mut App) -> bool {
     need
 }
 
-fn current_agent_state(app: &App) -> AgentState {
-    if app.status == "stopping" {
-        AgentState::TurnCancelling
-    } else if app.running {
-        AgentState::TurnRunning
-    } else {
-        AgentState::Idle
-    }
-}
-
 fn current_watchers(app: &App) -> Watchers {
     let subagents = app
         .children
@@ -4643,9 +4782,12 @@ fn draw(f: &mut Frame, app: &mut App) {
     );
 
     reflow_wire(&mut app.calls, &app.wire_manual);
-    let manual = app.wire_manual.clone();
-    for child in app.children.values_mut() {
-        reflow_wire(&mut child.calls, &manual);
+    // Only the pane on screen: a fold reconcile is about what is drawn, and
+    // children are never pruned, so walking all of them grew per-frame work
+    // for panes nobody is looking at. `viewing` is set before the frame that
+    // first shows a child.
+    if let Some(c) = app.viewing.clone().and_then(|id| app.children.get_mut(&id)) {
+        reflow_wire(&mut c.calls, &c.wire_manual);
     }
 
     let activity = current_turn_activity(app);
@@ -4727,7 +4869,10 @@ fn draw(f: &mut Frame, app: &mut App) {
     app.cache.area = wire[3];
     let posts = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .constraints([
+            Constraint::Percentage(app.layout.post_split),
+            Constraint::Percentage(100 - app.layout.post_split),
+        ])
         .split(left[1]);
 
     app.traj_area = panes[0];
@@ -5621,20 +5766,6 @@ fn draw_queue(f: &mut Frame, area: Rect, app: &App) {
 
 
 /// What to call the focused pane in the legend title.
-fn focus_name(focus: Focus) -> &'static str {
-    match focus {
-        Focus::Input => "input",
-        Focus::Story => "story",
-        Focus::Calls => "calls",
-        Focus::Meter => "meta",
-        Focus::Git => "git",
-        Focus::Files => "files",
-        Focus::PostIn => "POST in",
-        Focus::PostOut => "POST out",
-        Focus::Queue => "queue",
-    }
-}
-
 fn input_float_rows(app: &App) -> u16 {
     u16::from(app.queue.is_empty() && app.layout.post_h > 0)
 }
@@ -6285,11 +6416,142 @@ fn code_spans(text: &str) -> Vec<(usize, usize)> {
     if let Some((_, _, start)) = fence {
         spans.push((start, text.len()));
     }
+    spans.extend(indented_spans(text));
     spans
 }
 
-/// Backtick-delimited inline spans on one line. An unclosed opener is treated
-/// as code to the end of the line, so a half-streamed `` `<tag` `` is not eaten.
+/// Leading-whitespace width with tabs expanded to the next multiple of four,
+/// the way `scan.py::_indent_width` measures it.
+fn indent_width(line: &str) -> usize {
+    let mut w = 0usize;
+    for ch in line.chars() {
+        match ch {
+            ' ' => w += 1,
+            '\t' => w += 4 - w % 4,
+            _ => break,
+        }
+    }
+    w
+}
+
+fn expand_tabs(line: &str) -> Cow<'_, str> {
+    if !line.contains('\t') {
+        return Cow::Borrowed(line);
+    }
+    let mut out = String::with_capacity(line.len() + 8);
+    for ch in line.chars() {
+        if ch == '\t' {
+            let col = out.chars().count();
+            out.push_str(&" ".repeat(4 - col % 4));
+        } else {
+            out.push(ch);
+        }
+    }
+    Cow::Owned(out)
+}
+
+/// A list marker at the head of a tab-expanded line: how far the marker runs
+/// (including the space after it) and whether that space was there. `scan.py`
+/// spells this `BULLET`; both need it to know where a list item's content
+/// starts, because indented code is measured from that column and not from
+/// zero.
+fn bullet(line: &str) -> Option<(usize, bool)> {
+    let b = line.as_bytes();
+    let mut i = 0usize;
+    while i < b.len() && b[i] == b' ' {
+        i += 1;
+    }
+    if i < b.len() && matches!(b[i], b'-' | b'*' | b'+') {
+        i += 1;
+    } else {
+        let digits = i;
+        while i < b.len() && b[i].is_ascii_digit() {
+            i += 1;
+        }
+        if i == digits || i >= b.len() || !matches!(b[i], b'.' | b')') {
+            return None;
+        }
+        i += 1;
+    }
+    let after = i;
+    while i < b.len() && (b[i] == b' ' || b[i] == b'\t') {
+        i += 1;
+    }
+    if i > after {
+        Some((i, true))
+    } else if after == b.len() {
+        Some((after, false))
+    } else {
+        None
+    }
+}
+
+/// Byte ranges of CommonMark *indented* code blocks: a line four columns past
+/// the enclosing list item's content column, opening after a blank line, and
+/// everything that stays that deep.
+///
+/// The port of `scan.py::_indent_span` + `_list_col`, and it has to stay one:
+/// the dispatcher does not run a tag inside one of these, so if the story
+/// stripped it the sample would appear in neither pane — not dispatched, not
+/// printed. The list column is the fiddly half and cannot be dropped: under
+/// `- ` content starts at column 2, so four spaces there is an ordinary
+/// paragraph of that item and a real call.
+fn indented_spans(text: &str) -> Vec<(usize, usize)> {
+    let mut spans: Vec<(usize, usize)> = Vec::new();
+    let mut cols: Vec<usize> = Vec::new();
+    let mut blank = true;
+    let mut block_end = 0usize;
+    let mut off = 0usize;
+    for line in text.split('\n') {
+        let opens = line.starts_with("    ") || line.starts_with('\t');
+        if off >= block_end && blank && opens {
+            let floor = cols.last().copied().unwrap_or(0) + 4;
+            if indent_width(line) >= floor {
+                let mut end = off + line.len();
+                for next in text[end.min(text.len())..].split('\n').skip(1) {
+                    if !next.trim().is_empty() && indent_width(next) < floor {
+                        break;
+                    }
+                    end += next.len() + 1;
+                }
+                let end = end.min(text.len());
+                spans.push((off, end));
+                block_end = end;
+            }
+        }
+        if line.trim().is_empty() {
+            blank = true;
+        } else {
+            let ind = indent_width(line);
+            let expanded = expand_tabs(line);
+            let mark = bullet(&expanded);
+            if blank || mark.is_some() {
+                while cols.last().is_some_and(|&c| ind < c) {
+                    cols.pop();
+                }
+            }
+            if let Some((len, spaced)) = mark {
+                if ind <= cols.last().copied().unwrap_or(0) + 3 {
+                    cols.push(len + usize::from(!spaced));
+                }
+            }
+            blank = false;
+        }
+        off += line.len() + 1;
+    }
+    spans
+}
+
+/// Backtick-delimited inline spans on one line.
+///
+/// A run with no matching closer is not a span — it is literal text, which is
+/// what CommonMark says, what the markdown renderer draws, and what
+/// `scan.py::_in_code_span` decides. Treating it as code to end of line put
+/// the two out of step: one stray backtick ahead of a real call meant the
+/// dispatcher ran the call and pushed its card while the story printed the
+/// raw tag as prose — the same call in both panes, in two different shapes.
+/// Nothing is eaten by this: a half-streamed `` `<tag `` is withheld by
+/// `spoken_prefix`'s unterminated-tag cut instead, and printed once it closes.
 fn inline_code_spans(line: &str, base: usize, out: &mut Vec<(usize, usize)>) {
     let b = line.as_bytes();
     let mut i = 0usize;
@@ -6320,7 +6582,10 @@ fn inline_code_spans(line: &str, base: usize, out: &mut Vec<(usize, usize)>) {
                 j += 1;
             }
         }
-        let end = close.unwrap_or(b.len());
+        let Some(end) = close else {
+            i = start + n;
+            continue;
+        };
         out.push((base + start, base + end));
         i = end;
     }
@@ -6599,13 +6864,18 @@ fn reflow_wire(sb: &mut ScrollbackState, manual: &HashSet<EntryId>) {
 }
 
 /// Record that the reader took manual control of the selected wire card.
+///
+/// Resolves the pane on screen: the fold this protects is applied to
+/// `focused_scroll()`, so inside a child session this used to pin a parent id
+/// and reflow re-expanded the child's card on the next frame.
 fn pin_selected_wire(app: &mut App) {
-    let Some(i) = app.calls.selected() else {
+    let (calls, manual) = app.calls_and_manual();
+    let Some(i) = calls.selected() else {
         return;
     };
-    if let Some(e) = app.calls.entry(i) {
+    if let Some(e) = calls.entry(i) {
         let id = e.id;
-        app.wire_manual.insert(id);
+        manual.insert(id);
     }
 }
 
@@ -6855,9 +7125,10 @@ fn edit_start_line(path: &str, old: &str, new: &str) -> usize {
         if probe.is_empty() {
             continue;
         }
-        if let Some(byte) = text.find(probe)
-            && text.match_indices(probe).count() == 1
-        {
+        // One pass that stops at the second hit. `find` plus `count()` walked
+        // the whole file twice to answer "is there exactly one".
+        let mut hits = text.match_indices(probe);
+        if let (Some((byte, _)), None) = (hits.next(), hits.next()) {
             return text[..byte].matches('\n').count() + 1;
         }
     }
@@ -7066,6 +7337,20 @@ mod tests {
         assert_eq!(app.picker.effort_idx, 1);
         assert_eq!(app.picker.key(KeyCode::Esc), picker::PickerAction::Close);
         assert!(!app.picker.open);
+    }
+
+    fn focus_name(focus: Focus) -> &'static str {
+        match focus {
+            Focus::Input => "input",
+            Focus::Story => "story",
+            Focus::Calls => "calls",
+            Focus::Meter => "meta",
+            Focus::Git => "git",
+            Focus::Files => "files",
+            Focus::PostIn => "POST in",
+            Focus::PostOut => "POST out",
+            Focus::Queue => "queue",
+        }
     }
 
     use super::*;
@@ -8852,7 +9137,13 @@ mod tests {
         try_drain(None, &mut app).unwrap();
         assert_eq!(app.queue.len(), 1);
         assert_eq!(app.queue.iter().next().unwrap().text, "second queued");
-        assert_eq!(app.story.len(), 1);
+        assert!(
+            matches!(
+                app.story.entry(0).map(|e| &e.block),
+                Some(RenderBlock::UserPrompt(_))
+            ),
+            "the drained row is the turn that starts"
+        );
     }
 
     #[test]
@@ -8869,7 +9160,13 @@ mod tests {
         assert!(!quit);
         assert!(!app.running);
         assert!(app.queue.is_empty());
-        assert_eq!(app.story.len(), 1);
+        assert!(
+            matches!(
+                app.story.entry(0).map(|e| &e.block),
+                Some(RenderBlock::UserPrompt(_))
+            ),
+            "send-now puts the row it fired in the story"
+        );
     }
 
     #[test]
@@ -10477,17 +10774,6 @@ mod tests {
         );
     }
 
-
-    /// A local slash command never reaches the model: no turn runs, nothing
-    /// lands in world.messages. It used to push a UserPrompt block anyway, so
-    /// the story showed a turn that never happened.
-    /// The theme cache is process-global and cargo runs these on threads.
-    /// Any test that reads or writes it takes this first.
-    fn theme_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
-
     /// The launch theme is Oscura Midnight, and it is the tail of the
     /// precedence chain, not a clobber of it.
     #[test]
@@ -10528,6 +10814,9 @@ mod tests {
         }
     }
 
+    /// A local slash command never reaches the model: no turn runs, nothing
+    /// lands in world.messages. It used to push a UserPrompt block anyway, so
+    /// the story showed a turn that never happened.
     #[test]
     fn a_local_slash_command_leaves_no_turn_in_the_story() {
         let mut app = App::new();
@@ -10693,6 +10982,9 @@ mod tests {
     #[test]
     fn tab_skips_empty_queue() {
         let mut app = App::new();
+        // Focus follows the rects draw assigned, so a pane has to have been
+        // painted before Tab can land on it.
+        let _ = paint(&mut app, 140, 40);
         app.set_focus(Focus::PostOut);
         handle_key(None, &mut app, tab()).unwrap();
         assert_eq!(app.focus, Focus::Input, "empty queue must not take Tab");
@@ -10933,6 +11225,237 @@ mod tests {
             click(MouseEventKind::Down(MouseButton::Left), files.x + 2, files.y),
         );
         assert_eq!(app.files.sel, fixed, "border clicks must not move a cursor");
+    }
+
+
+    /// `error` is not a terminator. loop.py fires it for a reply the endpoint
+    /// cut short and keeps looping, and the reader thread synthesises one for
+    /// any unparseable NDJSON line — run_turns still emits exactly one
+    /// done/stopped afterwards. Clearing `running` here read as idle mid-step,
+    /// so Enter sent a second op:step that the bridge fired out of order.
+    #[test]
+    fn an_error_event_does_not_end_the_step() {
+        let mut app = App::new();
+        app.ready = true;
+        app.running = true;
+        app.turn_started = Some(Instant::now());
+        handle_event(&mut app, json!({"ev": "turn", "n": 1}));
+        handle_event(
+            &mut app,
+            json!({"ev": "error", "n": 1, "text": "[reply was cut short: max_tokens]"}),
+        );
+        assert!(app.running, "error ended a step that run_turns is still running");
+        assert!(app.turn_started.is_some(), "the turn clock was reset mid-step");
+        handle_event(&mut app, json!({"ev": "turn", "n": 2}));
+        handle_event(&mut app, json!({"ev": "done"}));
+        assert!(!app.running, "done is the terminator");
+    }
+
+    /// EntryIds are handed out per ScrollbackState starting at 1, so one shared
+    /// pin set made the parent's first wire card and every child's first wire
+    /// card the same id: folding one pinned the other, in a pane nobody
+    /// touched.
+    #[test]
+    fn a_wire_fold_pins_the_pane_it_was_made_in() {
+        let mut app = App::new();
+        let mut parent = Vec::new();
+        for i in 0..8 {
+            parent.push(wire_push(
+                &mut app.calls,
+                RenderBlock::agent_message(format!("P{i}")),
+            ));
+        }
+        app.calls.set_selected(Some(0));
+        pin_selected_wire(&mut app);
+        set_wire_mode(&mut app.calls, parent[0], DisplayMode::Collapsed);
+
+        let mut kid = Vec::new();
+        {
+            let child = app.ensure_child("kid", "task");
+            for i in 0..8 {
+                kid.push(wire_push(
+                    &mut child.calls,
+                    RenderBlock::agent_message(format!("C{i}")),
+                ));
+            }
+        }
+        assert_eq!(parent[0], kid[0], "ids are per pane, so they collide");
+
+        app.viewing = Some("kid".into());
+        set_wire_mode(
+            &mut app.children.get_mut("kid").unwrap().calls,
+            kid[0],
+            DisplayMode::Expanded,
+        );
+        let _ = paint(&mut app, 140, 40);
+        let mode = app.children["kid"].calls.get_by_id(kid[0]).map(|e| e.display_mode);
+        assert_eq!(
+            mode,
+            Some(DisplayMode::Collapsed),
+            "the parent's pin held a stale child card open"
+        );
+
+        // And a fold made inside the child survives the next frame.
+        let last = *kid.last().unwrap();
+        app.children.get_mut("kid").unwrap().calls.set_selected(Some(7));
+        pin_selected_wire(&mut app);
+        set_wire_mode(
+            &mut app.children.get_mut("kid").unwrap().calls,
+            last,
+            DisplayMode::Collapsed,
+        );
+        let _ = paint(&mut app, 140, 40);
+        let mode = app.children["kid"].calls.get_by_id(last).map(|e| e.display_mode);
+        assert_eq!(
+            mode,
+            Some(DisplayMode::Collapsed),
+            "reflow re-expanded a card the reader folded in the child pane"
+        );
+        assert_eq!(app.wire_manual.len(), 1, "a child fold landed in the parent's set");
+    }
+
+    /// A subagent's POST is billed to the same key. It used to be spent and
+    /// shown nowhere; it still must not repaint the bars that describe the
+    /// parent's transcript.
+    #[test]
+    fn a_subagent_bills_the_meter_without_taking_the_context_bar() {
+        let mut app = App::new();
+        handle_event(
+            &mut app,
+            json!({"ev": "complete", "n": 1, "model": "claude-opus-5",
+                   "usage": {"input_tokens": 1000, "output_tokens": 100,
+                             "cache_read_input_tokens": 2000}}),
+        );
+        let parent_spent = app.cache.spent;
+        let parent_fresh = app.cache.fresh;
+        handle_event(
+            &mut app,
+            json!({"ev": "child", "id": "kid", "kind": "complete", "n": 1,
+                   "model": "claude-opus-5",
+                   "usage": {"input_tokens": 500_000, "output_tokens": 1000}}),
+        );
+        assert!(
+            app.cache.spent > parent_spent,
+            "a subagent's tokens never reached the money row"
+        );
+        assert_eq!(app.cache.calls, 2, "the child's POST is a call that happened");
+        assert_eq!(
+            app.cache.fresh, parent_fresh,
+            "the child overwrote the parent's context bar"
+        );
+    }
+
+    /// Esc clears every selection on screen. `||` and `any` short-circuited at
+    /// the first pane that had one, so with a highlight on both panes it took
+    /// two presses and the second one also left the child session.
+    #[test]
+    fn esc_clears_both_panes_in_one_press() {
+        let mut app = App::new();
+        let sel = PersistentTextSelection {
+            entry_idx: 0,
+            range_id: 0,
+            anchor: SelectionEndpoint {
+                block_line_idx: 0,
+                col_within_range: 0,
+            },
+            head: SelectionEndpoint {
+                block_line_idx: 0,
+                col_within_range: 3,
+            },
+            origin: SelectionOrigin::Drag,
+            kind: SelectionKind::Linear,
+        };
+        app.story_text.persist = Some(sel);
+        app.calls_text.persist = Some(sel);
+        handle_key(None, &mut app, press(KeyCode::Esc)).unwrap();
+        assert!(app.story_text.persist.is_none());
+        assert!(app.calls_text.persist.is_none(), "the wire pane kept its highlight");
+    }
+
+    /// ctrl+←/→ on the POST panes moves a divider that draw ignored: the row
+    /// was split 50/50 whatever the layout said, saved and reloaded.
+    #[test]
+    fn the_post_divider_is_where_the_layout_says() {
+        let mut app = App::new();
+        let _ = paint(&mut app, 140, 40);
+        let even = app.post_in_area.width;
+        app.layout.grow_axis(Focus::PostIn, Axis::Horizontal, 20);
+        let _ = paint(&mut app, 140, 40);
+        assert!(
+            app.post_in_area.width > even,
+            "the POST divider ignored the layout: {} vs {even}",
+            app.post_in_area.width
+        );
+        assert_eq!(
+            app.post_in_area.width + app.post_out_area.width,
+            app.traj_area.width,
+            "the two halves must still fill the row"
+        );
+    }
+
+    /// Focus follows the rects draw assigned. On a short terminal the frame
+    /// clamps a requested pane to nothing, and Tab used to land on it anyway —
+    /// j/k then went to a pane with no rows on screen.
+    #[test]
+    fn focus_skips_a_pane_the_frame_clamped_away() {
+        let mut app = App::new();
+        let _ = paint(&mut app, 100, 12);
+        let open = pane_open(&app);
+        for (focus, area) in [
+            (Focus::Files, app.files_area),
+            (Focus::Git, app.git_area),
+            (Focus::PostIn, app.post_in_area),
+            (Focus::Meter, app.cache.area),
+        ] {
+            assert_eq!(
+                open(focus),
+                area.height > 0,
+                "{focus:?} claims to be open with {} rows",
+                area.height
+            );
+        }
+        assert!(
+            app.files_area.height == 0 || app.git_area.height == 0,
+            "12 rows should not fit both side panes; the test needs a smaller frame"
+        );
+        app.set_focus(Focus::Story);
+        for _ in 0..12 {
+            handle_key(None, &mut app, tab()).unwrap();
+            let rows = match app.focus {
+                Focus::Files => app.files_area.height,
+                Focus::Git => app.git_area.height,
+                Focus::PostIn => app.post_in_area.height,
+                Focus::PostOut => app.post_out_area.height,
+                Focus::Meter => app.cache.area.height,
+                _ => 1,
+            };
+            assert!(rows > 0, "Tab landed on {:?}, which has no rows", app.focus);
+        }
+    }
+
+
+    /// The work row's git tail comes from the git pane's background snapshot.
+    /// `sync` used to fork `git rev-parse` plus `git status --porcelain`
+    /// itself, and it runs after every syscall result and every finished
+    /// thought — on the thread that draws. `git status` measures 0.28s warm in
+    /// this repo, so a burst of results stalled the frame for seconds.
+    #[test]
+    fn a_burst_of_results_does_not_shell_out_on_the_ui_thread() {
+        let mut app = App::new();
+        app.ready = true;
+        let started = Instant::now();
+        for i in 0..16 {
+            handle_event(
+                &mut app,
+                json!({"ev": "result", "phase": "done", "tag": "bash",
+                       "attrs": {}, "body": format!("ls {i}"), "text": "ok"}),
+            );
+        }
+        let took = started.elapsed();
+        assert!(
+            took < Duration::from_millis(500),
+            "16 results took {took:?} — the event path is forking a process again"
+        );
     }
 
     /// The x of a tab label in the git title strip, laid out as `draw_git` does.

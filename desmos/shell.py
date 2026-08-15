@@ -191,6 +191,20 @@ class Shell:
                 return bytes(out), False
         return bytes(out), False
 
+    def owns_pty(self) -> bool:
+        """True when bash, not a program it started, owns the terminal.
+
+        Quiet is not a prompt. Believing it wrote `; echo "__desmos_..._rc:$?"`
+        into a python input() answer, because answering one question marked the
+        session as back at a prompt while the program was still reading stdin.
+        bash runs with job control here, so it hands the tty to each foreground
+        child and the kernel can be asked which group is holding it.
+        """
+        try:
+            return os.tcgetpgrp(self.master) == os.getpgid(self.proc.pid)
+        except OSError:
+            return False
+
     # ---------------------------------------------------------------- writing
 
     def send(self, text: str, *, quiet: float = QUIET, deadline: float = DEADLINE) -> str:
@@ -211,7 +225,11 @@ class Shell:
         """
         if not self.alive():
             return "shell exited"
-        one_line = "\n" not in text.strip() and self.at_prompt
+        # Sent into a session that was not at a prompt: the marker cannot go
+        # out, so this command's exit status is unknowable. Remembered here
+        # because at_prompt is overwritten by the read below.
+        busy = not self.at_prompt
+        one_line = "\n" not in text.strip() and not busy
         payload = (
             f'{text.strip()}; echo "{self.mark}$?"\n' if one_line else text.rstrip("\n") + "\n"
         )
@@ -220,7 +238,11 @@ class Shell:
         except OSError as exc:
             return f"shell write failed: {exc}"
         raw, done = self._read_until_marker(quiet, deadline, expect_marker=one_line)
-        self.at_prompt = done
+        # Without expect_marker the read ends at the first quiet window, so
+        # `done` only means "nothing more arrived". Asking the tty who owns it
+        # is the difference between an answered prompt and a program still
+        # waiting for its second question.
+        self.at_prompt = done and (one_line or self.owns_pty())
         body = head_tail(raw)
         # Everything from the marker onward is bookkeeping, not output.
         code = None
@@ -230,22 +252,51 @@ class Shell:
         body = body.strip()
         if code not in (None, "0"):
             return f"{body}\n[exit {code}]".strip()
-        if not done and self.alive():
+        if not self.at_prompt and self.alive():
             # Still running or waiting on input. Say so, or the model reads an
             # empty result as "it finished and printed nothing".
             note = "[still running — send more input, or <shell interrupt=\"1\"/>]"
             return f"{body}\n{note}".strip()
+        if busy:
+            # No marker went out, so "quiet and bash has the tty again" is not
+            # evidence the command succeeded -- it is not even evidence bash
+            # has read the line yet. `false` sent into a busy session came back
+            # "(no output)", which the model reads as success.
+            return f"{body}\n[sent while the session was busy — exit status unknown]".strip()
         return body or "(no output)"
 
     def interrupt(self) -> str:
-        """Ctrl-C, for a call that is stuck and a next call that should not be."""
+        """Ctrl-C, for a call that is stuck and a next call that should not be.
+
+        Signalling bash's own group was signalling the wrong process: the
+        foreground child has the terminal and a group of its own, and
+        interactive bash ignores SIGINT anyway -- so `<shell interrupt="1"/>`
+        returned "interrupted" while the stuck program kept the tty and ate the
+        next command as its input. Writing the tty's INTR byte was not it
+        either: that only becomes SIGINT while the foreground program leaves
+        ISIG on, and a pager, vim or anything else in raw mode reads \\x03 as a
+        keystroke and keeps running -- while interrupt() reported success. So
+        ask the tty which group is in the foreground and signal that group
+        directly, which is what the line discipline would have done.
+        """
         if not self.alive():
             return "shell exited"
         try:
-            os.killpg(os.getpgid(self.proc.pid), signal.SIGINT)
+            os.killpg(os.tcgetpgrp(self.master), signal.SIGINT)
         except OSError as exc:
             return f"interrupt failed: {exc}"
-        return (head_tail(self._drain(0.5)).strip() or "interrupted")
+        body = head_tail(self._drain(0.5))
+        # The interrupted one-liner's trailing `echo "<mark>$?"` still runs, so
+        # the raw marker lands here unless it is partitioned off like send does.
+        code = None
+        if self.mark in body:
+            body, _, rest = body.partition(self.mark)
+            code = rest.splitlines()[0].strip() if rest.strip() else None
+        self.at_prompt = self.owns_pty()
+        body = body.strip()
+        if code not in (None, "0"):
+            return f"{body}\n[exit {code}]".strip()
+        return body or "interrupted"
 
     def alive(self) -> bool:
         return self.proc.poll() is None

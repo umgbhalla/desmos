@@ -525,6 +525,9 @@ mod tests {
 
     #[test]
     fn selected_row_uses_grok_highlight_not_reverse() {
+        // lines() reads the process-global theme; the slash-command test writes
+        // it. Without the pin this reads one theme and renders under another.
+        let _pin = crate::theme_lock();
         let mut t = JsonTree::from_value(&json!({"model": "claude-opus-5", "max_tokens": 8}));
         let theme = Theme::current();
         let lines = t.lines(48, 6, true);

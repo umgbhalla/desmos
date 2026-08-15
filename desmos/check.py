@@ -45,15 +45,30 @@ def _check_path_deps_tracked() -> None:
     Asks git what is tracked rather than what exists, because the whole failure
     mode is a file that exists locally and is not in the repo.
     """
-    import re
     import subprocess
+    import tomllib
 
     root = Path(__file__).resolve().parent.parent
     manifest = root / "Cargo.toml"
     if not manifest.exists() or not (root / ".git").exists():
         return
 
-    deps = {m for m in re.findall(r'path\s*=\s*"([^"]+)"', manifest.read_text())}
+    # Parsed, not grepped. A regex over the raw text read `path = "../.."` out
+    # of a prose comment about vendored crates and failed on a manifest that
+    # was completely correct.
+    deps: set[str] = set()
+
+    def collect(node: object) -> None:
+        if isinstance(node, dict):
+            if isinstance(node.get("path"), str):
+                deps.add(node["path"])
+            for value in node.values():
+                collect(value)
+        elif isinstance(node, list):
+            for value in node:
+                collect(value)
+
+    collect(tomllib.loads(manifest.read_text()))
     missing = []
     for rel in sorted(deps):
         target = (root / rel / "Cargo.toml").resolve()
@@ -211,8 +226,23 @@ def self_check() -> None:
         assert launch_env["RUSTUP_TOOLCHAIN"] == "1.97.1"
         protoc = Path(launch_env["PROTOC"])
         assert protoc.is_file() and protoc.is_absolute()
-        for head in _tui_stabilize_fingerprints(_repo_root()):
+        # Against a temp root, not _repo_root(): pointed at the real checkout
+        # this check *wrote* the .git/HEAD files it then asserted, so it
+        # mutated the tree it was checking and passed no matter what the
+        # function did. Here the files start absent, so the assert is about
+        # the function creating them and about the contents it copies over.
+        fake_root = cwd / "fingerprint-root"
+        (fake_root / "vendor" / "grok-build" / ".git").mkdir(parents=True)
+        (fake_root / "vendor" / "grok-build" / ".git" / "HEAD").write_text(
+            "ref: refs/heads/desmos\n", encoding="utf-8"
+        )
+        heads = _tui_stabilize_fingerprints(fake_root)
+        assert heads, "no rerun-if-changed stand-in was created"
+        for head in heads:
+            # Missing, cargo rebuilds the pager rlib on every single launch.
             assert head.is_file(), head
+            assert head.read_text(encoding="utf-8") == "ref: refs/heads/desmos\n", head
+        assert _repo_root().is_dir()
         kept = _tui_build_env({"RUSTFLAGS": "-C debuginfo=1", "CARGO_TERM_QUIET": "true"})
         assert kept["RUSTFLAGS"] == "-C debuginfo=1"
         assert "CARGO_TERM_QUIET" not in kept
@@ -287,7 +317,6 @@ def self_check() -> None:
         )
         assert _insp.signature(_sa.spawn).parameters["agent"].default == "general"
         assert _insp.signature(_sa.fanout).parameters["agent"].default == "explore"
-        assert "defaults to explore" in caps
         assert "resume" in _insp.signature(_sa.spawn).parameters and "resume" in caps
         for _f in _TC.__dataclass_fields__:
             assert _f in caps, f"TaskContract.{_f} is not described in the prompt"
@@ -346,6 +375,66 @@ def self_check() -> None:
         assert all(x.startswith("\n") for x in stops), stops
         assert any("res" in x for x in stops), stops
         assert any("user" in x for x in stops), stops
+
+        # Three cache breakpoints and no fourth: ABI, catalog, last user. Every
+        # one of them is a prefix that stops moving, which is the whole point --
+        # a breakpoint on the assistant moves with every reply, so the segment
+        # it marks is never the segment the next request asks for and the cache
+        # is paid for and never read. Nothing in the suite watched this, so the
+        # one move the ABI forbids used to pass.
+        def _cached(blocks):
+            return [i for i, b in enumerate(blocks) if "cache_control" in b]
+
+        assert _cached(payload["system"]) == [0, 1], payload["system"]
+        abi_block, cat_block = payload["system"]
+        assert abi_block["text"] == ABI, "the first cached system block is not the ABI"
+        assert "<python> exec" in cat_block["text"], "the catalog is not its own cached block"
+        assert _cached(payload["messages"][0]["content"]) == [0]
+
+        # A transcript that ends on the assistant: the breakpoint has to walk
+        # back to the last user turn, not land on the tail.
+        tail_assistant = cached_payload(
+            "claude-opus-5",
+            ABI + "\n\n# tools\nx",
+            [
+                {"role": "user", "content": "first"},
+                {"role": "assistant", "content": [{"type": "text", "text": "a"}]},
+                {"role": "user", "content": "second"},
+                {"role": "assistant", "content": [{"type": "text", "text": "b"}]},
+            ],
+            8192,
+            thinking="low",
+        )
+        marked = [
+            (m["role"], b.get("text"))
+            for m in tail_assistant["messages"]
+            for b in m["content"]
+            if "cache_control" in b
+        ]
+        assert marked == [("user", "second")], marked
+
+        # An inbound cache_control on a user block is dropped and re-derived,
+        # or a replayed transcript accumulates one breakpoint per turn and
+        # blows the four-block limit the API enforces.
+        restamped = cached_payload(
+            "claude-opus-5",
+            ABI + "\n\n# tools\nx",
+            [
+                {"role": "user", "content": [{"type": "text", "text": "old", "cache_control": {"type": "ephemeral"}}]},
+                {"role": "assistant", "content": [{"type": "text", "text": "a"}]},
+                {"role": "user", "content": [{"type": "text", "text": "new"}]},
+            ],
+            8192,
+            thinking="low",
+        )
+        stamped = [
+            b.get("text")
+            for m in restamped["messages"]
+            for b in m["content"]
+            if "cache_control" in b
+        ]
+        assert stamped == ["new"], stamped
+
         replay = cached_payload(
             "claude-opus-5",
             ABI + "\n\n# tools\nx",
@@ -433,6 +522,27 @@ def self_check() -> None:
         # An unclosed fence never swallows the rest of the message.
         assert [b.tag for b in scan(fence + " oops\n<python>1</python>")] == ["python"]
         assert [b.tag for b in scan(fence + "\n<br/>\n" + fence + "\n<python>1</python>")] == ["python"]
+
+        # Four ways a real call used to become invisible. Each one reads to the
+        # loop as a message with no syscalls, which is exactly how it decides
+        # the model is finished -- so the command never ran and the turn ended
+        # with nothing printed to say so.
+        quoted = scan("<skill name='ping'/>\n<rollback n=1/>")
+        assert [(b.tag, b.attrs) for b in quoted] == [
+            ("skill", {"name": "ping"}),
+            ("rollback", {"n": "1"}),
+        ], quoted
+        # One stray backtick with no partner is literal text, not a span that
+        # eats the rest of the line and the call after it.
+        assert [b.tag for b in scan("the flag is `--all so <bash>echo hi</bash>")] == ["bash"]
+        # An indented sample is a code block the story pane draws as code. It
+        # must not dispatch -- and the real call under it must.
+        indented = scan("sample:\n\n    <bash>rm -rf /</bash>\n\nfor real:\n<bash>ls</bash>")
+        assert [(b.tag, b.body) for b in indented] == [("bash", "ls")], indented
+        # A same-name tag inside the body used to end it at the first closer:
+        # half the command ran and the rest became residue nobody read.
+        nested = scan('<bash>echo "<bash>inner</bash>" && ls</bash>')
+        assert [b.body for b in nested] == ['echo "<bash>inner</bash>" && ls'], nested
 
         lone = scan("<usage/>\n<reload/>\n<reload_sdk/>\n<rollback n=\"1\"/>\n<skill name=\"ping\"/>")
         assert [b.tag for b in lone] == ["usage", "reload", "reload_sdk", "rollback", "skill"]
@@ -555,6 +665,33 @@ def self_check() -> None:
         assert "speech" in seen and "result" in seen and "turn" in seen
         assert "post" in seen
         assert seen.index("post") < seen.index("complete")
+
+        # A syscall that raises is that syscall's result. It used to unwind the
+        # whole dispatch loop and take the syscalls before it with it: the
+        # <bash> had already run, its output was thrown away, and the model's
+        # next context showed its own tag with no outcome -- a side effect that
+        # happened and a transcript that never says it did.
+        w_raise = new_world(cwd, state_path=cwd / "harness-raise.json", ns={})
+        # An ambiguous edit body raises ValueError out of dispatch -- the exact
+        # call that first produced this.
+        ambiguous = "<edit path=\"nope.txt\">a\n---\nb\n---\nc</edit>"
+
+        def raising_complete(_model, _system, _messages, _max_tokens):
+            return {
+                "content": [
+                    {"type": "text", "text": f"<bash>echo ranfirst</bash>\n{ambiguous}\n<bash>echo ranlast</bash>"}
+                ],
+                "usage": {},
+            }
+
+        w_raise.complete_fn = raising_complete
+        from desmos.loop import turn as _turn
+
+        _speech, raise_results, _done, _asst = _turn(w_raise, list(w_raise.messages), 512)
+        assert [b.tag for b, _ in raise_results] == ["bash", "edit", "bash"], raise_results
+        assert raise_results[0][1].strip() == "ranfirst", "a raise ate an earlier syscall's output"
+        assert "ValueError" in raise_results[1][1], raise_results[1][1]
+        assert raise_results[2][1].strip() == "ranlast", "a raise ended the batch early"
 
         def thinking_complete(_model, _system, _messages, _max_tokens):
             return {
@@ -1321,10 +1458,53 @@ def self_check() -> None:
         assert child.persist is False
         assert "secret" not in child.tools
         assert "agents" not in child.tools
+        # Pruning w.tools is not the scope. dispatch answers the frozen tags
+        # without consulting w.tools at all, so a read-capability child could
+        # rewrite any file on disk while its tool table looked correctly
+        # empty -- the absence the old check asserted was true the whole time
+        # the containment was false. Assert the file, not the table.
+        scoped_file = cwd / "scoped.txt"
+        scoped_file.write_text("alpha\n", encoding="utf-8")
+        denied = dispatch(child, Block("edit", "alpha\n---\nBETA", {"path": str(scoped_file)}))
+        assert scoped_file.read_text(encoding="utf-8") == "alpha\n", (
+            f"a read-capability child edited a file on disk: {denied!r}"
+        )
+        assert "edit" not in child.allowed_tags, child.allowed_tags
+        # Same gate, harness-level tags: a note written here would outlive the
+        # child in the prompt the parent's own turn reads back.
+        dispatch(child, Block("system", "pwn", {"name": "pwn-note"}))
+        assert "pwn-note" not in child.notes
+        for tag in ("evolve", "rollback", "register", "reload_sdk"):
+            assert "outside this agent's scope" in dispatch(child, Block(tag, "x", {})), tag
+        # And the capability it does have still works, or the "scope" is just
+        # a broken child.
+        assert dispatch(child, Block("bash", "echo alive", {})).strip() == "alive"
+
         child.notes["pwn"] = "from-child"
         save_world(child)
         reloaded_parent = new_world(cwd, state_path=cwd / "harness-iso.json")
         assert "pwn" not in reloaded_parent.notes
+
+        # persist=False means nothing on disk, not just no harness.json.
+        # generations and memory each own their own writer, and each one used
+        # to reach the filesystem from a child that has no state file: a
+        # subagent snapshotted into the parent's .desmos and a child's
+        # <memory remember> edited the repo's durable MEMORY.md.
+        quiet_cwd = cwd / "no-writes"
+        quiet_cwd.mkdir()
+        quiet = new_world(quiet_cwd, state_path=None, ns={}, persist=False)
+        from desmos.loop import install_resources as _install, seed_builtins as _seed
+
+        _seed(quiet)
+        _install(quiet)
+        dispatch(quiet, Block("evolve", "probe", {}))
+        dispatch(quiet, Block("memory", "remember user.pwn.identity leaked", {}))
+        dispatch(quiet, Block("system", "in-memory only", {"name": "n"}))
+        save_world(quiet)
+        assert quiet.notes["n"] == "in-memory only", "the child lost its own note"
+        strays = sorted(str(p.relative_to(quiet_cwd)) for p in quiet_cwd.rglob("*"))
+        assert strays == [], f"a non-persistent world wrote to disk: {strays}"
+
         unknown = wait("nope")
         assert unknown[0]["state"] == "unknown"
         import desmos.subagent as S
@@ -1411,7 +1591,16 @@ def self_check() -> None:
         assert init["protocolVersion"] == 1
         assert init["authMethods"][0]["id"] == "none"
         assert init["agentCapabilities"]["loadSession"] is False
-        assert init["agentCapabilities"]["promptCapabilities"]["image"] is True
+        # What we advertise has to be what prompt_text carries. Claiming image
+        # support the loop cannot take made the pager send an image block,
+        # prompt_text drop it, and the empty prompt answer end_turn with no
+        # model call at all.
+        from desmos.acp import prompt_text as _prompt_text
+
+        carries_image = bool(
+            _prompt_text([{"type": "image", "data": "aGk=", "mimeType": "image/png"}])
+        )
+        assert init["agentCapabilities"]["promptCapabilities"]["image"] is carries_image
         assert init["_meta"]["grokShell"] is False
         assert acp_replies[1]["result"] == {}
         assert acp_replies[2]["result"]["sessionId"]
@@ -1436,6 +1625,12 @@ def self_check() -> None:
             }
 
         acp.sessions[sid].complete_fn = fake_acp
+        # session/new applies the *user's* saved settings, so this ran against
+        # whatever model the developer last switched to -- and on an OpenAI one
+        # the loop rejects XML in speech and the whole round trip fails here for
+        # a reason that has nothing to do with ACP. Pin the dialect the fake
+        # response is written in.
+        acp.sessions[sid].model = "claude-opus-5"
         prompted = acp.handle({
             "jsonrpc": "2.0",
             "id": 11,
@@ -2005,6 +2200,24 @@ def self_check() -> None:
         # pager compiles either way and just runs grok's agent instead of ours.
         _check_path_deps_tracked()
         _check_vendor_patch()
+
+        # These four modules were reachable only by running them by hand, so
+        # nothing in the floor covered contract acceptance, evidence judgment,
+        # token budgets, the HTTP-200-body overload retry, no-replay-after-
+        # output, cancelable backoff, OpenAI syscall item shape, or a landed
+        # task resuming a step. A check nobody runs is a check that is not
+        # there. Run them here; the floor is one command.
+        import importlib
+
+        for module, fns in (
+            ("desmos.subagent_check", ("self_check", "parallel_tool_check")),
+            ("desmos.transport_check", ("self_check",)),
+            ("desmos.openai_check", ("self_check",)),
+            ("desmos.pending_check", ("self_check",)),
+        ):
+            mod = importlib.import_module(module)
+            for fn in fns:
+                getattr(mod, fn)()
 
         try:
             from IPython.core.interactiveshell import InteractiveShell
