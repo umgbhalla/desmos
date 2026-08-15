@@ -285,7 +285,9 @@ impl BlockContent for OtherToolCallBlock {
                             lines.push(BlockLine::styled(a_line));
                         }
                     } else {
-                        // Generic output rendering (non-Q&A tools).
+                        // Generic output rendering (non-Q&A tools). The hang
+                        // under the bullet is applied centrally by
+                        // `prepend_bullet`, so nothing is padded here.
                         lines.push(Line::from("").into());
 
                         let styled_lines: Vec<Line<'static>> = output

@@ -2852,6 +2852,7 @@ dependencies = [
  "serde_json",
  "toml",
  "unicode-width 0.2.0",
+ "xai-grok-config",
  "xai-grok-pager",
  "xai-grok-pager-diff",
 ]
