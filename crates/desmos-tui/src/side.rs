@@ -115,6 +115,17 @@ impl GitPane {
         self.rows().get(self.sel)
     }
 
+    /// Jump straight to a tab. The keyboard walks the strip with `next_tab`;
+    /// a click lands on one label and needs to say which.
+    pub fn set_tab(&mut self, tab: GitTab) {
+        if tab == self.tab {
+            return;
+        }
+        self.tab = tab;
+        self.sel = 0;
+        self.scroll = 0;
+    }
+
     pub fn next_tab(&mut self, by: i32) {
         let n = GitTab::ALL.len() as i32;
         let i = (self.tab.index() as i32 + by).rem_euclid(n) as usize;

@@ -3232,6 +3232,35 @@ fn hit(area: Rect, col: u16, row: u16) -> bool {
         && row < area.y.saturating_add(area.height)
 }
 
+/// The git tab strip is drawn in the border title, so a click on a pane's top
+/// row is a click on a tab. Mirrors the span layout in `draw_git`.
+fn git_tab_at(area: Rect, col: u16, row: u16) -> Option<side::GitTab> {
+    if area.height < 3 || row != area.y {
+        return None;
+    }
+    // Left border, then the leading `Span::raw(" ")`.
+    let mut x = area.x.saturating_add(2);
+    for tab in side::GitTab::ALL {
+        let w = tab.label().chars().count() as u16 + 2;
+        if col >= x && col < x.saturating_add(w) {
+            return Some(tab);
+        }
+        x = x.saturating_add(w);
+    }
+    None
+}
+
+/// Which content row of a bordered pane a screen row lands on. `None` for the
+/// two border rows, so a click on the frame never moves a cursor.
+fn pane_row(area: Rect, row: u16) -> Option<usize> {
+    let inner = area.height.checked_sub(2)?;
+    if row <= area.y || row >= area.y + area.height - 1 {
+        return None;
+    }
+    let r = (row - area.y - 1) as usize;
+    (r < inner as usize).then_some(r)
+}
+
 fn handle_mouse(app: &mut App, m: MouseEvent) {
     if app.viewer.is_some() {
         handle_viewer_mouse(app, m);
@@ -3256,6 +3285,9 @@ fn handle_mouse(app: &mut App, m: MouseEvent) {
     let on_post_out = hit(app.post_out_area, m.column, m.row);
     let on_queue = hit(app.queue_area, m.column, m.row) && !app.queue.is_empty();
     let on_input = hit(app.input_area, m.column, m.row);
+    let on_git = hit(app.git_area, m.column, m.row);
+    let on_files = hit(app.files_area, m.column, m.row);
+    let on_meta = hit(app.cache.area, m.column, m.row);
 
     match m.kind {
         MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
@@ -3278,6 +3310,13 @@ fn handle_mouse(app: &mut App, m: MouseEvent) {
                     app.post_out
                         .scroll_down(3, app.post_out_area.height.saturating_sub(2));
                 }
+            } else if on_git {
+                app.git.select(if up { -3 } else { 3 });
+                let path = app.git.selected().and_then(|r| r.path.clone());
+                app.files.preview(path.as_deref());
+            } else if on_files {
+                let rows = app.files_area.height.saturating_sub(2) as usize;
+                app.files.move_by(if up { -3 } else { 3 }, rows);
             }
         }
         MouseEventKind::Down(MouseButton::Left) => {
@@ -3337,6 +3376,50 @@ fn handle_mouse(app: &mut App, m: MouseEvent) {
                         app.open_post_inspect();
                     } else {
                         app.last_click = Some((now, 0, pane));
+                    }
+                }
+                return;
+            }
+            if on_meta {
+                app.set_focus(Focus::Meter);
+                return;
+            }
+            if on_git {
+                app.set_focus(Focus::Git);
+                if let Some(tab) = git_tab_at(app.git_area, m.column, m.row) {
+                    app.git.set_tab(tab);
+                } else if let Some(row) = pane_row(app.git_area, m.row) {
+                    let idx = app.git.scroll + row;
+                    if idx < app.git.rows().len() {
+                        app.git.sel = idx;
+                    }
+                }
+                // Same rule as the keyboard: moving the git cursor previews.
+                let path = app.git.selected().and_then(|r| r.path.clone());
+                app.files.preview(path.as_deref());
+                return;
+            }
+            if on_files {
+                app.set_focus(Focus::Files);
+                if let Some(row) = pane_row(app.files_area, m.row) {
+                    if !app.files.in_file() {
+                        let idx = app.files.scroll + row;
+                        if idx < app.files.entries.len() {
+                            let now = Instant::now();
+                            let dbl = app
+                                .last_click
+                                .map(|(t, e, p)| {
+                                    p == 4 && e == idx && now.duration_since(t).as_millis() < 350
+                                })
+                                .unwrap_or(false);
+                            app.files.sel = idx;
+                            if dbl {
+                                app.last_click = None;
+                                app.files.enter();
+                            } else {
+                                app.last_click = Some((now, idx, 4));
+                            }
+                        }
                     }
                 }
                 return;
@@ -9490,5 +9573,76 @@ mod tests {
             ),
         );
         assert!(app.want_stop);
+    }
+
+    #[test]
+    fn mouse_reaches_git_files_and_meta() {
+        let mut app = App::new();
+        app.layout.git_h = 6;
+        app.layout.files_h = 8;
+        app.layout.meter_h = 8;
+        app.set_focus(Focus::Story);
+        let _ = paint(&mut app, 140, 50);
+        assert!(app.git_area.height >= 3 && app.files_area.height >= 3);
+
+        // Meta: click anywhere inside and it takes focus. It has no cursor, so
+        // that is the whole contract.
+        let meta = app.cache.area;
+        handle_mouse(
+            &mut app,
+            click(MouseEventKind::Down(MouseButton::Left), meta.x + 2, meta.y + 1),
+        );
+        assert_eq!(app.focus, Focus::Meter);
+
+        // Git: the tab strip is in the border title, so the top row is clickable.
+        let git = app.git_area;
+        let log = side::GitTab::Log;
+        let label_x = git_tab_x(git, log);
+        handle_mouse(
+            &mut app,
+            click(MouseEventKind::Down(MouseButton::Left), label_x, git.y),
+        );
+        assert_eq!(app.focus, Focus::Git);
+        assert_eq!(app.git.tab, log, "clicking a tab label must select it");
+
+        // Files: the wheel moves the cursor, a click lands on a row, and a
+        // click on the frame moves nothing.
+        let _ = paint(&mut app, 140, 50);
+        let files = app.files_area;
+        app.files.sel = 0;
+        handle_mouse(
+            &mut app,
+            click(MouseEventKind::ScrollDown, files.x + 2, files.y + 2),
+        );
+        assert!(
+            app.files.sel > 0,
+            "wheel over the file pane must move its cursor"
+        );
+        let row = 2u16;
+        handle_mouse(
+            &mut app,
+            click(MouseEventKind::Down(MouseButton::Left), files.x + 2, files.y + 1 + row),
+        );
+        assert_eq!(app.focus, Focus::Files);
+        assert_eq!(app.files.sel, app.files.scroll + row as usize);
+
+        let fixed = app.files.sel;
+        handle_mouse(
+            &mut app,
+            click(MouseEventKind::Down(MouseButton::Left), files.x + 2, files.y),
+        );
+        assert_eq!(app.files.sel, fixed, "border clicks must not move a cursor");
+    }
+
+    /// The x of a tab label in the git title strip, laid out as `draw_git` does.
+    fn git_tab_x(area: Rect, want: side::GitTab) -> u16 {
+        let mut x = area.x + 2;
+        for tab in side::GitTab::ALL {
+            if tab == want {
+                return x + 1;
+            }
+            x += tab.label().chars().count() as u16 + 2;
+        }
+        x
     }
 }
