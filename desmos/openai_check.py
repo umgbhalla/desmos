@@ -124,6 +124,62 @@ def self_check() -> None:
         assert "ns:" in envelope and "live_marker: list, len=2" in envelope, envelope
         assert envelope.count(task) == 1, envelope
 
+    # A malformed custom-tool payload is still a valid provider call and must
+    # receive one typed output. Nothing inside the mixed payload may run, and
+    # the loop must continue so the model can issue a corrected call.
+    from desmos.loop import run_turns
+
+    with TemporaryDirectory() as td:
+        cwd = Path(td)
+        world = new_world(cwd, state_path=cwd / "recover.sqlite3", ns={"live_marker": [1, 2]})
+        world.model = "gpt-5.6-sol"
+        attempts = 0
+        bad_input = "<python>live_marker.append(3)</python> stray prose"
+
+        def complete_recover(
+            _model: str, _system: str, messages: list[dict[str, Any]], _max: int
+        ) -> dict[str, Any]:
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                provider_call = {
+                    "type": "custom_tool_call",
+                    "name": "syscall",
+                    "call_id": "bad_call_1",
+                    "input": bad_input,
+                }
+                return {
+                    "content": [{**provider_call, "openai": provider_call}],
+                    "usage": {},
+                }
+            output = messages[-1]["content"]
+            assert isinstance(output, list) and output[0]["type"] == "custom_tool_call_output", output
+            assert output[0]["call_id"] == "bad_call_1", output
+            assert "syscall input rejected" in output[0]["output"], output
+            assert "nothing ran" in output[0]["output"], output
+            return {"content": [{"type": "text", "text": "recovered"}], "usage": {}}
+
+        world.complete_fn = complete_recover
+        events: list[dict[str, Any]] = []
+        answer = run_turns(world, "recover malformed call", quiet=True, on_event=events.append)
+        assert answer == "recovered", answer
+        assert attempts == 2, attempts
+        assert world.ns["live_marker"] == [1, 2], "a partial malformed payload was dispatched"
+        outputs = [
+            block
+            for message in world.messages
+            if message.get("role") == "user" and isinstance(message.get("content"), list)
+            for block in message["content"]
+            if block.get("type") == "custom_tool_call_output"
+        ]
+        assert len(outputs) == 1 and outputs[0]["call_id"] == "bad_call_1", outputs
+        assert any(
+            event.get("ev") == "result"
+            and event.get("phase") == "done"
+            and event.get("tag") == "syscall"
+            for event in events
+        ), events
+
     print("openai input check ok")
 
 

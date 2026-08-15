@@ -304,14 +304,52 @@ def turn(
         }
     )
     results: list[tuple[Block, str]] = []
+    recoverable = False
     call = syscall_call(assistant)
     if call:
         raw = call.get("input") or ""
         spans = scan_spans(raw)
-        edges = zip((0, *(end for _, _, end in spans)), (start for _, start, _ in spans))
-        if not spans or any(raw[start:end].strip() for start, end in edges) or raw[spans[-1][2] :].strip():
-            raise RuntimeError("OpenAI syscall input must contain only complete XML syscalls")
-        blocks = [block for block, _, _ in spans]
+        stray: list[str] = []
+        cursor = 0
+        for _, start, end in spans:
+            if raw[cursor:start].strip():
+                stray.append(raw[cursor:start])
+            cursor = end
+        if raw[cursor:].strip():
+            stray.append(raw[cursor:])
+        if not spans or stray:
+            # The provider call itself is valid and therefore must receive a
+            # typed output, even though its payload is not dispatchable. Raising
+            # here left the custom_tool_call unanswered and ended the whole
+            # step. Reject the payload atomically, pair the call with an error,
+            # and let run_turns ask the model for a corrected call.
+            problem = malformed_call_note(raw, stray)
+            failed = Block("syscall", raw, {})
+            results.append((failed, problem))
+            recoverable = True
+            fire(
+                {
+                    "ev": "result",
+                    "phase": "start",
+                    "tag": failed.tag,
+                    "attrs": {},
+                    "body": clip(raw),
+                    "text": "",
+                }
+            )
+            fire(
+                {
+                    "ev": "result",
+                    "phase": "done",
+                    "tag": failed.tag,
+                    "attrs": {},
+                    "body": clip(raw),
+                    "text": clip(problem),
+                }
+            )
+            blocks = []
+        else:
+            blocks = [block for block, _, _ in spans]
     elif family(world.model) == "openai" and scan(speech):
         raise RuntimeError("OpenAI emitted XML as speech instead of calling syscall")
     else:
@@ -400,7 +438,7 @@ def turn(
             'end="TOKEN" if the body contains tag text'
         )
     note = f"[{'; '.join(parts)}]" if parts else None
-    return speech, results, (not blocks and note is None), assistant, note
+    return speech, results, (not blocks and note is None and not recoverable), assistant, note
 
 
 # Why a reply ended early, and what to tell the model about it. The first two

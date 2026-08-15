@@ -2424,17 +2424,30 @@ def _run_checks() -> None:
         bad_item = dict(call_item, id="ct_bad", call_id="call_bad", input=call_item["input"] + " lousy?")
         w_bad = new_world(cwd, persist=False, ns={})
         w_bad.model = "gpt-5.6-sol"
-        w_bad.complete_fn = lambda *_args: {
+        bad_resp = {
             **call_resp,
             "content": _oai._blocks_from_items([bad_item]),
         }
+        bad_replies = iter([bad_resp, final_resp])
+        w_bad.complete_fn = lambda *_args: next(bad_replies)
         bad_events: list[dict] = []
         assert _run_openai(
-            w_bad, "calculate", max_turns=1, quiet=True, on_event=bad_events.append
-        ) == ""
+            w_bad, "calculate", max_turns=3, quiet=True, on_event=bad_events.append
+        ) == "done"
         assert "OPENAI_SYSCALL_EVAL" not in w_bad.ns, "invalid typed input must not dispatch"
+        bad_outputs = [
+            b
+            for m in w_bad.messages
+            if m.get("role") == "user" and isinstance(m.get("content"), list)
+            for b in m["content"]
+            if isinstance(b, dict) and b.get("type") == "custom_tool_call_output"
+        ]
+        assert len(bad_outputs) == 1 and bad_outputs[0]["call_id"] == "call_bad", bad_outputs
+        assert "syscall input rejected" in bad_outputs[0]["output"], bad_outputs
         assert any(
-            e.get("ev") == "error" and "only complete XML" in e.get("text", "")
+            e.get("ev") == "result"
+            and e.get("phase") == "done"
+            and e.get("tag") == "syscall"
             for e in bad_events
         ), bad_events
 
