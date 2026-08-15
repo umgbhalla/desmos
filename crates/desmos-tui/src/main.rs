@@ -1820,8 +1820,7 @@ fn seed_demo(app: &mut App) {
          to live in a note, a skill, or a named object the index still lists. \
          A paragraph this long must wrap across more than one row. WRAPEND",
     ));
-    // One edit, in both panes, so --demo shows the story card folded next to
-    // the wire card it was built from.
+    // One edit in Activity; Story carries only the reader-facing conversation.
     let demo_edit = json!({
         "ev": "result",
         "tag": "edit",
@@ -1829,10 +1828,6 @@ fn seed_demo(app: &mut App) {
         "body": "    if n < max_turns:\n---\n    if n <= max_turns:",
         "text": "ok",
     });
-    if let Some(card) = story_edit_card(&demo_edit) {
-        let id = app.story.push_block(card);
-        set_wire_mode(&mut app.story, id, DisplayMode::Collapsed);
-    }
     app.call_push_group(PostArgs::new(
         "user",
         1,
@@ -2458,13 +2453,9 @@ fn handle_event(app: &mut App, ev: Value) {
             let phase = ev.get("phase").and_then(Value::as_str).unwrap_or("done");
             if phase != "start" && phase != "delta" {
                 let tag = ev.get("tag").and_then(Value::as_str).unwrap_or("?");
-                // An edit reports itself in the story as a card, so counting it
-                // in the work sentence too would say the same thing twice —
-                // `edit x3` above three cards that name the files.
-                if let Some(card) = story_edit_card(&ev) {
-                    let id = app.story.push_block(card);
-                    set_wire_mode(&mut app.story, id, DisplayMode::Collapsed);
-                } else {
+                // Every edit detail has one home: Activity. Do not duplicate
+                // either its diff card or an `edit xN` work row in Story.
+                if tag != "edit" {
                     let target = call_target(tag, &ev);
                     app.stream.run.call(tag, target);
                     app.stream.run.sync(&mut app.story);
@@ -6667,21 +6658,6 @@ fn wire_compacted(n: u64, kept: u64, summary: &str) -> RenderBlock {
 /// pushed collapsed, so a turn that rewrites twenty files costs twenty header
 /// rows and not twenty diffs; `l` opens one, Enter zooms it into the viewer.
 ///
-/// This is the same block the wire pane gets, built a second time rather than
-/// shared: the two panes fold independently, and a card that opened in the
-/// story because the reader pressed `l` must not also open on the wire.
-fn story_edit_card(ev: &Value) -> Option<RenderBlock> {
-    if ev.get("tag").and_then(Value::as_str)? != "edit" {
-        return None;
-    }
-    match result_block(ev) {
-        block @ RenderBlock::ToolCall(ToolCallBlock::Edit(_)) => Some(block),
-        // A malformed edit body falls through wire_syscall's `edit` arm as
-        // something else; the story has no use for that shape.
-        _ => None,
-    }
-}
-
 /// Wire card for one XML syscall: the body that ran, then the result.
 fn wire_syscall(tag: &str, body: &str, attrs: &Value, result: &str) -> RenderBlock {
     match tag {
@@ -7425,38 +7401,28 @@ mod tests {
         assert!(!row.contains("cargo build"), "a command body leaked: {row}");
     }
 
-    /// The two panes as the reader actually sees them: a folded edit card in
-    /// the story that opens into readable before/after rows, and a wire title
-    /// that says which group the cursor is in.
+    /// The demo keeps its edit in Activity, where it opens into readable
+    /// before/after rows beside the wire group counter.
     #[test]
-    fn the_demo_paints_a_folded_edit_and_a_group_counter() {
+    fn the_demo_paints_an_activity_edit_and_a_group_counter() {
         let mut app = App::new();
         seed_demo(&mut app);
         // The POST rows are off by default; this test is about them, so put
         // them back the way the chip does.
         app.toggle_posts();
 
-        let folded = paint(&mut app, 120, 40);
-        // Folded, the card names the file by basename; opened, by full path.
+        assert_eq!(activity_edits(&app).len(), 1, "demo edit missing from Activity");
         assert!(
-            folded.contains("Edit loop.py"),
-            "no story edit card: {folded}"
+            !(0..app.story.len()).any(|i| matches!(
+                app.story.entry(i).map(|e| &e.block),
+                Some(RenderBlock::ToolCall(ToolCallBlock::Edit(_)))
+            )),
+            "demo edit leaked into Story"
         );
+        let painted = paint(&mut app, 120, 40);
         assert!(
-            !folded.contains("if n <= max_turns"),
-            "the card arrived open and spilled its diff into the story: {folded}"
-        );
-        assert!(
-            folded.contains("calls  #3/3"),
-            "the wire title lost its group counter: {folded}"
-        );
-
-        let id = app.story.entry(story_edits(&app)[0]).unwrap().id;
-        set_wire_mode(&mut app.story, id, DisplayMode::Expanded);
-        let open = paint(&mut app, 120, 40);
-        assert!(
-            open.contains("if n < max_turns:") && open.contains("if n <= max_turns:"),
-            "opening the card did not show both sides of the diff: {open}"
+            painted.contains("calls  #3/3"),
+            "the wire title lost its group counter: {painted}"
         );
     }
 
@@ -7648,83 +7614,38 @@ mod tests {
         })
     }
 
-    fn story_edits(app: &App) -> Vec<usize> {
-        (0..app.story.len())
+    fn activity_edits(app: &App) -> Vec<usize> {
+        (0..app.calls.len())
             .filter(|i| {
                 matches!(
-                    app.story.entry(*i).map(|e| &e.block),
+                    app.calls.entry(*i).map(|e| &e.block),
                     Some(RenderBlock::ToolCall(ToolCallBlock::Edit(_)))
                 )
             })
             .collect()
     }
 
-    /// An edit lands in the story as its own card, folded, the moment the
-    /// result arrives -- not at the end of the turn and not only on the wire.
     #[test]
-    fn an_edit_shows_up_in_the_story_folded_and_live() {
+    fn edits_render_only_in_activity() {
         let mut app = App::new();
         handle_event(&mut app, json!({"ev": "turn", "text": "go"}));
         handle_event(
             &mut app,
-            edit_ev("desmos/loop.py", "if n < max_turns:", "if n <= max_turns:", "ok"),
+            edit_ev("desmos/loop.py", "if old:", "if new:", "ok"),
         );
 
-        let edits = story_edits(&app);
-        assert_eq!(edits.len(), 1, "the edit did not reach the story");
-        let entry = app.story.entry(edits[0]).unwrap();
-        assert_eq!(
-            entry.display_mode,
-            DisplayMode::Collapsed,
-            "a story edit card must arrive folded, or a wide refactor buries the prose",
+        assert!(
+            !(0..app.story.len()).any(|i| matches!(
+                app.story.entry(i).map(|e| &e.block),
+                Some(RenderBlock::ToolCall(ToolCallBlock::Edit(_)))
+            )),
+            "edit diff leaked into Story"
         );
-        // Live: it is there before the turn ends.
-        assert!(!app.running, "sanity: no complete() was sent");
-
-        // And the wire pane still has its own copy -- the story card is a
-        // second block, not a move.
-        let wire = (0..app.calls.len())
-            .filter(|i| {
-                matches!(
-                    app.calls.entry(*i).map(|e| &e.block),
-                    Some(RenderBlock::ToolCall(ToolCallBlock::Edit(_)))
-                )
-            })
-            .count();
-        assert_eq!(wire, 1, "the edit left the wire pane");
+        assert_eq!(activity_edits(&app).len(), 1, "edit missing from Activity");
     }
 
-    /// Folding is per-pane. Opening the story card must not open the wire one:
-    /// they are two blocks, and the reader opened exactly one of them.
     #[test]
-    fn opening_a_story_edit_leaves_the_wire_card_folded() {
-        let mut app = App::new();
-        handle_event(&mut app, json!({"ev": "turn", "text": "go"}));
-        handle_event(&mut app, edit_ev("f.rs", "old", "new", "ok"));
-
-        let sid = app.story.entry(story_edits(&app)[0]).unwrap().id;
-        set_wire_mode(&mut app.story, sid, DisplayMode::Expanded);
-
-        let wire_edit = (0..app.calls.len())
-            .find(|i| {
-                matches!(
-                    app.calls.entry(*i).map(|e| &e.block),
-                    Some(RenderBlock::ToolCall(ToolCallBlock::Edit(_)))
-                )
-            })
-            .expect("wire edit card");
-        assert_eq!(
-            app.calls.entry(wire_edit).unwrap().display_mode,
-            DisplayMode::Collapsed,
-            "opening the story card reached across into the wire pane",
-        );
-    }
-
-    /// Edits carry themselves now, so they must drop out of the work sentence.
-    /// `edit x3` stacked above three cards that name the files is the same
-    /// fact printed twice.
-    #[test]
-    fn edits_do_not_also_count_toward_the_work_row() {
+    fn edits_do_not_create_story_work_rows() {
         let mut app = App::new();
         handle_event(&mut app, json!({"ev": "turn", "text": "go"}));
         for f in ["a.rs", "b.rs", "c.rs"] {
@@ -7734,40 +7655,26 @@ mod tests {
             Some(RenderBlock::System(b)) => Some(b.text.clone()),
             _ => None,
         });
-        assert!(
-            row.is_none(),
-            "three edits produced a work row as well as three cards: {row:?}"
-        );
-        assert_eq!(story_edits(&app).len(), 3, "one card per edit");
-
-        // A non-edit call still earns a row, and the row still ignores edits.
-        for _ in 0..2 {
-            handle_event(
-                &mut app,
-                json!({"ev": "result", "tag": "bash", "body": "cargo test", "text": "ok"}),
-            );
-        }
-        let row = (0..app.story.len())
-            .find_map(|i| match app.story.entry(i).map(|e| &e.block) {
-                Some(RenderBlock::System(b)) => Some(b.text.clone()),
-                _ => None,
-            })
-            .expect("two bash calls are a run");
-        assert!(row.contains("bash"), "row lost the real calls: {row}");
-        assert!(!row.contains("edit"), "edits leaked back into the row: {row}");
+        assert!(row.is_none(), "edits created a Story work row: {row:?}");
+        assert_eq!(activity_edits(&app).len(), 3, "one Activity card per edit");
     }
 
-    /// A failed edit is still the narrative -- it is the turn's whole point
-    /// when it happens -- so it gets a card too, carrying the error.
     #[test]
-    fn a_failed_edit_still_reaches_the_story() {
+    fn failed_edits_stay_in_activity_too() {
         let mut app = App::new();
         handle_event(&mut app, json!({"ev": "turn", "text": "go"}));
         handle_event(
             &mut app,
             edit_ev("f.rs", "missing", "new", "no match for old_string"),
         );
-        assert_eq!(story_edits(&app).len(), 1, "a failed edit vanished");
+        assert_eq!(activity_edits(&app).len(), 1, "failed edit vanished");
+        assert!(
+            !(0..app.story.len()).any(|i| matches!(
+                app.story.entry(i).map(|e| &e.block),
+                Some(RenderBlock::ToolCall(ToolCallBlock::Edit(_)))
+            )),
+            "failed edit leaked into Story"
+        );
     }
 
     /// One call is not a run. A row for a lone grep is worse than silence.
