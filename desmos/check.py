@@ -459,14 +459,12 @@ def _run_checks() -> None:
 
         assert INTERLEAVED_BETA not in payload["_betas"], payload["_betas"]
         assert payload["_betas"] == [_CB], payload["_betas"]
-        # Without these the model keeps writing past its own syscall and
-        # invents the reply to it, then reasons from the invention. Both
-        # markers are anchored to a line start so prose can still name them.
-        stops = payload["stop_sequences"]
-        assert len(stops) == 2, stops
-        assert all(x.startswith("\n") for x in stops), stops
-        assert any("res" in x for x in stops), stops
-        assert any("user" in x for x in stops), stops
+        # Deliberately absent -- see the note in cached_payload. The markers
+        # were pure text with no notion of intent, so a docs page that merely
+        # named one was guillotined mid-fence. Asserting their absence keeps
+        # the removal a decision rather than a regression: put them back and
+        # this fails until someone edits the reason next to it.
+        assert "stop_sequences" not in payload, payload["stop_sequences"]
 
         # Three cache breakpoints and no fourth: ABI, catalog, last user. Every
         # one of them is a prefix that stops moving, which is the whole point --

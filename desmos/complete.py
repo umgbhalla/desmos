@@ -320,14 +320,23 @@ def cached_payload(
         "max_tokens": max_tokens,
         "system": sys_blocks,
         "messages": msgs,
-        # A turn is over the moment the model hands back a syscall. Left to
-        # run, it keeps writing -- and what it writes next is the reply to its
-        # own call: an invented result block, then conclusions drawn from the
-        # invention. Measured on one session, 67% of assistant output was
-        # self-written transcript, and every false commit hash and phantom test
-        # count came from reading that back as fact. These cut generation at
-        # the moment it starts impersonating the harness.
-        "stop_sequences": ["\n<result", "\nuser<"],
+        # No stop_sequences, deliberately.
+        #
+        # They were the result-block and user-turn markers, anchored to a line
+        # start, and they did catch a real failure: left running past its own
+        # syscall the model writes the reply to that call and then reasons from
+        # the invention -- 67% of assistant output on one measured session, and
+        # every false commit hash with it.
+        #
+        # But the rule is pure text with no notion of intent, so writing *about*
+        # this harness trips it. It cut a docs page mid-fence, because the next
+        # line of an example began with the marker, and then told the model it
+        # had been impersonating the harness. Four true positives to one false
+        # in the session that retired it, and the false one cost a rewrite.
+        #
+        # Off while we find out what the unguarded failure actually looks like.
+        # loop.py still maps a `stop_sequence` stop_reason if an endpoint ever
+        # returns one, so turning them back on is one line here.
     }
     payload["_betas"] = apply_thinking(payload, model, thinking) + apply_compaction(payload, model)
     return payload
