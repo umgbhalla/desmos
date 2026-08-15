@@ -33,8 +33,8 @@ PERSONAS: dict[str, str] = {
 
 # capability modes: which tags the child may use
 CAPS: dict[str, tuple[str, ...]] = {
-    "read": ("python", "bash", "skill"),
-    "edit": ("python", "bash", "edit", "skill", "reload"),
+    "read": ("python", "bash", "skill", "todo"),
+    "edit": ("python", "bash", "edit", "skill", "reload", "todo"),
     "full": (),  # empty tuple == inherit everything
 }
 
@@ -245,7 +245,13 @@ def _scoped_tags(capability: str, contract: TaskContract | None) -> set[str] | N
     return allowed
 
 
-def _child_world(cfg: EffectiveConfig, parent: Any, contract: TaskContract | None = None):
+def _child_world(
+    cfg: EffectiveConfig,
+    parent: Any,
+    contract: TaskContract | None = None,
+    *,
+    todo_actor: str | None = None,
+):
     from desmos.loop import new_world, seed_builtins
 
     cwd = Path(cfg.cwd) if cfg.cwd else parent.cwd
@@ -256,6 +262,11 @@ def _child_world(cfg: EffectiveConfig, parent: Any, contract: TaskContract | Non
     w.thinking = cfg.thinking or parent.thinking
     allowed = _scoped_tags(cfg.capability, contract)
     if allowed is not None:
+        # The parent-todo bridge is a separate append-only capability. Typed
+        # task contracts still receive it even when their ordinary tool list is
+        # narrower; dispatch intercepts it before any parent handler is reached.
+        if todo_actor is not None:
+            allowed.add("todo")
         from desmos.dispatch import set_scope
 
         # The prune keeps the child's prompt truthful (subagent_prompt reads
@@ -297,6 +308,22 @@ def _child_world(cfg: EffectiveConfig, parent: Any, contract: TaskContract | Non
     if cfg.system_append:
         w.system_override = w.system_override.rstrip() + "\n\n" + cfg.system_append.strip()
     w.complete_fn = getattr(parent, "complete_fn", None)
+    parent_todo = parent.tools.get("todo")
+    if todo_actor is not None and parent_todo is not None and parent_todo.handler is not None:
+        from desmos.dispatch import set_child_todo_handler
+        from desmos.types import Tool
+
+        # This marker makes the syscall visible in the child prompt and scope;
+        # dispatch intercepts it before the marker can run.
+        w.tools["todo"] = Tool(
+            name="todo",
+            doc=(
+                "append a parent todo: action=append; body is the new item. "
+                "Existing parent rows cannot be changed"
+            ),
+            handler=lambda _body: "child todo dispatch marker",
+        )
+        set_child_todo_handler(w, parent_todo.handler, actor=f"subagent:{todo_actor}")
     return w
 
 
@@ -361,7 +388,12 @@ def _execute(run: Run, parent: Any) -> None:
         )
 
     try:
-        w = _child_world(run.cfg, parent, run.contract if run.structured else None)
+        w = _child_world(
+            run.cfg,
+            parent,
+            run.contract if run.structured else None,
+            todo_actor=run.id,
+        )
         if run.cfg.context == "resumed" and run.messages:
             w.messages = list(run.messages)
 

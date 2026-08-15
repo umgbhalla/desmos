@@ -32,6 +32,29 @@ from desmos.types import Block, World
 # id() cannot scope an unrelated later world.
 _SCOPES: dict[int, frozenset[str]] = globals().get("_SCOPES", {})
 
+# A child gets a narrow reference to its parent's todo handler, never the
+# parent World or persistence layer. Entries disappear with the child world.
+_CHILD_TODOS: dict[int, Callable[[str], Any]] = globals().get("_CHILD_TODOS", {})
+
+
+def set_child_todo_handler(
+    world: World, handler: Callable[..., Any], *, actor: str
+) -> None:
+    """Let a child append through a parent handler, with stable attribution."""
+    key = id(world)
+
+    def append(body: str) -> Any:
+        # The durable todo handler is a line-command parser: only `+ text`
+        # appends. Flatten the child body to one item so a second line such as
+        # `x 1` cannot smuggle an existing-row mutation through the parent.
+        text = " ".join(body.split())
+        if not text:
+            return "todo append rejected: item required"
+        return handler(f"+ [{actor}] {text}")
+
+    _CHILD_TODOS[key] = append
+    weakref.finalize(world, _CHILD_TODOS.pop, key, None)
+
 
 def set_scope(world: World, tags: Iterable[str] | None) -> None:
     """Restrict `world` to `tags`. None means every tag, as for the kernel."""
@@ -93,6 +116,23 @@ def dispatch(
         verdict = hook(world, block)
         if isinstance(verdict, str):
             return verdict
+    if block.tag == "todo" and id(world) in _CHILD_TODOS:
+        append = _CHILD_TODOS[id(world)]
+        action = (block.attrs.get("action") or block.attrs.get("op") or "append").lower()
+        if action != "append":
+            return (
+                f"todo {action!r} rejected: subagents may append parent todos "
+                "but may not mutate existing rows"
+            )
+        try:
+            return spill(
+                str(append(block.body)),
+                RESULT_CAP,
+                tag=block.tag,
+                cwd=world.cwd,
+            )
+        except Exception:
+            return traceback.format_exc()
     if block.tag == "python":
         return run_python(block.body, world, on_chunk=on_chunk)
     if block.tag == "bash":
