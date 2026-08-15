@@ -1843,6 +1843,14 @@ fn grok_appearance() -> AppearanceConfig {
     // regardless of this flag, so a finished thought still reads "Thought for
     // 12s".
     cfg.scrollback.blocks.thinking.header = false;
+    // Two card kinds, one column grid. An execute card draws the `┃` rail and
+    // puts its body at column 2; an edit card defaulted to no rail at all and a
+    // diff pushed two further columns right by its own indent. Side by side in
+    // the same pane that read as half the cards being tabbed. Give the edit the
+    // finished-command rail and drop its extra indent so both bodies start in
+    // the same place.
+    cfg.scrollback.blocks.edit.accent = Some(Theme::current().accent_success);
+    cfg.scrollback.blocks.edit.indent = false;
     cfg.show_timestamps = appearance_cache::load_timestamps();
     cfg.show_timeline = appearance_cache::load_show_timeline();
     // Density. Grok's defaults are tuned for one full-width chat column; this
@@ -9870,6 +9878,33 @@ mod tests {
             matches!(app.story.entry(0).map(|e| &e.block), Some(RenderBlock::System(_))),
             "a fold is not speech, but it must be said",
         );
+    }
+
+    #[test]
+    fn edit_and_execute_cards_share_a_rail_and_a_body_column() {
+        // Two card kinds in one pane. The execute card always drew the accent
+        // rail and set its body at column 2; the edit card shipped with no
+        // accent and a diff indented two further columns. Read together that
+        // looked like half the pane was tabbed and half was not.
+        let mut app = App::new();
+        handle_event(
+            &mut app,
+            json!({"ev":"result","tag":"bash","attrs":{},
+                   "body":"echo hi","text":"hi"}),
+        );
+        handle_event(
+            &mut app,
+            json!({"ev":"result","tag":"edit","attrs":{"path":"a.rs"},
+                   "body":"old\n---\nnew","text":"Edited a.rs"}),
+        );
+        app.set_focus(Focus::Calls);
+        let text = paint(&mut app, 90, 60);
+        // Rail on both headers.
+        assert!(text.contains("\u{2503}\u{25c6} bash"), "{text}");
+        assert!(text.contains("\u{2503}\u{25c6} Edit"), "{text}");
+        // Bodies start in the same column, one gap past the rail.
+        assert!(text.contains("\u{2503}  $ echo hi"), "{text}");
+        assert!(text.contains("\u{2503}  1  old"), "{text}");
     }
 
     #[test]
