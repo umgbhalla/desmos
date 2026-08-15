@@ -18,6 +18,10 @@ pub struct QueuedQuery {
     #[allow(dead_code)]
     pub id: u64,
     pub text: String,
+    /// Image paths attached to this prompt. They ride the queued row so a
+    /// follow-up typed with a screenshot still carries the screenshot when
+    /// its turn comes up.
+    pub images: Vec<String>,
 }
 
 #[derive(Debug, Default)]
@@ -41,9 +45,13 @@ impl QueryQueue {
     }
 
     pub fn push(&mut self, text: String) -> u64 {
+        self.push_with(text, Vec::new())
+    }
+
+    pub fn push_with(&mut self, text: String, images: Vec<String>) -> u64 {
         let id = self.next_id;
         self.next_id += 1;
-        self.items.push_back(QueuedQuery { id, text });
+        self.items.push_back(QueuedQuery { id, text, images });
         self.selected = Some(self.items.len() - 1);
         id
     }
@@ -105,10 +113,14 @@ impl QueryQueue {
     /// comes back it belongs in the slot it left — a row that jumps to the back
     /// because you fixed a typo in it is a reorder you did not ask for.
     pub fn insert_at(&mut self, idx: usize, text: String) -> u64 {
+        self.insert_at_with(idx, text, Vec::new())
+    }
+
+    pub fn insert_at_with(&mut self, idx: usize, text: String, images: Vec<String>) -> u64 {
         let id = self.next_id;
         self.next_id += 1;
         let idx = idx.min(self.items.len());
-        self.items.insert(idx, QueuedQuery { id, text });
+        self.items.insert(idx, QueuedQuery { id, text, images });
         self.selected = Some(idx);
         id
     }

@@ -3080,6 +3080,18 @@ fn handle_key(
         return Ok(false);
     }
     if is_paste_key(&key) {
+        // grok's order: probe the pasteboard for a raster or file URLs before
+        // falling back to text. A screenshot copied with Cmd+Shift+Ctrl+4 has
+        // no text representation at all, so text-first sees an empty clipboard
+        // and the picture is lost.
+        if let Some(path) = prompt::clipboard_image_path() {
+            if app.focus != Focus::Input {
+                app.set_focus(Focus::Input);
+            }
+            app.prompt.insert_image(&path);
+            app.notify("attached 1 image(s)");
+            return Ok(false);
+        }
         match clipboard_text() {
             Some(text) => apply_paste(app, &text, false),
             None => app.notify("clipboard empty"),
@@ -3404,9 +3416,33 @@ fn pane_open(app: &App) -> impl Fn(Focus) -> bool + use<> {
     }
 }
 
+/// The prompt text for an attachment-only send: the file names, nothing more.
+fn image_prompt_text(images: &[String]) -> String {
+    let names: Vec<&str> = images
+        .iter()
+        .map(|p| p.rsplit('/').next().unwrap_or(p.as_str()))
+        .collect();
+    names.join(", ")
+}
+
 fn apply_paste(app: &mut App, text: &str, inline: bool) {
     if app.focus != Focus::Input {
         app.set_focus(Focus::Input);
+    }
+    // A paste that is nothing but paths to images on disk is an attachment,
+    // not prose -- dragging a screenshot onto the terminal is how most of them
+    // arrive. Mixed or unresolvable text stays text; guessing the other way
+    // would drop what the user actually typed.
+    if !inline {
+        let paths = prompt::image_paste_paths(text);
+        if !paths.is_empty() {
+            let n = paths.len();
+            for path in paths {
+                app.prompt.insert_image(&path);
+            }
+            app.notify(format!("attached {n} image(s)"));
+            return;
+        }
     }
     if inline {
         app.prompt.handle_inline_paste(text);
@@ -3468,13 +3504,14 @@ fn try_drain(bridge: Option<&mut Bridge>, app: &mut App) -> io::Result<()> {
         return Ok(());
     };
     app.send_now = false;
-    start_step(bridge, app, item.text)
+    start_step(bridge, app, item.text, item.images)
 }
 
 fn start_step(
     mut bridge: Option<&mut Bridge>,
     app: &mut App,
     line: String,
+    images: Vec<String>,
 ) -> io::Result<()> {
     app.story_push(RenderBlock::user_prompt(&line));
     app.story.follow_new_turn(None, false);
@@ -3487,7 +3524,7 @@ fn start_step(
             app.running = true;
             app.turn_started = Some(Instant::now());
             app.status = "running".into();
-            b.send(&json!({"op": "step", "text": line}))?;
+            b.send(&json!({"op": "step", "text": line, "images": images}))?;
         }
         // --demo drives the same pane with canned events; its POST card is
         // what a step looks like there.
@@ -3508,7 +3545,15 @@ fn start_step(
 }
 
 fn submit_prompt(mut bridge: Option<&mut Bridge>, app: &mut App) -> io::Result<bool> {
-    let line = app.prompt.to_send();
+    let images = app.prompt.images();
+    // An image with no words is a real prompt -- "look at this" is the whole
+    // message. The bridge rejects an empty one, so name what was attached
+    // rather than inventing a sentence the user did not write.
+    let line = match (app.prompt.to_send(), images.is_empty()) {
+        (t, _) if !t.trim().is_empty() => t,
+        (_, false) => image_prompt_text(&images),
+        (t, true) => t,
+    };
     if line.trim().is_empty() {
         // Emptying a row you lifted out of the queue is how you delete it. The
         // row is already gone; say so, and do not fall through to send-now,
@@ -3619,18 +3664,18 @@ fn submit_prompt(mut bridge: Option<&mut Bridge>, app: &mut App) -> io::Result<b
     if app.running {
         let pos = match slot {
             Some(idx) => {
-                app.queue.insert_at(idx, line);
+                app.queue.insert_at_with(idx, line, images);
                 idx + 1
             }
             None => {
-                app.queue.push(line);
+                app.queue.push_with(line, images);
                 app.queue.len()
             }
         };
         app.notify(format!("queued #{pos}"));
         return Ok(false);
     }
-    start_step(bridge, app, line)?;
+    start_step(bridge, app, line, images)?;
     Ok(false)
 }
 
@@ -5829,12 +5874,11 @@ fn draw_input(f: &mut Frame, area: Rect, app: &mut App) {
             format!(" {text} "),
             Style::default().fg(theme.text_secondary),
         ));
-    } else if app.prompt.is_multiline() {
-        left_title.push(Span::styled(
-            " multiline ",
-            Style::default().fg(theme.accent_success),
-        ));
     }
+    // No "multiline" chip. Wrapping to a second row is visible in the box
+    // itself, so labelling it spent a title slot on something the user can
+    // already see -- and it painted a success-green accent on a state that is
+    // neither a success nor an event.
     if !left_title.is_empty() {
         block = block.title(Line::from(left_title));
     }
@@ -10338,7 +10382,7 @@ mod tests {
     #[test]
     fn live_events_route_conversation_to_story_and_work_to_activity() {
         let mut app = App::new();
-        start_step(None, &mut app, "inspect routing".into()).unwrap();
+        start_step(None, &mut app, "inspect routing".into(), Vec::new()).unwrap();
         handle_event(
             &mut app,
             json!({"ev": "thinking", "text": "private plan", "delta": false}),
@@ -10576,7 +10620,7 @@ mod tests {
         let mut app = App::new();
         assert!(!app.demo);
         app.bridge_gone = true;
-        start_step(None, &mut app, "carry on".into()).unwrap();
+        start_step(None, &mut app, "carry on".into(), Vec::new()).unwrap();
         assert!(!app.running, "nothing is running");
         assert_eq!(app.posts.len(), 0, "no POST group for a step that cannot run");
         let last = app.story.entry(app.story.len() - 1).map(|e| e.block.clone());
@@ -11283,6 +11327,21 @@ mod tests {
             !card.contains("gen 7"),
             "the composer still carries identity:\n{card}"
         );
+    }
+
+    #[test]
+    fn a_multiline_composer_is_not_labelled() {
+        // Wrapping to a second row is visible in the box itself. Labelling it
+        // spent a title slot on something already on screen, and painted a
+        // success-green accent on a state that is neither a success nor an
+        // event.
+        let mut app = App::new();
+        app.prompt.insert_str("first line\nsecond line");
+        assert!(app.prompt.is_multiline());
+        let painted = paint(&mut app, 120, 24);
+        let card = rows_of(&painted, app.input_area);
+        assert!(card.contains("second line"), "composer lost its text:\n{card}");
+        assert!(!card.contains("multiline"), "composer still labels itself:\n{card}");
     }
 
     #[test]

@@ -20,7 +20,10 @@ const TAB: &str = "    ";
 #[derive(Debug, Clone)]
 enum Seg {
     Text(String),
-    Chip { id: u64, body: String },
+    /// A pasted blob. `image` chips carry a filesystem path instead of
+    /// prose: they never reach the prompt text, they ride the step as an
+    /// attachment, and the model sees a real image block.
+    Chip { id: u64, body: String, image: bool },
 }
 
 #[derive(Debug, Clone, Default)]
@@ -66,6 +69,9 @@ impl PromptBuf {
         for s in &self.segs {
             match s {
                 Seg::Text(t) => out.push_str(t),
+                // An image chip is not text. Its bytes go up as an image
+                // block, and vision.attach writes the caption.
+                Seg::Chip { image: true, .. } => {}
                 Seg::Chip { body, .. } => out.push_str(body),
             }
         }
@@ -96,7 +102,7 @@ impl PromptBuf {
             return false;
         }
         if let Some(idx) = self.chip_near_cursor() {
-            if let Seg::Chip { body, .. } = &self.segs[idx] {
+            if let Seg::Chip { body, image: false, .. } = &self.segs[idx] {
                 if body == &text {
                     self.expand_seg(idx);
                     return true;
@@ -105,7 +111,7 @@ impl PromptBuf {
         }
         let lines = text.lines().count();
         if lines >= PASTE_CHIP_MIN_LINES || text.len() > PASTE_CHIP_DISPLAY_BYTES {
-            self.insert_chip(text);
+            self.insert_chip_kind(text, false);
         } else {
             self.insert_raw(&text);
         }
@@ -311,6 +317,9 @@ impl PromptBuf {
         true
     }
 
+    /// Test-only since the composer stopped labelling the state: wrapping is
+    /// visible in the box, so nothing in the render path needs to ask.
+    #[cfg(test)]
     pub fn is_multiline(&self) -> bool {
         self.to_send().contains('\n')
     }
@@ -380,8 +389,12 @@ impl PromptBuf {
         for (i, seg) in self.segs.iter().enumerate() {
             let here = self.seg == i;
             match seg {
-                Seg::Chip { id, body } => {
-                    let label = format!("[{}]", chip_label(body));
+                Seg::Chip { id, body, image } => {
+                    let label = if *image {
+                        format!("[{}]", image_chip_label(body))
+                    } else {
+                        format!("[{}]", chip_label(body))
+                    };
                     let w = UnicodeWidthStr::width(label.as_str());
                     if x + w > width && x > hang {
                         newline(&mut lines, &mut x);
@@ -521,11 +534,29 @@ impl PromptBuf {
         None
     }
 
-    fn insert_chip(&mut self, body: String) {
+    /// Paths of the image chips in the buffer, in order. These leave the
+    /// composer as attachments on the step, not as prompt text.
+    pub fn images(&self) -> Vec<String> {
+        self.segs
+            .iter()
+            .filter_map(|s| match s {
+                Seg::Chip { body, image: true, .. } => Some(body.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Attach one image by path. Never inlines, never coalesces: an image
+    /// is always a chip, however short its path is.
+    pub fn insert_image(&mut self, path: &str) {
+        self.insert_chip_kind(path.to_string(), true);
+    }
+
+    fn insert_chip_kind(&mut self, body: String, image: bool) {
         let id = self.next_id;
         self.next_id += 1;
         let idx = self.split_at_cursor();
-        self.segs.insert(idx, Seg::Chip { id, body });
+        self.segs.insert(idx, Seg::Chip { id, body, image });
         // Leave the cursor after the chip (grok: Enter submits, paste-again expands).
         self.seg = idx + 1;
         self.off = 0;
@@ -588,6 +619,12 @@ impl PromptBuf {
     }
 
     fn expand_seg(&mut self, idx: usize) {
+        // An image chip has no text to expand to -- its body is a path on
+        // disk, and spilling that into the prompt would send the model the
+        // filename instead of the picture.
+        if matches!(self.segs.get(idx), Some(Seg::Chip { image: true, .. })) {
+            return;
+        }
         let Seg::Chip { body, .. } = self.segs.remove(idx) else {
             return;
         };
@@ -694,6 +731,142 @@ pub fn is_text_key(key: &KeyEvent) -> bool {
         && !key.modifiers.contains(KeyModifiers::CONTROL)
         && !key.modifiers.contains(KeyModifiers::SUPER)
         && !key.modifiers.contains(KeyModifiers::ALT)
+}
+
+const IMAGE_EXTS: [&str; 5] = ["png", "jpg", "jpeg", "gif", "webp"];
+
+fn unescape_pasted_path(raw: &str) -> String {
+    let t = raw.trim();
+    let t = t
+        .strip_prefix('\'')
+        .and_then(|r| r.strip_suffix('\''))
+        .or_else(|| t.strip_prefix('"').and_then(|r| r.strip_suffix('"')))
+        .unwrap_or(t);
+    if let Some(rest) = t.strip_prefix("file://") {
+        return percent_decode(rest);
+    }
+    let mut out = String::with_capacity(t.len());
+    let mut chars = t.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            if let Some(n) = chars.next() {
+                out.push(n);
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+fn percent_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            if let Ok(v) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
+                out.push(v);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8(out).unwrap_or_else(|_| s.to_string())
+}
+
+/// A file that exists, allowing for whitespace that a round trip through text
+/// has normalised. macOS writes screenshot names with U+202F before AM/PM, and
+/// any paste turns that into a plain space -- so the exact name misses a file
+/// that is plainly sitting there.
+fn resolve_path(path: &str) -> Option<std::path::PathBuf> {
+    let p = std::path::PathBuf::from(path);
+    if p.is_file() {
+        return Some(p);
+    }
+    let want: String = path.split_whitespace().collect::<Vec<_>>().join(" ");
+    let name = std::path::Path::new(&want).file_name()?.to_owned();
+    let dir = p.parent()?;
+    for entry in std::fs::read_dir(dir).ok()? {
+        let entry = entry.ok()?;
+        let got: String = entry
+            .file_name()
+            .to_string_lossy()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        if got == name.to_string_lossy() {
+            return Some(entry.path());
+        }
+    }
+    None
+}
+
+/// Image paths named by a paste, or empty when the paste is prose.
+///
+/// Three shapes reach a terminal composer: a Finder copy (`file://` URLs, one
+/// per line), a drag onto the terminal (a shell-escaped path), and a quoted
+/// path. Only a paste whose every line resolves to an existing image becomes
+/// an attachment -- guessing wrong the other way silently drops what the user
+/// actually typed, which is far worse than one un-attached path.
+pub fn image_paste_paths(text: &str) -> Vec<String> {
+    let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+    if lines.is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::with_capacity(lines.len());
+    for line in lines {
+        let path = unescape_pasted_path(line);
+        let ext_ok = std::path::Path::new(&path)
+            .extension()
+            .map(|e| IMAGE_EXTS.contains(&e.to_string_lossy().to_lowercase().as_str()))
+            .unwrap_or(false);
+        if !ext_ok {
+            return Vec::new();
+        }
+        match resolve_path(&path) {
+            Some(p) => out.push(p.to_string_lossy().into_owned()),
+            None => return Vec::new(),
+        }
+    }
+    out
+}
+
+/// Clipboard raster written to a temp file, for Ctrl+V of a screenshot.
+///
+/// grok probes the pasteboard for an image or file URLs before falling back to
+/// text; this is that probe, reduced to the one answer the composer needs.
+pub fn clipboard_image_path() -> Option<String> {
+    let text = xai_grok_pager::clipboard::system_clipboard_get();
+    let (image, file_urls) =
+        xai_grok_pager::clipboard::system_clipboard_probe_attachments(text.as_deref()).ok()?;
+    if let Some(urls) = file_urls {
+        let paths = image_paste_paths(&urls);
+        if let Some(first) = paths.into_iter().next() {
+            return Some(first);
+        }
+    }
+    let image = image?;
+    let ext = match image.mime_type.as_str() {
+        "image/jpeg" => "jpg",
+        "image/gif" => "gif",
+        "image/webp" => "webp",
+        _ => "png",
+    };
+    let dir = std::env::temp_dir().join("desmos-paste");
+    std::fs::create_dir_all(&dir).ok()?;
+    let name = format!(
+        "clip-{}.{ext}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_millis()
+    );
+    let path = dir.join(name);
+    std::fs::write(&path, &image.data).ok()?;
+    Some(path.to_string_lossy().into_owned())
 }
 
 pub fn clipboard_text() -> Option<String> {
@@ -815,6 +988,11 @@ pub fn normalize_cr(text: &str) -> String {
 
 fn expand_tabs(text: &str) -> String {
     text.replace('\t', TAB)
+}
+
+fn image_chip_label(path: &str) -> String {
+    let name = path.rsplit('/').next().unwrap_or(path);
+    format!("img {name}")
 }
 
 fn chip_label(body: &str) -> String {
