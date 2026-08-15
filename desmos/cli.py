@@ -356,6 +356,12 @@ def main() -> int:
     r.add_argument("task")
     r.add_argument("--model", default=os.environ.get("DESMOS_MODEL") or "claude-opus-5")
     r.add_argument("--max-turns", type=int, default=32)
+    r.add_argument(
+        "--max-total-tokens",
+        type=int,
+        default=None,
+        help="stop the run once this many prompt+completion tokens are billed",
+    )
     r.add_argument("--max-tokens", type=int, default=MAX_TOKENS)
     r.add_argument("--cwd", default=".")
     r.add_argument("--out", default="")

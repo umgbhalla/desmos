@@ -999,6 +999,38 @@ def self_check() -> None:
         assert any("max_turns" in str(m.get("content")) for m in w_cap.messages), "the cap must be said"
         assert any("max_turns" in e.get("text", "") for e in cap_evs if e.get("ev") == "error")
 
+        # Neither is running out of money. A child gets a token ceiling from
+        # its contract; the root loop had only max_turns, so four huge turns
+        # were unbounded in the unit that bills. Drive the real entry point --
+        # run_turns with max_total_tokens -- and assert it stopped early, said
+        # why in the transcript, and reported `stopped` rather than `done`.
+        w_bud = new_world(cwd, state_path=None, persist=False, ns={})
+        bud_calls = {"n": 0}
+
+        def spendy(*_a, **_k):
+            bud_calls["n"] += 1
+            return {
+                "content": [{"type": "text", "text": "<bash>echo x</bash>"}],
+                "usage": {"input_tokens": 400, "output_tokens": 200},
+            }
+
+        w_bud.complete_fn = spendy
+        bud_evs: list[dict] = []
+        _run(w_bud, "spend", quiet=True, max_turns=8, max_total_tokens=1000, on_event=bud_evs.append)
+        assert bud_calls["n"] == 2, f"600/turn against a 1000 ceiling must stop at 2, got {bud_calls['n']}"
+        assert any(
+            "token budget of 1000" in str(m.get("content")) for m in w_bud.messages
+        ), "the budget stop must be in the transcript"
+        stops = [e for e in bud_evs if e.get("ev") == "stopped"]
+        assert stops and "token budget" in stops[-1].get("text", ""), bud_evs[-3:]
+        assert not any(e.get("ev") == "done" for e in bud_evs), "a budget stop is not a clean finish"
+
+        # And the ceiling is per step, not per session: a second step on the
+        # same world starts its count at zero rather than inheriting the spend.
+        bud_calls["n"] = 0
+        _run(w_bud, "spend again", quiet=True, max_turns=8, max_total_tokens=1000)
+        assert bud_calls["n"] == 2, f"the count must restart per step, got {bud_calls['n']}"
+
         # The OpenAI stream needs the terminal check the Anthropic one grew.
         from desmos import openai as _oai_stream
 

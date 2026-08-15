@@ -292,6 +292,18 @@ def _commit_step(world: World, prompt: str, last: str) -> None:
     save(world)
 
 
+def _spent_tokens(world: World, since: int) -> int:
+    """Prompt + completion tokens billed by this step so far."""
+    total = 0
+    for entry in world.log[since:]:
+        usage = entry.get("usage") or {}
+        for key in ("input_tokens", "output_tokens"):
+            value = usage.get(key)
+            if isinstance(value, int):
+                total += value
+    return total
+
+
 def run_turns(
     world: World,
     prompt: str,
@@ -301,6 +313,7 @@ def run_turns(
     quiet: bool = False,
     on_event: Callable[[dict[str, Any]], None] | None = None,
     should_stop: Callable[[], bool] | None = None,
+    max_total_tokens: int | None = None,
 ) -> str:
     """Run a step to its end, and always say how it ended.
 
@@ -322,6 +335,7 @@ def run_turns(
             "turn, or spawn() a subagent, which gets its own world"
         )
     world.running = True
+    hit: list[str] = []
     try:
         return _run_turns(
             world,
@@ -331,11 +345,15 @@ def run_turns(
             quiet=quiet,
             on_event=on_event,
             should_stop=should_stop,
+            max_total_tokens=max_total_tokens,
+            budget_hit=hit,
         )
     finally:
         world.running = False
         if on_event is not None:
-            if should_stop is not None and should_stop():
+            if hit:
+                on_event({"ev": "stopped", "text": f"{hit[0]}, saved"})
+            elif should_stop is not None and should_stop():
                 on_event({"ev": "stopped", "text": "stopped, saved"})
             else:
                 on_event({"ev": "done"})
@@ -350,13 +368,31 @@ def _run_turns(
     quiet: bool = False,
     on_event: Callable[[dict[str, Any]], None] | None = None,
     should_stop: Callable[[], bool] | None = None,
+    max_total_tokens: int | None = None,
+    budget_hit: list[str] | None = None,
 ) -> str:
     def emit(ev: dict[str, Any]) -> None:
         if on_event is not None:
             on_event(ev)
 
+    # A child gets a token ceiling from its contract's budget. The root loop
+    # only ever had max_turns, so a run that burned its whole context in four
+    # enormous turns was unbounded in the one unit that costs money. Count from
+    # where this step began, so a nested step() is charged for itself rather
+    # than for the session in front of it.
+    spent_from = len(world.log)
+    hit = budget_hit if budget_hit is not None else []
+
     def stopped() -> bool:
-        return should_stop is not None and should_stop()
+        if max_total_tokens is not None and not hit:
+            if _spent_tokens(world, spent_from) >= max_total_tokens:
+                hit.append(f"token budget of {max_total_tokens} reached")
+        return bool(hit) or (should_stop is not None and should_stop())
+
+    def stop_note(n: int) -> str:
+        if hit:
+            return f"[stopped: {hit[0]} after turn {n}]"
+        return f"[stopped by the user after turn {n}]"
 
     # Tag handlers reach the wire through here.
     world.emit = emit
@@ -365,6 +401,8 @@ def _run_turns(
     last = ""
     for n in range(1, max_turns + 1):
         if stopped():
+            if n > 1:
+                world.messages.append({"role": "user", "content": stop_note(n - 1)})
             _commit_step(world, prompt, last)
             return last
         emit({"ev": "turn", "n": n})
@@ -377,7 +415,7 @@ def _run_turns(
                 max_tokens,
                 n=n,
                 emit=emit,
-                should_stop=should_stop,
+                should_stop=stopped,
             )
         except Exception as exc:  # noqa: BLE001
             # A failure is a value, not an unwind. Letting it propagate left a
@@ -418,9 +456,7 @@ def _run_turns(
                 # the model's own tags, whichever results happened to run, and
                 # nothing saying it had been interrupted -- which reads as work
                 # that finished.
-                world.messages.append(
-                    {"role": "user", "content": f"[stopped by the user after turn {n}]"}
-                )
+                world.messages.append({"role": "user", "content": stop_note(n)})
             _commit_step(world, prompt, speech)
             return speech
     # Same for the cap: it was printed, and the bridge runs quiet=True, so the
@@ -454,12 +490,24 @@ def new_world(
 
 
 def bind_step(world: World) -> Callable[..., str]:
-    def step(prompt: str, *, max_turns: int = 32, max_tokens: int = MAX_TOKENS) -> str:
+    def step(
+        prompt: str,
+        *,
+        max_turns: int = 32,
+        max_tokens: int = MAX_TOKENS,
+        max_total_tokens: int | None = None,
+    ) -> str:
         if not isinstance(prompt, str) or not prompt.strip():
             raise TypeError("step(prompt) needs a non-empty string")
         from desmos.loop import run_turns as _run
 
-        return _run(world, prompt, max_turns=max_turns, max_tokens=max_tokens)
+        return _run(
+            world,
+            prompt,
+            max_turns=max_turns,
+            max_tokens=max_tokens,
+            max_total_tokens=max_total_tokens,
+        )
 
     world.ns["step"] = step
     world.ns["world"] = world
@@ -574,7 +622,13 @@ def run(args: Any) -> int:
     print(f"model={world.model} thinking={world.thinking} max_turns={args.max_turns} cwd={cwd}")
     print(system_prompt(world))
     print("--------------")
-    run_turns(world, args.task, max_turns=args.max_turns, max_tokens=args.max_tokens)
+    run_turns(
+        world,
+        args.task,
+        max_turns=args.max_turns,
+        max_tokens=args.max_tokens,
+        max_total_tokens=getattr(args, "max_total_tokens", None),
+    )
     summary = {
         "task": args.task,
         "ns": ns_names(world),
