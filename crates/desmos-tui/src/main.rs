@@ -195,31 +195,44 @@ fn pretty_json(v: &Value) -> String {
 }
 
 impl Focus {
+    /// Tab walks the frame clockwise, Shift-Tab anti-clockwise. The old order
+    /// walked down the right column, jumped back to the middle of the left one,
+    /// and then walked *down* that too -- half a ring in one direction and half
+    /// in the other, so neither key had a direction you could point at.
+    ///
+    /// The frame is two columns. Left, top to bottom: Story, the POST split,
+    /// Queue, Input. Right, top to bottom: Activity, Git, Files, Meta. So
+    /// clockwise is: across the top, down the right edge, back across the
+    /// bottom, up the left edge.
     fn next(self) -> Self {
         match self {
+            // Across the top and down the right column.
             Self::Story => Self::Calls,
-            Self::Calls => Self::Meter,
-            Self::Meter => Self::Git,
+            Self::Calls => Self::Git,
             Self::Git => Self::Files,
-            Self::Files => Self::PostIn,
-            Self::PostIn => Self::PostOut,
-            Self::PostOut => Self::Queue,
-            Self::Queue => Self::Input,
-            Self::Input => Self::Story,
+            Self::Files => Self::Meter,
+            // Bottom-right to bottom-left, then back up the left column.
+            Self::Meter => Self::Input,
+            Self::Input => Self::Queue,
+            Self::Queue => Self::PostOut,
+            // The POST split is one row of two panes; going left inside it is
+            // still going anti-clockwise around the ring.
+            Self::PostOut => Self::PostIn,
+            Self::PostIn => Self::Story,
         }
     }
 
     fn prev(self) -> Self {
         match self {
-            Self::Story => Self::Input,
-            Self::Calls => Self::Story,
-            Self::Meter => Self::Calls,
-            Self::Git => Self::Meter,
+            Self::Story => Self::PostIn,
+            Self::PostIn => Self::PostOut,
+            Self::PostOut => Self::Queue,
+            Self::Queue => Self::Input,
+            Self::Input => Self::Meter,
+            Self::Meter => Self::Files,
             Self::Files => Self::Git,
-            Self::PostIn => Self::Files,
-            Self::PostOut => Self::PostIn,
-            Self::Queue => Self::PostOut,
-            Self::Input => Self::Queue,
+            Self::Git => Self::Calls,
+            Self::Calls => Self::Story,
         }
     }
 
@@ -11357,22 +11370,92 @@ mod tests {
         assert_ne!(app.git.tab, tab_before, "→ walks the git tab strip");
     }
 
+    /// Tab is a ring, and the ring has a direction: clockwise around the frame.
+    /// Asserted against the rects draw actually assigned, not against the match
+    /// arms -- an order that reads clockwise in source can still zig-zag on
+    /// screen once the layout moves a pane.
+    #[test]
+    fn tab_walks_the_frame_clockwise() {
+        let mut app = App::new();
+        // Side panes are collapsed until they are opened, and a pane with no
+        // rows is not on the ring at all.
+        app.layout.git_h = 6;
+        app.layout.files_h = 6;
+        app.queue.push("later".into());
+        let _ = paint(&mut app, 160, 60);
+        let rect = |app: &App, f: Focus| match f {
+            Focus::Story => app.traj_area,
+            Focus::Calls => app.call_area,
+            Focus::PostIn => app.post_in_area,
+            Focus::PostOut => app.post_out_area,
+            Focus::Queue => app.queue_area,
+            Focus::Git => app.git_area,
+            Focus::Files => app.files_area,
+            Focus::Meter => app.cache.area,
+            Focus::Input => app.input_area,
+        };
+        let ring = [
+            Focus::Story,
+            Focus::Calls,
+            Focus::Git,
+            Focus::Files,
+            Focus::Meter,
+            Focus::Input,
+            Focus::Queue,
+            Focus::PostOut,
+            Focus::PostIn,
+        ];
+        // The cycle is exactly this ring, and Shift-Tab is exactly its inverse.
+        let open = pane_open(&app);
+        for (i, f) in ring.iter().enumerate() {
+            let want = ring[(i + 1) % ring.len()];
+            assert!(open(*f), "{} is not on screen", focus_name(*f));
+            assert_eq!(f.next_open(&open), want, "Tab from {}", focus_name(*f));
+            assert_eq!(want.prev_open(&open), *f, "Shift-Tab from {}", focus_name(want));
+        }
+        // Down the right edge: x stays on the right column, y only grows.
+        for pair in [
+            (Focus::Calls, Focus::Git),
+            (Focus::Git, Focus::Files),
+            (Focus::Files, Focus::Meter),
+        ] {
+            let (a, b) = (rect(&app, pair.0), rect(&app, pair.1));
+            assert_eq!(a.x, b.x, "{} left the right column", focus_name(pair.1));
+            assert!(a.y < b.y, "{} went up, not down", focus_name(pair.1));
+        }
+        // Up the left edge: x stays left, y only shrinks.
+        for pair in [
+            (Focus::Input, Focus::Queue),
+            (Focus::Queue, Focus::PostOut),
+            (Focus::PostOut, Focus::PostIn),
+        ] {
+            let (a, b) = (rect(&app, pair.0), rect(&app, pair.1));
+            assert!(a.y >= b.y, "{} went down, not up", focus_name(pair.1));
+        }
+        // The POST split is one row of two panes, so climbing the left edge
+        // enters it on the right and leaves on the left.
+        assert!(rect(&app, Focus::PostIn).x < rect(&app, Focus::PostOut).x);
+        // The two crossings: top-left to top-right, bottom-right to bottom-left.
+        assert!(rect(&app, Focus::Story).x < rect(&app, Focus::Calls).x);
+        assert!(rect(&app, Focus::Input).x < rect(&app, Focus::Meter).x);
+    }
+
     #[test]
     fn tab_skips_empty_queue() {
         let mut app = App::new();
         // Focus follows the rects draw assigned, so a pane has to have been
         // painted before Tab can land on it.
         let _ = paint(&mut app, 140, 40);
-        app.set_focus(Focus::PostOut);
+        app.set_focus(Focus::Input);
         handle_key(None, &mut app, tab()).unwrap();
-        assert_eq!(app.focus, Focus::Input, "empty queue must not take Tab");
+        assert_eq!(app.focus, Focus::PostOut, "empty queue must not take Tab");
         handle_key(None, &mut app, backtab()).unwrap();
-        assert_eq!(app.focus, Focus::PostOut, "Shift-Tab must skip empty queue");
+        assert_eq!(app.focus, Focus::Input, "Shift-Tab must skip empty queue");
         app.queue.push("later".into());
         handle_key(None, &mut app, tab()).unwrap();
         assert_eq!(app.focus, Focus::Queue);
         handle_key(None, &mut app, tab()).unwrap();
-        assert_eq!(app.focus, Focus::Input);
+        assert_eq!(app.focus, Focus::PostOut);
         handle_key(None, &mut app, backtab()).unwrap();
         assert_eq!(app.focus, Focus::Queue);
     }
