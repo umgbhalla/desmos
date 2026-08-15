@@ -108,6 +108,8 @@ def runtime_block(world: World) -> str:
             f"  generations: {sdk / 'generations.py'}",
             f"readme: {root / 'README.md'}",
             f"docs: {root / 'docs'}",
+            f"  design: {root / 'docs' / 'design.md'}",
+            f"  tags: {root / 'docs' / 'tags.md'}",
             f"  extensibility: {root / 'docs' / 'extensibility.md'}",
             f"  self-growth: {root / 'docs' / 'self-growth.md'}",
             f"  subagents: {root / 'docs' / 'subagents.md'}",

@@ -1,0 +1,37 @@
+name: Feature request
+description: Propose a capability, a tag, a pane, or a doc that should exist.
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What you were trying to do when the harness got in the way.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposal
+      description: What you want instead, concretely.
+    validations:
+      required: true
+  - type: dropdown
+    id: layer
+    attributes:
+      label: Which layer should own it
+      description: "See docs/design.md. Most capability belongs outside the frozen core."
+      options:
+        - a skill (SKILL.md, loaded on demand)
+        - an extension (.desmos/extensions/*.py)
+        - a grown tag (registered at runtime)
+        - the TUI
+        - the frozen core (needs a strong reason)
+        - not sure
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: What you tried instead
+      description: Existing tag, skill, or workaround, and why it was not enough.

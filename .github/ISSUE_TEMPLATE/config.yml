@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/umgbhalla/desmos/security/advisories/new
+    about: Report privately. Never in a public issue.
+  - name: Design and tag reference
+    url: https://github.com/umgbhalla/desmos/blob/main/docs/design.md
+    about: How the loop, dispatcher, persistence and providers fit together.

@@ -1,10 +1,24 @@
+<div align="center">
+
 # desmos
 
-A coding agent that owns its harness.
+**A coding agent that owns its harness.**
 
-You put data in the kernel. You write a prompt. You call `step`. The model
-peeks at variables by name. It does not get their contents stuffed into the
-chat. Sequential `step` calls see prior prompts and answers.
+[![check](https://github.com/umgbhalla/desmos/actions/workflows/check.yml/badge.svg)](https://github.com/umgbhalla/desmos/actions/workflows/check.yml)
+[![license](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![python](https://img.shields.io/badge/python-3.11%2B-blue.svg)](pyproject.toml)
+[![dependencies](https://img.shields.io/badge/runtime%20deps-0-brightgreen.svg)](pyproject.toml)
+
+[Design](docs/design.md) · [Tags](docs/tags.md) · [Self-growth](docs/self-growth.md) · [Subagents](docs/subagents.md) · [Contributing](CONTRIBUTING.md)
+
+</div>
+
+---
+
+## The inversion
+
+Most agents own the conversation and call your code. desmos flips it. **You own
+a Python kernel; the agent is a function you call from inside it.**
 
 ```python
 doc = open("paper.txt").read()
@@ -12,247 +26,258 @@ step("what's in doc? don't dump it")
 step("ok, now list the functions it defines")
 ```
 
-Frozen XML tags are the brainstem. Everything else — new tools, descriptions,
-system notes, skills — the model writes itself from inside the kernel. The
-next `complete()` sees the change. No restart.
+`doc` never enters the prompt. The model gets an *index* of the kernel — names
+and shapes — and a way to run code against them. It fetches what it needs. The
+context window ends up holding decisions and results instead of payloads, and
+sequential `step` calls share one transcript.
 
-```
-<python>          exec, names persist
-<bash>            isolated one-shot in cwd, no state kept
-<shell>           preferred persistent pty; 5s read windows, commands survive
-<edit>            unique replace (old --- new)
-<register>        grow a new tag
-<system>          write / delete a catalog note
-<tool>            rewrite a tool description
-<skill>           load a full SKILL.md
-<reload>          rediscover skills/extensions now
-<reload_sdk>      reimport desmos.* and rebind step
-<evolve>          snapshot grown state
-<rollback>        restore generation n=
-```
+The second half of the idea: **capability is discovered, not compiled in.**
+Thirteen frozen XML tags are the brainstem. Every other tool, description, note
+and skill is written by the agent, at runtime, into state that survives the
+process. The next `complete()` sees the change. No restart.
 
-## IPython
+## Quickstart
 
 ```bash
 uv venv && uv pip install -e ".[kernel]"
 source .venv/bin/activate
-git submodule update --init vendor/comet   # only for the optional Comet frontend
-python -m desmos console          # IPython with step and world bound
-python -m desmos tui              # story | calls | input  (needs cargo)
-python -m desmos tui --demo       # same layout, no API key
-python -m desmos tui --grok       # grok-build pager, desmos as ACP agent
-python -m desmos comet            # Comet desktop frontend via ACP
-python -m desmos kernel           # install a Jupyter kernelspec named Desmos
+
+export ANTHROPIC_API_KEY=...      # or: python -m desmos auth login   (OpenAI)
+
+python -m desmos check            # self-check, no API key needed
+python -m desmos tui              # the full interface (needs cargo)
+python -m desmos tui --demo       # same layout, offline, no key
+python -m desmos console          # IPython with step() and world bound
+python -m desmos run "add a --json flag to inverted.py --check"
 ```
 
-The harness itself is stdlib-only — `dependencies = []`. The `kernel` extra is
-just IPython.
+The harness itself is stdlib-only — `pyproject.toml` says `dependencies = []`.
+The `kernel` extra is just IPython. Only the TUI needs Rust.
 
-Default TUI, left column then right:
+## The frozen tags
+
+Text the model writes is speech. An XML tag is a syscall.
+
+| tag | what it does |
+|---|---|
+| `python` | exec in the persistent kernel; names stay |
+| `bash` | one-shot subprocess in cwd, no state kept |
+| `shell` | named persistent pty: cwd, env, venv and running processes survive |
+| `edit` | replace exactly one occurrence (`old` / `---` / `new`) |
+| `register` | install a new tag, live on the next dispatch |
+| `system` | write or delete a note — doctrine, in every prompt |
+| `tool` | rewrite a tool's catalog description |
+| `skill` | load a full `SKILL.md` on demand |
+| `reload` | rediscover skills and extensions now |
+| `reload_sdk` | reimport `desmos.*` and rebind `step` without restarting |
+| `evolve` | snapshot grown state as the next generation |
+| `rollback` | restore generation `n` |
+| `memory` | durable cross-session memory, kept out of the prompt |
+
+Every tag in a reply runs, in order; all results come back together as
+user-role `result` blocks on the same transcript. Any tag takes `end="TOKEN"`
+so a body can contain tag text safely.
+
+**Full reference with attributes and result shapes: [docs/tags.md](docs/tags.md).**
+
+## How a turn works
+
+```mermaid
+sequenceDiagram
+    participant U as you (kernel)
+    participant L as loop
+    participant P as provider
+    participant D as dispatch
+    U->>L: step("task")
+    L->>P: system prompt + transcript
+    P-->>L: thinking, speech, syscalls (streamed)
+    L->>D: each tag, in written order
+    D-->>L: results (capped, spilled to a file if huge)
+    L->>P: next POST with the results appended
+    Note over L,P: until the reply has no syscalls
+    L-->>U: final speech
+```
+
+Grown tools, notes and the transcript tail live in `.desmos/harness.sqlite3`.
+`evolve` snapshots them as a numbered generation; `rollback` restores one. That
+pair is what makes self-modification survivable.
+
+**Architecture, dispatch order, persistence and the invariants:
+[docs/design.md](docs/design.md).**
+
+## The TUI
 
 ```
-story        the turn: your prompt, thinking, speech as markdown,
-             and each <edit> as a folded diff card (→ opens, ⏎ zooms)
+python -m desmos tui
+```
+
+Left column, then right:
+
+```
+story        the turn: your prompt, speech as markdown, each edit as a
+             folded diff card
 POST in/out  the last complete() request and reply as a folding JSON tree
 queue        follow-ups stacked while a step runs (hidden when empty)
 input        the composer
 
-calls        the wire: complete() cards and every syscall with body + result
+activity     the wire: complete() cards and every syscall with body + result
 git          status / branches / log, tabbed
 files        the file the git cursor points at, or the filesystem
-meta         bottom-right: the turn row (spinner, phase/turn elapsed, live
-             subagent count), ctx bar, cache read-vs-write, cost,
-             model/effort/gen, theme
+meta         ctx bar, cache read-vs-write, cost, model/effort/gen, theme
 ```
 
 `ctrl+p` opens the settings picker (provider, model, effort). `ctrl+g` and
-`ctrl+b` toggle the git and file panes. Tab cycles panes, skipping any that is
-collapsed to zero rows; in every pane the arrows mean the same thing — up/down
-moves the cursor, left/right drives that pane's second axis (fold, tab,
-directory, order). `?` in any pane but the composer floats that pane's key
-cheatsheet.
+`ctrl+b` toggle the git and file panes. Tab cycles panes, skipping any collapsed
+to zero rows; everywhere, up/down moves the cursor and left/right drives that
+pane's second axis (fold, tab, directory, order). `?` floats the focused pane's
+cheatsheet. `Enter` zooms the selected block into a searchable viewer.
 
-In calls, `[` and `]` step whole groups — one group per `complete()` POST,
-holding the syscalls that POST produced. The pane title counts them (`#2/5`).
-Arrows still mean fold, so the group step gets its own pair of keys.
+While a step runs, `Enter` queues a follow-up instead of interrupting; an empty
+`Enter` is send-now. `[` and `]` reorder the queue.
 
-`--grok` launches grok-build's pager-bin (`--minimal --no-leader`) with
-`python -m desmos acp` on stdio. `desmos comet` builds and launches the
-vendored Comet desktop frontend with Desmos registered as an ACP harness; see
-[the Comet frontend guide](docs/comet-frontend.md) for scope and setup.
+`--grok` launches grok-build's pager with `python -m desmos acp` on stdio.
+`python -m desmos comet` launches the vendored Comet desktop frontend with
+desmos registered as an ACP harness — see
+[docs/comet-frontend.md](docs/comet-frontend.md).
 
-`DESMOS_ACP` is our branch inside the committed pager, not upstream, so a sync
-that overwrites it hands `--grok` back to grok's own agent with no compile
-error; `python -m desmos check` asserts it is still there.
-
-Ordinary cells stay Python. `step("...")` is the agent. Syscall results
-append as user-role `<result>` blocks on the same transcript (Pi-style).
-`<evolve>` / `<rollback>` snapshot grown state as numbered generations.
-`<edit path="file">old\\n---\\nnew</edit>` is the Prime-style unique replace.
-
-The agent updates itself: write a skill or a note, then `<reload/>`. After
-editing the SDK: `<reload_sdk/>` (or `reload_sdk()` in a cell) reimports
-`desmos.*` and rebinds `step` without restarting IPython. New ABI/loop apply
-on the next `complete()`.
-
-### Building the TUI
-
-Only the TUI needs Rust. `rust-toolchain.toml` pins **1.97.1**, and the pager's
-build scripts need a proto compiler (`brew install protobuf`, or
-`protobuf-compiler` on Debian). `.cargo/config.toml` forces
-`PROTOC=scripts/protoc` — a wrapper that resolves to a real absolute file so
-cargo's `rerun-if-changed` stays stable; a bare PATH `protoc` makes cargo
-rebuild the whole pager graph on every launch.
-
-`python -m desmos tui` hashes our sources and reuses `target/release/desmos-tui`
-unless those bytes changed, so only the first launch is the slow one.
-`vendor/grok-build` is committed, but a cold build still fetches two git deps
-(the `async-openai` patch and `nucleo`) — it is not an offline build.
-
-### Auth
-
-```bash
-export ANTHROPIC_API_KEY=...       # anthropic: environment only
-python -m desmos auth login        # openai: browser + PKCE to localhost:1455
-python -m desmos auth login --device
-python -m desmos auth status       # which providers are usable
-```
-
-OpenAI credentials land in `~/.desmos/auth.json` (`DESMOS_AUTH` moves it). An
-existing Codex CLI login at `~/.codex/auth.json` is read as-is.
+Recording clips of any of this: [docs/demos.md](docs/demos.md).
 
 ## Two providers
 
 Anthropic and OpenAI, one transcript, switchable mid-session.
 
-```
-anthropic   claude-opus-5, claude-sonnet-4-6      ANTHROPIC_API_KEY
-openai      gpt-5.6-sol, -luna, -terra            device login, ~/.desmos/auth.json
+| provider | models | credential |
+|---|---|---|
+| anthropic | `claude-opus-5`, `claude-sonnet-4-6` | `ANTHROPIC_API_KEY` (environment only) |
+| openai | `gpt-5.6-sol`, `-luna`, `-terra` | `python -m desmos auth login` → `~/.desmos/auth.json` |
+
+```bash
+python -m desmos auth login             # browser + PKCE to localhost:1455
+python -m desmos auth login --device
+python -m desmos auth status            # which providers are usable
 ```
 
-`ctrl+p` in the TUI picks provider → model → effort and saves the choice to
-`~/.desmos/settings.json` (`DESMOS_SETTINGS` moves that file). The saved choice
-outranks whatever the last session persisted. A machine with no settings file
-has not been onboarded, so the TUI opens the picker instead of guessing.
+An existing Codex CLI login at `~/.codex/auth.json` is read as-is.
 
-Switching keeps the transcript. Blocks the other provider made survive as
-plain text — lossy, never fatal — because a reasoning item is opaque to
-anything but the endpoint that produced it. Nothing is compacted or discarded
-to make a switch work.
+Switching keeps the transcript. Blocks the other provider made survive as plain
+text — lossy, never fatal, because a reasoning item is opaque to anything but
+the endpoint that produced it. Nothing is compacted or discarded to make a
+switch work.
 
 The system prompt adapts to the family it is driving (`desmos/dialect.py`): the
 capability half is identical, the working-style half is not. Asking Opus 5 for
-brevity shortens its answers; asking GPT-5.6 the same thing shortens the
-artifact instead, so it is not asked.
+brevity shortens its answers; asking GPT-5.6 the same shortens the artifact
+instead, so it is not asked.
 
-Both providers fold the transcript server-side once it grows past the trigger —
-Anthropic via `compact_20260112`, OpenAI via Responses `context_management`.
-The returned block is opaque, replayed verbatim, and is the cut point for
-everything before it. desmos never rewrites history locally; a fold paints a
-`FOLD` card on the wire pane.
+Both providers fold the transcript **server-side** once it passes the trigger —
+Anthropic via `compact_20260112`, OpenAI via Responses `context_management`. The
+returned block is opaque, replayed verbatim, and becomes the cut point for
+everything before it. desmos never rewrites history locally, so a fold cannot
+invalidate the cached prefix.
 
-`ANTHROPIC_API_KEY` comes from the environment. Never commit it.
-`DESMOS_MODEL` picks the model for `desmos run` and `inverted.py` (default
-`claude-opus-5`). The TUI does not consult it: `~/.desmos/settings.json` wins,
-and a machine with no settings file opens the picker.
-`DESMOS_THINKING` is the effort floor (`low` by default). Opus 5 uses adaptive
-thinking; older Claude 4 models use a token budget plus interleaved thinking.
-On OpenAI the same dial becomes `reasoning.effort`.
+`ctrl+p` in the TUI saves provider/model/effort to `~/.desmos/settings.json`
+(`DESMOS_SETTINGS` moves it); that file outranks whatever the last session
+persisted, and a machine without one opens the picker rather than guessing.
+`DESMOS_MODEL` picks the model for `desmos run` and `inverted.py`;
+`DESMOS_THINKING` is the effort floor (`low`).
 
 ## Headless
 
 ```bash
-python -m desmos check
-python -m desmos run "add a --json flag to inverted.py --check"
-# or
+python -m desmos run "task"
+python inverted.py "task"          # back-compat entry, same defaults
 python inverted.py --check
-python inverted.py "task"
 ```
 
-Both entry points take the same defaults (`--max-tokens`, `--max-turns`,
-`--max-total-tokens`).
+Both take the same `--max-tokens`, `--max-turns`, `--max-total-tokens`. Traces
+land under `runs/`. State lands in `.desmos/harness.sqlite3` (gitignored). The
+chat is append-only inside a session, only its tail is carried across a restart,
+and `reset()` clears it outright.
 
-State lands in `.desmos/harness.sqlite3` (gitignored): grown tools, notes, prior
-steps. The chat is append-only inside a session, but only its tail is carried
-across a restart, and `reset()` clears it outright. Traces go under `runs/`.
+## Skills and extensions
 
-## Skills and extensions (Pi / Prime grain)
+Same grain as [pi](https://github.com/earendil-works/pi) and Prime Agent. The
+base ABI stays frozen; capability is discovered.
 
-Same shape as [earendil-works/pi](https://github.com/earendil-works/pi) and Prime
-Agent. The base ABI stays frozen. Capability is discovered, not baked in.
-
-**Skills** — Agent Skills `SKILL.md`. Catalog is name + description only.
-`<skill name="…"/>` loads the full file. Python-backed skills (a `handle`/`run`
-module) are imported into the kernel.
-
-```
-~/.desmos/skills/<name>/SKILL.md
-.desmos/skills/<name>/SKILL.md
-~/.agents/skills/          # shared with other harnesses
-.agents/skills/
-```
-
-The two `~` roots are machine-global and shared with every other harness on the
-box. Every `SKILL.md` found under any of these puts its name and description in
-`<available_skills>` on every POST, so a skill dropped there by something else
-is one desmos pays for too.
-
-**Extensions** — `load(api)` Python files. They can `api.register_tool` or
-`api.on("before_dispatch", …)`.
+**Skills** are Agent Skills `SKILL.md` files. The catalog carries name and
+description only — `skill name="…"` loads the full body on demand, so a long
+procedure costs one line until someone asks for it. Python-backed skills are
+imported into the kernel.
 
 ```
-~/.desmos/extensions/*.py
-.desmos/extensions/*.py
+.desmos/skills/<name>/SKILL.md      project
+~/.desmos/skills/<name>/SKILL.md    machine
+.agents/skills/  ~/.agents/skills/  shared with other harnesses
 ```
 
-See [docs/extensibility.md](docs/extensibility.md).
+The `~` roots are shared with every other harness on the box, so a skill dropped
+there by something else is one desmos pays for too.
 
-## Demos
+**Extensions** are `load(api)` Python files under `.desmos/extensions/` or
+`~/.desmos/extensions/`. They can `api.tool(...)` to add a tag, or
+`api.hook("before_dispatch", …)` to inspect or veto one — returning a string
+from that hook replaces the result and the call never runs.
 
-Recorded with [termctrl](https://github.com/zeu5/termctrl) driving the offline
-`--demo` TUI, so a capture needs no API key.
+See [docs/extensibility.md](docs/extensibility.md) and
+[docs/self-growth.md](docs/self-growth.md).
 
-    ./scripts/record-demo.sh panes     # story vs wire, folding, POST tree
-    ./scripts/record-demo.sh wire      # tail stays open, overflow counted
-    ./scripts/record-demo.sh zoom      # zoom a block into the pager, search
+## Subagents
 
-All three export **2600x1448 at 60fps**, verified with ffprobe. Resolution is
-cell geometry, not a flag:
+`spawn` returns immediately; `wait`, `gather`, `status` and `result` collect.
+A child is an isolated `World` with its own transcript, a scoped tag set, and no
+ability to write parent state. Depth is capped at 1.
 
-    width  = (cols * cell_width  + 2 * padding) * pixel_ratio
-    height = (rows * cell_height + 2 * padding) * pixel_ratio
+Pass a `TaskContract` (or the `simple={...}` shorthand) and the parent judges the
+child's claims against what it actually observed — `judgment(id)` is the verdict,
+`result(id)` is only the child's story about itself. A bare string task skips all
+of that and gives you prose you have to take on trust.
+[docs/subagents.md](docs/subagents.md).
 
-Defaults are `140x38` cells at `9x18`, padding `20`, ratio `2`. Override per run:
+## Development
 
-    COLS=160 ROWS=45 RATIO=3 ./scripts/record-demo.sh panes   # 4320x2532
+```bash
+python -m desmos check                     # harness self-check
+python -m unittest discover -s tests -q    # unit tests
+cargo test -p desmos-tui                   # TUI
+cargo test -p xai-grok-markdown -p xai-grok-markdown-core
+```
 
-Raise `RATIO` instead of upscaling afterwards: termctrl rasterises at the target
-size, so glyph edges stay sharp. Exact 16:9 is not reachable with integer cells
--- 2600x1448 is 1.795.
+Never `cargo build --workspace`: every vendored grok crate is a member, so that
+builds ~89 packages. Always target a package.
 
-`--record` keeps the raw `.termctrl` (original timing, bytes, input, markers), so
-re-cutting a clip never re-runs the session:
+Building the TUI needs Rust (`rust-toolchain.toml` pins **1.97.1**) and a
+protobuf compiler (`brew install protobuf`, or `protobuf-compiler` on Debian).
+`.cargo/config.toml` forces `PROTOC=scripts/protoc`, a wrapper that resolves to
+a real absolute path so cargo's `rerun-if-changed` stays stable — a bare PATH
+`protoc` makes cargo rebuild the whole pager graph on every launch.
+`python -m desmos tui` hashes our sources and reuses `target/release/desmos-tui`
+unless they changed, so only the first launch is slow. `vendor/grok-build` is
+committed, but a cold build still fetches two git deps; it is not offline.
 
-    termctrl markers captures/panes.termctrl
-    termctrl video captures/panes.termctrl --edit plan.json --footer
+`DESMOS_ACP` is our branch inside the committed pager, not upstream — a sync
+that overwrites it hands `--grok` back to grok's own agent with no compile
+error, so `python -m desmos check` asserts it is still there.
 
-Two things that bite: input atoms need `text:<char>` (a bare `j` is rejected),
-and `termctrl start` is not idempotent, so the script stops and prunes the
-session name first.
+Contributions welcome: [CONTRIBUTING.md](CONTRIBUTING.md).
+Vulnerabilities: [SECURITY.md](SECURITY.md) — never a public issue.
 
-### What is worth filming
+## Docs
 
-One idea per clip. The offline demo is static content, so navigation scenes
-yield only 3-5 unique screens. Streaming, queueing, subagents and the diff card
-need a live session (`--live`, which does spend tokens).
+| page | what it covers |
+|---|---|
+| [design.md](docs/design.md) | architecture, turn loop, dispatch, persistence, invariants |
+| [tags.md](docs/tags.md) | every tag, attributes, result shapes |
+| [self-growth.md](docs/self-growth.md) | how the agent extends itself |
+| [extensibility.md](docs/extensibility.md) | writing an extension |
+| [subagents.md](docs/subagents.md) | contracts, fan-out, judgment |
+| [comet-frontend.md](docs/comet-frontend.md) | the optional desktop frontend |
+| [openai-prompt-cache-audit.md](docs/openai-prompt-cache-audit.md) | measured cache behaviour |
+| [demos.md](docs/demos.md) | recording the TUI |
 
-| scene | shows | offline |
-|---|---|---|
-| `panes` | prose left, the syscalls that produced it right | yes |
-| `wire` | newest cards open, older folded, `N more up` | yes |
-| `zoom` | block viewer: search, wrap, raw | yes |
-| stream | a syscall card opening, stdout arriving into it | no |
-| queue | Enter stacking follow-ups mid-step, `[` `]` reorder | no |
-| spawn | SubagentBlock, Enter into the child session | no |
-| diff | an edit card rendering hunks | no |
-| lag | `POST out #5  waiting #6` mid-step | no |
+`AGENTS.md` (symlinked as `CLAUDE.md`) is the instruction file for coding agents
+run against this repo.
+
+## License
+
+MIT — see [LICENSE](LICENSE). Vendored third-party code under `vendor/` keeps
+its own license.

@@ -1,0 +1,63 @@
+name: Bug report
+description: Something in the harness, the TUI, or a provider path behaves wrong.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Security issues do not go here — use
+        [private reporting](https://github.com/umgbhalla/desmos/security/advisories/new).
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you expected, and what you got instead.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Reproduction
+      description: The smallest sequence that shows it. Commands, prompts, keys pressed.
+      render: shell
+    validations:
+      required: true
+  - type: dropdown
+    id: surface
+    attributes:
+      label: Surface
+      options:
+        - TUI (python -m desmos tui)
+        - console / IPython
+        - headless (desmos run, inverted.py)
+        - ACP frontend (--grok, comet)
+        - subagents
+        - persistence / generations
+        - docs
+    validations:
+      required: true
+  - type: input
+    id: model
+    attributes:
+      label: Model and effort
+      placeholder: claude-opus-5 / low
+  - type: textarea
+    id: check
+    attributes:
+      label: Self-check output
+      description: "Output of `python -m desmos check`. Redact anything key-shaped."
+      render: shell
+  - type: input
+    id: env
+    attributes:
+      label: OS, Python, and (for TUI bugs) cargo version
+      placeholder: macOS 15.3, Python 3.12.7, cargo 1.97.1
+    validations:
+      required: true
+  - type: checkboxes
+    id: sanity
+    attributes:
+      label: Before filing
+      options:
+        - label: "`python -m desmos check` was run and its output is above or attached."
+        - label: No API keys, tokens, or transcript contents that should stay private are in this report.

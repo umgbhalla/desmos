@@ -11,7 +11,29 @@ jobs:
         with:
           python-version: "3.12"
       - name: self-check
+        run: python3 -m desmos check
+      - name: unit tests
+        run: python3 -m unittest discover -s tests -q
+      - name: back-compat entry
         run: python3 inverted.py --check
+      - name: docs links resolve
+        run: |
+          python3 - <<'PY'
+          import pathlib, re, sys
+          root = pathlib.Path(".")
+          bad = []
+          for md in [*root.glob("*.md"), *root.glob("docs/*.md"), *root.glob(".github/**/*.md")]:
+              for text, link in re.findall(r"\[([^\]]*)\]\(([^)]+)\)", md.read_text()):
+                  if link.startswith(("http://", "https://", "#", "mailto:")):
+                      continue
+                  target = (md.parent / link.split("#")[0]).resolve()
+                  if not target.exists():
+                      bad.append(f"{md}: [{text}]({link})")
+          if bad:
+              print("\n".join(bad), file=sys.stderr)
+              sys.exit(1)
+          print("all relative links resolve")
+          PY
       - name: no secrets
         # Key-shaped material only: a 16-char floor no placeholder or "$VAR"
         # clears, so the whole tree is in scope with no pathspec exclusions --
