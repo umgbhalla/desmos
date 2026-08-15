@@ -5309,6 +5309,18 @@ fn draw(f: &mut Frame, app: &mut App) {
         let buf = f.buffer_mut();
         app.picker.render(buf, area);
     }
+    // Everything above paints over the panes, but a Kitty placement sits
+    // above the cell background: an image behind an open modal would show
+    // through it. Dropping this frame's placements makes the flush delete
+    // them, and the next frame without a modal puts them back.
+    if app.post_inspect.is_some()
+        || app.viewer.is_some()
+        || app.help
+        || app.session_picker.open
+        || app.picker.open
+    {
+        app.media.frame.clear();
+    }
 }
 
 fn draw_json_tree(
@@ -12628,6 +12640,34 @@ mod tests {
             !app.media.frame.is_empty(),
             "see card produced no image placement"
         );
+    }
+
+    /// An open modal paints over the story, but a placement is drawn above
+    /// the cell background -- the image would show through. The frame has to
+    /// come back empty so the flush deletes it.
+    #[test]
+    fn a_modal_takes_the_images_down() {
+        let _kitty = gfx::set_protocol_for_test(gfx::GraphicsProtocol::Kitty);
+        let png = png_file("modal");
+        let mut app = App::new();
+        start_step(
+            None,
+            &mut app,
+            "look".into(),
+            vec![png.to_string_lossy().into_owned()],
+        )
+        .unwrap();
+        let backend = TestBackend::new(140, 40);
+        let mut term = Terminal::new(backend).unwrap();
+
+        app.media.frame.clear();
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        assert!(!app.media.frame.is_empty(), "no image to hide");
+
+        app.help = true;
+        app.media.frame.clear();
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        assert!(app.media.frame.is_empty(), "image left under the modal");
     }
 
     /// Without inline graphics nothing is written to the terminal at all --
