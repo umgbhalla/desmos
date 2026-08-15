@@ -14,6 +14,14 @@ from desmos.const import FROZEN, PRIOR_KEEP
 from desmos.exec import callable_from_source
 from desmos.types import Tool, World
 
+# There is no getumask, so it is read by setting it -- which is why it happens
+# once here, at import, while the process is still single-threaded. Doing it
+# inside the write left the whole process at umask 0 for two syscalls, and any
+# file another thread or a forked <shell> created in that window landed
+# world-writable.
+_UMASK = os.umask(0)
+os.umask(_UMASK)
+
 SCHEMA_VERSION = 1
 SESSION_ID = "default"
 DB_FILENAME = "harness.sqlite3"
@@ -37,13 +45,11 @@ def atomic_write(path: Path, text: str) -> None:
         # a rewrite would drop the mode someone already set, and a first write
         # would land private where the plain open() this replaced left umask
         # (MEMORY.md is meant to be read by humans, including a second account
-        # sharing the checkout). There is no getumask, so read it by setting it.
+        # sharing the checkout).
         if path.exists():
             os.chmod(tmp, path.stat().st_mode & 0o777)
         else:
-            mask = os.umask(0)
-            os.umask(mask)
-            os.chmod(tmp, 0o666 & ~mask)
+            os.chmod(tmp, 0o666 & ~_UMASK)
         os.replace(tmp, path)
     except BaseException:
         Path(tmp).unlink(missing_ok=True)

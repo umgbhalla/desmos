@@ -8,6 +8,7 @@ import os
 import select
 import signal
 import subprocess
+import sys
 import threading
 import time
 import traceback
@@ -64,6 +65,22 @@ class PythonStopped(BaseException):
     """
 
 
+def _in_python_block(ident: int) -> bool:
+    """True while a frame compiled from a <python> block is on that thread.
+
+    The one thing the watcher can see from outside that an async exception
+    cannot skip: a frame is off the stack because the interpreter took it off.
+    Everything the kernel thread could set for us -- an Event, a flag -- can be
+    interrupted on the bytecode before it.
+    """
+    frame = sys._current_frames().get(ident)
+    while frame is not None:
+        if frame.f_code.co_filename == "<python>":
+            return True
+        frame = frame.f_back
+    return False
+
+
 @contextlib.contextmanager
 def _watchdog(should_stop: ShouldStop | None, timeout: float) -> Any:
     """Raise PythonStopped into this thread once it has run too long.
@@ -75,13 +92,15 @@ def _watchdog(should_stop: ShouldStop | None, timeout: float) -> Any:
     reports the stop when it returns. Nothing short of a subprocess can, and a
     subprocess is a different tag -- <python> exists to touch world.ns.
     """
-    tid = ctypes.c_ulong(threading.get_ident())
+    ident = threading.get_ident()
+    tid = ctypes.c_ulong(ident)
     setexc = ctypes.pythonapi.PyThreadState_SetAsyncExc
     reason: list[str] = []
     finished = threading.Event()
 
     def watch() -> None:
         deadline = time.monotonic() + timeout
+        thrown = False
         while not finished.wait(_WATCH_TICK):
             if not reason:
                 if should_stop is not None and should_stop():
@@ -90,7 +109,16 @@ def _watchdog(should_stop: ShouldStop | None, timeout: float) -> Any:
                     reason.append(f"timed out after {timeout:g}s")
                 else:
                     continue
+            if thrown and not _in_python_block(ident):
+                # A throw has landed and the block is off the stack, so there
+                # is nothing left to stop. Waiting for finished instead would
+                # leak this thread whenever the throw arrived in the two
+                # bytecodes between the yield returning and the finally that
+                # sets it -- and a leaked watcher re-arms PythonStopped into
+                # whatever the kernel does next, for as long as it lives.
+                return
             setexc(tid, ctypes.py_object(PythonStopped))
+            thrown = True
 
     watcher = threading.Thread(target=watch, daemon=True)
     watcher.start()
@@ -101,9 +129,9 @@ def _watchdog(should_stop: ShouldStop | None, timeout: float) -> Any:
         try:
             watcher.join()
         finally:
-            # The last re-arm can land just after join() returns, so the clear
-            # has to run on that path too -- otherwise the kernel gets a
-            # PythonStopped one call later, out of nowhere.
+            # A re-arm the watcher fired just before it stopped may still be
+            # pending, undelivered, on this thread. Clear it or the kernel gets
+            # a PythonStopped one call later, out of nowhere.
             setexc(tid, None)
 
 
@@ -120,6 +148,9 @@ def run_python(
         return "(empty)"
     buf = _ChunkWriter(on_chunk)
     ns = world.ns
+    # Bound before the with: a stop thrown while the watchdog is still starting
+    # never reaches `as stopped`, and the handler below read it anyway.
+    stopped: list[str] = []
     try:
         with _watchdog(should_stop, PYTHON_TIMEOUT if timeout is None else timeout) as stopped:
             # ast.parse ran outside the redirect, so a warning raised while
@@ -279,24 +310,49 @@ def run_bash(
 
 
 def callable_from_source(world: World, source: str, name: str) -> Callable[..., Any]:
-    local: dict[str, Any] = {}
-    exec(compile(source, f"<register:{name}>", "exec"), world.ns, local)
-    # Only what this source defined. The fallback used to be
-    # `world.ns.get("handle")`, so one <python> block that left a top-level
-    # `handle` in the namespace got registered under every later tag name --
-    # and the tag still answered "registered <greet>" while dispatching the
-    # older function. A body that defines nothing registered that too.
-    fn = local.get(name) or local.get("handle")
-    if not callable(fn):
-        for v in local.values():
-            if callable(v):
-                fn = v
-                break
-    if not callable(fn):
+    # The handler is whichever `def` *this* source wrote, named for the tag or
+    # named handle. Nothing else counts. Taking whatever the namespace happened
+    # to hold registered a `handle` some older <python> block had left behind;
+    # taking the first callable in the exec locals registered the private
+    # helper above the handler, or `pathlib.Path` off an import line -- and the
+    # tag answered "registered <loud>" either way while dispatching that.
+    #
+    # An assignment counts too, as long as this source wrote it: `handle =
+    # functools.partial(...)` and `handle = lambda body, **a: ...` are handlers
+    # the model writes, and looking only at `def` refused them -- or, with one
+    # helper def beside the assignment, silently registered the helper.
+    defs = []
+    bound = []
+    for node in ast.parse(source).body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            defs.append(node.name)
+        elif isinstance(node, ast.Assign):
+            bound += [t.id for t in node.targets if isinstance(t, ast.Name)]
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            bound.append(node.target.id)
+    if name in defs or name in bound:
+        pick = name
+    elif "handle" in defs or "handle" in bound:
+        pick = "handle"
+    elif len(defs) == 1:
+        # One def and no ambiguity about which one it is.
+        pick = defs[0]
+    elif defs:
+        raise ValueError(
+            f"<register name={name!r}> body defines {', '.join(defs)} and none of "
+            f"them is the handler; name it `{name}` or `handle`"
+        )
+    else:
         raise ValueError(
             f"<register name={name!r}> body defined no function; write "
             f"`def {name}(body, **attrs): ...` or `def handle(body, **attrs): ...`"
         )
+    # One namespace, not globals + a throwaway locals dict: a helper the body
+    # defines has to still be there when the handler runs and calls it.
+    exec(compile(source, f"<register:{name}>", "exec"), world.ns)
+    fn = world.ns.get(pick)
+    if not callable(fn):
+        raise ValueError(f"<register name={name!r}>: {pick} is not callable")
     world.ns[f"handle_{name}"] = fn
     return fn
 

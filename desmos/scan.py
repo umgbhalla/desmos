@@ -63,8 +63,9 @@ def _indent_width(line: str) -> int:
     return len(line) - len(line.lstrip(" "))
 
 
-def _list_col(lines: list[str]) -> int:
-    """Content column of the innermost list item still open after `lines`.
+def _list_cols(text: str) -> list[tuple[int, int, bool]]:
+    """For each line: its start offset, the open list item's content column, and
+    whether the line before it was blank.
 
     CommonMark measures an indented code block from the enclosing item's
     content column, not from column zero: under `- ` the content starts at 2,
@@ -72,10 +73,19 @@ def _list_col(lines: list[str]) -> int:
     a real call. A blank line and then a shallower line closes the item; a
     shallower line with no blank before it is a lazy continuation and does not,
     which is why this cannot be decided from the previous line alone.
+
+    One forward pass, because the answer for every line is wanted. Recomputing
+    it per candidate tag was quadratic on ordinary markdown -- a 28 KB reply
+    made of a list with indented continuations took 1.7 seconds to scan, and
+    the loop scans each message more than once.
     """
+    rows: list[tuple[int, int, bool]] = []
     cols: list[int] = []
     blank = True
-    for ln in lines:
+    off = 0
+    for ln in text.split("\n"):
+        rows.append((off, cols[-1] if cols else 0, blank))
+        off += len(ln) + 1
         if not ln.strip():
             blank = True
             continue
@@ -87,20 +97,28 @@ def _list_col(lines: list[str]) -> int:
         if m and ind <= (cols[-1] if cols else 0) + 3:
             cols.append(len(m.group(0)) + (0 if m.group(1) else 1))
         blank = False
-    return cols[-1] if cols else 0
+    return rows
 
 
-def _indent_span(text: str, pos: int) -> tuple[int, int] | None:
+def _indent_span(
+    text: str, pos: int, rows: list[tuple[int, int, bool]] | None = None
+) -> tuple[int, int] | None:
     """Span of the next indented code block at or after `pos`.
 
     Only where CommonMark actually starts one: over-masking would re-create the
     failure this whole scanner is careful about, a real call disappearing.
     """
+    if rows is None:
+        rows = _list_cols(text)
+    from bisect import bisect_right
+
+    starts = [r[0] for r in rows]
     for m in INDENTED.finditer(text, pos):
-        before = text[: m.start()].splitlines()
-        if before and before[-1].strip():
+        i = bisect_right(starts, m.start()) - 1
+        _, col, blank = rows[i]
+        if not blank:
             continue  # indented continuation of a paragraph, not a block
-        floor = _list_col(before) + 4
+        floor = col + 4
         if _indent_width(m.group(0)) < floor:
             continue  # a paragraph of the list item it sits in, not code
         end = m.end()
@@ -112,6 +130,47 @@ def _indent_span(text: str, pos: int) -> tuple[int, int] | None:
     return None
 
 
+def _in_string(body: str) -> bool:
+    """Is the end of `body` inside an unclosed quote?
+
+    Bash and Python agree on the part that matters here: a run of `'` or `"`
+    opens, the same run closes, and a backslash escapes the next character
+    inside a double quote. Triple quotes are handled by the run length, so a
+    docstring mentioning a closing tag does not end the block.
+    """
+    i, n = 0, len(body)
+    while i < n:
+        c = body[i]
+        if c == "\\":
+            i += 2
+            continue
+        if c not in "\"'":
+            i += 1
+            continue
+        run = 3 if body[i : i + 3] in ('"""', "'''") else 1
+        quote = body[i : i + run]
+        j = i + run
+        while j < n:
+            if body[j] == "\\" and run == 1 and quote == '"':
+                j += 2
+                continue
+            if body[j : j + run] == quote:
+                break
+            j += 1
+        if j >= n:
+            return True  # opened and never closed: everything after is string
+        i = j + run
+    return False
+
+
+def _run(line: str, i: int) -> int:
+    """Length of the backtick run starting at `i`."""
+    j = i
+    while j < len(line) and line[j] == "`":
+        j += 1
+    return j - i
+
+
 def _in_code_span(text: str, at: int) -> int | None:
     """End of the inline code span containing `at`, if there is one.
 
@@ -121,37 +180,32 @@ def _in_code_span(text: str, at: int) -> int | None:
     CommonMark says and what the renderer draws. Treating it as code to end of
     line let one stray backtick eat the syscall after it, and a message with no
     syscalls left in it is how the loop decides the model is finished.
+
+    Backticks are found with `str.find`, not by walking characters: this runs
+    once per candidate tag over that tag's whole line, and a 326 KB reply with
+    no newline in it -- a pasted JSX dump -- stalled the turn for 26 seconds
+    walking the same line in Python for every tag on it.
     """
     start = text.rfind("\n", 0, at) + 1
     end = text.find("\n", at)
     line = text[start:] if end < 0 else text[start:end]
     col = at - start
-    i = 0
-    while i < len(line):
-        if line[i] != "`":
-            i += 1
-            continue
-        n = 0
-        while i + n < len(line) and line[i + n] == "`":
-            n += 1
+    i = line.find("`")
+    while i >= 0:
+        n = _run(line, i)
         j, close = i + n, None
-        while j < len(line):
-            if line[j] == "`":
-                m = 0
-                while j + m < len(line) and line[j + m] == "`":
-                    m += 1
-                if m == n:
-                    close = j + m
-                    break
-                j += m
-            else:
-                j += 1
+        while (j := line.find("`", j)) >= 0:
+            m = _run(line, j)
+            if m == n:
+                close = j + m
+                break
+            j += m
         if close is None:
-            i += n
+            i = line.find("`", i + n)
             continue
         if i <= col < close:
             return start + close
-        i = close
+        i = line.find("`", close)
     return None
 
 
@@ -207,7 +261,8 @@ def scan_spans(text: str) -> list[tuple[Block, int, int]]:
     blocks: list[tuple[Block, int, int]] = []
     pos = 0
     fence = _fence_span(text, 0)
-    indent = _indent_span(text, 0)
+    rows = _list_cols(text)
+    indent = _indent_span(text, 0, rows)
     while True:
         m = TAG_OPEN.search(text, pos)
         if not m:
@@ -218,7 +273,7 @@ def scan_spans(text: str) -> list[tuple[Block, int, int]]:
             pos = fence[1]
             continue
         while indent and indent[1] <= m.start():
-            indent = _indent_span(text, indent[1])
+            indent = _indent_span(text, indent[1], rows)
         if indent and indent[0] <= m.start() < indent[1]:
             pos = indent[1]
             continue
@@ -240,26 +295,27 @@ def scan_spans(text: str) -> list[tuple[Block, int, int]]:
         if not fm:
             pos = m.end()  # unterminated: a cut-off reply is not half-dispatched
             continue
-        # A same-name tag inside the body used to end it at the first closer:
-        # half a <bash> command ran and the rest became residue nobody read.
-        # Depth-matching past that closer is only safe while nothing else is in
-        # the way -- one `<python>` mentioned in a string plus one stray
-        # `</python>` further down the prose is enough to balance across a whole
-        # `<bash>ls</bash>` and eat it, which is the failure this scanner exists
-        # to prevent. So the search stops at the first tag past the first closer
-        # that is not another closer for this same tag.
-        depth, end, stop = 1, fm.start(), fm.end()
-        for om in TAG_ANY.finditer(text, m.end()):
-            shut = bool(om.group(1)) and om.group(2) == tag
-            if om.start() >= stop and not shut:
+        # The body ends at the first closer that is not inside a string, because
+        # the only closer the model writes early is one it quoted: `print("
+        # </python>")`, `echo "</bash>"`. Ending there truncated the body and ran
+        # half the program.
+        #
+        # Depth-matching past it is worse. An opener quoted anywhere in the body
+        # inflates the count, so one stray `</bash>` further down the prose
+        # balances across everything between -- and for <bash> that means the
+        # narration in between is executed. `<bash>echo "<bash>"</bash>` then a
+        # line of prose then `</bash>` ran the prose. Quoting is what tells the
+        # two apart, so ask about quoting rather than counting tags.
+        end, stop = fm.start(), fm.end()
+        while _in_string(text[m.end() : end]):
+            fm = closer.search(text, stop)
+            if not fm:
+                end, stop = m.end(), m.end()  # unterminated once quotes are honoured
                 break
-            if shut:
-                depth -= 1
-                if depth == 0:
-                    end, stop = om.start(), om.end()
-                    break
-            elif not om.group(1) and om.group(2) == tag and not om.group(4):
-                depth += 1
+            end, stop = fm.start(), fm.end()
+        if stop == m.end():
+            pos = m.end()
+            continue
         blocks.append((Block(tag, text[m.end() : end], attrs), m.start(), stop))
         pos = stop
     return blocks
