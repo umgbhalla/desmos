@@ -32,6 +32,9 @@
 //! Query stack: Enter mid-step queues a follow-up. After the step ends the
 //! front runs. Empty Enter is send-now (stop + fire the front).
 
+mod app;
+mod events;
+mod input;
 mod json_tree;
 mod picker;
 mod prompt;
@@ -39,6 +42,9 @@ mod queue;
 mod session;
 mod side;
 mod slash;
+mod stream;
+mod wire;
+mod work;
 
 /// The theme cache is process-global and cargo runs tests on threads. Any test
 /// that reads or writes it takes this first, in any module of this binary.
@@ -61,8 +67,6 @@ fn theme_lock() -> std::sync::MutexGuard<'static, ()> {
     guard
 }
 
-use std::borrow::Cow;
-use std::collections::{HashMap, HashSet};
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::process::{Child, ChildStdin, Command, Stdio};
@@ -102,7 +106,7 @@ use xai_grok_pager::scrollback::{
     DisplayMode, EntryId, RenderBlock, ScratchBuffer, ScrollbackEntry, ScrollbackPane,
     ScrollbackState,
     text_selection::{
-        ActiveTextDrag, PendingTextDrag, PersistentTextSelection, RangeHit,
+        ActiveTextDrag, PendingTextDrag, PersistentTextSelection,
         ResolvedSelectionModel, SelectionEndpoint, SelectionKind, SelectionOrigin,
         configured_word_separators, drag_threshold_exceeded, reconstruct_selection_text,
         render_active_selection_overlay, render_persistent_selection_overlay,
@@ -120,22 +124,15 @@ use xai_grok_pager::views::modal_window::{
 };
 use xai_grok_pager::glyphs;
 
+use app::*;
+use events::*;
+use input::*;
+use stream::*;
+use wire::*;
+use work::*;
 use json_tree::JsonTree;
-use prompt::{PromptBuf, clipboard_text, coalesce_events, is_inline_paste_key, is_paste_key, is_text_key};
-use queue::QueryQueue;
+use prompt::{clipboard_text, coalesce_events, is_inline_paste_key, is_paste_key, is_text_key};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Focus {
-    Story,
-    Calls,
-    Meter,
-    Git,
-    Files,
-    PostIn,
-    PostOut,
-    Queue,
-    Input,
-}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ViewerSrc {
@@ -196,240 +193,7 @@ fn pretty_json(v: &Value) -> String {
     serde_json::to_string_pretty(v).unwrap_or_else(|_| v.to_string())
 }
 
-impl Focus {
-    /// Tab walks the frame clockwise, Shift-Tab anti-clockwise. The old order
-    /// walked down the right column, jumped back to the middle of the left one,
-    /// and then walked *down* that too -- half a ring in one direction and half
-    /// in the other, so neither key had a direction you could point at.
-    ///
-    /// The frame is two columns. Left, top to bottom: Story, the POST split,
-    /// Queue, Input. Right, top to bottom: Activity, Git, Files, Meta. So
-    /// clockwise is: across the top, down the right edge, back across the
-    /// bottom, up the left edge.
-    fn next(self) -> Self {
-        match self {
-            // Across the top and down the right column.
-            Self::Story => Self::Calls,
-            Self::Calls => Self::Git,
-            Self::Git => Self::Files,
-            Self::Files => Self::Meter,
-            // Bottom-right to bottom-left, then back up the left column.
-            Self::Meter => Self::Input,
-            Self::Input => Self::Queue,
-            Self::Queue => Self::PostOut,
-            // The POST split is one row of two panes; going left inside it is
-            // still going anti-clockwise around the ring.
-            Self::PostOut => Self::PostIn,
-            Self::PostIn => Self::Story,
-        }
-    }
 
-    fn prev(self) -> Self {
-        match self {
-            Self::Story => Self::PostIn,
-            Self::PostIn => Self::PostOut,
-            Self::PostOut => Self::Queue,
-            Self::Queue => Self::Input,
-            Self::Input => Self::Meter,
-            Self::Meter => Self::Files,
-            Self::Files => Self::Git,
-            Self::Git => Self::Calls,
-            Self::Calls => Self::Story,
-        }
-    }
-
-    /// Tab cycle. A pane collapsed to zero rows is not a pane.
-    fn next_open(self, open: &dyn Fn(Focus) -> bool) -> Self {
-        let mut f = self.next();
-        for _ in 0..8 {
-            if open(f) {
-                break;
-            }
-            f = f.next();
-        }
-        f
-    }
-
-    fn prev_open(self, open: &dyn Fn(Focus) -> bool) -> Self {
-        let mut f = self.prev();
-        for _ in 0..8 {
-            if open(f) {
-                break;
-            }
-            f = f.prev();
-        }
-        f
-    }
-}
-
-/// Pane sizes, adjusted live with `+` / `-` on the focused pane and kept in
-/// `.desmos/tui.json` so a session does not start by re-doing the layout.
-#[derive(Clone, Copy, PartialEq, Eq)]
-struct PaneLayout {
-    /// Width of the wire column (calls + meter) as a percent of the top row.
-    wire_pct: u16,
-    /// Rows for the POST in/out split; 0 hides it.
-    post_h: u16,
-    /// Rows for the cache meter; 0 hides it.
-    meter_h: u16,
-    /// Width of POST in as a percent of the POST row; the rest is POST out.
-    post_split: u16,
-    /// Rows for the git pane; 0 keeps it closed, which is how it starts.
-    git_h: u16,
-    /// Rows for the file view under it; 0 keeps it closed.
-    files_h: u16,
-}
-
-/// Which way a resize key pushes. `+`/`-` drive each pane's main axis;
-/// ctrl+arrows drive whichever axis the arrow points along.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Axis {
-    Horizontal,
-    Vertical,
-}
-
-impl Default for PaneLayout {
-    fn default() -> Self {
-        Self {
-            wire_pct: 38,
-            post_h: 12,
-            // Five inner rows hold context, cache, cost, agent, and theme;
-            // +2 for the border. Runtime activity lives on the composer.
-            meter_h: 7,
-            post_split: 50,
-            // Both side panes start open. A pane you have to know about before
-            // you can see it is a pane nobody sees; git state and the file it
-            // points at are the two things a harness turn is about. Kept small
-            // so the calls pane still owns most of the wire column — the
-            // `spare` clamp in draw() squeezes these to nothing before it
-            // takes a row off calls.
-            git_h: 6,
-            files_h: 8,
-        }
-    }
-}
-
-impl PaneLayout {
-    const MIN_WIRE: u16 = 15;
-    const MAX_WIRE: u16 = 75;
-    const MAX_POST: u16 = 28;
-    const MAX_METER: u16 = 12;
-    const MIN_SPLIT: u16 = 20;
-    const MAX_SPLIT: u16 = 80;
-    const MAX_SIDE: u16 = 30;
-    /// What a closed side pane opens to — enough for a tab strip and a few rows.
-    const OPEN_SIDE: u16 = 10;
-
-    /// The axis `+` / `-` drives for a pane: the one it can actually give away
-    /// space along. Story and calls share a width; meter and POST own rows.
-    fn main_axis(focus: Focus) -> Axis {
-        match focus {
-            Focus::Story | Focus::Calls => Axis::Horizontal,
-            _ => Axis::Vertical,
-        }
-    }
-
-    fn grow(&mut self, focus: Focus, by: i16) {
-        self.grow_axis(focus, Self::main_axis(focus), by);
-    }
-
-    fn grow_axis(&mut self, focus: Focus, axis: Axis, by: i16) {
-        let step = |v: u16, lo: u16, hi: u16| -> u16 {
-            (v as i16 + by).clamp(lo as i16, hi as i16) as u16
-        };
-        match (focus, axis) {
-            // Story widens by taking the wire column's width, and vice versa.
-            (Focus::Story, Axis::Horizontal) => {
-                self.wire_pct = (self.wire_pct as i16 - by)
-                    .clamp(Self::MIN_WIRE as i16, Self::MAX_WIRE as i16)
-                    as u16
-            }
-            (Focus::Calls | Focus::Meter, Axis::Horizontal) => {
-                self.wire_pct = step(self.wire_pct, Self::MIN_WIRE, Self::MAX_WIRE)
-            }
-            // The top row is whatever the POST split leaves, so story and calls
-            // grow taller by pushing POST down.
-            (Focus::Story | Focus::Calls, Axis::Vertical) => {
-                self.post_h = (self.post_h as i16 - by).clamp(0, Self::MAX_POST as i16) as u16
-            }
-            (Focus::Meter, Axis::Vertical) => self.meter_h = step(self.meter_h, 0, Self::MAX_METER),
-            (Focus::Git, Axis::Vertical) => self.git_h = step(self.git_h, 0, Self::MAX_SIDE),
-            (Focus::Files, Axis::Vertical) => self.files_h = step(self.files_h, 0, Self::MAX_SIDE),
-            (Focus::Git | Focus::Files, Axis::Horizontal) => {
-                self.wire_pct = step(self.wire_pct, Self::MIN_WIRE, Self::MAX_WIRE)
-            }
-            (Focus::PostIn | Focus::PostOut, Axis::Vertical) => {
-                self.post_h = step(self.post_h, 0, Self::MAX_POST)
-            }
-            // POST in and out share a row: one grows out of the other.
-            (Focus::PostIn, Axis::Horizontal) => {
-                self.post_split = step(self.post_split, Self::MIN_SPLIT, Self::MAX_SPLIT)
-            }
-            (Focus::PostOut, Axis::Horizontal) => {
-                self.post_split = (self.post_split as i16 - by)
-                    .clamp(Self::MIN_SPLIT as i16, Self::MAX_SPLIT as i16)
-                    as u16
-            }
-            (Focus::Queue | Focus::Input, _) => {}
-        }
-    }
-
-    fn path() -> Option<PathBuf> {
-        // The pane tests paint an App::new() and assert which panes got rows,
-        // so they have to run against the default layout. Without this, a
-        // developer (or CI) whose cwd holds a saved .desmos/tui.json with
-        // post_h/git_h/files_h at 0 fails ten of them: the panes the test
-        // expects to be painted are the ones that human collapsed.
-        if cfg!(test) {
-            return None;
-        }
-        let cwd = std::env::current_dir().ok()?;
-        Some(cwd.join(".desmos").join("tui.json"))
-    }
-
-    fn load() -> Self {
-        let Some(p) = Self::path() else {
-            return Self::default();
-        };
-        let Ok(raw) = std::fs::read_to_string(p) else {
-            return Self::default();
-        };
-        let Ok(v) = serde_json::from_str::<Value>(&raw) else {
-            return Self::default();
-        };
-        let d = Self::default();
-        let n = |k: &str, fallback: u16| {
-            v.get(k).and_then(Value::as_u64).unwrap_or(fallback as u64) as u16
-        };
-        Self {
-            wire_pct: n("wire_pct", d.wire_pct).clamp(Self::MIN_WIRE, Self::MAX_WIRE),
-            post_h: n("post_h", d.post_h).min(Self::MAX_POST),
-            meter_h: n("meter_h", d.meter_h).min(Self::MAX_METER),
-            post_split: n("post_split", d.post_split).clamp(Self::MIN_SPLIT, Self::MAX_SPLIT),
-            git_h: n("git_h", d.git_h).min(Self::MAX_SIDE),
-            files_h: n("files_h", d.files_h).min(Self::MAX_SIDE),
-        }
-    }
-
-    fn save(&self) {
-        let Some(p) = Self::path() else { return };
-        if let Some(dir) = p.parent() {
-            let _ = std::fs::create_dir_all(dir);
-        }
-        let _ = std::fs::write(
-            p,
-            json!({
-                "wire_pct": self.wire_pct,
-                "post_h": self.post_h,
-                "meter_h": self.meter_h,
-                "post_split": self.post_split,
-                "git_h": self.git_h,
-                "files_h": self.files_h,
-            })
-            .to_string(),
-        );
-    }
-}
 
 struct Bridge {
     child: Child,
@@ -516,226 +280,6 @@ impl Drop for Bridge {
     }
 }
 
-/// In-flight thinking / speech. Deltas buffer here; grok markdown
-/// (`push_chunk`) runs once per frame, not once per SSE token.
-#[derive(Default)]
-struct StreamCursor {
-    think: Option<EntryId>,
-    speech: Option<EntryId>,
-    speech_raw: String,
-    speech_shown: String,
-    pending_think: String,
-    /// The invisible stretch since the last prose.
-    run: WorkRun,
-}
-
-impl StreamCursor {
-    fn live(&self) -> bool {
-        self.think.is_some() || self.speech.is_some()
-    }
-
-    fn flush(&mut self, story: &mut ScrollbackState, activity: &mut ScrollbackState) {
-        if let Some(id) = self.think {
-            if !self.pending_think.is_empty() {
-                activity.push_chunk_to_thinking(id, &self.pending_think);
-                self.pending_think.clear();
-            }
-        }
-        self.flush_speech(story);
-    }
-
-    fn flush_speech(&mut self, story: &mut ScrollbackState) {
-        let shown = spoken_prefix(&self.speech_raw);
-        self.show_speech(story, shown);
-    }
-
-    fn show_speech(&mut self, story: &mut ScrollbackState, shown: String) {
-        if shown.trim().is_empty() && self.speech.is_none() {
-            self.speech_shown = shown;
-            return;
-        }
-        if self.speech.is_none() && !shown.is_empty() {
-            self.run.fold(story);
-            self.speech = Some(story.start_streaming_agent());
-        }
-        if let Some(id) = self.speech {
-            if shown.starts_with(&self.speech_shown) {
-                let extra = &shown[self.speech_shown.len()..];
-                if !extra.is_empty() {
-                    story.push_chunk_to_agent(id, extra);
-                }
-            } else {
-                story.finish_running(id);
-                let nid = story.start_streaming_agent();
-                self.speech = Some(nid);
-                if !shown.is_empty() {
-                    story.push_chunk_to_agent(nid, &shown);
-                }
-            }
-        }
-        self.speech_shown = shown;
-    }
-
-    fn finish_think(&mut self, story: &mut ScrollbackState) {
-        if let Some(id) = self.think {
-            if !self.pending_think.is_empty() {
-                story.push_chunk_to_thinking(id, &self.pending_think);
-                self.pending_think.clear();
-            }
-        }
-        if let Some(id) = self.think.take() {
-            let empty = story.get_by_id(id).is_some_and(|e| match &e.block {
-                RenderBlock::Thinking(t) => t.text().trim().is_empty(),
-                _ => false,
-            });
-            if empty {
-                story.remove_entry(id);
-            } else {
-                story.finish_running(id);
-                // A live thought streams Expanded, and grok keeps an Expanded
-                // thinking block expanded on finish (Ctrl+E stickiness). The
-                // record we want is one row, so say so explicitly.
-                set_wire_mode(story, id, DisplayMode::Collapsed);
-                let ms = story.get_by_id(id).and_then(|e| match &e.block {
-                    RenderBlock::Thinking(t) => t.elapsed_time_ms(),
-                    _ => None,
-                });
-                self.run.thought(id, ms);
-                self.run.sync(story);
-            }
-        }
-    }
-
-    fn finish_speech(&mut self, story: &mut ScrollbackState) {
-        // Nothing is in flight once the stream is over, so release what
-        // `spoken_prefix` held back: an opener whose closer never arrived is a
-        // mention, not a call, and the kernel is about to dispatch nothing for
-        // it. Without this pass the hold is never lifted -- `speech_raw` is
-        // cleared three lines down -- and the tail of the message is printed
-        // in neither pane.
-        let shown = strip_syscalls(&self.speech_raw).trim_start().to_string();
-        self.show_speech(story, shown);
-        if let Some(id) = self.speech.take() {
-            story.finish_running(id);
-        }
-        self.speech_raw.clear();
-        self.speech_shown.clear();
-    }
-
-    fn finish(&mut self, story: &mut ScrollbackState, activity: &mut ScrollbackState) {
-        self.finish_think(activity);
-        self.finish_speech(story);
-    }
-}
-
-/// What a call was aimed at, when that is structural rather than payload.
-///
-/// A path from an attr is a target. For a shell command the *program* is the
-/// semantic part -- `cargo`, `git`, `grep` -- while its flags and arguments are
-/// the payload the calls pane already holds, so only the bare program name
-/// comes across, and only after stepping past a leading `cd`.
-fn call_target(tag: &str, ev: &Value) -> Option<String> {
-    if let Some(p) = ev
-        .get("attrs")
-        .and_then(|a| a.get("path"))
-        .and_then(Value::as_str)
-    {
-        return Some(
-            p.rsplit('/')
-                .next()
-                .filter(|s| !s.is_empty())
-                .unwrap_or(p)
-                .to_string(),
-        );
-    }
-    if tag != "bash" {
-        return None;
-    }
-    let body = ev.get("body").and_then(Value::as_str)?;
-    for step in body.split("&&").flat_map(|s| s.split(';')) {
-        let Some(word) = step.split_whitespace().next() else {
-            continue;
-        };
-        if matches!(word, "cd" | "export" | "set" | "source" | "") || word.contains('=') {
-            continue;
-        }
-        let prog = word.rsplit('/').next().unwrap_or(word);
-        return Some(prog.to_string());
-    }
-    None
-}
-
-/// What the repo looks like at the seam, where prose starts.
-///
-/// A run of invisible work is worth reading precisely because it changed
-/// something on disk, and the reader should not have to go look. A moved HEAD
-/// is the headline; otherwise the dirty count is.
-///
-/// Read from the git pane's background snapshot. This used to fork
-/// `git rev-parse` plus `git status --porcelain` on the UI thread, from a
-/// function called after every syscall result and every finished thought —
-/// 0.28s warm per status call in this repo, seconds of frozen frame in a
-/// burst. The snapshot is stale by as much as one read, so a syscall result
-/// forces a fresh one and [`WorkRun::settle`] rewrites the row when it lands:
-/// the run's last call is usually the one that mattered, and `fold` runs the
-/// moment prose starts, well before the pane's own 4s timer comes round.
-fn git_tail(git: &side::GitPane, head_at_start: Option<&str>) -> Option<String> {
-    if let (Some(before), Some(now)) = (head_at_start, git.head()) {
-        if before != now {
-            return Some(format!("\u{00b7} committed {now}"));
-        }
-    }
-    match git.dirty()? {
-        0 => Some("\u{00b7} tree clean".into()),
-        1 => Some("\u{00b7} 1 file dirty".into()),
-        n => Some(format!("\u{00b7} {n} files dirty")),
-    }
-}
-
-/// One thing that happened where the story could not see it.
-#[derive(Debug, Clone, PartialEq)]
-enum Seg {
-    /// A finished thought, in milliseconds.
-    Thought(u64),
-    /// A syscall: the tag, and a target only where one is structural.
-    Call { tag: String, target: Option<String> },
-}
-
-/// A stretch of invisible work — the thoughts and syscalls between two pieces
-/// of prose — folded into one line the reader can actually follow.
-///
-/// The story is a whitelist of narrative kinds, so a run of tool work shows up
-/// as nothing but a stack of collapsed thoughts: three "Thought for 9s" rows
-/// and no hint that six files were read and two were rewritten. This is the
-/// connective tissue. It never carries a body, because it is built from tags
-/// and attrs and never sees one.
-#[derive(Default)]
-struct WorkRun {
-    segs: Vec<Seg>,
-    /// Thought blocks to fold away once the row replaces them.
-    thoughts: Vec<EntryId>,
-    /// HEAD when the run opened, to spot a commit at the seam.
-    head_at_start: Option<String>,
-    /// The repo tail for this run, built from the git pane's background
-    /// snapshot as events arrive. `sync` cannot reach the pane — it is called
-    /// from deep inside the stream cursor — and it must not shell out itself.
-    tail: Option<String>,
-    /// The row itself, once the run has earned one. Rewritten in place as the
-    /// run grows, so it never moves and never stacks.
-    row: Option<EntryId>,
-    /// Generation of the first git read that will see what the run's last
-    /// syscall did — [`side::GitPane::poll`]'s answer, taken at the result.
-    fresh_gen: u64,
-    /// The row a fold just closed: its id, its sentence, the HEAD the run
-    /// opened on, and the read generation its tail is owed. Held until a read
-    /// that old lands, because the tail written at the fold came from a
-    /// snapshot older than the run's last syscall.
-    settled: Option<(EntryId, String, Option<String>, u64)>,
-}
-
-/// Below this a run is not worth a row: the collapsed thought already says
-/// everything, and a line for one grep is worse than silence.
-const RUN_MIN_CALLS: usize = 2;
 
 /// How long a notice stays on the composer's edge. Long enough to read after
 /// the keystroke that caused it, short enough that it is never stale chrome.
@@ -751,193 +295,6 @@ const COMPOSER_DEFAULT_ROWS: u16 = 8;
 /// the kernel stopped.
 const BRIDGE_GONE: &str = "the harness process is gone. nothing further runs in this session; \
                            quit and start it again to continue from the saved transcript.";
-
-impl WorkRun {
-    /// Take the repo state the git pane read on its worker thread. Called as
-    /// events arrive, which is where `app.git` is reachable.
-    fn note_repo(&mut self, git: &side::GitPane) {
-        // Until the run makes its first syscall nothing it did can have moved
-        // HEAD, so every read that lands before then is a better "before" than
-        // the one held. Pinning the first snapshot instead blamed this run for
-        // a commit another terminal made in the previous refresh window.
-        if self.calls() == 0 {
-            self.head_at_start = git.head().map(str::to_string);
-        }
-        self.tail = git_tail(git, self.head_at_start.as_deref());
-    }
-
-    fn call(&mut self, tag: &str, target: Option<String>) {
-        self.segs.push(Seg::Call {
-            tag: tag.to_string(),
-            target,
-        });
-    }
-
-    fn thought(&mut self, _id: EntryId, elapsed_ms: Option<i64>) {
-        // Thinking lives in Activity now, so the Story work-run summary must
-        // not retain or remove an entry id from a different scrollback.
-        self.segs
-            .push(Seg::Thought(elapsed_ms.unwrap_or(0).max(0) as u64));
-    }
-
-    fn calls(&self) -> usize {
-        self.segs
-            .iter()
-            .filter(|s| matches!(s, Seg::Call { .. }))
-            .count()
-    }
-
-    /// Rewrite the row for the run so far. Called after every segment, so the
-    /// reader watches the work accumulate instead of staring at a stack of
-    /// collapsed thoughts until the answer arrives.
-    ///
-    /// The row is written in place: one entry per run, updated, never a second
-    /// row and never a jump to the bottom. It appears only once the run has
-    /// earned it, which is also when the thoughts it summarises are removed.
-    fn sync(&mut self, story: &mut ScrollbackState) {
-        if self.calls() < RUN_MIN_CALLS {
-            return;
-        }
-        let line = row_line(&work_sentence(&self.segs), self.tail.as_deref());
-        for id in self.thoughts.drain(..) {
-            story.remove_entry(id);
-        }
-        let live = self.row.filter(|id| story.get_by_id(*id).is_some());
-        match live {
-            Some(id) => {
-                if let Some(entry) = story.get_by_id_mut(id) {
-                    entry.block = RenderBlock::system(line);
-                }
-                story.mark_structurally_dirty(id);
-                story.mark_height_dirty(id);
-            }
-            None => self.row = Some(story.push_block(RenderBlock::system(line))),
-        }
-    }
-
-    /// Close the run at the seam, just before prose starts. The last sync
-    /// catches the final call; what git says about it is usually still in
-    /// flight, so the row is handed to `settle` for one more read.
-    fn fold(&mut self, story: &mut ScrollbackState) {
-        self.sync(story);
-        if let Some(id) = self.row {
-            self.settled = Some((
-                id,
-                work_sentence(&self.segs),
-                self.head_at_start.clone(),
-                self.fresh_gen,
-            ));
-        }
-        self.reset();
-    }
-
-    /// Rewrite the folded row's tail from a git read that saw the run's last
-    /// syscall.
-    ///
-    /// This is the `git commit` case: the run's last syscall moves HEAD, prose
-    /// starts a fraction of a second later and folds the row from the snapshot
-    /// that preceded the commit, and without this the reader is left with
-    /// "· 4 files dirty" over a run that committed. Waiting on the generation
-    /// rather than on "the next read to land" is the difference between fixing
-    /// that and printing a second pre-commit answer: when the commit landed
-    /// behind a read already in flight, the next snapshot to arrive is the one
-    /// that started too early.
-    fn settle(&mut self, story: &mut ScrollbackState, git: &side::GitPane) {
-        let Some((id, sentence, head, need)) = self.settled.take() else {
-            return;
-        };
-        if git.snap_gen() < need {
-            self.settled = Some((id, sentence, head, need));
-            return;
-        }
-        let Some(entry) = story.get_by_id_mut(id) else {
-            return;
-        };
-        entry.block = RenderBlock::system(row_line(
-            &sentence,
-            git_tail(git, head.as_deref()).as_deref(),
-        ));
-        story.mark_structurally_dirty(id);
-        story.mark_height_dirty(id);
-    }
-
-    fn reset(&mut self) {
-        self.fresh_gen = 0;
-        self.segs.clear();
-        self.thoughts.clear();
-        self.head_at_start = None;
-        self.tail = None;
-        self.row = None;
-    }
-}
-
-/// The work row as it is written: the sentence, then the repo tail if there
-/// is one. Two spaces, because the tail already opens with its own `·`.
-fn row_line(sentence: &str, tail: Option<&str>) -> String {
-    match tail {
-        Some(t) => format!("{sentence}  {t}"),
-        None => sentence.to_string(),
-    }
-}
-
-/// Render a run as one line: thoughts as durations, calls compressed.
-///
-/// Consecutive calls with the same tag become `tag xN`, a lone call keeps its
-/// target, and a run longer than [`SENTENCE_MAX`] groups elides its middle. One
-/// line, always, so the row cannot push the transcript around as it grows.
-fn work_sentence(segs: &[Seg]) -> String {
-    // Group into alternating thought / work phases.
-    let mut phases: Vec<String> = Vec::new();
-    let mut work: Vec<(String, Option<String>, usize)> = Vec::new();
-    let flush = |work: &mut Vec<(String, Option<String>, usize)>, out: &mut Vec<String>| {
-        if work.is_empty() {
-            return;
-        }
-        let parts: Vec<String> = work
-            .drain(..)
-            .map(|(tag, target, n)| match (n, target) {
-                (1, Some(t)) => format!("{tag} {t}"),
-                (1, None) => tag,
-                (n, _) => format!("{tag} \u{00d7}{n}"),
-            })
-            .collect();
-        out.push(parts.join(", "));
-    };
-    for seg in segs {
-        match seg {
-            Seg::Thought(ms) => {
-                flush(&mut work, &mut phases);
-                phases.push(format!("thought {}", human_secs(*ms)));
-            }
-            Seg::Call { tag, target } => match work.last_mut() {
-                Some((t, _, n)) if t == tag => *n += 1,
-                _ => work.push((tag.clone(), target.clone(), 1)),
-            },
-        }
-    }
-    flush(&mut work, &mut phases);
-
-    const SENTENCE_MAX: usize = 5;
-    if phases.len() > SENTENCE_MAX {
-        let head = phases[..2].join(" \u{2192} ");
-        let tail = phases[phases.len() - 2..].join(" \u{2192} ");
-        return format!("{head} \u{2192} \u{2026} \u{2192} {tail}");
-    }
-    phases.join(" \u{2192} ")
-}
-
-/// Durations read as durations: 900ms is "0.9s", 95s is "1m35s".
-fn human_secs(ms: u64) -> String {
-    let secs = ms as f64 / 1000.0;
-    if secs < 10.0 {
-        format!("{secs:.1}s")
-    } else if secs < 60.0 {
-        format!("{}s", secs.round() as u64)
-    } else {
-        let s = secs.round() as u64;
-        format!("{}m{:02}s", s / 60, s % 60)
-    }
-}
 
 /// Live execute card. Stdout deltas join here; one `push_chunk_to_execute` per frame.
 #[derive(Default)]
@@ -965,179 +322,6 @@ impl ExecStream {
     }
 }
 
-/// Child spawn session — grok's per-child AgentView, split into desmos panes.
-struct ChildSess {
-    story: ScrollbackState,
-    calls: ScrollbackState,
-    story_scratch: ScratchBuffer,
-    calls_scratch: ScratchBuffer,
-    story_sel: ResolvedSelectionModel,
-    calls_sel: ResolvedSelectionModel,
-    parent_entry: Option<EntryId>,
-    stream: StreamCursor,
-    exec: ExecStream,
-    story_text: TextSel,
-    calls_text: TextSel,
-    /// This child's POSTs, same contract as `App::posts`. A child runs its
-    /// own, so it needs its own index — sharing the parent's would step the
-    /// cursor to entries that are not in this pane.
-    posts: PostRows,
-    /// Hand-folded cards in *this* pane. EntryIds are handed out per
-    /// ScrollbackState from 1, so a set shared with the parent pinned card #1
-    /// in every session at once.
-    wire_manual: HashSet<EntryId>,
-}
-
-/// Grok text selection for one scrollback (drag, persist, double-click word).
-#[derive(Default)]
-struct TextSel {
-    pending: Option<PendingTextDrag>,
-    active: Option<ActiveTextDrag>,
-    persist: Option<PersistentTextSelection>,
-    last_hit: Option<(Instant, RangeHit)>,
-    clicks: u8,
-}
-
-impl TextSel {
-    fn clear(&mut self) {
-        self.pending = None;
-        self.active = None;
-        self.persist = None;
-    }
-
-    fn note_click(&mut self, now: Instant, hit: RangeHit) -> u8 {
-        if let Some((t, prev)) = self.last_hit {
-            if prev.entry_idx == hit.entry_idx
-                && prev.range_id == hit.range_id
-                && prev.block_line_idx == hit.block_line_idx
-                && now.duration_since(t).as_millis() < 400
-            {
-                self.clicks = (self.clicks + 1).min(3);
-                self.last_hit = Some((now, hit));
-                return self.clicks;
-            }
-        }
-        self.clicks = 1;
-        self.last_hit = Some((now, hit));
-        1
-    }
-}
-
-struct App {
-    prompt: PromptBuf,
-    model: String,
-    thinking: String,
-    /// A switch the bridge has not applied yet. `op: model` queues behind a
-    /// running step, so writing app.model on the picker's say-so made the
-    /// header claim a model the harness was not using — for up to max_turns.
-    /// Hold it here and let the bridge's snapshot be the thing that promotes it.
-    model_pending: Option<(String, String)>,
-    /// Slash completion for the composer. Recomputed on every keystroke that
-    /// changes the line, so it never has to be dismissed explicitly.
-    slash: slash::Slash,
-    /// Theme active before the completion list began previewing. `None` means
-    /// there is no preview transaction to roll back.
-    theme_preview_origin: Option<ThemeKind>,
-    generation: String,
-    running: bool,
-    turn_started: Option<Instant>,
-    /// First chrome paint waits for the bridge `ready` snapshot so the
-    /// status line never flashes `effort:— gen —`.
-    ready: bool,
-    /// Click on grok `[stop]` — applied in the event loop with the bridge.
-    want_stop: bool,
-    turn_cancel: Option<Rect>,
-    status: String,
-    /// The last thing worth telling the user, and when. `status` alone was
-    /// written in twenty places and rendered in none of them; a notice is that
-    /// same string with a clock on it, so it can lapse instead of lingering.
-    notice: Option<(Instant, String)>,
-    story: ScrollbackState,
-    calls: ScrollbackState,
-    post_in: JsonTree,
-    post_out: JsonTree,
-    post_req: Value,
-    post_resp: Value,
-    post_inspect: Option<PostInspect>,
-    /// New/resume choice shown only when a saved transcript exists.
-    session_picker: session::SessionPicker,
-    /// Onboarding / settings overlay. Modal when open.
-    picker: picker::Picker,
-    story_scratch: ScratchBuffer,
-    calls_scratch: ScratchBuffer,
-    /// Inline-image state: what has been uploaded to the terminal, and where
-    /// this frame wants it drawn. Populated during `draw`, consumed by
-    /// `flush_media` right after the frame lands.
-    media: Media,
-    story_sel: ResolvedSelectionModel,
-    calls_sel: ResolvedSelectionModel,
-    post_n: u64,
-    /// Sequence number of the response currently in `post_out`. Lags `post_n`
-    /// while a step is in flight: the out pane is still holding the previous
-    /// turn's reply, and saying so beats blanking it under a new number.
-    post_out_n: u64,
-    queue: QueryQueue,
-    send_now: bool,
-    /// Cheatsheet for the focused pane's keys, open until the next key.
-    help: bool,
-    /// Slot a queued row was lifted from for editing, so Enter puts it back
-    /// where it was instead of at the end of the queue.
-    queue_edit: Option<usize>,
-    drain_after: bool,
-    children: HashMap<String, ChildSess>,
-    viewing: Option<String>,
-    stream: StreamCursor,
-    exec: ExecStream,
-    viewer: Option<BlockViewerPane>,
-    viewer_src: ViewerSrc,
-    focus: Focus,
-    traj_area: Rect,
-    call_area: Rect,
-    /// Wire cards the reader folded or opened by hand. reflow_wire leaves
-    /// these alone; without it the auto-open would fight every keystroke.
-    wire_manual: HashSet<EntryId>,
-    /// One row per `complete()` POST, and the wire pane's group index.
-    ///
-    /// The pager has turn navigation already, but it derives turns from
-    /// `RenderBlock::UserPrompt` entries and the wire pane has none: its
-    /// groups start at a POST card, which is a `ToolCall::Other`. So the
-    /// boundaries are recorded where they are pushed rather than rebuilt from
-    /// block shape, which would mean matching on the header string.
-    posts: PostRows,
-    /// Whether the `YOU POST` / `MODEL POST` cards are on the wire.
-    ///
-    /// Off by default: they are the turn's accounting, not its content, and
-    /// one per turn between the syscalls is most of the pane. The chip in the
-    /// calls title puts them back.
-    show_posts: bool,
-    /// Where that chip is, so a click on the border can hit it.
-    calls_chip: Option<Rect>,
-    post_in_area: Rect,
-    post_out_area: Rect,
-    queue_area: Rect,
-    input_area: Rect,
-    input_inner: Rect,
-    mouse: Option<(u16, u16)>,
-    last_click: Option<(Instant, usize, u8)>, // time, entry, pane: 0 story 1 calls 2 in 3 out
-    last_chip_click: Option<(Instant, u64)>,
-    story_text: TextSel,
-    calls_text: TextSel,
-    cache: CacheMeter,
-    git: side::GitPane,
-    files: side::FilePane,
-    git_area: Rect,
-    files_area: Rect,
-    layout: PaneLayout,
-    /// `--demo`: canned events, no harness behind the composer. Without it a
-    /// missing bridge means the harness died, and the two must not paint the
-    /// same, or a dead session answers a prompt with a POST card labelled
-    /// "demo" and then sits there.
-    demo: bool,
-    /// The bridge was attached and then died. Distinct from having no
-    /// bridge at all: --demo and the pane tests run without one on purpose,
-    /// and telling them the harness is gone is a lie they cannot act on.
-    bridge_gone: bool,
-}
 
 /// Prompt-cache window for the meter under the calls pane.
 ///
@@ -1435,456 +619,6 @@ fn config_theme() -> Option<ThemeKind> {
         .and_then(ThemeKind::from_name)
 }
 
-impl App {
-    fn new() -> Self {
-        theme_cache::set(initial_theme());
-        let mut app = Self {
-            prompt: PromptBuf::new(),
-            model: String::new(),
-            thinking: String::new(),
-            model_pending: None,
-            slash: slash::Slash::default(),
-            theme_preview_origin: None,
-            generation: String::new(),
-            running: false,
-            turn_started: None,
-            ready: false,
-            want_stop: false,
-            turn_cancel: None,
-            status: "idle".into(),
-            notice: None,
-            story: ScrollbackState::new(),
-            calls: ScrollbackState::new(),
-            post_in: JsonTree::default(),
-            post_out: JsonTree::default(),
-            post_req: json!({}),
-            post_resp: json!({}),
-            post_inspect: None,
-            session_picker: session::SessionPicker::default(),
-            picker: picker::Picker::default(),
-            story_scratch: ScratchBuffer::new(),
-            calls_scratch: ScratchBuffer::new(),
-            media: Media::default(),
-            story_sel: ResolvedSelectionModel::default(),
-            calls_sel: ResolvedSelectionModel::default(),
-            post_n: 0,
-            post_out_n: 0,
-            queue: QueryQueue::default(),
-            send_now: false,
-            help: false,
-            queue_edit: None,
-            drain_after: false,
-            children: HashMap::new(),
-            viewing: None,
-            stream: StreamCursor::default(),
-            exec: ExecStream::default(),
-            viewer: None,
-            viewer_src: ViewerSrc::Story,
-            focus: Focus::Input,
-            traj_area: Rect::default(),
-            call_area: Rect::default(),
-            wire_manual: HashSet::new(),
-            posts: PostRows::default(),
-            show_posts: false,
-            calls_chip: None,
-            post_in_area: Rect::default(),
-            post_out_area: Rect::default(),
-            queue_area: Rect::default(),
-            input_area: Rect::default(),
-            input_inner: Rect::default(),
-            mouse: None,
-            last_click: None,
-            last_chip_click: None,
-            story_text: TextSel::default(),
-            calls_text: TextSel::default(),
-            cache: CacheMeter::default(),
-            git: side::GitPane::new(&std::env::current_dir().unwrap_or_default()),
-            files: side::FilePane::new(&std::env::current_dir().unwrap_or_default()),
-            git_area: Rect::default(),
-            files_area: Rect::default(),
-            layout: PaneLayout::load(),
-            demo: false,
-            bridge_gone: false,
-        };
-        app.apply_grok_settings();
-        app
-    }
-
-    /// Load ~/.grok/pager.toml + grok UI cache (timestamps, compact, …)
-    /// and push it onto both scrollbacks. Same stack the pager uses.
-    fn apply_grok_settings(&mut self) {
-        let cfg = grok_appearance();
-        appearance::set_tab_width(cfg.scrollback.display.tab_width);
-        // Verb grouping folds consecutive tools into "Ran 3 tools". Fine in
-        // grok chat; fatal on the wire pane — every POST and <python> stays
-        // its own row.
-        appearance_cache::set_group_tool_verbs(false);
-        // One blank row after every entry. Grok's chat column is one block per
-        // paragraph, so it costs ~10% there; the story is many one-line blocks
-        // -- a thought, a system row, a tool title -- in a third of the screen,
-        // and a third of the pane was going to gap rows. Every block already
-        // carries an accent column and a bullet, which is what the gap was
-        // saying. `/dense` keeps the row for anyone who wants the air.
-        appearance_cache::set_entry_gap(0);
-        // ...except the row above a user prompt. Dense packing loses the turn
-        // boundary: with no blank row anywhere, a new prompt reads as one more
-        // block in the same run. One row there is the only spacing the story
-        // spends, and it is the one that says "this is where you spoke".
-        appearance_cache::set_turn_gap(1);
-        self.story.set_appearance(cfg.clone());
-        self.calls.set_appearance(cfg.clone());
-        for child in self.children.values_mut() {
-            child.story.set_appearance(cfg.clone());
-            child.calls.set_appearance(cfg.clone());
-        }
-    }
-
-    fn ensure_child(&mut self, id: &str, task: &str) -> &mut ChildSess {
-        if !self.children.contains_key(id) {
-            let look = grok_appearance();
-            let mut story = ScrollbackState::new();
-            let mut calls = ScrollbackState::new();
-            story.set_appearance(look.clone());
-            calls.set_appearance(look);
-            if !task.is_empty() {
-                story.push_block(RenderBlock::user_prompt(task));
-            }
-            self.children.insert(
-                id.to_string(),
-                ChildSess {
-                    story,
-                    calls,
-                    story_scratch: ScratchBuffer::new(),
-                    calls_scratch: ScratchBuffer::new(),
-                    story_sel: ResolvedSelectionModel::default(),
-                    calls_sel: ResolvedSelectionModel::default(),
-                    parent_entry: None,
-                    stream: StreamCursor::default(),
-                    exec: ExecStream::default(),
-                    story_text: TextSel::default(),
-                    calls_text: TextSel::default(),
-                    posts: PostRows::default(),
-                    wire_manual: HashSet::new(),
-                },
-            );
-        }
-        self.children.get_mut(id).expect("just inserted")
-    }
-
-    fn text_sel(&mut self, calls: bool) -> &mut TextSel {
-        if let Some(id) = self.viewing.clone() {
-            if let Some(c) = self.children.get_mut(&id) {
-                return if calls {
-                    &mut c.calls_text
-                } else {
-                    &mut c.story_text
-                };
-            }
-        }
-        if calls {
-            &mut self.calls_text
-        } else {
-            &mut self.story_text
-        }
-    }
-
-    fn sel_model(&self, calls: bool) -> &ResolvedSelectionModel {
-        if let Some(id) = self.viewing.as_deref() {
-            if let Some(c) = self.children.get(id) {
-                return if calls { &c.calls_sel } else { &c.story_sel };
-            }
-        }
-        if calls {
-            &self.calls_sel
-        } else {
-            &self.story_sel
-        }
-    }
-
-    fn viewer_scroll(&mut self) -> &mut ScrollbackState {
-        match self.viewer_src {
-            ViewerSrc::Calls => self.calls_scroll(),
-            ViewerSrc::Story => self.story_scroll(),
-        }
-    }
-
-    fn open_block_viewer(&mut self) -> bool {
-        self.post_inspect = None;
-        if self.viewer.is_some() {
-            self.viewer = None;
-            return true;
-        }
-        if self.open_selected_session() {
-            return true;
-        }
-        let src = if self.focus == Focus::Calls {
-            ViewerSrc::Calls
-        } else {
-            ViewerSrc::Story
-        };
-        let pane = match src {
-            ViewerSrc::Calls => self.calls_scroll(),
-            ViewerSrc::Story => self.story_scroll(),
-        };
-        let Some(idx) = pane.selected() else {
-            return false;
-        };
-        let Some(entry) = pane.entry(idx) else {
-            return false;
-        };
-        let Some(viewer) = viewer_for_entry(entry) else {
-            return false;
-        };
-        self.viewer_src = src;
-        self.viewer = Some(viewer);
-        true
-    }
-
-    fn open_selected_session(&mut self) -> bool {
-        // grok: Enter / Ctrl-F / double-click on SubagentBlock replaces
-        // the parent scrollback with the child AgentView. Already inside
-        // a child: do not nest (desmos spawn depth is 1).
-        if self.viewing.is_some()
-            || matches!(
-                self.focus,
-                Focus::Calls | Focus::PostIn | Focus::PostOut | Focus::Queue
-            )
-        {
-            return false;
-        }
-        let Some(idx) = self.story.selected() else {
-            return false;
-        };
-        let id = match self.story.entry(idx).map(|e| &e.block) {
-            Some(RenderBlock::Subagent(sb)) => sb.child_session_id.clone(),
-            _ => return false,
-        };
-        let task = match self.story.entry(idx).map(|e| &e.block) {
-            Some(RenderBlock::Subagent(sb)) => sb.description.clone(),
-            _ => String::new(),
-        };
-        self.ensure_child(&id, &task);
-        self.viewing = Some(id);
-        self.focus = Focus::Story;
-        true
-    }
-
-    fn story_scroll(&mut self) -> &mut ScrollbackState {
-        if let Some(id) = self.viewing.clone() {
-            if let Some(c) = self.children.get_mut(&id) {
-                return &mut c.story;
-            }
-        }
-        &mut self.story
-    }
-
-    fn calls_scroll(&mut self) -> &mut ScrollbackState {
-        if let Some(id) = self.viewing.clone() {
-            if let Some(c) = self.children.get_mut(&id) {
-                return &mut c.calls;
-            }
-        }
-        &mut self.calls
-    }
-
-    /// The wire pane on screen and its group index together, parent or child.
-    /// Group navigation needs both halves of the same session or it steps the
-    /// cursor to entries that live in the other one.
-    fn calls_and_posts(&mut self) -> (&mut ScrollbackState, &mut PostRows) {
-        if let Some(id) = self.viewing.clone() {
-            if let Some(c) = self.children.get_mut(&id) {
-                return (&mut c.calls, &mut c.posts);
-            }
-        }
-        (&mut self.calls, &mut self.posts)
-    }
-
-    /// The wire pane on screen and the hand-fold set that belongs to it.
-    fn calls_and_manual(&mut self) -> (&mut ScrollbackState, &mut HashSet<EntryId>) {
-        if let Some(id) = self.viewing.clone() {
-            if let Some(c) = self.children.get_mut(&id) {
-                return (&mut c.calls, &mut c.wire_manual);
-            }
-        }
-        (&mut self.calls, &mut self.wire_manual)
-    }
-
-    fn calls_and_posts_ref(&self) -> (&ScrollbackState, &PostRows) {
-        if let Some(id) = self.viewing.as_ref() {
-            if let Some(c) = self.children.get(id) {
-                return (&c.calls, &c.posts);
-            }
-        }
-        (&self.calls, &self.posts)
-    }
-
-    /// Put the `POST #n` cards on the wire, or take them off. Both panes on
-    /// screen follow the one flag: a child's wire is the same pane.
-    fn toggle_posts(&mut self) {
-        self.show_posts = !self.show_posts;
-        let shown = self.show_posts;
-        if shown {
-            self.posts.show(&mut self.calls);
-        } else {
-            self.posts.hide(&mut self.calls);
-        }
-        for c in self.children.values_mut() {
-            if shown {
-                c.posts.show(&mut c.calls);
-            } else {
-                c.posts.hide(&mut c.calls);
-            }
-        }
-    }
-
-    fn story_push(&mut self, block: RenderBlock) {
-        // follow_mode is already true on a fresh state; prepare_layout pins
-        // the viewport. goto_bottom() before the first layout has
-        // viewport_height=0, so max_offset == total_height and the whole
-        // transcript scrolls off-screen.
-        self.story.push_block(block);
-    }
-
-    fn call_push(&mut self, block: RenderBlock) {
-        wire_push(&mut self.calls, block);
-    }
-
-    /// Push a card that opens a new call group. Every `complete()` POST starts
-    /// one; the syscalls it produced land after it and belong to it.
-    fn call_push_group(&mut self, args: PostArgs) {
-        let shown = self.show_posts;
-        self.posts.push(&mut self.calls, args, shown);
-    }
-
-    /// `(current, total)` group position, 1-based, for the wire pane title.
-    ///
-    /// "Current" follows the selection when there is one so `[`/`]` can be
-    /// watched moving, and otherwise reports the newest group, which is what
-    /// the tail the reader is staring at actually belongs to.
-    fn call_group_pos(&self) -> Option<(usize, usize)> {
-        let (calls, posts) = self.calls_and_posts_ref();
-        let starts = posts.starts(calls);
-        let total = starts.len();
-        if total == 0 {
-            return None;
-        }
-        // Groups are pushed in entry order, so the group a card belongs to is
-        // the last boundary at or above it.
-        let cur = match calls.selected() {
-            Some(sel) => starts.iter().filter(|start| **start <= sel).count().max(1),
-            None => total,
-        };
-        Some((cur, total))
-    }
-
-    /// Move the wire selection to the first card of the previous/next group.
-    ///
-    /// Returns false when there is nowhere to go, so the caller can leave the
-    /// selection alone rather than snapping to an end.
-    fn select_call_group(&mut self, forward: bool) -> bool {
-        let (calls, posts) = self.calls_and_posts();
-        let starts = posts.starts(calls);
-        if starts.is_empty() {
-            return false;
-        }
-        let target = match calls.selected() {
-            None if forward => starts.first().copied(),
-            None => starts.last().copied(),
-            Some(cur) if forward => starts.iter().copied().find(|s| *s > cur),
-            Some(cur) => starts.iter().rev().copied().find(|s| *s < cur),
-        };
-        let Some(target) = target else {
-            return false;
-        };
-        calls.set_selected(Some(target));
-        calls.scroll_to_entry_top(target);
-        true
-    }
-
-    fn focused_scroll(&mut self) -> &mut ScrollbackState {
-        match self.focus {
-            Focus::Calls => self.calls_scroll(),
-            _ => self.story_scroll(),
-        }
-    }
-
-    fn focused_tree(&mut self) -> Option<&mut JsonTree> {
-        match self.focus {
-            Focus::PostIn => Some(&mut self.post_in),
-            Focus::PostOut => Some(&mut self.post_out),
-            _ => None,
-        }
-    }
-
-    fn set_last_post(&mut self, n: u64, request: &Value, response: &Value) {
-        self.post_n = n;
-        self.post_req = request.clone();
-        self.post_in = JsonTree::from_value(request);
-        // The request event carries an empty response. Keep the previous reply
-        // and its number rather than clearing the pane, so a completed turn
-        // stays readable until the next one actually answers.
-        if !response.is_null() && response != &json!({}) {
-            self.post_resp = response.clone();
-            self.post_out = JsonTree::from_value(response);
-            self.post_out_n = n;
-        }
-        if let Some(inspect) = self.post_inspect.as_mut() {
-            inspect.sync_raw(n, request, response);
-        }
-    }
-
-    fn open_post_inspect(&mut self) {
-        self.viewer = None;
-        if self.post_inspect.is_some() {
-            self.post_inspect = None;
-            return;
-        }
-        let tab = if self.focus == Focus::PostOut { 1 } else { 0 };
-        self.post_inspect = Some(PostInspect::open(tab));
-    }
-
-    /// Say something to the user. Sets `status` too, so the handful of places
-    /// that read it keep working, but stamps it so the composer can show it and
-    /// then drop it. Lifecycle words -- idle, running, stopping -- assign
-    /// `status` directly and raise no notice: the composer's animated frame
-    /// carries runtime state, and "idle" landing would wipe "copied".
-    fn notify(&mut self, msg: impl Into<String>) {
-        let msg = msg.into();
-        self.notice = Some((Instant::now(), msg.clone()));
-        self.status = msg;
-    }
-
-    /// A notice that has had its few seconds. Checked on the idle tick, since
-    /// nothing else forces a repaint once the text stops being true.
-    fn notice_stale(&self) -> bool {
-        self.notice
-            .as_ref()
-            .is_some_and(|(t, _)| t.elapsed() > NOTICE_TTL)
-    }
-
-    fn set_focus(&mut self, focus: Focus) {
-        let focus = if focus == Focus::Queue && self.queue.is_empty() {
-            return;
-        } else {
-            focus
-        };
-        if self.focus == focus {
-            return;
-        }
-        self.focus = focus;
-        match focus {
-            Focus::Story => self.story_scroll().on_activate(),
-            Focus::Calls => self.calls_scroll().on_activate(),
-            Focus::Meter
-            | Focus::Git
-            | Focus::Files
-            | Focus::PostIn
-            | Focus::PostOut
-            | Focus::Queue
-            | Focus::Input => {}
-        }
-    }
-}
 
 fn grok_appearance() -> AppearanceConfig {
     let mut cfg = std::fs::read_to_string(util::pager_toml_path())
@@ -2120,16 +854,16 @@ fn seed_spawn(app: &mut App) {
         Some("claude-opus-5".into()),
         true,
     );
-    let eid = app.story.push_block(RenderBlock::Subagent(block));
-    app.story.set_last_running(true);
+    let eid = app.sess.story.push_block(RenderBlock::Subagent(block));
+    app.sess.story.set_last_running(true);
     {
         let shown = app.show_posts;
         let child = app.ensure_child(id, task);
         child.parent_entry = Some(eid);
-        child.story.push_block(RenderBlock::thinking(
+        child.sess.story.push_block(RenderBlock::thinking(
             "read notes first, then say what cache actually is.",
         ));
-        child.story.push_block(RenderBlock::agent_message(
+        child.sess.story.push_block(RenderBlock::agent_message(
             "cache is last-user only. ABI is frozen. Speech is not memory.",
         ));
         let args = PostArgs::new(
@@ -2141,14 +875,14 @@ fn seed_spawn(app: &mut App) {
             1,
             0,
         );
-        child.posts.push(&mut child.calls, args, shown);
+        child.sess.posts.push(&mut child.sess.calls, args, shown);
         wire_push(
-            &mut child.calls,
+            &mut child.sess.calls,
             wire_syscall("python", "list(world.notes)", &json!({}), "['cache']"),
         );
     }
-    app.story.finish_running(eid);
-    app.story.push_block(RenderBlock::Subagent(SubagentBlock::completed(
+    app.sess.story.finish_running(eid);
+    app.sess.story.push_block(RenderBlock::Subagent(SubagentBlock::completed(
         task,
         id,
         Duration::from_secs(4),
@@ -2192,6 +926,44 @@ fn main() -> io::Result<()> {
         LeaveAlternateScreen
     )?;
     result
+}
+
+fn resolved_theme(name: &str) -> Option<ThemeKind> {
+    ThemeKind::from_name(name).map(|kind| {
+        if kind.is_auto() {
+            theme_cache::resolve_initial_theme()
+        } else {
+            kind
+        }
+    })
+}
+
+/// Keep theme completion transactional: selection paints immediately, while
+/// leaving the list without accepting restores the theme active on entry.
+fn sync_theme_preview(app: &mut App) {
+    let selected = app
+        .slash
+        .is_theme_values()
+        .then(|| app.slash.selected_text())
+        .flatten()
+        .and_then(resolved_theme);
+    if let Some(kind) = selected {
+        if app.theme_preview_origin.is_none() {
+            app.theme_preview_origin = Some(Theme::current_kind());
+        }
+        if Theme::current_kind() != kind {
+            theme_cache::set(kind);
+            app.apply_grok_settings();
+        }
+    } else if let Some(origin) = app.theme_preview_origin.take() {
+        theme_cache::set(origin);
+        app.apply_grok_settings();
+    }
+}
+
+fn update_slash(app: &mut App) {
+    app.slash.update(&app.prompt.to_send(), &app.picker);
+    sync_theme_preview(app);
 }
 
 fn run(
@@ -2266,7 +1038,7 @@ fn run(
             dirty = true;
         }
 
-        let live = streaming(app) || app.running || app.story.has_running_entries();
+        let live = streaming(app) || app.running || app.sess.story.has_running_entries();
         if live && last_anim.elapsed() >= ANIM {
             if tick_scrollbacks(app) || app.running {
                 dirty = true;
@@ -2278,15 +1050,15 @@ fn run(
         // for it. A collapsed pane over an idle session wants no timer at all:
         // three `git` subprocesses every four seconds, forever, on a tree
         // where a status call is a quarter second of disk.
-        if app.layout.git_h > 0 || app.running || app.stream.run.settled.is_some() {
+        if app.layout.git_h > 0 || app.running || app.sess.stream.run.settled.is_some() {
             app.git.poll(false);
         }
         if app.git.drain() {
             // The row a fold left owing takes its tail from this read if this
             // is the read it was waiting on; the live run gets its next sync
             // from it either way.
-            app.stream.run.settle(&mut app.story, &app.git);
-            app.stream.run.note_repo(&app.git);
+            app.sess.stream.run.settle(&mut app.sess.story, &app.git);
+            app.sess.stream.run.note_repo(&app.git);
             dirty = true;
         }
         if expire_notice(app) {
@@ -2392,456 +1164,6 @@ fn wait_ready(bridge: Option<&mut Bridge>, app: &mut App) {
     }
 }
 
-/// Compact one-line title for a spawn: first non-empty line, parenthesised
-/// asides (usually an absolute path) dropped, first sentence only, capped so
-/// the live status suffix still fits on a normal-width story pane.
-fn task_title(task: &str) -> String {
-    let first = task
-        .lines()
-        .find(|l| !l.trim().is_empty())
-        .unwrap_or("")
-        .trim();
-    let mut flat = String::new();
-    let mut depth = 0usize;
-    for ch in first.chars() {
-        match ch {
-            '(' => depth += 1,
-            ')' => depth = depth.saturating_sub(1),
-            _ if depth == 0 => flat.push(ch),
-            _ => {}
-        }
-    }
-    let flat = flat.split_whitespace().collect::<Vec<_>>().join(" ");
-    let stop = flat.find(". ").map(|i| i + 1).unwrap_or(flat.len());
-    let mut title = flat[..stop].trim().trim_end_matches('.').trim().to_string();
-    if title.chars().count() > TITLE_CHARS {
-        title = title
-            .chars()
-            .take(TITLE_CHARS - 1)
-            .collect::<String>()
-            .trim_end()
-            .to_string();
-        title.push('\u{2026}');
-    }
-    title
-}
-
-/// Longest task title kept before eliding.
-const TITLE_CHARS: usize = 52;
-
-fn subagent_status(ev: &Value, head: Option<&str>) -> String {
-    let mut parts: Vec<String> = Vec::new();
-    if let Some(head) = head.map(str::trim).filter(|s| !s.is_empty()) {
-        parts.push(head.to_string());
-    }
-    if let Some(progress) = ev
-        .get("progress")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|s| !s.is_empty() && !parts.iter().any(|part| part == s))
-    {
-        parts.push(progress.to_string());
-    }
-    parts.join(" \u{b7} ")
-}
-
-/// How a finished child is labelled: the judge's verdict when there is one,
-/// otherwise the stop reason, otherwise the terminal stage.
-fn subagent_verdict(ev: &Value) -> String {
-    if let Some(accepted) = ev.get("accepted").and_then(Value::as_bool) {
-        return if accepted { "accepted" } else { "rejected" }.to_string();
-    }
-    for key in ["stop_reason", "stage", "phase"] {
-        if let Some(v) = ev
-            .get(key)
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-        {
-            return v.to_string();
-        }
-    }
-    String::new()
-}
-
-fn handle_subagent(app: &mut App, ev: &Value) {
-    let phase = ev.get("phase").and_then(Value::as_str).unwrap_or("");
-    let id = ev.get("id").and_then(Value::as_str).unwrap_or("");
-    if id.is_empty() {
-        return;
-    }
-    match phase {
-        "started" => {
-            let task = ev.get("task").and_then(Value::as_str).unwrap_or("");
-            let agent = ev.get("agent").and_then(Value::as_str).unwrap_or("general");
-            let persona = ev
-                .get("persona")
-                .and_then(Value::as_str)
-                .filter(|s| !s.is_empty())
-                .map(str::to_string);
-            let model = ev
-                .get("model")
-                .and_then(Value::as_str)
-                .filter(|s| !s.is_empty())
-                .map(str::to_string);
-            let title = task_title(task);
-            let block = SubagentBlock::started(&title, id, agent, persona, None, model, true);
-            let eid = app.story.push_block(RenderBlock::Subagent(block));
-            app.story.set_last_running(true);
-            app.ensure_child(id, &title).parent_entry = Some(eid);
-        }
-        "progress" => {
-            let stage = ev.get("stage").and_then(Value::as_str);
-            let label = subagent_status(ev, stage);
-            let eid = app.children.get(id).and_then(|c| c.parent_entry);
-            if let Some(eid) = eid {
-                if let Some(entry) = app.story.get_by_id_mut(eid) {
-                    if let RenderBlock::Subagent(ref mut sb) = entry.block {
-                        if !label.is_empty() {
-                            sb.activity_label = Some(label);
-                            entry.invalidate_cache();
-                        }
-                    }
-                }
-            }
-        }
-        // Parent cancellation and runtime failure are terminal too; no terminal
-        // child may leave a spinner behind on the parent story.
-        "done" | "failed" | "stopped" => {
-            let secs = ev.get("secs").and_then(Value::as_f64).unwrap_or(0.0);
-            let elapsed = Duration::from_secs_f64(secs.max(0.0));
-            let err = ev
-                .get("error")
-                .and_then(Value::as_str)
-                .filter(|s| !s.is_empty())
-                .map(str::to_string);
-            let eid = app.children.get(id).and_then(|c| c.parent_entry);
-            if let Some(eid) = eid {
-                app.story.finish_running(eid);
-                // The spawn row keeps rendering its activity label after it
-                // stops running, so retire it with the verdict and what the
-                // child actually spent rather than a stale mid-flight turn.
-                let verdict = subagent_verdict(ev);
-                let label = subagent_status(ev, Some(&verdict));
-                if let Some(entry) = app.story.get_by_id_mut(eid) {
-                    if let RenderBlock::Subagent(ref mut sb) = entry.block {
-                        if !label.is_empty() {
-                            sb.activity_label = Some(label);
-                            entry.invalidate_cache();
-                        }
-                    }
-                }
-            }
-            let desc = eid
-                .and_then(|eid| app.story.get_by_id(eid))
-                .and_then(|e| match &e.block {
-                    RenderBlock::Subagent(sb) => Some(sb.description.clone()),
-                    _ => None,
-                })
-                .unwrap_or_default();
-            let terminal = if phase == "done" && err.is_none() {
-                RenderBlock::Subagent(SubagentBlock::completed(&desc, id, elapsed))
-            } else {
-                RenderBlock::Subagent(SubagentBlock::failed(
-                    &desc,
-                    id,
-                    elapsed,
-                    err.clone(),
-                ))
-            };
-            app.story.push_block(terminal);
-            // Child speech already landed via `child` events. Only surface a
-            // failure that never produced speech.
-            if let Some(err) = err {
-                app.ensure_child(id, "")
-                    .story
-                    .push_block(RenderBlock::system(err));
-            }
-        }
-        _ => {}
-    }
-}
-
-fn handle_child(app: &mut App, ev: &Value) {
-    let id = ev.get("id").and_then(Value::as_str).unwrap_or("");
-    if id.is_empty() {
-        return;
-    }
-    let kind = ev.get("kind").and_then(Value::as_str).unwrap_or("");
-    app.ensure_child(id, "");
-    // A subagent's tokens are billed to the same key, so they belong in the
-    // money row — they were spent and shown nowhere. Totals only: the context
-    // and TTL bars describe the parent's transcript, not this child's.
-    if kind == "complete" {
-        let usage = ev.get("usage").cloned().unwrap_or(json!({}));
-        let model = ev.get("model").and_then(Value::as_str).unwrap_or("?");
-        app.cache.bill(&usage, model);
-    }
-    let mut last_post: Option<(u64, Value, Value)> = None;
-    let shown = app.show_posts;
-    let child = app.children.get_mut(id).expect("child");
-    match kind {
-        "thinking" => {
-            let redacted = ev.get("redacted").and_then(Value::as_bool).unwrap_or(false);
-            let delta = ev.get("delta").and_then(Value::as_bool).unwrap_or(false);
-            let text = ev.get("text").and_then(Value::as_str).unwrap_or("");
-            apply_thinking(
-                &mut child.story,
-                &mut child.calls,
-                &mut child.stream,
-                redacted,
-                text,
-                delta,
-            );
-        }
-        "speech" => {
-            let delta = ev.get("delta").and_then(Value::as_bool).unwrap_or(false);
-            let text = ev.get("text").and_then(Value::as_str).unwrap_or("");
-            apply_speech(
-                &mut child.story,
-                &mut child.calls,
-                &mut child.stream,
-                text,
-                delta,
-            );
-        }
-        "post" => {
-            let n = ev.get("n").and_then(Value::as_u64).unwrap_or(0);
-            if let Some(req) = ev.get("request") {
-                last_post = Some((n, req.clone(), json!({})));
-            }
-        }
-        "complete" => {
-            child.stream.finish(&mut child.story, &mut child.calls);
-            finish_exec(&mut child.calls, &mut child.exec);
-            let n = ev.get("n").and_then(Value::as_u64).unwrap_or(0);
-            let origin = ev.get("origin").and_then(Value::as_str).unwrap_or("llm");
-            let model = ev.get("model").and_then(Value::as_str).unwrap_or("?");
-            let thinking = ev.get("thinking").and_then(Value::as_str).unwrap_or("");
-            let usage = ev.get("usage").cloned().unwrap_or(json!({}));
-            let thoughts = ev.get("thoughts").and_then(Value::as_u64).unwrap_or(0);
-            let redacted = ev.get("redacted").and_then(Value::as_u64).unwrap_or(0);
-            child.posts.push(
-                &mut child.calls,
-                PostArgs::new(origin, n, model, thinking, &usage, thoughts, redacted),
-                shown,
-            );
-            if let (Some(req), Some(resp)) = (ev.get("request"), ev.get("response")) {
-                last_post = Some((n, req.clone(), resp.clone()));
-            }
-        }
-        "result" => {
-            child.stream.finish(&mut child.story, &mut child.calls);
-            apply_result(&mut child.calls, &mut child.exec, ev);
-        }
-        "turn" => {
-            child.stream.finish(&mut child.story, &mut child.calls);
-        }
-        _ => {}
-    }
-    // The POST split is the parent's wire. A child's request/response only
-    // belongs there while the human is actually inside that child session;
-    // otherwise a background subagent silently overwrites the parent's meters
-    // and JSON panes with someone else's model and usage.
-    if let Some((n, req, resp)) = last_post {
-        if app.viewing.as_deref() == Some(id) {
-            app.set_last_post(n, &req, &resp);
-        }
-    }
-}
-
-fn handle_event(app: &mut App, ev: Value) {
-    let kind = ev.get("ev").and_then(Value::as_str).unwrap_or("");
-    // The work row's repo tail, taken here because this is where the git pane
-    // is reachable. sync() is called from inside the stream cursor and used to
-    // fork git itself, on this thread, once per result and per thought.
-    app.stream.run.note_repo(&app.git);
-    match kind {
-        "picker" => app.picker.observe(&ev),
-        "login" => {
-            let text = ev.get("text").and_then(Value::as_str).unwrap_or("");
-            let done = ev.get("done").and_then(Value::as_bool).unwrap_or(false)
-                || ev.get("failed").and_then(Value::as_bool).unwrap_or(false);
-            app.picker.login_line(text, done);
-        }
-        "ready" | "snapshot" => {
-            app.picker.observe(&ev);
-            if let Some(b) = ev.get("billing").and_then(Value::as_str) {
-                app.cache.plan = b == "plan";
-            }
-            if let Some(p) = ev.get("provider").and_then(Value::as_str) {
-                app.cache.ephemeral = p == "anthropic";
-            }
-            if let Some(s) = ev.get("model").and_then(Value::as_str) {
-                app.model = s.into();
-                // The bridge is the authority. Once it reports the model we
-                // queued, the pending badge has nothing left to announce.
-                if app.model_pending.as_ref().is_some_and(|(m, _)| m == s) {
-                    app.model_pending = None;
-                }
-            }
-            if let Some(s) = ev.get("thinking").and_then(Value::as_str) {
-                app.thinking = s.into();
-            }
-            if let Some(n) = ev.get("generation").and_then(Value::as_u64) {
-                app.generation = n.to_string();
-            } else if let Some(s) = ev.get("generation").and_then(Value::as_str) {
-                app.generation = s.into();
-            }
-            app.ready = true;
-            if !app.running {
-                app.status = "idle".into();
-            }
-        }
-        "subagent" => handle_subagent(app, &ev),
-        "child" => handle_child(app, &ev),
-        "thinking" => {
-            let redacted = ev.get("redacted").and_then(Value::as_bool).unwrap_or(false);
-            let delta = ev.get("delta").and_then(Value::as_bool).unwrap_or(false);
-            let text = ev.get("text").and_then(Value::as_str).unwrap_or("");
-            apply_thinking(
-                &mut app.story,
-                &mut app.calls,
-                &mut app.stream,
-                redacted,
-                text,
-                delta,
-            );
-        }
-        "speech" => {
-            let delta = ev.get("delta").and_then(Value::as_bool).unwrap_or(false);
-            let text = ev.get("text").and_then(Value::as_str).unwrap_or("");
-            apply_speech(&mut app.story, &mut app.calls, &mut app.stream, text, delta);
-        }
-        "result" => {
-            app.stream.finish(&mut app.story, &mut app.calls);
-            let phase = ev.get("phase").and_then(Value::as_str).unwrap_or("done");
-            if phase != "start" && phase != "delta" {
-                let tag = ev.get("tag").and_then(Value::as_str).unwrap_or("?");
-                // Every edit detail has one home: Activity. Do not duplicate
-                // either its diff card or an `edit xN` work row in Story.
-                if tag != "edit" {
-                    let target = call_target(tag, &ev);
-                    app.stream.run.call(tag, target);
-                    app.stream.run.sync(&mut app.story);
-                }
-                // A syscall just ran against this checkout. Start the read now
-                // rather than waiting out the pane's timer: the run folds as
-                // soon as prose starts, and the tail it prints is whatever has
-                // landed by then. One read at a time however fast the calls
-                // arrive — `poll` answers with the generation that will see
-                // this call's work, and `settle` holds the row for it.
-                app.stream.run.fresh_gen = app.git.poll(true);
-            }
-            apply_result(&mut app.calls, &mut app.exec, &ev);
-        }
-        "post" => {
-            let n = ev.get("n").and_then(Value::as_u64).unwrap_or(0);
-            let empty = json!({});
-            let req = ev.get("request").unwrap_or(&empty);
-            // The body about to go over the wire is the only unarguable answer
-            // to "which model is this". A switch applied mid-step (or from the
-            // kernel, which never sends a snapshot) used to leave the composer
-            // naming the old model until the next user turn.
-            if let Some(m) = req.get("model").and_then(Value::as_str) {
-                if !m.is_empty() && app.model != m {
-                    app.model = m.into();
-                }
-                if app.model_pending.as_ref().is_some_and(|(p, _)| p == m) {
-                    app.model_pending = None;
-                }
-            }
-            app.set_last_post(n, req, &empty);
-        }
-        // The wire pane exists so the human sees what the harness did. A fold
-        // rewrites the transcript the model reads, so it belongs here and not
-        // in the story — it is not something the model said.
-        "compacted" => {
-            let n = ev.get("n").and_then(Value::as_u64).unwrap_or(0);
-            let kept = ev.get("kept").and_then(Value::as_u64).unwrap_or(0);
-            let summary = ev.get("text").and_then(Value::as_str).unwrap_or("");
-            app.call_push(wire_compacted(n, kept, summary));
-            // The card carries the summary, but a fold is not a detail: the
-            // model's memory of this session just changed shape. Say so where
-            // the human is actually reading, and say what it means.
-            app.story_push(RenderBlock::system(&fold_notice(n, kept)));
-            app.notify("context folded");
-        }
-        "complete" => {
-            app.stream.finish(&mut app.story, &mut app.calls);
-            finish_exec(&mut app.calls, &mut app.exec);
-            let n = ev.get("n").and_then(Value::as_u64).unwrap_or(0);
-            let origin = ev.get("origin").and_then(Value::as_str).unwrap_or("llm");
-            let model = ev.get("model").and_then(Value::as_str).unwrap_or("?");
-            let thinking = ev.get("thinking").and_then(Value::as_str).unwrap_or("");
-            let usage = ev.get("usage").cloned().unwrap_or(json!({}));
-            app.cache.observe(&usage, model);
-            if let Some(req) = ev.get("request") {
-                app.cache.observe_roles(req);
-            }
-            let thoughts = ev.get("thoughts").and_then(Value::as_u64).unwrap_or(0);
-            let redacted = ev.get("redacted").and_then(Value::as_u64).unwrap_or(0);
-            app.call_push_group(PostArgs::new(
-                origin, n, model, thinking, &usage, thoughts, redacted,
-            ));
-            let empty = json!({});
-            let req = ev.get("request").unwrap_or(&empty);
-            let resp = ev.get("response").unwrap_or(&empty);
-            if req != &empty || resp != &empty {
-                app.set_last_post(n, req, resp);
-            }
-        }
-        "turn" => {
-            app.status = "running".into();
-            app.stream.finish(&mut app.story, &mut app.calls);
-        }
-        "done" => {
-            app.stream.finish(&mut app.story, &mut app.calls);
-            app.stream.run.fold(&mut app.story);
-            finish_exec(&mut app.calls, &mut app.exec);
-            app.running = false;
-            app.turn_started = None;
-            app.status = "idle".into();
-            app.drain_after = !app.queue.is_empty();
-        }
-        "stopped" => {
-            app.stream.finish(&mut app.story, &mut app.calls);
-            finish_exec(&mut app.calls, &mut app.exec);
-            let t = ev
-                .get("text")
-                .and_then(Value::as_str)
-                .unwrap_or("stopped, saved");
-            app.story_push(RenderBlock::system(t));
-            app.running = false;
-            app.turn_started = None;
-            app.status = "idle".into();
-            // A stop ends only the active step. Follow-ups already queued are
-            // still explicit user requests and must self-feed exactly as they
-            // do after a normal `done`; deleting a queue row is how to cancel it.
-            app.drain_after = !app.queue.is_empty();
-        }
-        // The harness explaining itself. Not speech (that is the model) and not
-        // an error, so it must not touch running state.
-        "notice" => {
-            let t = ev.get("text").and_then(Value::as_str).unwrap_or("");
-            if !t.is_empty() {
-                app.story_push(RenderBlock::system(t));
-            }
-        }
-        // Not a terminator. loop.py fires this for a reply the endpoint cut
-        // short and keeps looping, and the reader thread synthesises one for
-        // any unparseable NDJSON line. Clearing running here read as idle while
-        // run_turns was still going, so Enter sent a second op:step that fired
-        // later, out of order. Only done/stopped end a step.
-        "error" => {
-            app.stream.finish(&mut app.story, &mut app.calls);
-            finish_exec(&mut app.calls, &mut app.exec);
-            let t = ev.get("text").and_then(Value::as_str).unwrap_or("error");
-            app.story_push(RenderBlock::system(t));
-        }
-        _ => {}
-    }
-}
 
 /// Ctrl+C: stop the in-flight step and persist; quit only when idle.
 /// A second Ctrl+C while stopping force-quits.
@@ -2876,8 +1198,8 @@ fn apply_session_choice(
     app: &mut App,
     choice: session::Choice,
 ) -> io::Result<()> {
-    app.story = ScrollbackState::new();
-    app.calls = ScrollbackState::new();
+    app.sess.story = ScrollbackState::new();
+    app.sess.calls = ScrollbackState::new();
     app.apply_grok_settings();
     match choice {
         session::Choice::New => {
@@ -2934,782 +1256,6 @@ fn apply_picker(
     Ok(false)
 }
 
-fn resolved_theme(name: &str) -> Option<ThemeKind> {
-    ThemeKind::from_name(name).map(|kind| {
-        if kind.is_auto() {
-            theme_cache::resolve_initial_theme()
-        } else {
-            kind
-        }
-    })
-}
-
-/// Keep theme completion transactional: selection paints immediately, while
-/// leaving the list without accepting restores the theme active on entry.
-fn sync_theme_preview(app: &mut App) {
-    let selected = app
-        .slash
-        .is_theme_values()
-        .then(|| app.slash.selected_text())
-        .flatten()
-        .and_then(resolved_theme);
-    if let Some(kind) = selected {
-        if app.theme_preview_origin.is_none() {
-            app.theme_preview_origin = Some(Theme::current_kind());
-        }
-        if Theme::current_kind() != kind {
-            theme_cache::set(kind);
-            app.apply_grok_settings();
-        }
-    } else if let Some(origin) = app.theme_preview_origin.take() {
-        theme_cache::set(origin);
-        app.apply_grok_settings();
-    }
-}
-
-fn update_slash(app: &mut App) {
-    app.slash.update(&app.prompt.to_send(), &app.picker);
-    sync_theme_preview(app);
-}
-
-fn handle_key(
-    mut bridge: Option<&mut Bridge>,
-    app: &mut App,
-    key: KeyEvent,
-) -> io::Result<bool> {
-    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
-        return on_ctrl_c(bridge.as_deref_mut(), app);
-    }
-    // A saved transcript must be accepted or replaced before either the model
-    // picker or the panes receive input.
-    if app.session_picker.open {
-        if let Some(choice) = app.session_picker.key(key.code) {
-            apply_session_choice(bridge.as_deref_mut(), app, choice)?;
-        }
-        return Ok(false);
-    }
-    // The picker is modal on purpose. On a fresh machine there is no session
-    // behind it to type into, so it has to win before any pane sees the key.
-    if app.picker.open {
-        let action = app.picker.key(key.code);
-        return apply_picker(bridge.as_deref_mut(), app, action);
-    }
-    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('p') {
-        let (m, e) = (app.model.clone(), app.thinking.clone());
-        app.picker.open_for_change(&m, &e);
-        return Ok(false);
-    }
-    // An open completion list is modal for the four keys it owns, and has to
-    // say so up here: Tab and Esc are claimed by the global pane-cycle further
-    // down, so a handler in the input branch never sees them.
-    if app.slash.open && app.focus == Focus::Input {
-        match key.code {
-            KeyCode::Up => {
-                app.slash.move_sel(-1);
-                sync_theme_preview(app);
-                return Ok(false);
-            }
-            KeyCode::Down => {
-                app.slash.move_sel(1);
-                sync_theme_preview(app);
-                return Ok(false);
-            }
-            // Tab always completes. Enter only completes when there is
-            // something left to complete -- otherwise it sends.
-            //
-            // Enter used to accept unconditionally, which made a command with
-            // no argument unrunnable: typing /reset left one suggestion,
-            // accepting it produced the line already typed, the list matched
-            // it again, and Enter looped there forever. The only escape was a
-            // space, because "/reset " has an empty argument and closes the
-            // list. Accepting is only a move if it changes the line.
-            KeyCode::Tab => {
-                if let Some(line) = app.slash.accept() {
-                    app.prompt.clear();
-                    app.prompt.insert_str(&line);
-                    update_slash(app);
-                }
-                return Ok(false);
-            }
-            KeyCode::Enter => {
-                // A theme row is already a complete choice: Enter commits the
-                // preview and runs the local command in one step. Other lists
-                // keep their ordinary completion semantics.
-                if app.slash.is_theme_values()
-                    && let Some(line) = app.slash.accept()
-                {
-                    app.prompt.clear();
-                    app.prompt.insert_str(&line);
-                    app.slash.close();
-                    app.theme_preview_origin = None;
-                    return submit_prompt(bridge.as_deref_mut(), app);
-                }
-                // Send anything that already runs. "Would accepting change the
-                // line" was the wrong question: /model takes an argument, so
-                // accept() appended a space, so Enter completed instead of
-                // sending -- and bare /model, which is how the picker opens,
-                // could never be submitted at all. verdict already knows which
-                // lines are runnable, including the ones whose argument is
-                // optional, so ask it.
-                let typed = app.prompt.to_send();
-                if slash::verdict(&typed, &app.picker) == slash::Verdict::Ready {
-                    app.slash.close();
-                } else if let Some(line) = app.slash.accept() {
-                    if line != typed {
-                        app.prompt.clear();
-                        app.prompt.insert_str(&line);
-                        update_slash(app);
-                        return Ok(false);
-                    }
-                    app.slash.close();
-                } else {
-                    app.slash.close();
-                }
-            }
-            KeyCode::Esc => {
-                app.slash.close();
-                sync_theme_preview(app);
-                return Ok(false);
-            }
-            _ => {}
-        }
-    }
-    // ctrl+g / ctrl+b open the side panes from anywhere, including the input
-    // box: a pane you have to tab to before you can open is a pane nobody
-    // opens. Pressing the key on an open pane closes it again.
-    if key.modifiers.contains(KeyModifiers::CONTROL)
-        && matches!(key.code, KeyCode::Char('g') | KeyCode::Char('b'))
-        && app.viewer.is_none()
-        && app.post_inspect.is_none()
-    {
-        let git = key.code == KeyCode::Char('g');
-        let (h, focus) = if git {
-            (&mut app.layout.git_h, Focus::Git)
-        } else {
-            (&mut app.layout.files_h, Focus::Files)
-        };
-        if *h == 0 {
-            *h = PaneLayout::OPEN_SIDE;
-            app.layout.save();
-            app.set_focus(focus);
-            if git {
-                app.git.poll(true);
-            }
-        } else {
-            *h = 0;
-            app.layout.save();
-            if app.focus == focus {
-                app.set_focus(Focus::Input);
-            }
-        }
-        return Ok(false);
-    }
-
-    // The cheatsheet is a modal over the focused pane, so it eats the next key
-    // whatever it is. Anything else means guessing which keys are "dismiss" and
-    // which fall through, and a sheet you have to dismiss twice is worse than
-    // no sheet.
-    if app.help {
-        app.help = false;
-        return Ok(false);
-    }
-    // `?` in any pane but the composer. Every pane has its own verbs and none
-    // of them were written down anywhere you could read while looking at the
-    // pane; the legend that used to live on the composer border was one line
-    // for the whole app and went away with it. In the composer `?` is a
-    // question mark.
-    if key.code == KeyCode::Char('?')
-        && app.focus != Focus::Input
-        && app.viewer.is_none()
-        && app.post_inspect.is_none()
-    {
-        app.help = true;
-        return Ok(false);
-    }
-
-    // Pane resize runs before every pane-specific branch: the POST trees and
-    // the queue consume their keys and return, so a resize handled later never
-    // reaches them. `+` grows the focused pane, `-` shrinks it, `0` resets.
-    if app.focus != Focus::Input && app.viewer.is_none() && app.post_inspect.is_none() {
-        match key.code {
-            KeyCode::Char('+') | KeyCode::Char('=') => {
-                app.layout.grow(app.focus, 2);
-                app.layout.save();
-                return Ok(false);
-            }
-            KeyCode::Char('-') | KeyCode::Char('_') => {
-                app.layout.grow(app.focus, -2);
-                app.layout.save();
-                return Ok(false);
-            }
-            KeyCode::Char('0') => {
-                app.layout = PaneLayout::default();
-                app.layout.save();
-                return Ok(false);
-            }
-            // ctrl+arrows resize along the arrow: up/down changes rows even for
-            // panes whose `+` key drives width, left/right changes width even
-            // for the ones whose `+` drives rows.
-            KeyCode::Up | KeyCode::Down | KeyCode::Left | KeyCode::Right
-                if key.modifiers.contains(KeyModifiers::CONTROL) =>
-            {
-                let (axis, by) = match key.code {
-                    KeyCode::Up => (Axis::Vertical, 2),
-                    KeyCode::Down => (Axis::Vertical, -2),
-                    KeyCode::Right => (Axis::Horizontal, 2),
-                    _ => (Axis::Horizontal, -2),
-                };
-                app.layout.grow_axis(app.focus, axis, by);
-                app.layout.save();
-                return Ok(false);
-            }
-            _ => {}
-        }
-    }
-    if app.viewer.is_some() {
-        if is_inline_paste_key(&key) || is_paste_key(&key) {
-            match clipboard_text() {
-                Some(text) => {
-                    if let Some(viewer) = app.viewer.as_mut() {
-                        viewer.handle_paste(&text);
-                    }
-                }
-                None => app.notify("clipboard empty"),
-            }
-            return Ok(false);
-        }
-        handle_viewer_key(app, key);
-        return Ok(false);
-    }
-    if app.post_inspect.is_some() {
-        if is_inline_paste_key(&key) || is_paste_key(&key) {
-            match clipboard_text() {
-                Some(text) => {
-                    if let Some(v) = app
-                        .post_inspect
-                        .as_mut()
-                        .and_then(|p| p.raw_viewer.as_mut())
-                    {
-                        v.handle_paste(&text);
-                    }
-                }
-                None => app.notify("clipboard empty"),
-            }
-            return Ok(false);
-        }
-        handle_post_inspect_key(app, key);
-        return Ok(false);
-    }
-    if is_inline_paste_key(&key) {
-        match clipboard_text() {
-            Some(text) => apply_paste(app, &text, true),
-            None => app.notify("clipboard empty"),
-        }
-        return Ok(false);
-    }
-    if is_paste_key(&key) {
-        // grok's order: probe the pasteboard for a raster or file URLs before
-        // falling back to text. A screenshot copied with Cmd+Shift+Ctrl+4 has
-        // no text representation at all, so text-first sees an empty clipboard
-        // and the picture is lost.
-        if let Some(path) = prompt::clipboard_image_path() {
-            if app.focus != Focus::Input {
-                app.set_focus(Focus::Input);
-            }
-            app.prompt.insert_image(&path);
-            app.notify("attached 1 image(s)");
-            return Ok(false);
-        }
-        match clipboard_text() {
-            Some(text) => apply_paste(app, &text, false),
-            None => app.notify("clipboard empty"),
-        }
-        return Ok(false);
-    }
-    match key.code {
-        KeyCode::Tab if key.modifiers.contains(KeyModifiers::SHIFT) => {
-            app.set_focus(app.focus.prev_open(&pane_open(app)));
-            return Ok(false);
-        }
-        KeyCode::BackTab => {
-            app.set_focus(app.focus.prev_open(&pane_open(app)));
-            return Ok(false);
-        }
-        KeyCode::Tab => {
-            app.set_focus(app.focus.next_open(&pane_open(app)));
-            return Ok(false);
-        }
-        KeyCode::Esc => {
-            // Accumulate, never short-circuit: `||` and `any` stopped at the
-            // first pane that had a selection, so with a highlight on both the
-            // story and the wire, Esc cleared one per press.
-            let mut cleared = app.story_text.persist.take().is_some();
-            cleared |= app.calls_text.persist.take().is_some();
-            for c in app.children.values_mut() {
-                cleared |= c.story_text.persist.take().is_some();
-                cleared |= c.calls_text.persist.take().is_some();
-            }
-            if cleared {
-                return Ok(false);
-            }
-            if app.viewing.take().is_some() {
-                app.focus = Focus::Story;
-                return Ok(false);
-            }
-            if app.focus == Focus::Input {
-                app.set_focus(Focus::Story);
-                return Ok(false);
-            }
-            if app.focus == Focus::Queue {
-                app.set_focus(Focus::Input);
-                return Ok(false);
-            }
-            // Esc steps back one pane rather than reaching the quit below it.
-            // These branches used to live in the per-pane handlers further
-            // down, where this match had already returned — so Esc anywhere in
-            // the side column fell through to `focused_scroll`, which maps
-            // every non-Calls focus to the story, found no selection there,
-            // and quit the harness.
-            if app.focus == Focus::Files {
-                app.set_focus(Focus::Git);
-                return Ok(false);
-            }
-            if app.focus == Focus::Git || app.focus == Focus::Meter {
-                app.set_focus(Focus::Input);
-                return Ok(false);
-            }
-            let sb = app.focused_scroll();
-            if sb.selected().is_some() {
-                sb.clear_selection();
-                return Ok(false);
-            }
-            return Ok(true);
-        }
-        _ => {}
-    }
-
-    if matches!(app.focus, Focus::PostIn | Focus::PostOut) {
-        let view_h = if app.focus == Focus::PostIn {
-            app.post_in_area.height.saturating_sub(2)
-        } else {
-            app.post_out_area.height.saturating_sub(2)
-        };
-        match key.code {
-            KeyCode::Char('j') | KeyCode::Down => {
-                if let Some(t) = app.focused_tree() {
-                    t.select_next();
-                }
-            }
-            KeyCode::Char('k') | KeyCode::Up => {
-                if let Some(t) = app.focused_tree() {
-                    t.select_prev();
-                }
-            }
-            KeyCode::Char('h') | KeyCode::Left => {
-                if let Some(t) = app.focused_tree() {
-                    t.collapse();
-                }
-            }
-            KeyCode::Char('l') | KeyCode::Right | KeyCode::Enter => {
-                if let Some(t) = app.focused_tree() {
-                    t.toggle();
-                }
-            }
-            KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                app.open_post_inspect();
-            }
-            KeyCode::Char('e') => app.open_post_inspect(),
-            KeyCode::PageUp => {
-                if let Some(t) = app.focused_tree() {
-                    t.scroll_up(8);
-                }
-            }
-            KeyCode::PageDown => {
-                if let Some(t) = app.focused_tree() {
-                    t.scroll_down(8, view_h);
-                }
-            }
-            KeyCode::Char('i') => app.set_focus(Focus::Input),
-            _ => {}
-        }
-        return Ok(false);
-    }
-
-    if app.focus == Focus::Queue {
-        match key.code {
-            KeyCode::Char('j') | KeyCode::Down => app.queue.select_next(),
-            KeyCode::Char('k') | KeyCode::Up => app.queue.select_prev(),
-            // The queue's second axis is order, so that is what ←/→ drive.
-            KeyCode::Char('[') | KeyCode::Char('h') | KeyCode::Left => {
-                app.queue.move_selected(-1)
-            }
-            KeyCode::Char(']') | KeyCode::Char('l') | KeyCode::Right => {
-                app.queue.move_selected(1)
-            }
-            KeyCode::Char('d') | KeyCode::Backspace | KeyCode::Delete => {
-                app.queue.remove_selected();
-                app.queue_edit = None;
-                if app.queue.is_empty() {
-                    app.set_focus(Focus::Input);
-                }
-            }
-            // Drop was the only thing you could do to a queued row, so fixing a
-            // typo in one meant deleting it and typing the whole thing again.
-            // `e` lifts it into the composer instead; the slot is remembered so
-            // Enter puts it back where it was.
-            KeyCode::Char('e') => {
-                if let Some(idx) = app.queue.selected
-                    && let Some(item) = app.queue.remove_selected()
-                {
-                    app.prompt.clear();
-                    app.prompt.insert_str(&item.text);
-                    app.queue_edit = Some(idx);
-                    app.set_focus(Focus::Input);
-                    app.notify(format!("editing #{} — enter puts it back", idx + 1));
-                }
-            }
-            KeyCode::Enter => return send_now(bridge, app),
-            KeyCode::Char('i') => app.set_focus(Focus::Input),
-            _ => {}
-        }
-        return Ok(false);
-    }
-
-    if app.focus == Focus::Git && !matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
-        let rows = app.git_area.height.saturating_sub(2) as usize;
-        match key.code {
-            KeyCode::Char('j') | KeyCode::Down => app.git.select(1),
-            KeyCode::Char('k') | KeyCode::Up => app.git.select(-1),
-            KeyCode::PageDown => app.git.select(rows as i32),
-            KeyCode::PageUp => app.git.select(-(rows as i32)),
-            // Git's second axis is the tab strip in its own title bar, so ←/→
-            // move along it. Going *in* is Enter, which lands in the file pane.
-            KeyCode::Char(']') | KeyCode::Right => app.git.next_tab(1),
-            KeyCode::Char('[') | KeyCode::Left => app.git.next_tab(-1),
-            KeyCode::Char('r') => {
-                app.git.poll(true);
-            }
-            KeyCode::Char('i') => app.set_focus(Focus::Input),
-            KeyCode::Enter | KeyCode::Char('l') => {
-                // Opening a row is what fills the file pane, so open that pane
-                // too rather than loading into something invisible.
-                let path = app.git.selected().and_then(|r| r.path.clone());
-                if let Some(p) = path {
-                    app.files.open(&p);
-                    if app.layout.files_h == 0 {
-                        app.layout.files_h = PaneLayout::OPEN_SIDE;
-                        app.layout.save();
-                    }
-                    app.set_focus(Focus::Files);
-                }
-            }
-            _ => {}
-        }
-        // Walking the list previews as it goes, the way druk's tree does. A row
-        // that names no file (a branch, a commit) leaves the pane alone.
-        let path = app.git.selected().and_then(|r| r.path.clone());
-        app.files.preview(path.as_deref());
-        return Ok(false);
-    }
-    if app.focus == Focus::Files && !matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
-        let rows = app.files_area.height.saturating_sub(2) as usize;
-        match key.code {
-            KeyCode::Char('j') | KeyCode::Down => app.files.move_by(1, rows),
-            KeyCode::Char('k') | KeyCode::Up => app.files.move_by(-1, rows),
-            KeyCode::PageDown => app.files.move_by(rows as i32, rows),
-            KeyCode::PageUp => app.files.move_by(-(rows as i32), rows),
-            // Down the tree and back up it. `←` out of a file lands on that
-            // file in its own directory, so `←` `→` is a round trip.
-            KeyCode::Char('l') | KeyCode::Right | KeyCode::Enter => app.files.enter(),
-            KeyCode::Char('h') | KeyCode::Left => app.files.back(),
-            KeyCode::Char('i') => app.set_focus(Focus::Input),
-            _ => {}
-        }
-        return Ok(false);
-    }
-    // The meter has no cursor and nothing to fold. Without this it fell into
-    // the scrollback branch below, where `focused_scroll` maps every non-Calls
-    // focus to the story — so j/k in the meter silently drove the story pane.
-    if app.focus == Focus::Meter {
-        if key.code == KeyCode::Char('i') {
-            app.set_focus(Focus::Input);
-        }
-        return Ok(false);
-    }
-    if app.focus != Focus::Input {
-        match key.code {
-            KeyCode::Char('j') | KeyCode::Down => app.focused_scroll().select_next(),
-            KeyCode::Char('k') | KeyCode::Up => app.focused_scroll().select_prev(),
-            KeyCode::Char('h') | KeyCode::Left => {
-                if app.focus == Focus::Calls {
-                    pin_selected_wire(app);
-                }
-                app.focused_scroll().collapse_selected()
-            }
-            KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                let _ = app.open_block_viewer();
-            }
-            KeyCode::Char('l') | KeyCode::Right | KeyCode::Enter => {
-                // grok: Enter on a SubagentBlock opens the child session.
-                // Anything else with a viewer zooms into BlockViewerPane.
-                if key.code == KeyCode::Enter && app.open_block_viewer() {
-                } else {
-                    if app.focus == Focus::Calls {
-                        pin_selected_wire(app);
-                    }
-                    app.focused_scroll().toggle_fold_selected();
-                }
-            }
-            // Group step. Arrows already mean fold in this pane, so walking
-            // whole POST groups gets its own pair rather than overloading them.
-            // The POST rows are the turn's accounting, not its content, so
-            // they stay off until asked for — by this key or the title chip.
-            KeyCode::Char('p') if app.focus == Focus::Calls => {
-                app.toggle_posts();
-                let on = if app.show_posts { "on" } else { "off" };
-                app.notify(format!("POST rows {on}"));
-            }
-            KeyCode::Char('[') if app.focus == Focus::Calls => {
-                app.select_call_group(false);
-            }
-            KeyCode::Char(']') if app.focus == Focus::Calls => {
-                app.select_call_group(true);
-            }
-            KeyCode::Char('r') => app.focused_scroll().toggle_raw_selected(),
-            KeyCode::PageUp => app.focused_scroll().page_up(),
-            KeyCode::PageDown => app.focused_scroll().page_down(),
-            KeyCode::Char('i') => app.set_focus(Focus::Input),
-            _ => {}
-        }
-        return Ok(false);
-    }
-
-    let width = app.input_inner.width.max(20);
-    match key.code {
-        KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            app.prompt.move_line_home(width);
-        }
-        KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            app.prompt.move_line_end(width);
-        }
-        KeyCode::Char(c) if is_text_key(&key) => app.prompt.insert_char(c),
-        KeyCode::Backspace => app.prompt.backspace(),
-        KeyCode::Delete => app.prompt.delete(),
-        KeyCode::Left => app.prompt.move_left(),
-        KeyCode::Right => app.prompt.move_right(),
-        KeyCode::Up => app.prompt.move_up(width),
-        KeyCode::Down => app.prompt.move_down(width),
-        KeyCode::Home => app.prompt.move_line_home(width),
-        KeyCode::End => app.prompt.move_line_end(width),
-        KeyCode::Enter if is_mod_enter(&key) => {
-            app.prompt.insert_char('\n');
-        }
-        KeyCode::Enter => {
-            if app.prompt.expand_at_cursor() {
-                return Ok(false);
-            }
-            if app.prompt.apply_backslash_continuation() {
-                return Ok(false);
-            }
-            return submit_prompt(bridge, app);
-        }
-        _ => {}
-    }
-    // One recompute after any edit, rather than a call at each of the dozen
-    // sites that can change the line. A line that stopped being a command
-    // closes the list on its own.
-    update_slash(app);
-    Ok(false)
-}
-
-/// Tab skips panes the layout has collapsed to nothing.
-fn pane_open(app: &App) -> impl Fn(Focus) -> bool + use<> {
-    // The rects draw actually assigned, not the heights the layout asked for.
-    // A short terminal clamps a requested pane to zero rows, and Tab used to
-    // land on it anyway — j/k then went to a pane with nothing on screen. This
-    // is the same ground truth the mouse hit-tests use, and one frame is
-    // always painted before the first key is read.
-    let queue = !app.queue.is_empty();
-    let post = app.post_in_area.height > 0;
-    let meter = app.cache.area.height > 0;
-    let git = app.git_area.height > 0;
-    let files = app.files_area.height > 0;
-    move |f| match f {
-        Focus::Queue => queue,
-        Focus::PostIn | Focus::PostOut => post,
-        Focus::Meter => meter,
-        Focus::Git => git,
-        Focus::Files => files,
-        _ => true,
-    }
-}
-
-/// The prompt text for an attachment-only send: the file names, nothing more.
-fn image_prompt_text(images: &[String]) -> String {
-    let names: Vec<&str> = images
-        .iter()
-        .map(|p| p.rsplit('/').next().unwrap_or(p.as_str()))
-        .collect();
-    names.join(", ")
-}
-
-/// Inline-image bookkeeping for the Kitty graphics protocol.
-///
-/// The scrollback renderer reserves the rows and hands back an
-/// [`InlineMediaPlacement`] per visible image; the pixels are never part of
-/// the ratatui buffer. They are escape sequences written straight to the
-/// terminal after the frame is flushed, which is why this state lives outside
-/// the draw pass: an image is transmitted once per path, then only *placed*
-/// (a ~80 byte escape) on every later frame.
-#[derive(Default)]
-struct Media {
-    /// Kitty image id per file, allocated on first successful transmit.
-    ids: HashMap<PathBuf, u32>,
-    /// Encoded bytes per file, kept so a re-place never re-reads the disk.
-    bytes: HashMap<PathBuf, Vec<u8>>,
-    next_id: u32,
-    /// Ids holding a live placement from the previous frame. Anything that
-    /// scrolls out of view has to be deleted explicitly -- a Kitty placement
-    /// outlives the cells it was drawn over.
-    placed: HashSet<u32>,
-    /// Placements collected during the current draw pass.
-    frame: Vec<InlineMediaPlacement>,
-}
-
-/// A story row for one attached image: the file name, its path, and the
-/// picture underneath. `None` when the path is not a decodable image, in
-/// which case nothing is pushed and the prompt row stands alone.
-fn media_block(path: &str) -> Option<RenderBlock> {
-    use xai_grok_pager::prompt_images::ScrollbackImageRef;
-    ScrollbackImageRef::from_path(path)?;
-    let name = std::path::Path::new(path)
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| path.to_string());
-    Some(RenderBlock::ToolCall(ToolCallBlock::Other(
-        OtherToolCallBlock::new("image", name).with_media_ref(path, false),
-    )))
-}
-
-/// Draw the frame's inline images.
-///
-/// Runs after `terminal.draw`: the placement escapes address screen cells the
-/// frame just painted, and Kitty draws them under (z = -1) the text already
-/// there. The cursor is saved and restored around the batch, because placing
-/// an image moves it and the composer's caret was set by the frame.
-fn flush_media(app: &mut App, out: &mut impl Write) -> io::Result<()> {
-    let frame = std::mem::take(&mut app.media.frame);
-    if !gfx::scrollback_inline_overlay_active() {
-        return Ok(());
-    }
-    let mut esc = String::new();
-    let mut now: HashSet<u32> = HashSet::new();
-    let mut seen: HashSet<PathBuf> = HashSet::new();
-    for p in frame {
-        // `full_rows == 0` is the text-affordance placement the renderer emits
-        // for terminals without graphics: no pixels, just a clickable row.
-        if p.full_rows == 0 || p.info.is_video || !seen.insert(p.info.path.clone()) {
-            continue;
-        }
-        let path = p.info.path.clone();
-        if !app.media.bytes.contains_key(&path) {
-            let Ok(raw) = std::fs::read(&path) else { continue };
-            let Some(ready) = gfx::prepare_overlay_image_bytes(&raw) else {
-                continue;
-            };
-            app.media.bytes.insert(path.clone(), ready);
-        }
-        let known = app.media.ids.get(&path).copied();
-        let id = known.unwrap_or(app.media.next_id + 1);
-        let bytes = &app.media.bytes[&path];
-        if known.is_none() {
-            let Some(t) = gfx::transmit_inline_image(bytes, id) else {
-                continue;
-            };
-            esc.push_str(&t);
-        }
-        let Some(place) = gfx::place_inline_image(
-            bytes,
-            p.info.width,
-            p.info.height,
-            p.screen_rect,
-            p.full_rows,
-            p.top_crop_rows,
-            id,
-            known.is_none(),
-        ) else {
-            continue;
-        };
-        esc.push_str(&place);
-        now.insert(id);
-        if known.is_none() {
-            app.media.next_id = id;
-            app.media.ids.insert(path, id);
-        }
-    }
-    for id in &app.media.placed {
-        if !now.contains(id) {
-            esc.push_str(&gfx::clear_kitty_image(*id));
-        }
-    }
-    app.media.placed = now;
-    if esc.is_empty() {
-        return Ok(());
-    }
-    out.write_all(b"\x1b7")?;
-    out.write_all(esc.as_bytes())?;
-    out.write_all(b"\x1b8")?;
-    out.flush()
-}
-
-fn apply_paste(app: &mut App, text: &str, inline: bool) {
-    if app.focus != Focus::Input {
-        app.set_focus(Focus::Input);
-    }
-    // A paste that is nothing but paths to images on disk is an attachment,
-    // not prose -- dragging a screenshot onto the terminal is how most of them
-    // arrive. Mixed or unresolvable text stays text; guessing the other way
-    // would drop what the user actually typed.
-    if !inline {
-        let paths = prompt::image_paste_paths(text);
-        if !paths.is_empty() {
-            let n = paths.len();
-            for path in paths {
-                app.prompt.insert_image(&path);
-            }
-            app.notify(format!("attached {n} image(s)"));
-            return;
-        }
-    }
-    if inline {
-        app.prompt.handle_inline_paste(text);
-    } else {
-        app.prompt.handle_paste(text);
-    }
-}
-
-/// The command alone, or the command followed by its argument — never a
-/// longer word that merely starts the same way.
-fn is_slash_word(line: &str, cmd: &str) -> bool {
-    line == cmd || line.strip_prefix(cmd).is_some_and(|rest| rest.starts_with(' '))
-}
-
-fn is_local_slash(line: &str) -> bool {
-    let t = line.trim();
-    t == "/quit"
-        || t == "/exit"
-        || t == "/timestamps"
-        || t == "/compact"
-        || t == "/dense"
-        || t == "/reset"
-        || t == "/reload"
-        // A bare prefix match eats real prose: "/modelling the data" is a
-        // prompt, not a command. Require the word to end.
-        || is_slash_word(t, "/theme")
-        || is_slash_word(t, "/thinking")
-        || is_slash_word(t, "/model")
-}
-
 fn send_now(mut bridge: Option<&mut Bridge>, app: &mut App) -> io::Result<bool> {
     if app.queue.is_empty() {
         return Ok(false);
@@ -3751,6 +1297,7 @@ fn start_step(
     images: Vec<String>,
 ) -> io::Result<()> {
     app.story_push(RenderBlock::user_prompt(&line));
+    app.sess.story.follow_new_turn(None, false);
     // The attachments ride under the prompt that carries them: one row per
     // image, with the picture itself where the terminal can draw one.
     for path in &images {
@@ -3758,7 +1305,7 @@ fn start_step(
             app.story_push(block);
         }
     }
-    app.story.follow_new_turn(None, false);
+    app.sess.story.follow_new_turn(None, false);
     if app.viewing.is_some() {
         app.notify("esc to leave session");
         return Ok(());
@@ -3882,10 +1429,10 @@ fn submit_prompt(mut bridge: Option<&mut Bridge>, app: &mut App) -> io::Result<b
         if let Some(b) = bridge.as_mut() {
             b.send(&json!({"op":"reset"}))?;
         }
-        app.story.clear();
-        app.calls.clear();
-        app.posts.clear();
-        app.wire_manual.clear();
+        app.sess.story.clear();
+        app.sess.calls.clear();
+        app.sess.posts.clear();
+        app.sess.wire_manual.clear();
         app.post_in.clear();
         app.post_out.clear();
         app.post_req = json!({});
@@ -3933,406 +1480,6 @@ fn submit_prompt(mut bridge: Option<&mut Bridge>, app: &mut App) -> io::Result<b
     Ok(false)
 }
 
-fn hit(area: Rect, col: u16, row: u16) -> bool {
-    col >= area.x
-        && col < area.x.saturating_add(area.width)
-        && row >= area.y
-        && row < area.y.saturating_add(area.height)
-}
-
-/// The git tab strip is drawn in the border title, so a click on a pane's top
-/// row is a click on a tab. Mirrors the span layout in `draw_git`.
-fn git_tab_at(area: Rect, col: u16, row: u16) -> Option<side::GitTab> {
-    if area.height < 3 || row != area.y {
-        return None;
-    }
-    // Left border, then the leading `Span::raw(" ")`.
-    let mut x = area.x.saturating_add(2);
-    for tab in side::GitTab::ALL {
-        let w = tab.label().chars().count() as u16 + 2;
-        if col >= x && col < x.saturating_add(w) {
-            return Some(tab);
-        }
-        x = x.saturating_add(w);
-    }
-    None
-}
-
-/// Where a chip drawn inside a pane's border title lands on screen, so a
-/// click on the frame can hit it. Mirrors the heading in `draw_scrollback`:
-/// left border, the leading space, then the title.
-fn title_chip_rect(area: Rect, title: &str, chip: &str) -> Option<Rect> {
-    if area.height < 3 {
-        return None;
-    }
-    let at = title.find(chip)?;
-    let off = title[..at].chars().count() as u16;
-    let x = area.x.saturating_add(2).saturating_add(off);
-    let w = chip.chars().count() as u16;
-    (x.saturating_add(w) <= area.x.saturating_add(area.width)).then_some(Rect {
-        x,
-        y: area.y,
-        width: w,
-        height: 1,
-    })
-}
-
-/// Which content row of a bordered pane a screen row lands on. `None` for the
-/// two border rows, so a click on the frame never moves a cursor.
-fn pane_row(area: Rect, row: u16) -> Option<usize> {
-    let inner = area.height.checked_sub(2)?;
-    if row <= area.y || row >= area.y + area.height - 1 {
-        return None;
-    }
-    let r = (row - area.y - 1) as usize;
-    (r < inner as usize).then_some(r)
-}
-
-fn handle_mouse(app: &mut App, m: MouseEvent) {
-    if app.viewer.is_some() {
-        handle_viewer_mouse(app, m);
-        return;
-    }
-    if app.post_inspect.is_some() {
-        handle_post_inspect_mouse(app, m);
-        return;
-    }
-    app.mouse = Some((m.column, m.row));
-    if matches!(m.kind, MouseEventKind::Down(MouseButton::Left)) {
-        if let Some(area) = app.turn_cancel {
-            if hit(area, m.column, m.row) {
-                app.want_stop = true;
-                return;
-            }
-        }
-        if let Some(area) = app.calls_chip {
-            if hit(area, m.column, m.row) {
-                app.toggle_posts();
-                return;
-            }
-        }
-    }
-    let on_calls = hit(app.call_area, m.column, m.row);
-    let on_story = hit(app.traj_area, m.column, m.row);
-    let on_post_in = hit(app.post_in_area, m.column, m.row);
-    let on_post_out = hit(app.post_out_area, m.column, m.row);
-    let on_queue = hit(app.queue_area, m.column, m.row) && !app.queue.is_empty();
-    let on_input = hit(app.input_area, m.column, m.row);
-    let on_git = hit(app.git_area, m.column, m.row);
-    let on_files = hit(app.files_area, m.column, m.row);
-    let on_meta = hit(app.cache.area, m.column, m.row);
-    let on_slash = slash_popup_area(app.input_area, app)
-        .is_some_and(|area| hit(area, m.column, m.row));
-
-    match m.kind {
-        MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
-            let up = matches!(m.kind, MouseEventKind::ScrollUp);
-            if on_slash && app.slash.open {
-                app.slash.move_sel(if up { -1 } else { 1 });
-                sync_theme_preview(app);
-            } else if on_calls {
-                wheel_scroll(app.calls_scroll(), up, 3);
-            } else if on_story {
-                wheel_scroll(app.story_scroll(), up, 3);
-            } else if on_post_in {
-                if up {
-                    app.post_in.scroll_up(3);
-                } else {
-                    app.post_in
-                        .scroll_down(3, app.post_in_area.height.saturating_sub(2));
-                }
-            } else if on_post_out {
-                if up {
-                    app.post_out.scroll_up(3);
-                } else {
-                    app.post_out
-                        .scroll_down(3, app.post_out_area.height.saturating_sub(2));
-                }
-            } else if on_git {
-                app.git.select(if up { -3 } else { 3 });
-                let path = app.git.selected().and_then(|r| r.path.clone());
-                app.files.preview(path.as_deref());
-            } else if on_files {
-                let rows = app.files_area.height.saturating_sub(2) as usize;
-                app.files.move_by(if up { -3 } else { 3 }, rows);
-            }
-        }
-        MouseEventKind::Down(MouseButton::Left) => {
-            if on_queue {
-                app.set_focus(Focus::Queue);
-                if app.queue_area.height > 2 {
-                    let row = m.row.saturating_sub(app.queue_area.y.saturating_add(1)) as usize;
-                    let idx = app.queue.visible_skip() + row;
-                    if idx < app.queue.len() {
-                        app.queue.selected = Some(idx);
-                    }
-                }
-                return;
-            }
-            if on_input {
-                app.set_focus(Focus::Input);
-                if hit(app.input_inner, m.column, m.row) {
-                    let col = m.column.saturating_sub(app.input_inner.x);
-                    let row = m.row.saturating_sub(app.input_inner.y);
-                    let hit_chip = app.prompt.click(col, row, app.input_inner.width);
-                    if let Some(id) = hit_chip {
-                        let now = Instant::now();
-                        let dbl = app
-                            .last_chip_click
-                            .map(|(t, cid)| cid == id && now.duration_since(t).as_millis() < 350)
-                            .unwrap_or(false);
-                        if dbl {
-                            app.prompt.expand_chip_id(id);
-                            app.last_chip_click = None;
-                        } else {
-                            app.last_chip_click = Some((now, id));
-                        }
-                    }
-                }
-                return;
-            }
-            if on_post_in || on_post_out {
-                let (tree, area) = if on_post_in {
-                    app.set_focus(Focus::PostIn);
-                    (&mut app.post_in, app.post_in_area)
-                } else {
-                    app.set_focus(Focus::PostOut);
-                    (&mut app.post_out, app.post_out_area)
-                };
-                if area.height > 2 && area.width > 2 {
-                    let row = m.row.saturating_sub(area.y.saturating_add(1));
-                    tree.click(row, area.width.saturating_sub(2));
-                    let now = Instant::now();
-                    let pane = if on_post_in { 2u8 } else { 3 };
-                    let dbl = app
-                        .last_click
-                        .map(|(t, _, p)| p == pane && now.duration_since(t).as_millis() < 350)
-                        .unwrap_or(false);
-                    if dbl {
-                        app.last_click = None;
-                        app.open_post_inspect();
-                    } else {
-                        app.last_click = Some((now, 0, pane));
-                    }
-                }
-                return;
-            }
-            if on_meta {
-                app.set_focus(Focus::Meter);
-                return;
-            }
-            if on_git {
-                app.set_focus(Focus::Git);
-                if let Some(tab) = git_tab_at(app.git_area, m.column, m.row) {
-                    app.git.set_tab(tab);
-                } else if let Some(row) = pane_row(app.git_area, m.row) {
-                    let idx = app.git.scroll + row;
-                    if idx < app.git.rows().len() {
-                        app.git.sel = idx;
-                    }
-                }
-                // Same rule as the keyboard: moving the git cursor previews.
-                let path = app.git.selected().and_then(|r| r.path.clone());
-                app.files.preview(path.as_deref());
-                return;
-            }
-            if on_files {
-                app.set_focus(Focus::Files);
-                if let Some(row) = pane_row(app.files_area, m.row) {
-                    if !app.files.in_file() {
-                        let idx = app.files.scroll + row;
-                        if idx < app.files.entries.len() {
-                            let now = Instant::now();
-                            let dbl = app
-                                .last_click
-                                .map(|(t, e, p)| {
-                                    p == 4 && e == idx && now.duration_since(t).as_millis() < 350
-                                })
-                                .unwrap_or(false);
-                            app.files.sel = idx;
-                            if dbl {
-                                app.last_click = None;
-                                app.files.enter();
-                            } else {
-                                app.last_click = Some((now, idx, 4));
-                            }
-                        }
-                    }
-                }
-                return;
-            }
-            if on_calls {
-                app.set_focus(Focus::Calls);
-            } else if on_story {
-                app.set_focus(Focus::Story);
-            } else {
-                return;
-            }
-            handle_scrollback_down(app, on_calls, m.column, m.row);
-        }
-        MouseEventKind::Drag(MouseButton::Left) => {
-            if on_calls || on_story {
-                handle_scrollback_drag(app, on_calls, m.column, m.row);
-            }
-        }
-        MouseEventKind::Up(MouseButton::Left) => {
-            if on_calls || on_story || app.story_text.active.is_some() || app.calls_text.active.is_some()
-            {
-                handle_scrollback_up(app, on_calls, m.column, m.row);
-            }
-        }
-        _ => {}
-    }
-}
-
-fn handle_scrollback_down(app: &mut App, calls: bool, col: u16, row: u16) {
-    let model = app.sel_model(calls).clone();
-    app.text_sel(calls).clear();
-    if let Some(hit) = model.hit_test_text_exact(col, row) {
-        let width = model.visible_block_content_width(hit.entry_idx);
-        {
-            let sel = app.text_sel(calls);
-            sel.pending = Some(PendingTextDrag {
-                anchor: hit,
-                start_col: col,
-                start_row: row,
-                anchor_content_width: width,
-            });
-            sel.note_click(Instant::now(), hit);
-        }
-        if calls {
-            app.calls_scroll().set_selected(Some(hit.entry_idx));
-        } else {
-            app.story_scroll().set_selected(Some(hit.entry_idx));
-        }
-        return;
-    }
-    let Some(geom) = model.hit_test_visible_block(col, row) else {
-        return;
-    };
-    let idx = geom.entry_idx;
-    let now = Instant::now();
-    let pane: u8 = if calls { 1 } else { 0 };
-    let dbl = app
-        .last_click
-        .map(|(t, e, p)| p == pane && e == idx && now.duration_since(t).as_millis() < 350)
-        .unwrap_or(false);
-    if calls {
-        app.calls_scroll().set_selected(Some(idx));
-    } else {
-        app.story_scroll().set_selected(Some(idx));
-    }
-    if dbl {
-        app.last_click = None;
-        if !calls && app.open_selected_session() {
-            return;
-        }
-        if calls {
-            pin_selected_wire(app);
-            app.calls_scroll().toggle_fold_selected();
-        } else {
-            app.story_scroll().toggle_fold_selected();
-        }
-    } else {
-        app.last_click = Some((now, idx, pane));
-    }
-}
-
-fn handle_scrollback_drag(app: &mut App, calls: bool, col: u16, row: u16) {
-    let model = app.sel_model(calls).clone();
-    let sel = app.text_sel(calls);
-    if let Some(pending) = sel.pending {
-        if !drag_threshold_exceeded(&pending, col, row) {
-            return;
-        }
-        let head = model
-            .hit_test_nearest_in_range(pending.anchor, col, row)
-            .unwrap_or(pending.anchor);
-        sel.active = Some(ActiveTextDrag {
-            anchor: pending.anchor,
-            head,
-            kind: SelectionKind::Linear,
-            anchor_content_width: pending.anchor_content_width,
-        });
-        return;
-    }
-    if let Some(mut drag) = sel.active {
-        if let Some(head) = model.hit_test_nearest_in_range(drag.anchor, col, row) {
-            drag.head = head;
-            sel.active = Some(drag);
-        }
-    }
-}
-
-fn handle_scrollback_up(app: &mut App, calls: bool, _col: u16, _row: u16) {
-    let model = app.sel_model(calls).clone();
-    let copied = {
-        let sel = app.text_sel(calls);
-        if let Some(drag) = sel.active.take() {
-            sel.pending = None;
-            if let Some(text) = reconstruct_selection_text(&model, &drag) {
-                if !text.is_empty() {
-                    sel.persist = Some(PersistentTextSelection {
-                        entry_idx: drag.anchor.entry_idx,
-                        range_id: drag.anchor.range_id,
-                        anchor: SelectionEndpoint {
-                            block_line_idx: drag.anchor.block_line_idx,
-                            col_within_range: drag.anchor.col_within_range,
-                        },
-                        head: SelectionEndpoint {
-                            block_line_idx: drag.head.block_line_idx,
-                            col_within_range: drag.head.col_within_range,
-                        },
-                        origin: SelectionOrigin::Drag,
-                        kind: drag.kind,
-                    });
-                    let _ = SystemClipboard::try_set(&text);
-                    Some(text)
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
-        } else if let Some(pending) = sel.pending.take() {
-            let clicks = sel.clicks;
-            if clicks >= 2 {
-                if let Some(word) =
-                    semantic_selection_at(&model, &pending.anchor, configured_word_separators())
-                {
-                    sel.persist = Some(PersistentTextSelection {
-                        entry_idx: pending.anchor.entry_idx,
-                        range_id: pending.anchor.range_id,
-                        anchor: word.anchor,
-                        head: word.head,
-                        origin: if clicks >= 3 {
-                            SelectionOrigin::TripleClick
-                        } else {
-                            SelectionOrigin::DoubleClick
-                        },
-                        kind: SelectionKind::Linear,
-                    });
-                    if word.text.is_empty() {
-                        None
-                    } else {
-                        let _ = SystemClipboard::try_set(&word.text);
-                        Some(word.text)
-                    }
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
-        } else {
-            None
-        }
-    };
-    if copied.is_some() {
-        app.notify("copied");
-    }
-}
-
 fn viewer_for_entry(entry: &ScrollbackEntry) -> Option<BlockViewerPane> {
     match &entry.block {
         RenderBlock::Thinking(_) | RenderBlock::AgentMessage(_) => {
@@ -4357,102 +1504,6 @@ fn viewer_for_entry(entry: &ScrollbackEntry) -> Option<BlockViewerPane> {
         RenderBlock::System(s) => Some(BlockViewerPane::for_plain_text("system", &s.text.clone())),
         RenderBlock::Subagent(_) => None,
         _ => None,
-    }
-}
-
-fn handle_viewer_key(app: &mut App, key: KeyEvent) {
-    let mut raw = false;
-    let mut id = None;
-    let mut selected = None;
-    {
-        let Some(viewer) = app.viewer.as_mut() else {
-            return;
-        };
-        if viewer.is_close_key(&key) {
-            app.viewer = None;
-            return;
-        }
-        if !viewer.handle_key(&key) {
-            return;
-        }
-        if viewer.raw_toggle_pending {
-            viewer.raw_toggle_pending = false;
-            viewer.list_state.set_scroll_anchor();
-            raw = true;
-            id = Some(viewer.entry_id);
-            selected = viewer.list_state.selected_id();
-        }
-    }
-    if raw {
-        let id = id.expect("raw toggle has an entry");
-        let old_source = app.viewer_scroll().get_by_id(id).and_then(|entry| {
-            selected.and_then(|sid| BlockViewerPane::source_line_for_id(&entry.block, sid))
-        });
-        if let Some(entry) = app.viewer_scroll().get_by_id_mut(id) {
-            entry.toggle_raw();
-        }
-        if let Some(entry) = app.viewer_scroll().get_by_id(id).cloned() {
-            if let Some(viewer) = app.viewer.as_mut() {
-                viewer.rebuild_items(&entry);
-                viewer.jump_to_source_line(&entry, old_source);
-            }
-        }
-    }
-    let id = app.viewer.as_ref().map(|v| v.entry_id);
-    let entry = id.and_then(|id| app.viewer_scroll().get_by_id(id).cloned());
-    if let (Some(entry), Some(viewer)) = (entry, app.viewer.as_mut()) {
-        if let Some(text) = viewer.process_pending_copy(&entry) {
-            let _ = SystemClipboard::try_set(&text);
-            app.notify("copied");
-        }
-    }
-}
-
-fn handle_viewer_mouse(app: &mut App, m: MouseEvent) {
-    let mut close = false;
-    let mut drag = None;
-    let mut id = None;
-    {
-        let Some(viewer) = app.viewer.as_mut() else {
-            return;
-        };
-        match handle_modal_mouse(&mut viewer.modal, m.kind, m.column, m.row) {
-            ModalWindowOutcome::CloseRequested => close = true,
-            ModalWindowOutcome::Handled => return,
-            _ => {
-                match m.kind {
-                    MouseEventKind::ScrollDown => viewer.handle_scroll(3),
-                    MouseEventKind::ScrollUp => viewer.handle_scroll(-3),
-                    MouseEventKind::Down(MouseButton::Left)
-                    | MouseEventKind::Drag(MouseButton::Left)
-                    | MouseEventKind::Up(MouseButton::Left)
-                    | MouseEventKind::Moved => {
-                        viewer.handle_mouse(m.kind, m.column, m.row);
-                    }
-                    _ => {}
-                }
-                drag = viewer.drag_copy_text.take();
-                id = Some(viewer.entry_id);
-            }
-        }
-    }
-    if close {
-        app.viewer = None;
-        return;
-    }
-    let key_text = if drag.is_none() {
-        id.and_then(|id| app.viewer_scroll().get_by_id(id).cloned())
-            .and_then(|entry| {
-                app.viewer
-                    .as_mut()
-                    .and_then(|v| v.process_pending_copy(&entry))
-            })
-    } else {
-        None
-    };
-    if let Some(text) = drag.or(key_text) {
-        let _ = SystemClipboard::try_set(&text);
-        app.notify("copied");
     }
 }
 
@@ -4586,208 +1637,6 @@ fn post_inspect_footer() -> [Shortcut<'static>; 4] {
     ]
 }
 
-fn handle_post_inspect_key(app: &mut App, key: KeyEvent) {
-    let n = app.post_n;
-    let req = app.post_req.clone();
-    let resp = app.post_resp.clone();
-    let footer = post_inspect_footer();
-    let (title, mut config) = post_inspect_chrome(n, &footer);
-    let title_owned = title;
-    config.title = &title_owned;
-    let close = {
-        let Some(inspect) = app.post_inspect.as_mut() else {
-            return;
-        };
-        match handle_modal_key(&mut inspect.modal, &key, &config) {
-            ModalWindowOutcome::CloseRequested => true,
-            ModalWindowOutcome::TabChanged(tab) => {
-                inspect.set_tab(tab, n, &req, &resp);
-                return;
-            }
-            _ => false,
-        }
-    };
-    if close {
-        app.post_inspect = None;
-        return;
-    }
-    let none = KeyModifiers::NONE;
-    match key.code {
-        KeyCode::Char('q') if key.modifiers == none => {
-            app.post_inspect = None;
-            return;
-        }
-        KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            app.post_inspect = None;
-            return;
-        }
-        KeyCode::Tab | KeyCode::Char(']') => {
-            let tab = app
-                .post_inspect
-                .as_ref()
-                .map(|p| (p.modal.active_tab + 1) % 2)
-                .unwrap_or(0);
-            if let Some(inspect) = app.post_inspect.as_mut() {
-                inspect.set_tab(tab, n, &req, &resp);
-            }
-            return;
-        }
-        KeyCode::BackTab | KeyCode::Char('[') => {
-            let tab = app
-                .post_inspect
-                .as_ref()
-                .map(|p| if p.modal.active_tab == 0 { 1 } else { 0 })
-                .unwrap_or(0);
-            if let Some(inspect) = app.post_inspect.as_mut() {
-                inspect.set_tab(tab, n, &req, &resp);
-            }
-            return;
-        }
-        KeyCode::Char('r') if key.modifiers == none => {
-            if let Some(inspect) = app.post_inspect.as_mut() {
-                inspect.toggle_raw(n, &req, &resp);
-            }
-            return;
-        }
-        KeyCode::Char('y') if key.modifiers == none => {
-            let tab = app
-                .post_inspect
-                .as_ref()
-                .map(|p| p.modal.active_tab)
-                .unwrap_or(0);
-            let val = if tab == 0 { &req } else { &resp };
-            let _ = SystemClipboard::try_set(&pretty_json(val));
-            app.notify("copied");
-            return;
-        }
-        _ => {}
-    }
-    let raw = app.post_inspect.as_ref().is_some_and(|p| p.raw);
-    if raw {
-        let close_raw = app
-            .post_inspect
-            .as_ref()
-            .and_then(|p| p.raw_viewer.as_ref())
-            .is_some_and(|v| v.is_close_key(&key));
-        if close_raw {
-            app.post_inspect = None;
-            return;
-        }
-        if let Some(viewer) = app
-            .post_inspect
-            .as_mut()
-            .and_then(|p| p.raw_viewer.as_mut())
-        {
-            let _ = viewer.handle_key(&key);
-        }
-        return;
-    }
-    let view_h = app
-        .post_inspect
-        .as_ref()
-        .map(|p| p.content.height)
-        .unwrap_or(8);
-    let tab = app
-        .post_inspect
-        .as_ref()
-        .map(|p| p.modal.active_tab)
-        .unwrap_or(0);
-    let tree = if tab == 0 {
-        &mut app.post_in
-    } else {
-        &mut app.post_out
-    };
-    match key.code {
-        KeyCode::Char('j') | KeyCode::Down => tree.select_next(),
-        KeyCode::Char('k') | KeyCode::Up => tree.select_prev(),
-        KeyCode::Char('h') | KeyCode::Left => tree.collapse(),
-        KeyCode::Char('l') | KeyCode::Right | KeyCode::Enter => tree.toggle(),
-        KeyCode::PageUp => tree.scroll_up(8),
-        KeyCode::PageDown => tree.scroll_down(8, view_h),
-        _ => {}
-    }
-}
-
-fn handle_post_inspect_mouse(app: &mut App, m: MouseEvent) {
-    let n = app.post_n;
-    let req = app.post_req.clone();
-    let resp = app.post_resp.clone();
-    let outcome = {
-        let Some(inspect) = app.post_inspect.as_mut() else {
-            return;
-        };
-        handle_modal_mouse(&mut inspect.modal, m.kind, m.column, m.row)
-    };
-    match outcome {
-        ModalWindowOutcome::CloseRequested => {
-            app.post_inspect = None;
-            return;
-        }
-        ModalWindowOutcome::TabChanged(tab) => {
-            if let Some(inspect) = app.post_inspect.as_mut() {
-                inspect.set_tab(tab, n, &req, &resp);
-            }
-            return;
-        }
-        ModalWindowOutcome::Handled => return,
-        _ => {}
-    }
-    let raw = app.post_inspect.as_ref().is_some_and(|p| p.raw);
-    if raw {
-        if let Some(viewer) = app
-            .post_inspect
-            .as_mut()
-            .and_then(|p| p.raw_viewer.as_mut())
-        {
-            match m.kind {
-                MouseEventKind::ScrollDown => viewer.handle_scroll(3),
-                MouseEventKind::ScrollUp => viewer.handle_scroll(-3),
-                MouseEventKind::Down(MouseButton::Left)
-                | MouseEventKind::Drag(MouseButton::Left)
-                | MouseEventKind::Up(MouseButton::Left)
-                | MouseEventKind::Moved => {
-                    viewer.handle_mouse(m.kind, m.column, m.row);
-                }
-                _ => {}
-            }
-        }
-        return;
-    }
-    let area = app
-        .post_inspect
-        .as_ref()
-        .map(|p| p.content)
-        .unwrap_or_default();
-    if area.width == 0 || area.height == 0 {
-        return;
-    }
-    let on = m.column >= area.x
-        && m.column < area.x.saturating_add(area.width)
-        && m.row >= area.y
-        && m.row < area.y.saturating_add(area.height);
-    if !on {
-        return;
-    }
-    let tab = app
-        .post_inspect
-        .as_ref()
-        .map(|p| p.modal.active_tab)
-        .unwrap_or(0);
-    let tree = if tab == 0 {
-        &mut app.post_in
-    } else {
-        &mut app.post_out
-    };
-    match m.kind {
-        MouseEventKind::ScrollUp => tree.scroll_up(3),
-        MouseEventKind::ScrollDown => tree.scroll_down(3, area.height),
-        MouseEventKind::Down(MouseButton::Left) => {
-            tree.click(m.row.saturating_sub(area.y), area.width);
-        }
-        _ => {}
-    }
-}
-
 fn draw_post_inspect(f: &mut Frame, app: &mut App) {
     let theme = Theme::current();
     let n = app.post_n;
@@ -4827,21 +1676,6 @@ fn draw_post_inspect(f: &mut Frame, app: &mut App) {
     };
     let lines = tree.lines(inner.width, inner.height, true);
     f.render_widget(Paragraph::new(lines), inner);
-}
-
-/// Wheel/page only after prepare_layout has a real viewport. scroll_down
-/// with viewport_height=0 uses max_offset=total_height and walks off the end.
-fn wheel_scroll(sb: &mut ScrollbackState, up: bool, rows: u16) {
-    let (_, vp, _) = sb.scroll_info();
-    if vp == 0 {
-        return;
-    }
-    if up {
-        sb.scroll_up(rows);
-    } else {
-        sb.scroll_down(rows);
-    }
-    clamp_scroll(sb);
 }
 
 fn clamp_scroll(sb: &mut ScrollbackState) {
@@ -4980,9 +1814,9 @@ fn expire_notice(app: &mut App) -> bool {
 }
 
 fn tick_scrollbacks(app: &mut App) -> bool {
-    let mut need = app.story.tick() || app.calls.tick();
+    let mut need = app.sess.story.tick() || app.sess.calls.tick();
     for child in app.children.values_mut() {
-        need |= child.story.tick() || child.calls.tick();
+        need |= child.sess.story.tick() || child.sess.calls.tick();
     }
     need
 }
@@ -4991,17 +1825,17 @@ fn current_turn_activity(app: &App) -> Option<TurnActivity> {
     if !app.running {
         return None;
     }
-    if app.exec.live() {
+    if app.sess.exec.live() {
         let title = exec_activity_title(app);
         return Some(TurnActivity::ToolRunning {
             title,
             description: None,
         });
     }
-    if app.stream.speech.is_some() || !app.stream.speech_raw.is_empty() {
+    if app.sess.stream.speech.is_some() || !app.sess.stream.speech_raw.is_empty() {
         return Some(TurnActivity::Responding);
     }
-    if app.stream.think.is_some() || !app.stream.pending_think.is_empty() {
+    if app.sess.stream.think.is_some() || !app.sess.stream.pending_think.is_empty() {
         return Some(TurnActivity::Thinking);
     }
     Some(TurnActivity::Waiting(WaitingReason::Model))
@@ -5075,28 +1909,28 @@ fn meta_id(app: &App) -> MetaId {
 /// carries every body and every result. Disjoint routes, not a filter: meta
 /// gets the tag, calls gets the payload.
 fn exec_activity_title(app: &App) -> String {
-    if app.exec.tag.is_empty() {
+    if app.sess.exec.tag.is_empty() {
         "syscall".into()
     } else {
-        format!("<{}>", app.exec.tag)
+        format!("<{}>", app.sess.exec.tag)
     }
 }
 
 fn streaming(app: &App) -> bool {
-    app.stream.live()
-        || app.exec.live()
+    app.sess.stream.live()
+        || app.sess.exec.live()
         || app
             .children
             .values()
-            .any(|c| c.stream.live() || c.exec.live())
+            .any(|c| c.sess.stream.live() || c.sess.exec.live())
 }
 
 fn flush_streams(app: &mut App) {
-    app.stream.flush(&mut app.story, &mut app.calls);
-    app.exec.flush(&mut app.calls);
+    app.sess.stream.flush(&mut app.sess.story, &mut app.sess.calls);
+    app.sess.exec.flush(&mut app.sess.calls);
     for child in app.children.values_mut() {
-        child.stream.flush(&mut child.story, &mut child.calls);
-        child.exec.flush(&mut child.calls);
+        child.sess.stream.flush(&mut child.sess.story, &mut child.sess.calls);
+        child.sess.exec.flush(&mut child.sess.calls);
     }
 }
 
@@ -5108,13 +1942,13 @@ fn draw(f: &mut Frame, app: &mut App) {
         f.area(),
     );
 
-    reflow_wire(&mut app.calls, &app.wire_manual);
+    reflow_wire(&mut app.sess.calls, &app.sess.wire_manual);
     // Only the pane on screen: a fold reconcile is about what is drawn, and
     // children are never pruned, so walking all of them grew per-frame work
     // for panes nobody is looking at. `viewing` is set before the frame that
     // first shows a child.
     if let Some(c) = app.viewing.clone().and_then(|id| app.children.get_mut(&id)) {
-        reflow_wire(&mut c.calls, &c.wire_manual);
+        reflow_wire(&mut c.sess.calls, &c.sess.wire_manual);
     }
 
     // Columns first, because the composer wraps at the story column's width and
@@ -5243,54 +2077,54 @@ fn draw(f: &mut Frame, app: &mut App) {
         draw_scrollback(
             f,
             panes[0],
-            &mut child.story,
-            &mut child.story_scratch,
-            &mut child.story_sel,
+            &mut child.sess.story,
+            &mut child.sess.story_scratch,
+            &mut child.sess.story_sel,
             &title,
             theme.accent_skill,
             app.focus == Focus::Story,
             app.mouse,
-            &child.story_text,
+            &child.sess.story_text,
             &mut app.media.frame,
         );
         draw_scrollback(
             f,
             panes[1],
-            &mut child.calls,
-            &mut child.calls_scratch,
-            &mut child.calls_sel,
+            &mut child.sess.calls,
+            &mut child.sess.calls_scratch,
+            &mut child.sess.calls_sel,
             &calls_title,
             theme.accent_tool,
             app.focus == Focus::Calls,
             app.mouse,
-            &child.calls_text,
+            &child.sess.calls_text,
             &mut app.media.frame,
         );
     } else {
         draw_scrollback(
             f,
             panes[0],
-            &mut app.story,
-            &mut app.story_scratch,
-            &mut app.story_sel,
+            &mut app.sess.story,
+            &mut app.sess.story_scratch,
+            &mut app.sess.story_sel,
             "Story",
             theme.accent_assistant,
             app.focus == Focus::Story,
             app.mouse,
-            &app.story_text,
+            &app.sess.story_text,
             &mut app.media.frame,
         );
         draw_scrollback(
             f,
             panes[1],
-            &mut app.calls,
-            &mut app.calls_scratch,
-            &mut app.calls_sel,
+            &mut app.sess.calls,
+            &mut app.sess.calls_scratch,
+            &mut app.sess.calls_sel,
             &calls_title,
             theme.accent_tool,
             app.focus == Focus::Calls,
             app.mouse,
-            &app.calls_text,
+            &app.sess.calls_text,
             &mut app.media.frame,
         );
     }
@@ -6220,7 +3054,7 @@ fn draw_input(f: &mut Frame, area: Rect, app: &mut App) {
     // The whole composer frame is the activity indicator. Runtime states keep
     // their own hue while the bold pulse makes progress visible without adding
     // another status row.
-    let pulse = (app.story.animation_tick() / 6) % 2 == 0;
+    let pulse = (app.sess.story.animation_tick() / 6) % 2 == 0;
     let mut border_style = Style::default().fg(signal_color);
     if signal.is_some() && pulse {
         border_style = border_style.add_modifier(Modifier::BOLD);
@@ -6243,7 +3077,7 @@ fn draw_input(f: &mut Frame, area: Rect, app: &mut App) {
     if let Some(label) = signal_label.as_ref() {
         let frames = glyphs::braille_spinner_frames();
         let frame = frames
-            .get(app.story.animation_tick() as usize % frames.len().max(1))
+            .get(app.sess.story.animation_tick() as usize % frames.len().max(1))
             .copied()
             .unwrap_or(" ");
         left_title.push(Span::styled(
@@ -6637,986 +3471,6 @@ fn draw_paste_preview(f: &mut Frame, input: Rect, body: &str, on_chip: bool) {
     f.render_widget(Paragraph::new(lines), inner);
 }
 
-fn spoken_prefix(text: &str) -> String {
-    let (spans, open_fence) = code_spans(text);
-    // Mid-stream an open fence is still a code block: its closer is one of the
-    // things the stream has not delivered yet. Masking it keeps a half-written
-    // `<div` in a fenced HTML sample from stalling the render, and the tail
-    // released by `finish_speech` is the one that follows `scan.py`.
-    let mut live = spans.clone();
-    if let Some(f) = open_fence {
-        live.push((f, text.len()));
-    }
-    // A call whose closer has not arrived yet is a syscall in flight. Hold
-    // everything from its `<` back: the alternative is that the body streams
-    // into the story as prose, and it stays there, because by the time the
-    // closer lands the chunk has already been appended to a live block.
-    //
-    // The streaming path must strip bodies, not just markers: dropping the
-    // markers alone is right for prose about markup and wrong for a command.
-    let mut cut = text.len();
-    let mut i = 0usize;
-    while let Some(hit) = next_tag(text, i, &live) {
-        match hit.end {
-            Some(end) => i = end,
-            None => {
-                cut = hit.start; // opener still being typed, or body still arriving
-                break;
-            }
-        }
-    }
-    // Under an open fence the two readings differ, and only for a tag the
-    // kernel would run: if the fence closes it is code, and if it never closes
-    // `scan.py` dispatches it. Nobody can tell which yet, so hold there rather
-    // than print a call and retract it a frame later -- a retraction that
-    // cannot be taken back once the chunk is in a live block. A tag with no
-    // closer needs no hold *yet* -- but mid-stream "no closer" only means it
-    // has not arrived. Streaming past it printed the raw call, and when the
-    // closer landed the cut moved backwards, so `shown` no longer began with
-    // what was already drawn: flush_speech finished the stale block and opened
-    // a second one, leaving the truncated copy in the story for good. Holding
-    // at the first tag start costs nothing -- a fenced sample stalls at the `<`
-    // until the fence closes either way.
-    if let Some(f) = open_fence {
-        if let Some(hit) = next_tag(text, f, &spans) {
-            cut = cut.min(hit.start);
-        }
-    }
-    // A call that opens the turn leaves the prose behind it beginning with the
-    // newlines that separated the two. Those survive as an empty first line,
-    // and the timestamp overlay always lands on the first content line -- so
-    // the stamp ends up alone on a blank row, one row above the sentence it
-    // belongs to, and a one-line reply costs four rows instead of one.
-    // Leading whitespace is never information here, and trimming it is stable
-    // under streaming: once consumed it stays consumed, so the prefix check in
-    // flush_speech still holds.
-    strip_syscalls(&text[..cut]).trim_start().to_string()
-}
-
-/// A trailing `<` is only worth withholding if it could open a tag: `<`
-/// followed by a letter or `/`. Without this, `if a < b` in streamed prose
-/// stalls the render until some later `>` arrives.
-fn looks_like_tag_start(rest: &str) -> bool {
-    let mut it = rest.chars();
-    it.next();
-    match it.next() {
-        Some('/') => it.next().is_some_and(|c| c.is_ascii_alphabetic()),
-        Some(c) => c.is_ascii_alphabetic(),
-        None => true,
-    }
-}
-
-fn start_thinking(story: &mut ScrollbackState, stream: &mut StreamCursor) {
-    if stream.think.is_some() {
-        return;
-    }
-    let id = story.push_block(RenderBlock::thinking_streaming());
-    story.set_last_running(true);
-    // Grok's truncated mode marks the clipped head with a bare "…" row. That
-    // marker only reads as a marker under the header, and the header is the
-    // status row's job -- so a live thought renders its whole body (grok
-    // minimal does the same in its live tail) and the pane's bottom edge does
-    // the clipping. finish_think folds it back to one collapsed row.
-    set_wire_mode(story, id, DisplayMode::Expanded);
-    stream.think = Some(id);
-}
-
-fn finish_exec(calls: &mut ScrollbackState, exec: &mut ExecStream) {
-    exec.flush(calls);
-    if let Some(id) = exec.id.take() {
-        calls.finish_running(id);
-        // Do not fold here. reflow_wire owns fold state and keeps the tail
-        // open, so collapsing on finish only produces a one-frame flash
-        // before it is reopened.
-    }
-    exec.pending.clear();
-    exec.tag.clear();
-}
-
-fn apply_result(calls: &mut ScrollbackState, exec: &mut ExecStream, ev: &Value) {
-    let phase = ev.get("phase").and_then(Value::as_str).unwrap_or("done");
-    match phase {
-        "start" => {
-            finish_exec(calls, exec);
-            let id = wire_push(calls, result_block(ev));
-            // Open while it streams so stdout is visible as it arrives.
-            set_wire_mode(calls, id, DisplayMode::Expanded);
-            calls.set_last_running(true);
-            exec.id = Some(id);
-            exec.tag = ev
-                .get("tag")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string();
-        }
-        "delta" => {
-            let text = ev.get("text").and_then(Value::as_str).unwrap_or("");
-            if !text.is_empty() {
-                exec.pending.push_str(text);
-            }
-        }
-        _ => {
-            exec.flush(calls);
-            let text = ev.get("text").and_then(Value::as_str).unwrap_or("");
-            let tag = ev.get("tag").and_then(Value::as_str).unwrap_or("?");
-            if let Some(id) = exec.id.take() {
-                if let Some(entry) = calls.get_by_id_mut(id) {
-                    match &mut entry.block {
-                        RenderBlock::ToolCall(ToolCallBlock::Execute(block)) => {
-                            if block.output.as_ref().is_none_or(|s| s.is_empty())
-                                && !text.is_empty()
-                            {
-                                block.output = Some(text.to_string());
-                            }
-                            if looks_failed(tag, text) {
-                                block.set_error(Some(
-                                    text.lines().next().unwrap_or("failed").to_string(),
-                                ));
-                            }
-                            block.finish();
-                        }
-                        // Only python/bash are Execute cards. `edit`, `register`,
-                        // `system`, `skill`, `evolve` and every tag grown with
-                        // <register> render as Other, which has no streaming
-                        // output slot — rebuild the card from the done event so
-                        // the wire pane actually shows what the syscall returned.
-                        other => *other = result_block(ev),
-                    }
-                }
-                calls.finish_running(id);
-                // Fold state is reflow_wire's job; a finished call that is
-                // still recent stays readable instead of blinking shut.
-                calls.mark_height_dirty(id);
-            } else {
-                wire_push(calls, result_block(ev));
-            }
-        }
-    }
-}
-
-fn apply_thinking(
-    story: &mut ScrollbackState,
-    activity: &mut ScrollbackState,
-    stream: &mut StreamCursor,
-    redacted: bool,
-    text: &str,
-    delta: bool,
-) {
-    if redacted {
-        stream.finish_speech(story);
-        stream.finish_think(activity);
-        activity.push_block(RenderBlock::thinking(
-            "redacted thinking — opaque block, replayed on the next complete(), not speech.",
-        ));
-        return;
-    }
-    if delta {
-        stream.finish_speech(story);
-        if text.is_empty() {
-            return;
-        }
-        start_thinking(activity, stream);
-        stream.pending_think.push_str(text);
-        return;
-    }
-    stream.finish_speech(story);
-    stream.finish_think(activity);
-    if !text.trim().is_empty() {
-        activity.push_block(RenderBlock::thinking(text));
-    }
-}
-
-fn apply_speech(
-    story: &mut ScrollbackState,
-    activity: &mut ScrollbackState,
-    stream: &mut StreamCursor,
-    text: &str,
-    delta: bool,
-) {
-    if delta {
-        stream.finish_think(activity);
-        stream.speech_raw.push_str(text);
-        return;
-    }
-    stream.finish_think(activity);
-    stream.finish_speech(story);
-    // The story carries prose. A syscall goes to the calls pane, body and all.
-    let spoken = strip_syscalls(text);
-    if !spoken.trim().is_empty() {
-        story.push_block(RenderBlock::agent_message(spoken));
-    }
-}
-
-/// Byte ranges of `text` that are literal code -- fenced blocks (fence lines
-/// included), inline backtick spans, indented blocks -- and, separately, the
-/// offset of a fence that never closed. XML stripping must leave the ranges
-/// alone, or `<div>` inside a fenced HTML sample silently vanishes from the
-/// story.
-///
-/// An unterminated fence is deliberately *not* one of the ranges.
-/// `scan.py::_fence_span` returns None for it and says why: masking to end of
-/// text would drop every syscall written after one stray backtick run. So the
-/// kernel really does dispatch `<bash>ls</bash>` sitting under an unclosed
-/// fence, and if the story masked it the call would be run *and* printed raw
-/// as prose. Its offset comes back separately because the streaming caller has
-/// one more thing to decide with it: mid-stream, that fence may simply be
-/// waiting for a closer that has not arrived yet.
-fn code_spans(text: &str) -> (Vec<(usize, usize)>, Option<usize>) {
-    fn run(s: &str, c: char) -> usize {
-        s.chars().take_while(|&x| x == c).count()
-    }
-
-    let mut spans: Vec<(usize, usize)> = Vec::new();
-    // fence char, opener length, start offset, and how many spans predate it.
-    let mut fence: Option<(char, usize, usize, usize)> = None;
-    let mut off = 0usize;
-
-    for line in text.split_inclusive('\n') {
-        let trimmed = line.trim_start();
-        let indent = line.len() - trimmed.len();
-        let first = trimmed.chars().next();
-        let mut fenced_line = false;
-
-        match fence {
-            Some((fc, flen, start, mark)) => {
-                let n = run(trimmed, fc);
-                if first == Some(fc) && n >= flen && trimmed[n..].trim().is_empty() {
-                    // Closed. The block is one span, and the backtick runs
-                    // recorded inside it were never inline spans of their own.
-                    spans.truncate(mark);
-                    spans.push((start, off + line.len()));
-                    fence = None;
-                    fenced_line = true;
-                }
-            }
-            None => {
-                if indent <= 3 && (first == Some('`') || first == Some('~')) {
-                    let fc = first.unwrap();
-                    let n = run(trimmed, fc);
-                    if n >= 3 {
-                        fence = Some((fc, n, off, spans.len()));
-                        fenced_line = true;
-                    }
-                }
-            }
-        }
-
-        // Interior lines are measured for inline spans as they go, because a
-        // fence that never closes leaves them exactly that: ordinary lines
-        // whose backticks still open and close spans, the way `scan.py` reads
-        // them once `_fence_span` has declined to mask anything.
-        if !fenced_line {
-            inline_code_spans(line, off, &mut spans);
-        }
-        off += line.len();
-    }
-
-    let open = fence.map(|(_, _, start, _)| start);
-    spans.extend(indented_spans(text));
-    (spans, open)
-}
-
-/// Leading-whitespace width with tabs expanded to the next multiple of four,
-/// the way `scan.py::_indent_width` measures it.
-fn indent_width(line: &str) -> usize {
-    let mut w = 0usize;
-    for ch in line.chars() {
-        match ch {
-            ' ' => w += 1,
-            '\t' => w += 4 - w % 4,
-            _ => break,
-        }
-    }
-    w
-}
-
-fn expand_tabs(line: &str) -> Cow<'_, str> {
-    if !line.contains('\t') {
-        return Cow::Borrowed(line);
-    }
-    let mut out = String::with_capacity(line.len() + 8);
-    for ch in line.chars() {
-        if ch == '\t' {
-            let col = out.chars().count();
-            out.push_str(&" ".repeat(4 - col % 4));
-        } else {
-            out.push(ch);
-        }
-    }
-    Cow::Owned(out)
-}
-
-/// A list marker at the head of a tab-expanded line: how far the marker runs
-/// (including the space after it) and whether that space was there. `scan.py`
-/// spells this `BULLET`; both need it to know where a list item's content
-/// starts, because indented code is measured from that column and not from
-/// zero.
-fn bullet(line: &str) -> Option<(usize, bool)> {
-    let b = line.as_bytes();
-    let mut i = 0usize;
-    while i < b.len() && b[i] == b' ' {
-        i += 1;
-    }
-    if i < b.len() && matches!(b[i], b'-' | b'*' | b'+') {
-        i += 1;
-    } else {
-        let digits = i;
-        while i < b.len() && b[i].is_ascii_digit() {
-            i += 1;
-        }
-        if i == digits || i >= b.len() || !matches!(b[i], b'.' | b')') {
-            return None;
-        }
-        i += 1;
-    }
-    let after = i;
-    while i < b.len() && (b[i] == b' ' || b[i] == b'\t') {
-        i += 1;
-    }
-    if i > after {
-        Some((i, true))
-    } else if after == b.len() {
-        Some((after, false))
-    } else {
-        None
-    }
-}
-
-/// Byte ranges of CommonMark *indented* code blocks: a line four columns past
-/// the enclosing list item's content column, opening after a blank line, and
-/// everything that stays that deep.
-///
-/// The port of `scan.py::_indent_span` + `_list_col`, and it has to stay one:
-/// the dispatcher does not run a tag inside one of these, so if the story
-/// stripped it the sample would appear in neither pane — not dispatched, not
-/// printed. The list column is the fiddly half and cannot be dropped: under
-/// `- ` content starts at column 2, so four spaces there is an ordinary
-/// paragraph of that item and a real call.
-fn indented_spans(text: &str) -> Vec<(usize, usize)> {
-    let mut spans: Vec<(usize, usize)> = Vec::new();
-    let mut cols: Vec<usize> = Vec::new();
-    let mut blank = true;
-    let mut block_end = 0usize;
-    let mut off = 0usize;
-    for line in text.split('\n') {
-        let opens = line.starts_with("    ") || line.starts_with('\t');
-        if off >= block_end && blank && opens {
-            let floor = cols.last().copied().unwrap_or(0) + 4;
-            if indent_width(line) >= floor {
-                let mut end = off + line.len();
-                for next in text[end.min(text.len())..].split('\n').skip(1) {
-                    if !next.trim().is_empty() && indent_width(next) < floor {
-                        break;
-                    }
-                    end += next.len() + 1;
-                }
-                let end = end.min(text.len());
-                spans.push((off, end));
-                block_end = end;
-            }
-        }
-        if line.trim().is_empty() {
-            blank = true;
-        } else {
-            let ind = indent_width(line);
-            let expanded = expand_tabs(line);
-            let mark = bullet(&expanded);
-            if blank || mark.is_some() {
-                while cols.last().is_some_and(|&c| ind < c) {
-                    cols.pop();
-                }
-            }
-            if let Some((len, spaced)) = mark {
-                if ind <= cols.last().copied().unwrap_or(0) + 3 {
-                    cols.push(len + usize::from(!spaced));
-                }
-            }
-            blank = false;
-        }
-        off += line.len() + 1;
-    }
-    spans
-}
-
-/// Backtick-delimited inline spans on one line.
-///
-/// A run with no matching closer is not a span — it is literal text, which is
-/// what CommonMark says, what the markdown renderer draws, and what
-/// `scan.py::_in_code_span` decides. Treating it as code to end of line put
-/// the two out of step: one stray backtick ahead of a real call meant the
-/// dispatcher ran the call and pushed its card while the story printed the
-/// raw tag as prose — the same call in both panes, in two different shapes.
-/// Nothing is eaten by this: a half-streamed `` `<tag `` is withheld by
-/// `spoken_prefix`'s unterminated-tag cut instead, and printed once it closes.
-fn inline_code_spans(line: &str, base: usize, out: &mut Vec<(usize, usize)>) {
-    let b = line.as_bytes();
-    let mut i = 0usize;
-    while i < b.len() {
-        if b[i] != b'`' {
-            i += 1;
-            continue;
-        }
-        let mut n = 0usize;
-        while i + n < b.len() && b[i + n] == b'`' {
-            n += 1;
-        }
-        let start = i;
-        let mut j = i + n;
-        let mut close = None;
-        while j < b.len() {
-            if b[j] == b'`' {
-                let mut m = 0usize;
-                while j + m < b.len() && b[j + m] == b'`' {
-                    m += 1;
-                }
-                if m == n {
-                    close = Some(j + m);
-                    break;
-                }
-                j += m;
-            } else {
-                j += 1;
-            }
-        }
-        let Some(end) = close else {
-            i = start + n;
-            continue;
-        };
-        out.push((base + start, base + end));
-        i = end;
-    }
-}
-
-fn in_code(spans: &[(usize, usize)], i: usize) -> bool {
-    spans.iter().any(|&(a, z)| i >= a && i < z)
-}
-
-/// Tags whose body is executed verbatim, and the only ones the closing-tag
-/// quoting heuristic applies to. The port of `scan.py::_QUOTED_BODY`, and it
-/// has to stay the same set: widen it and prose bodies vanish from the story
-/// on an apostrophe, narrow it and a quoted `</bash>` truncates a command.
-const QUOTED_BODY: [&str; 4] = ["python", "bash", "shell", "register"];
-
-/// One tag the way `scan.py::scan_spans` sees it.
-struct TagHit {
-    /// Offset of the `<`.
-    start: usize,
-    /// Offset just past the `>` of the opener.
-    open_end: usize,
-    /// End of the whole call, or None when no closer ever arrived. The kernel
-    /// does not half-dispatch a cut-off reply -- `scan_spans` skips such an
-    /// opener entirely -- so None means "this is prose", not "this is a call".
-    end: Option<usize>,
-}
-
-/// The next syscall in `text` at or after `from`, skipping `spans`.
-///
-/// This is the single place the story decides what ran, and it answers exactly
-/// what `scan.py::scan_spans` answers, because the two disagreeing is visible:
-/// strip something the kernel left inert and the text is in neither pane, keep
-/// something the kernel ran and it is raw prose in the story *and* a card in
-/// the calls pane.
-///
-/// Not a call, and therefore skipped as ordinary text: a lone `</bash>`
-/// (`TAG_OPEN` cannot match one, so the kernel never sees a tag there) and a
-/// `<>` with no name.
-fn next_tag(text: &str, from: usize, spans: &[(usize, usize)]) -> Option<TagHit> {
-    let mut i = from;
-    while let Some(rel) = text[i..].find('<') {
-        let start = i + rel;
-        if in_code(spans, start) || !looks_like_tag_start(&text[start..]) {
-            i = start + 1;
-            continue;
-        }
-        let Some(gt) = text[start..].find('>') else {
-            // Still being typed; there is no tag until the `>` lands.
-            return Some(TagHit { start, open_end: text.len(), end: None });
-        };
-        let open_end = start + gt + 1;
-        let inner = &text[start + 1..open_end - 1];
-        // Name runs to the first space, and a self-closing marker has no body.
-        let name = inner
-            .trim_end_matches('/')
-            .split_whitespace()
-            .next()
-            .unwrap_or("");
-        if name.is_empty() || name.starts_with('/') {
-            i = open_end;
-            continue;
-        }
-        if inner.trim_end().ends_with('/') {
-            return Some(TagHit { start, open_end, end: Some(open_end) });
-        }
-        // An explicit end token makes the body opaque, exactly as in
-        // `scan.py`: the call runs to its `name:TOKEN` closer and every bare
-        // closer inside it is ordinary text. Miss this and the stripper hunts
-        // for a closer that is never written, calls the opener unterminated,
-        // and paints the whole body -- plus the token closer -- into the story.
-        if let Some(token) = end_token(inner) {
-            let usable = !token.is_empty()
-                && token
-                    .chars()
-                    .all(|c| c.is_alphanumeric() || c == '_' || c == '.' || c == '-');
-            // An unusable token is dropped by the kernel rather than falling
-            // back to a bare closer, so nothing ran and nothing is hidden.
-            let end = if usable {
-                find_custom_close(text, name, &token, open_end)
-            } else {
-                None
-            };
-            return Some(TagHit { start, open_end, end });
-        }
-        // The body ends at the first closer that is not inside a quoted
-        // string, which is `scan_spans`'s rule and its reason: the only closer
-        // a model writes early is one it quoted (`echo "</bash>"`), and
-        // stopping there truncates the body and runs half the program.
-        //
-        // Only for `QUOTED_BODY` tags, exactly as in scan.py. A commit message
-        // is prose, and prose has apostrophes: "the TUI's stripper" opens a
-        // quote that never closes, so every closer after it reads as quoted,
-        // the call reads as unterminated, and the whole message lands in the
-        // story pane. scan.py learned this at the cost of three lost commits.
-        let quoted_body = QUOTED_BODY.contains(&name);
-        let mut at = open_end;
-        loop {
-            let Some((cs, ce)) = find_close(text, name, at) else {
-                return Some(TagHit { start, open_end, end: None });
-            };
-            if quoted_body && in_string(&text[open_end..cs]) {
-                at = ce;
-                continue;
-            }
-            return Some(TagHit { start, open_end, end: Some(ce) });
-        }
-    }
-    None
-}
-
-/// `</name>` at or after `from`, allowing the space `scan.py`'s closer regex
-/// allows (`</name\s*>`). Returns the range the closer occupies.
-fn find_close(text: &str, name: &str, from: usize) -> Option<(usize, usize)> {
-    let pat = format!("</{name}");
-    let mut i = from;
-    while let Some(rel) = text[i..].find(&pat) {
-        let s = i + rel;
-        let rest = &text[s + pat.len()..];
-        let ws = rest.len() - rest.trim_start().len();
-        if rest[ws..].starts_with('>') {
-            return Some((s, s + pat.len() + ws + 1));
-        }
-        i = s + pat.len();
-    }
-    None
-}
-
-/// The `name:TOKEN` closer at or after `from`, allowing the space `scan.py`'s
-/// custom closer allows around the colon and before the `>`. Returns the offset
-/// just past it.
-fn find_custom_close(text: &str, name: &str, token: &str, from: usize) -> Option<usize> {
-    let open = format!("</{name}");
-    let mut i = from;
-    while let Some(rel) = text[i..].find(&open) {
-        let s = i + rel;
-        let rest = &text[s + open.len()..];
-        let a = rest.len() - rest.trim_start().len();
-        if let Some(after) = rest[a..].strip_prefix(':') {
-            let b = after.len() - after.trim_start().len();
-            if let Some(tail) = after[b..].strip_prefix(token) {
-                let c = tail.len() - tail.trim_start().len();
-                if tail[c..].starts_with('>') {
-                    return Some(s + open.len() + a + 1 + b + token.len() + c + 1);
-                }
-            }
-        }
-        i = s + open.len();
-    }
-    None
-}
-
-/// The `end="TOKEN"` attribute of an opener, if it declared one. Values may be
-/// quoted or bare, which is what `scan.py::ATTR` accepts.
-fn end_token(inner: &str) -> Option<String> {
-    let b = inner.as_bytes();
-    let mut i = 0usize;
-    while i < b.len() {
-        if !(b[i].is_ascii_alphabetic() || b[i] == b'_') {
-            i += 1;
-            continue;
-        }
-        let s = i;
-        while i < b.len()
-            && (b[i].is_ascii_alphanumeric() || b[i] == b'_' || b[i] == b'.' || b[i] == b'-')
-        {
-            i += 1;
-        }
-        let name = &inner[s..i];
-        let mut j = i;
-        while j < b.len() && (b[j] as char).is_whitespace() {
-            j += 1;
-        }
-        if j >= b.len() || b[j] != b'=' {
-            continue;
-        }
-        j += 1;
-        while j < b.len() && (b[j] as char).is_whitespace() {
-            j += 1;
-        }
-        if j >= b.len() {
-            return None;
-        }
-        let (value, next) = if b[j] == b'"' || b[j] == b'\'' {
-            let quote = b[j];
-            let vs = j + 1;
-            let mut k = vs;
-            while k < b.len() && b[k] != quote {
-                k += 1;
-            }
-            (&inner[vs..k], (k + 1).min(b.len()))
-        } else {
-            let vs = j;
-            let mut k = j;
-            while k < b.len()
-                && !(b[k] as char).is_whitespace()
-                && b[k] != b'"'
-                && b[k] != b'\''
-                && b[k] != b'>'
-            {
-                k += 1;
-            }
-            (&inner[vs..k], k)
-        };
-        i = next;
-        if name == "end" {
-            return Some(value.to_string());
-        }
-    }
-    None
-}
-
-/// Does `body` end inside an unclosed quote? The port of `scan.py::_in_string`,
-/// and it decides where a syscall body ends. Bash and Python agree on the part
-/// that matters: a run of `'` or `"` opens, the same run closes, a backslash
-/// escapes the next character inside a double quote, and a triple run swallows
-/// the closing tag a docstring happens to mention.
-fn in_string(body: &str) -> bool {
-    let b = body.as_bytes();
-    let n = b.len();
-    let mut i = 0usize;
-    while i < n {
-        if b[i] == b'\\' {
-            i += 2;
-            continue;
-        }
-        if b[i] != b'"' && b[i] != b'\'' {
-            i += 1;
-            continue;
-        }
-        let run = if b[i..].starts_with(b"\"\"\"") || b[i..].starts_with(b"'''") {
-            3
-        } else {
-            1
-        };
-        let quote = &b[i..i + run];
-        let mut j = i + run;
-        while j < n {
-            if b[j] == b'\\' && run == 1 && quote[0] == b'"' {
-                j += 2;
-                continue;
-            }
-            if b[j..].starts_with(quote) {
-                break;
-            }
-            j += 1;
-        }
-        if j >= n {
-            return true; // opened and never closed: everything after is string
-        }
-        i = j + run;
-    }
-    false
-}
-
-/// Strip whole syscalls from prose -- markers *and* bodies.
-///
-/// Deleting the markers alone is not enough: it leaves the command behind as
-/// if someone had said it. The command is not prose; it belongs to the calls
-/// pane, which already renders it as a card.
-///
-/// Structure decides, not a list of names: an opener with a matching closer is
-/// a syscall whatever it is called, which means a tag registered later needs no
-/// change here. A bare mention with no closer is left alone -- marker and all,
-/// because the kernel leaves it alone too -- so naming a tool mid-sentence
-/// still reads.
-fn strip_syscalls(text: &str) -> String {
-    let (spans, _) = code_spans(text);
-    let mut out = String::new();
-    let mut i = 0usize;
-    while let Some(hit) = next_tag(text, i, &spans) {
-        out.push_str(&text[i..hit.start]);
-        match hit.end {
-            Some(end) => i = end,
-            None => {
-                // Inert to the dispatcher, so it stays visible here or it is
-                // in neither pane.
-                out.push_str(&text[hit.start..hit.open_end]);
-                i = hit.open_end;
-            }
-        }
-    }
-    out.push_str(&text[i..]);
-    out
-}
-
-/// Push a wire card Collapsed. It does not stay that way: `reflow_wire` runs
-/// every frame and reopens the tail, so a fresh card is Expanded by the time
-/// it is painted. Starting folded keeps grok's Other/Read/Edit defaults from
-/// flashing their full payload for one frame before the reconcile.
-///
-/// `l` / Enter opens a card, `h` folds it; either marks it manual and
-/// `reflow_wire` stops managing it.
-/// The arguments one `POST #n` card is built from.
-///
-/// Held next to the pane rather than only inside it: POST rows are off by
-/// default now, and a row that is not on screen still has to be rebuildable
-/// the moment the reader asks for it back.
-#[derive(Clone)]
-struct PostArgs {
-    origin: String,
-    n: u64,
-    model: String,
-    thinking: String,
-    usage: Value,
-    thoughts: u64,
-    redacted: u64,
-}
-
-impl PostArgs {
-    fn new(
-        origin: &str,
-        n: u64,
-        model: &str,
-        thinking: &str,
-        usage: &Value,
-        thoughts: u64,
-        redacted: u64,
-    ) -> Self {
-        Self {
-            origin: origin.to_string(),
-            n,
-            model: model.to_string(),
-            thinking: thinking.to_string(),
-            usage: usage.clone(),
-            thoughts,
-            redacted,
-        }
-    }
-
-    fn block(&self) -> RenderBlock {
-        wire_complete(
-            &self.origin,
-            self.n,
-            &self.model,
-            &self.thinking,
-            &self.usage,
-            self.thoughts,
-            self.redacted,
-        )
-    }
-}
-
-struct PostRow {
-    args: PostArgs,
-    /// The live card, while the row is on screen.
-    id: Option<EntryId>,
-    /// The card this POST was pushed after — `None` when it opened the pane.
-    /// Recorded once, at push time, and never moved: it is what a hidden row
-    /// goes back in front of. The card *after* it cannot be used for that,
-    /// because streaming execute output and results append to the pane
-    /// without passing through here.
-    prev: Option<EntryId>,
-}
-
-/// Every `complete()` POST of one wire pane, on screen or held back.
-///
-/// This is also the pane's group index: a group starts at its POST card, or —
-/// when the POST rows are hidden — at the first card that followed it.
-#[derive(Default)]
-struct PostRows(Vec<PostRow>);
-
-impl PostRows {
-    fn len(&self) -> usize {
-        self.0.len()
-    }
-
-    fn is_empty(&self) -> bool {
-        self.0.is_empty()
-    }
-
-    fn clear(&mut self) {
-        self.0.clear();
-    }
-
-    fn push(&mut self, calls: &mut ScrollbackState, args: PostArgs, shown: bool) {
-        let prev = calls
-            .len()
-            .checked_sub(1)
-            .and_then(|i| calls.entry(i))
-            .map(|e| e.id);
-        let id = if shown {
-            Some(wire_push(calls, args.block()))
-        } else {
-            None
-        };
-        self.0.push(PostRow { args, id, prev });
-    }
-
-    /// Put every held-back card back where it was pushed.
-    fn show(&mut self, calls: &mut ScrollbackState) {
-        let mut after: Option<EntryId> = None;
-        for row in &mut self.0 {
-            if let Some(id) = row.id {
-                after = Some(id);
-                continue;
-            }
-            // Two POSTs in a row share a `prev` — the model answered without
-            // calling anything — so the second belongs after the first.
-            let prev = match (after, row.prev) {
-                (Some(a), None) => Some(a),
-                (Some(a), Some(p))
-                    if calls.index_of_id(a) >= calls.index_of_id(p) && a != p =>
-                {
-                    Some(a)
-                }
-                _ => row.prev,
-            };
-            let at = match prev {
-                Some(p) => calls.index_of_id(p).map(|i| i + 1),
-                None => Some(0),
-            };
-            let anchor = at.and_then(|i| calls.entry(i)).map(|e| e.id);
-            let id = match anchor {
-                Some(a) => calls.insert_block_before(a, row.args.block()),
-                None => calls.push_block(row.args.block()),
-            };
-            set_wire_mode(calls, id, DisplayMode::Collapsed);
-            row.id = Some(id);
-            after = Some(id);
-        }
-    }
-
-    /// Take every POST card off the pane, keeping the data to rebuild it.
-    fn hide(&mut self, calls: &mut ScrollbackState) {
-        // A POST pushed straight after another POST has that card as its
-        // `prev`; dropping the first would leave the second pointing at an id
-        // the pane no longer has, so the link is repaired as we go.
-        let mut dropped: Option<(EntryId, Option<EntryId>)> = None;
-        for row in &mut self.0 {
-            if let (Some((gone, gone_prev)), Some(p)) = (dropped, row.prev) {
-                if p == gone {
-                    row.prev = gone_prev;
-                }
-            }
-            if let Some(id) = row.id.take() {
-                calls.remove_entry(id);
-                dropped = Some((id, row.prev));
-            }
-        }
-    }
-
-    /// Index of the first card of each group, in pane order.
-    fn starts(&self, calls: &ScrollbackState) -> Vec<usize> {
-        let mut out: Vec<usize> = self
-            .0
-            .iter()
-            .filter_map(|row| match row.id {
-                Some(id) => calls.index_of_id(id),
-                None => {
-                    let at = match row.prev {
-                        Some(p) => calls.index_of_id(p)? + 1,
-                        None => 0,
-                    };
-                    (at < calls.len()).then_some(at)
-                }
-            })
-            .collect();
-        out.sort_unstable();
-        out.dedup();
-        out
-    }
-}
-
-fn wire_push(sb: &mut ScrollbackState, block: RenderBlock) -> EntryId {
-    let eid = sb.push_block(block);
-    set_wire_mode(sb, eid, DisplayMode::Collapsed);
-    eid
-}
-
-/// How many trailing wire cards stay open. The tail is where the reader is
-/// looking; older cards fold back to a header + preview.
-const WIRE_OPEN: usize = 3;
-
-/// Keep the tail of the wire pane open: the last `WIRE_OPEN` cards, plus any
-/// card still running, are Expanded; everything above them collapses. Finished
-/// thoughts start collapsed even at the tail. Cards in `manual` were folded or
-/// opened by hand and are never touched.
-///
-/// Runs every frame. It is a fold-state reconcile, not an event handler, so a
-/// card that arrives while another is streaming still ends up in the right
-/// state without every push site remembering to call it.
-fn reflow_wire(sb: &mut ScrollbackState, manual: &HashSet<EntryId>) {
-    let n = sb.len();
-    let mut rows: Vec<(EntryId, bool, bool)> = Vec::with_capacity(n);
-    for i in 0..n {
-        if let Some(e) = sb.entry(i) {
-            rows.push((
-                e.id,
-                e.is_running,
-                matches!(e.block, RenderBlock::Thinking(_)),
-            ));
-        }
-    }
-    let cut = rows.len().saturating_sub(WIRE_OPEN);
-    for (idx, (id, running, thinking)) in rows.into_iter().enumerate() {
-        if manual.contains(&id) {
-            continue;
-        }
-        let want = if thinking && !running {
-            DisplayMode::Collapsed
-        } else if running || idx >= cut {
-            DisplayMode::Expanded
-        } else {
-            DisplayMode::Collapsed
-        };
-        set_wire_mode(sb, id, want);
-    }
-}
-
-/// Record that the reader took manual control of the selected wire card.
-///
-/// Resolves the pane on screen: the fold this protects is applied to
-/// `focused_scroll()`, so inside a child session this used to pin a parent id
-/// and reflow re-expanded the child's card on the next frame.
-fn pin_selected_wire(app: &mut App) {
-    let (calls, manual) = app.calls_and_manual();
-    let Some(i) = calls.selected() else {
-        return;
-    };
-    if let Some(e) = calls.entry(i) {
-        let id = e.id;
-        manual.insert(id);
-    }
-}
-
-fn set_wire_mode(sb: &mut ScrollbackState, id: EntryId, mode: DisplayMode) {
-    if let Some(entry) = sb.get_by_id_mut(id) {
-        if entry.display_mode == mode {
-            return;
-        }
-        entry.set_display_mode(mode);
-        entry.display_mode_pinned = true;
-    }
-    sb.mark_height_dirty(id);
-}
 
 fn result_block(ev: &Value) -> RenderBlock {
     let tag = ev.get("tag").and_then(Value::as_str).unwrap_or("?");
@@ -7654,39 +3508,6 @@ fn wire_complete(
     ))
 }
 
-/// Plain-language story row for a fold. The wire card is evidence; this is the
-/// explanation — what happened, what the model now reads, what did not change.
-fn fold_notice(n: u64, kept: u64) -> String {
-    let scope = if kept > 0 {
-        format!("the {kept} most recent messages were kept verbatim")
-    } else {
-        "only the summary was kept".to_string()
-    };
-    format!(
-        "context folded at POST #{n} — the provider replaced the earlier turns with a summary; \
-         {scope}. Nothing above was deleted from this pane; the model just reads the summary \
-         instead of the originals from here on."
-    )
-}
-
-/// Wire card for a server-side fold. The model's memory just got rewritten,
-/// which is the largest thing the harness does to itself in a run — without a
-/// card the only symptom is the context bar dropping for no stated reason.
-fn wire_compacted(n: u64, kept: u64, summary: &str) -> RenderBlock {
-    let head = if kept > 0 {
-        format!("FOLD:  POST #{n}  {kept} kept")
-    } else {
-        format!("FOLD:  POST #{n}")
-    };
-    let body = if summary.trim().is_empty() {
-        "earlier turns folded by the server".to_string()
-    } else {
-        summary.to_string()
-    };
-    RenderBlock::ToolCall(ToolCallBlock::Other(
-        OtherToolCallBlock::new(head, "context compacted".to_string()).with_output(body),
-    ))
-}
 
 /// The story's copy of an `<edit>` result, or `None` for any other syscall.
 ///
@@ -8081,6 +3902,7 @@ mod tests {
 
     use super::*;
     use ratatui::backend::TestBackend;
+    use xai_grok_pager::scrollback::DisplayMode;
     use xai_grok_pager::glyphs;
 
     fn buffer_text(term: &Terminal<TestBackend>) -> String {
@@ -8258,7 +4080,7 @@ mod tests {
         );
     }
 
-    fn paint(app: &mut App, w: u16, h: u16) -> String {
+    pub(crate) fn paint(app: &mut App, w: u16, h: u16) -> String {
         let backend = TestBackend::new(w, h);
         let mut term = Terminal::new(backend).unwrap();
         term.draw(|f| draw(f, app)).unwrap();
@@ -8372,64 +4194,6 @@ mod tests {
         );
     }
 
-    fn call(tag: &str, target: Option<&str>) -> Seg {
-        Seg::Call {
-            tag: tag.into(),
-            target: target.map(Into::into),
-        }
-    }
-
-    /// The sentence is the whole point: it has to read like one.
-    #[test]
-    fn a_run_reads_as_one_sentence() {
-        let segs = vec![
-            Seg::Thought(12_000),
-            call("edit", Some("main.rs")),
-            call("python", None),
-            call("python", None),
-            call("bash", Some("cargo")),
-            Seg::Thought(8_400),
-            call("bash", Some("cargo")),
-        ];
-        assert_eq!(
-            work_sentence(&segs),
-            "thought 12s \u{2192} edit main.rs, python \u{00d7}2, bash cargo \u{2192} thought 8.4s \u{2192} bash cargo"
-        );
-    }
-
-    #[test]
-    fn a_long_run_elides_its_middle_instead_of_wrapping() {
-        let mut segs = Vec::new();
-        for i in 0..8 {
-            segs.push(Seg::Thought(1_000 * (i + 1)));
-            segs.push(call("bash", Some("git")));
-        }
-        let line = work_sentence(&segs);
-        assert!(line.contains('\u{2026}'), "long run must elide: {line}");
-        assert!(line.len() < 90, "still too long: {line}");
-    }
-
-    #[test]
-    fn durations_read_as_durations() {
-        assert_eq!(human_secs(900), "0.9s");
-        assert_eq!(human_secs(9_400), "9.4s");
-        assert_eq!(human_secs(12_000), "12s");
-        assert_eq!(human_secs(95_000), "1m35s");
-    }
-
-    /// A shell command contributes its program and nothing else. This is the
-    /// rule that keeps the row from becoming a second calls pane.
-    #[test]
-    fn a_shell_call_contributes_its_program_not_its_command() {
-        let ev = json!({
-            "tag": "bash",
-            "body": "cd /Users/zeus/hub/desmos && cargo test --workspace 2>&1 | grep FAIL",
-        });
-        assert_eq!(call_target("bash", &ev).as_deref(), Some("cargo"));
-        let edit = json!({"tag": "edit", "attrs": {"path": "crates/desmos-tui/src/main.rs"}});
-        assert_eq!(call_target("edit", &edit).as_deref(), Some("main.rs"));
-    }
-
     /// Driven through handle_event, because the row is only worth anything if
     /// the real event path builds it. The thoughts must be gone: two rows
     /// saying the same thing is what this replaced.
@@ -8441,7 +4205,7 @@ mod tests {
         let mut app = App::new();
         handle_event(&mut app, json!({"ev": "turn", "text": "go"}));
         let row = |app: &App| {
-            (0..app.story.len()).find_map(|i| match app.story.entry(i).map(|e| &e.block) {
+            (0..app.sess.story.len()).find_map(|i| match app.sess.story.entry(i).map(|e| &e.block) {
                 Some(RenderBlock::System(b)) => Some(b.text.clone()),
                 _ => None,
             })
@@ -8457,8 +4221,8 @@ mod tests {
 
         // A third call rewrites the same row rather than stacking a second.
         handle_event(&mut app, json!({"ev": "result", "tag": "read", "body": "main.rs", "text": "ok"}));
-        let rows = (0..app.story.len())
-            .filter(|i| matches!(app.story.entry(*i).map(|e| &e.block), Some(RenderBlock::System(_))))
+        let rows = (0..app.sess.story.len())
+            .filter(|i| matches!(app.sess.story.entry(*i).map(|e| &e.block), Some(RenderBlock::System(_))))
             .count();
         assert_eq!(rows, 1, "the run must own exactly one row");
         let grown = row(&app).unwrap();
@@ -8486,8 +4250,8 @@ mod tests {
         );
         let _ = paint(&mut app, 120, 34);
 
-        let kinds: Vec<&str> = (0..app.story.len())
-            .filter_map(|i| app.story.entry(i).map(|e| match &e.block {
+        let kinds: Vec<&str> = (0..app.sess.story.len())
+            .filter_map(|i| app.sess.story.entry(i).map(|e| match &e.block {
                 RenderBlock::Thinking(_) => "Thinking",
                 RenderBlock::System(_) => "System",
                 RenderBlock::AgentMessage(_) => "AgentMessage",
@@ -8499,8 +4263,8 @@ mod tests {
             vec!["System", "AgentMessage"],
             "the run should be one row, then the prose: {kinds:?}"
         );
-        let row = (0..app.story.len())
-            .find_map(|i| match app.story.entry(i).map(|e| &e.block) {
+        let row = (0..app.sess.story.len())
+            .find_map(|i| match app.sess.story.entry(i).map(|e| &e.block) {
                 Some(RenderBlock::System(b)) => Some(b.text.clone()),
                 _ => None,
             })
@@ -8522,8 +4286,8 @@ mod tests {
 
         assert_eq!(activity_edits(&app).len(), 1, "demo edit missing from Activity");
         assert!(
-            !(0..app.story.len()).any(|i| matches!(
-                app.story.entry(i).map(|e| &e.block),
+            !(0..app.sess.story.len()).any(|i| matches!(
+                app.sess.story.entry(i).map(|e| &e.block),
                 Some(RenderBlock::ToolCall(ToolCallBlock::Edit(_)))
             )),
             "demo edit leaked into Story"
@@ -8550,29 +4314,29 @@ mod tests {
             );
         }
         let _ = paint(&mut app, 120, 34);
-        assert_eq!(app.posts.len(), 3, "one group per POST");
+        assert_eq!(app.sess.posts.len(), 3, "one group per POST");
 
-        let starts: Vec<usize> = app.posts.starts(&app.calls);
+        let starts: Vec<usize> = app.sess.posts.starts(&app.sess.calls);
 
         // A painted pane already has a cursor, so clear it to reach the
         // no-selection path: forward from nowhere lands on the first group.
-        app.calls.set_selected(None);
+        app.sess.calls.set_selected(None);
         assert!(app.select_call_group(true));
-        assert_eq!(app.calls.selected(), Some(starts[0]));
+        assert_eq!(app.sess.calls.selected(), Some(starts[0]));
         assert!(app.select_call_group(true));
-        assert_eq!(app.calls.selected(), Some(starts[1]));
+        assert_eq!(app.sess.calls.selected(), Some(starts[1]));
         assert!(app.select_call_group(true));
-        assert_eq!(app.calls.selected(), Some(starts[2]));
+        assert_eq!(app.sess.calls.selected(), Some(starts[2]));
         // Past the last group there is nowhere to go, and the selection holds.
         assert!(!app.select_call_group(true), "forward wrapped off the end");
-        assert_eq!(app.calls.selected(), Some(starts[2]));
+        assert_eq!(app.sess.calls.selected(), Some(starts[2]));
 
         assert!(app.select_call_group(false));
-        assert_eq!(app.calls.selected(), Some(starts[1]));
+        assert_eq!(app.sess.calls.selected(), Some(starts[1]));
         assert!(app.select_call_group(false));
-        assert_eq!(app.calls.selected(), Some(starts[0]));
+        assert_eq!(app.sess.calls.selected(), Some(starts[0]));
         assert!(!app.select_call_group(false), "back wrapped off the start");
-        assert_eq!(app.calls.selected(), Some(starts[0]));
+        assert_eq!(app.sess.calls.selected(), Some(starts[0]));
     }
 
     /// A child session runs its own POSTs, so it needs its own group index.
@@ -8606,9 +4370,9 @@ mod tests {
             );
         }
 
-        assert_eq!(app.posts.len(), 2, "parent groups");
+        assert_eq!(app.sess.posts.len(), 2, "parent groups");
         assert_eq!(
-            app.children["deadbeef"].posts.len(),
+            app.children["deadbeef"].sess.posts.len(),
             3,
             "the child's POSTs did not open groups of their own",
         );
@@ -8627,20 +4391,21 @@ mod tests {
         );
 
         let child_starts: Vec<usize> = app.children["deadbeef"]
+            .sess
             .posts
-            .starts(&app.children["deadbeef"].calls);
+            .starts(&app.children["deadbeef"].sess.calls);
         // The parent was painted, so it already carries a cursor. Whatever it
         // is, a step taken inside the child must leave it exactly there.
-        let parent_sel = app.calls.selected();
-        app.children.get_mut("deadbeef").unwrap().calls.set_selected(None);
+        let parent_sel = app.sess.calls.selected();
+        app.children.get_mut("deadbeef").unwrap().sess.calls.set_selected(None);
         assert!(app.select_call_group(true));
         assert_eq!(
-            app.children["deadbeef"].calls.selected(),
+            app.children["deadbeef"].sess.calls.selected(),
             Some(child_starts[0]),
             "the step moved something other than the child's wire",
         );
         assert_eq!(
-            app.calls.selected(),
+            app.sess.calls.selected(),
             parent_sel,
             "stepping inside a child moved the parent's wire cursor",
         );
@@ -8662,13 +4427,13 @@ mod tests {
             }
         }
         let _ = paint(&mut app, 120, 34);
-        let starts: Vec<usize> = app.posts.starts(&app.calls);
+        let starts: Vec<usize> = app.sess.posts.starts(&app.sess.calls);
 
         // Land inside group 1, two cards past its head.
-        app.calls.set_selected(Some(starts[0] + 2));
+        app.sess.calls.set_selected(Some(starts[0] + 2));
         assert!(app.select_call_group(true));
         assert_eq!(
-            app.calls.selected(),
+            app.sess.calls.selected(),
             Some(starts[1]),
             "a group step behaved like a plain cursor move",
         );
@@ -8702,14 +4467,14 @@ mod tests {
         let mut app = App::new();
         handle_event(&mut app, json!({"ev": "turn", "text": "go"}));
         handle_event(&mut app, json!({"ev": "complete", "n": 1, "origin": "llm"}));
-        assert_eq!(app.posts.len(), 1);
+        assert_eq!(app.sess.posts.len(), 1);
 
-        app.prompt = PromptBuf::new();
+        app.prompt = prompt::PromptBuf::new();
         for c in "/reset".chars() {
             app.prompt.insert_char(c);
         }
         let _ = submit_prompt(None, &mut app);
-        assert!(app.posts.is_empty(), "group index survived /reset");
+        assert!(app.sess.posts.is_empty(), "group index survived /reset");
         assert_eq!(app.call_group_pos(), None);
     }
 
@@ -8724,10 +4489,10 @@ mod tests {
     }
 
     fn activity_edits(app: &App) -> Vec<usize> {
-        (0..app.calls.len())
+        (0..app.sess.calls.len())
             .filter(|i| {
                 matches!(
-                    app.calls.entry(*i).map(|e| &e.block),
+                    app.sess.calls.entry(*i).map(|e| &e.block),
                     Some(RenderBlock::ToolCall(ToolCallBlock::Edit(_)))
                 )
             })
@@ -8744,8 +4509,8 @@ mod tests {
         );
 
         assert!(
-            !(0..app.story.len()).any(|i| matches!(
-                app.story.entry(i).map(|e| &e.block),
+            !(0..app.sess.story.len()).any(|i| matches!(
+                app.sess.story.entry(i).map(|e| &e.block),
                 Some(RenderBlock::ToolCall(ToolCallBlock::Edit(_)))
             )),
             "edit diff leaked into Story"
@@ -8760,7 +4525,7 @@ mod tests {
         for f in ["a.rs", "b.rs", "c.rs"] {
             handle_event(&mut app, edit_ev(f, "old", "new", "ok"));
         }
-        let row = (0..app.story.len()).find_map(|i| match app.story.entry(i).map(|e| &e.block) {
+        let row = (0..app.sess.story.len()).find_map(|i| match app.sess.story.entry(i).map(|e| &e.block) {
             Some(RenderBlock::System(b)) => Some(b.text.clone()),
             _ => None,
         });
@@ -8778,8 +4543,8 @@ mod tests {
         );
         assert_eq!(activity_edits(&app).len(), 1, "failed edit vanished");
         assert!(
-            !(0..app.story.len()).any(|i| matches!(
-                app.story.entry(i).map(|e| &e.block),
+            !(0..app.sess.story.len()).any(|i| matches!(
+                app.sess.story.entry(i).map(|e| &e.block),
                 Some(RenderBlock::ToolCall(ToolCallBlock::Edit(_)))
             )),
             "failed edit leaked into Story"
@@ -8804,18 +4569,18 @@ mod tests {
             json!({"ev": "speech", "delta": true, "text": "Found it."}),
         );
         let _ = paint(&mut app, 120, 34);
-        let story_thoughts = (0..app.story.len())
+        let story_thoughts = (0..app.sess.story.len())
             .filter(|i| {
                 matches!(
-                    app.story.entry(*i).map(|e| &e.block),
+                    app.sess.story.entry(*i).map(|e| &e.block),
                     Some(RenderBlock::Thinking(_))
                 )
             })
             .count();
-        let activity_thoughts = (0..app.calls.len())
+        let activity_thoughts = (0..app.sess.calls.len())
             .filter(|i| {
                 matches!(
-                    app.calls.entry(*i).map(|e| &e.block),
+                    app.sess.calls.entry(*i).map(|e| &e.block),
                     Some(RenderBlock::Thinking(_))
                 )
             })
@@ -8860,19 +4625,6 @@ mod tests {
         );
     }
 
-    /// Code spans are protected: markup inside a fence or backticks is the
-    /// reader's subject matter, not a call. This was covered against a stripper
-    /// that no longer exists, so it is re-pinned against the one that runs.
-    #[test]
-    fn markup_inside_code_is_not_a_call() {
-        let fenced = "see\n```html\n<div class=\"x\">hi</div>\n```\ndone";
-        let got = strip_syscalls(fenced);
-        assert!(got.contains("<div class=\"x\">"), "fenced opener stripped: {got}");
-        assert!(got.contains("</div>"), "fenced closer stripped: {got}");
-        let inline = "use `<python>` not <python>x</python>";
-        assert_eq!(strip_syscalls(inline), "use `<python>` not ");
-    }
-
     /// The failure this guards: a command body streamed into the story one
     /// delta at a time, was appended to a live block, and stayed there when
     /// the closer finally arrived. Checking only the final story misses it --
@@ -8896,8 +4648,8 @@ mod tests {
         ];
         for (n, d) in deltas.iter().enumerate() {
             handle_event(&mut app, json!({"ev": "speech", "delta": true, "text": d}));
-            let story: String = (0..app.story.len())
-                .filter_map(|i| match app.story.entry(i).map(|e| &e.block) {
+            let story: String = (0..app.sess.story.len())
+                .filter_map(|i| match app.sess.story.entry(i).map(|e| &e.block) {
                     Some(RenderBlock::AgentMessage(m)) => Some(m.text()),
                     _ => None,
                 })
@@ -8910,8 +4662,8 @@ mod tests {
             }
         }
         handle_event(&mut app, json!({"ev": "complete", "n": 1}));
-        let story: String = (0..app.story.len())
-            .filter_map(|i| match app.story.entry(i).map(|e| &e.block) {
+        let story: String = (0..app.sess.story.len())
+            .filter_map(|i| match app.sess.story.entry(i).map(|e| &e.block) {
                 Some(RenderBlock::AgentMessage(m)) => Some(m.text()),
                 _ => None,
             })
@@ -9124,51 +4876,6 @@ mod tests {
             !text.contains("cargo test --workspace"),
             "the command leaked into the story:\n{text}"
         );
-    }
-
-    #[test]
-    fn a_syscall_leaves_nothing_behind() {
-        let one = format!("{}bash{}cd /tmp && cargo test{}bash{}", '<', '>', "</", '>');
-        assert_eq!(strip_syscalls(&one).trim(), "", "body survived: {:?}", strip_syscalls(&one));
-    }
-
-    #[test]
-    fn prose_around_a_multiline_call_survives() {
-        let src = format!(
-            "before\n{}edit path=\"f\"{}a\n---\nb{}edit{}\nafter",
-            '<', '>', "</", '>'
-        );
-        let got = strip_syscalls(&src);
-        assert!(got.contains("before"), "{got:?}");
-        assert!(got.contains("after"), "{got:?}");
-        assert!(!got.contains("---"), "body survived: {got:?}");
-        assert!(!got.contains("path="), "attrs survived: {got:?}");
-    }
-
-    #[test]
-    fn naming_a_tool_in_a_sentence_still_reads() {
-        // No closer, so nothing to drop: the sentence keeps its shape.
-        let src = format!("use {}python{} for the kernel", '<', '>');
-        let got = strip_syscalls(&src);
-        assert!(got.contains("use "), "{got:?}");
-        assert!(got.contains("for the kernel"), "{got:?}");
-        // And a backticked mention is untouched, code spans being sacred.
-        let fenced = format!("use `{}python{}` not raw", '<', '>');
-        assert!(strip_syscalls(&fenced).contains("python"), "{:?}", strip_syscalls(&fenced));
-    }
-
-    #[test]
-    fn two_calls_in_one_turn_both_go() {
-        let src = format!(
-            "one{}bash{}ls{}bash{} two {}python{}x=1{}python{} three",
-            '<', '>', "</", '>', '<', '>', "</", '>'
-        );
-        let got = strip_syscalls(&src);
-        assert!(got.contains("one"), "{got:?}");
-        assert!(got.contains("two"), "{got:?}");
-        assert!(got.contains("three"), "{got:?}");
-        assert!(!got.contains("ls"), "{got:?}");
-        assert!(!got.contains("x=1"), "{got:?}");
     }
 
     #[test]
@@ -9410,9 +5117,9 @@ mod tests {
             json!({"ev":"result","phase":"start","tag":"bash","attrs":{},"body":"echo hi"}),
         );
         let _ = paint(&mut app, 120, 30);
-        let id = app.calls.entry(0).map(|e| e.id).expect("card pushed");
+        let id = app.sess.calls.entry(0).map(|e| e.id).expect("card pushed");
         assert_eq!(
-            app.calls.get_by_id(id).map(|e| e.display_mode),
+            app.sess.calls.get_by_id(id).map(|e| e.display_mode),
             Some(DisplayMode::Expanded),
             "a running call should be open"
         );
@@ -9422,13 +5129,13 @@ mod tests {
         );
         // Checked before the next paint: nothing may fold it in between.
         assert_ne!(
-            app.calls.get_by_id(id).map(|e| e.display_mode),
+            app.sess.calls.get_by_id(id).map(|e| e.display_mode),
             Some(DisplayMode::Collapsed),
             "completed call folded before the next frame -- that is the flash"
         );
         let text = paint(&mut app, 120, 30);
         assert_eq!(
-            app.calls.get_by_id(id).map(|e| e.display_mode),
+            app.sess.calls.get_by_id(id).map(|e| e.display_mode),
             Some(DisplayMode::Expanded),
             "recent completed call should stay open"
         );
@@ -9524,59 +5231,6 @@ mod tests {
         assert!(!e.is_success(), "a failing edit must not look successful");
     }
 
-    fn wire_modes(app: &App) -> Vec<DisplayMode> {
-        (0..app.calls.len())
-            .filter_map(|i| app.calls.entry(i).map(|e| e.display_mode))
-            .collect()
-    }
-
-    #[test]
-    fn last_three_wire_cards_stay_open() {
-        let mut app = App::new();
-        for i in 0..7 {
-            wire_push(&mut app.calls, RenderBlock::agent_message(format!("CARD{i}")));
-        }
-        let _ = paint(&mut app, 140, 40);
-        let modes = wire_modes(&app);
-        assert_eq!(modes.len(), 7);
-        for (i, m) in modes.iter().enumerate() {
-            if i >= 4 {
-                assert_eq!(*m, DisplayMode::Expanded, "card {i} should be open: {modes:?}");
-            } else {
-                assert_eq!(*m, DisplayMode::Collapsed, "card {i} should be folded: {modes:?}");
-            }
-        }
-    }
-
-    #[test]
-    fn a_running_card_stays_open_however_old() {
-        let mut app = App::new();
-        let old = wire_push(&mut app.calls, RenderBlock::agent_message("OLDRUNNER"));
-        app.calls.set_last_running(true);
-        for i in 0..6 {
-            wire_push(&mut app.calls, RenderBlock::agent_message(format!("CARD{i}")));
-        }
-        let _ = paint(&mut app, 140, 40);
-        let mode = app.calls.get_by_id(old).map(|e| e.display_mode);
-        assert_eq!(mode, Some(DisplayMode::Expanded), "a running card must not fold");
-    }
-
-    #[test]
-    fn a_hand_folded_card_is_left_alone() {
-        let mut app = App::new();
-        let mut last = None;
-        for i in 0..3 {
-            last = Some(wire_push(&mut app.calls, RenderBlock::agent_message(format!("CARD{i}"))));
-        }
-        let _ = paint(&mut app, 140, 40);
-        let id = last.unwrap();
-        app.wire_manual.insert(id);
-        set_wire_mode(&mut app.calls, id, DisplayMode::Collapsed);
-        let _ = paint(&mut app, 140, 40);
-        let mode = app.calls.get_by_id(id).map(|e| e.display_mode);
-        assert_eq!(mode, Some(DisplayMode::Collapsed), "reflow overrode a manual fold");
-    }
-
     #[test]
     fn wire_column_reaches_the_queue_not_just_the_top_third() {
         // POST in/out sit under the story column, so the calls border must
@@ -9612,7 +5266,7 @@ mod tests {
             !first.contains("more down"),
             "follow mode is pinned to the tail, nothing is below it:\n{first}"
         );
-        app.story.scroll_up(20);
+        app.sess.story.scroll_up(20);
         let text = paint(&mut app, 120, 30);
         assert!(text.contains("more up"), "no up-overflow marker:\n{text}");
         assert!(text.contains("more down"), "no down-overflow marker:\n{text}");
@@ -9701,7 +5355,7 @@ mod tests {
         let backend = TestBackend::new(52, 42);
         let mut term = Terminal::new(backend).unwrap();
         term.draw(|f| draw(f, &mut app)).unwrap();
-        app.story.goto_top();
+        app.sess.story.goto_top();
         term.draw(|f| draw(f, &mut app)).unwrap();
         let text = buffer_text(&term);
         let start = row_of(&text, "WRAPSTART").expect(&text);
@@ -9719,12 +5373,12 @@ mod tests {
         let backend = TestBackend::new(140, 40);
         let mut term = Terminal::new(backend).unwrap();
         term.draw(|f| draw(f, &mut app)).unwrap();
-        let (_, vp, _) = app.story.scroll_info();
+        let (_, vp, _) = app.sess.story.scroll_info();
         assert!(vp > 0, "layout never set a viewport");
-        app.story.scroll_down(10_000);
-        clamp_scroll(&mut app.story);
+        app.sess.story.scroll_down(10_000);
+        clamp_scroll(&mut app.sess.story);
         term.draw(|f| draw(f, &mut app)).unwrap();
-        let (off, vp, total) = app.story.scroll_info();
+        let (off, vp, total) = app.sess.story.scroll_info();
         let max = total.saturating_sub(vp as usize);
         assert!(
             off <= max,
@@ -9744,8 +5398,8 @@ mod tests {
         let backend = TestBackend::new(140, 40);
         let mut term = Terminal::new(backend).unwrap();
         term.draw(|f| draw(f, &mut app)).unwrap();
-        wheel_scroll(&mut app.calls, false, 200);
-        let (off, vp, total) = app.calls.scroll_info();
+        wheel_scroll(&mut app.sess.calls, false, 200);
+        let (off, vp, total) = app.sess.calls.scroll_info();
         let max = total.saturating_sub(vp as usize);
         assert_eq!(off, max.min(off));
         assert!(off <= max, "calls offset {off} > max {max}");
@@ -9796,11 +5450,12 @@ mod tests {
     }
 
     /// A legend nobody checks is a legend that lies. Every `Char` key a pane's
-    /// handler answers to has to appear in that pane's table — read out of this
-    /// file, so adding a key without documenting it fails here.
+    /// handler answers to has to appear in that pane's table — read out of
+    /// `input.rs`, where `handle_key` lives, so adding a key without
+    /// documenting it fails here.
     #[test]
     fn the_cheatsheet_lists_every_key_its_pane_answers_to() {
-        let src = include_str!("main.rs");
+        let src = include_str!("input.rs");
         let slice = |from: &str, to: &str| -> String {
             let a = src.find(from).unwrap_or_else(|| panic!("anchor gone: {from}"));
             let b = src[a..]
@@ -9902,7 +5557,7 @@ mod tests {
         let rows: Vec<String> = app.queue.iter().map(|q| q.text.clone()).collect();
         assert_eq!(rows, vec!["first", "middle one", "third"]);
         assert!(app.queue_edit.is_none(), "the slot is spent once it is used");
-        assert_eq!(app.story.len(), 0, "editing a queued row runs no turn");
+        assert_eq!(app.sess.story.len(), 0, "editing a queued row runs no turn");
     }
 
     /// Emptying the composer while editing is the delete. It must not fall
@@ -9948,7 +5603,7 @@ mod tests {
         assert!(!quit);
         assert_eq!(app.queue.len(), 1);
         assert!(app.prompt.to_send().is_empty());
-        assert_eq!(app.story.len(), 0, "queued follow-up must not hit story yet");
+        assert_eq!(app.sess.story.len(), 0, "queued follow-up must not hit story yet");
     }
 
     #[test]
@@ -9963,7 +5618,7 @@ mod tests {
         assert_eq!(app.queue.iter().next().unwrap().text, "second queued");
         assert!(
             matches!(
-                app.story.entry(0).map(|e| &e.block),
+                app.sess.story.entry(0).map(|e| &e.block),
                 Some(RenderBlock::UserPrompt(_))
             ),
             "the drained row is the turn that starts"
@@ -9986,7 +5641,7 @@ mod tests {
         try_drain(None, &mut app).unwrap();
         assert!(app.queue.is_empty());
         assert!(matches!(
-            app.story.entry(app.story.len() - 1).map(|entry| &entry.block),
+            app.sess.story.entry(app.sess.story.len() - 1).map(|entry| &entry.block),
             Some(RenderBlock::UserPrompt(_))
         ));
     }
@@ -10007,7 +5662,7 @@ mod tests {
         assert!(app.queue.is_empty());
         assert!(
             matches!(
-                app.story.entry(0).map(|e| &e.block),
+                app.sess.story.entry(0).map(|e| &e.block),
                 Some(RenderBlock::UserPrompt(_))
             ),
             "send-now puts the row it fired in the story"
@@ -10232,12 +5887,12 @@ mod tests {
     /// Wire cards ship folded; open every one so a test can assert on the
     /// body and result the fold hides.
     fn expand_calls(app: &mut App) {
-        app.calls.goto_top();
-        for _ in 0..app.calls.len() {
-            app.calls.expand_selected();
-            app.calls.select_next();
+        app.sess.calls.goto_top();
+        for _ in 0..app.sess.calls.len() {
+            app.sess.calls.expand_selected();
+            app.sess.calls.select_next();
         }
-        app.calls.goto_top();
+        app.sess.calls.goto_top();
     }
 
     /// A fold rewrites what the model remembers. It is the harness acting on
@@ -10604,9 +6259,9 @@ mod tests {
 
         // The evidence is the card; the story gets exactly one harness row that
         // says what happened. It must be a System row — a fold is not speech.
-        assert_eq!(app.story.len(), 1, "the fold went unexplained where it is read");
+        assert_eq!(app.sess.story.len(), 1, "the fold went unexplained where it is read");
         assert!(
-            matches!(app.story.entry(0).map(|e| &e.block), Some(RenderBlock::System(_))),
+            matches!(app.sess.story.entry(0).map(|e| &e.block), Some(RenderBlock::System(_))),
             "a fold is not speech, but it must be said",
         );
     }
@@ -10737,8 +6392,8 @@ mod tests {
             text.contains("old cache line"),
             "removed line missing from the diff:\n{text}"
         );
-        let idx = app.calls.len().saturating_sub(1);
-        let mode = app.calls.entry(idx).map(|e| e.display_mode());
+        let idx = app.sess.calls.len().saturating_sub(1);
+        let mode = app.sess.calls.entry(idx).map(|e| e.display_mode());
         assert_eq!(mode, Some(DisplayMode::Expanded));
     }
 
@@ -10748,10 +6403,10 @@ mod tests {
         app.running = true;
         app.turn_started = Some(Instant::now());
         app.story_push(RenderBlock::thinking_streaming());
-        app.story.set_last_running(true);
-        let t0 = app.story.animation_tick();
-        assert!(app.story.tick(), "visible running entry must request redraw");
-        assert!(app.story.animation_tick() > t0);
+        app.sess.story.set_last_running(true);
+        let t0 = app.sess.story.animation_tick();
+        assert!(app.sess.story.tick(), "visible running entry must request redraw");
+        assert!(app.sess.story.animation_tick() > t0);
         app.set_focus(Focus::Input);
         let text = paint(&mut app, 120, 30);
         assert!(!text.contains('❯'), "input must not show a chevron:\n{text}");
@@ -10770,11 +6425,11 @@ mod tests {
     fn grok_settings_land_on_scrollback() {
         let app = App::new();
         assert_eq!(
-            app.story.appearance().show_timestamps,
+            app.sess.story.appearance().show_timestamps,
             appearance_cache::load_timestamps()
         );
         assert_eq!(
-            app.calls.appearance().prompt.compact,
+            app.sess.calls.appearance().prompt.compact,
             appearance_cache::load()
         );
     }
@@ -10793,14 +6448,6 @@ mod tests {
         app.status = "running".into();
         assert!(on_ctrl_c(None, &mut app).unwrap());
         assert!(!app.running);
-    }
-
-    #[test]
-    fn stripping_keeps_markdown_structure() {
-        let got = strip_syscalls("## cache\n\n**87%**\n<python>x</python>\nmore");
-        assert!(got.contains("## cache"), "{got}");
-        assert!(got.contains('\n'), "{got}");
-        assert!(!got.contains("<python>"), "{got}");
     }
 
     #[test]
@@ -10843,7 +6490,7 @@ mod tests {
         .unwrap();
         assert!(!quit);
         assert_eq!(app.prompt.to_send(), "hello\n");
-        assert_eq!(app.story.len(), 0);
+        assert_eq!(app.sess.story.len(), 0);
         assert!(app.prompt.is_multiline());
     }
 
@@ -10859,7 +6506,7 @@ mod tests {
         .unwrap();
         assert!(!quit);
         assert_eq!(app.prompt.to_send(), "hello\n");
-        assert_eq!(app.story.len(), 0);
+        assert_eq!(app.sess.story.len(), 0);
     }
 
     #[test]
@@ -10867,7 +6514,7 @@ mod tests {
         let mut app = App::new();
         apply_paste(&mut app, "a\nb\nc", false);
         assert_eq!(app.prompt.to_send(), "a\nb\nc");
-        assert_eq!(app.story.len(), 0);
+        assert_eq!(app.sess.story.len(), 0);
     }
 
     #[test]
@@ -10883,7 +6530,7 @@ mod tests {
         .unwrap();
         assert!(!quit);
         assert_eq!(app.prompt.to_send(), "a\nb\nc\nd");
-        assert_eq!(app.story.len(), 0);
+        assert_eq!(app.sess.story.len(), 0);
         assert!(app.prompt.preview_body().is_none());
     }
 
@@ -10918,7 +6565,7 @@ mod tests {
             }),
         );
         let idx = first_subagent(&app).expect("spawn row");
-        let RenderBlock::Subagent(sb) = &app.story.entry(idx).expect("entry").block else {
+        let RenderBlock::Subagent(sb) = &app.sess.story.entry(idx).expect("entry").block else {
             panic!("expected a spawn row");
         };
         assert_eq!(
@@ -10937,7 +6584,7 @@ mod tests {
                 "turns": 12,
             }),
         );
-        let RenderBlock::Subagent(sb) = &app.story.entry(idx).expect("entry").block else {
+        let RenderBlock::Subagent(sb) = &app.sess.story.entry(idx).expect("entry").block else {
             panic!("expected a spawn row");
         };
         assert_eq!(
@@ -10947,9 +6594,9 @@ mod tests {
     }
 
     fn first_subagent(app: &App) -> Option<usize> {
-        (0..app.story.len()).find(|&i| {
+        (0..app.sess.story.len()).find(|&i| {
             matches!(
-                app.story.entry(i).map(|e| &e.block),
+                app.sess.story.entry(i).map(|e| &e.block),
                 Some(RenderBlock::Subagent(_))
             )
         })
@@ -11100,7 +6747,7 @@ mod tests {
         );
 
         let idx = first_subagent(&app).expect("started block");
-        let entry = app.story.entry(idx).expect("entry");
+        let entry = app.sess.story.entry(idx).expect("entry");
         match &entry.block {
             RenderBlock::Subagent(sb) => {
                 assert!(matches!(sb.kind, SubagentBlockKind::Started));
@@ -11110,9 +6757,9 @@ mod tests {
             other => panic!("expected Subagent, got {other:?}"),
         }
         assert!(
-            (0..app.story.len()).any(|i| {
+            (0..app.sess.story.len()).any(|i| {
                 matches!(
-                    app.story.entry(i).map(|e| &e.block),
+                    app.sess.story.entry(i).map(|e| &e.block),
                     Some(RenderBlock::Subagent(sb))
                         if matches!(sb.kind, SubagentBlockKind::Completed { .. })
                 )
@@ -11126,12 +6773,12 @@ mod tests {
             !parent.contains("CHILDONLY"),
             "child speech leaked onto parent story:\n{parent}"
         );
-        assert_eq!(app.calls.len(), 0, "child wire must not hit parent calls");
+        assert_eq!(app.sess.calls.len(), 0, "child wire must not hit parent calls");
 
         let child = app.children.get("deadbeef").expect("child session");
-        assert!(child.story.len() >= 2, "task + speech stay in child Story");
+        assert!(child.sess.story.len() >= 2, "task + speech stay in child Story");
         assert_eq!(
-            child.calls.len(),
+            child.sess.calls.len(),
             3,
             "thought + complete + syscall stay in child Activity"
         );
@@ -11143,7 +6790,7 @@ mod tests {
         seed_demo(&mut app);
         app.set_focus(Focus::Story);
         let idx = first_subagent(&app).expect("demo spawn");
-        app.story.set_selected(Some(idx));
+        app.sess.story.set_selected(Some(idx));
         let _ = handle_key(
             None,
             &mut app,
@@ -11173,7 +6820,7 @@ mod tests {
         seed_demo(&mut app);
         app.set_focus(Focus::Story);
         let idx = first_subagent(&app).expect("demo spawn");
-        app.story.set_selected(Some(idx));
+        app.sess.story.set_selected(Some(idx));
         let _ = handle_key(
             None,
             &mut app,
@@ -11223,8 +6870,8 @@ mod tests {
             json!({"ev": "speech", "text": "final answer", "delta": false}),
         );
 
-        let story_kinds: Vec<&str> = (0..app.story.len())
-            .filter_map(|i| app.story.entry(i))
+        let story_kinds: Vec<&str> = (0..app.sess.story.len())
+            .filter_map(|i| app.sess.story.entry(i))
             .map(|entry| match &entry.block {
                 RenderBlock::UserPrompt(_) => "prompt",
                 RenderBlock::AgentMessage(_) => "speech",
@@ -11232,8 +6879,8 @@ mod tests {
                 _ => "other",
             })
             .collect();
-        let activity_kinds: Vec<&str> = (0..app.calls.len())
-            .filter_map(|i| app.calls.entry(i))
+        let activity_kinds: Vec<&str> = (0..app.sess.calls.len())
+            .filter_map(|i| app.sess.calls.entry(i))
             .map(|entry| match &entry.block {
                 RenderBlock::Thinking(_) => "thinking",
                 RenderBlock::ToolCall(_) => "tool",
@@ -11267,7 +6914,7 @@ mod tests {
         let mut app = App::new();
         app.running = true;
         handle_event(&mut app, json!({"ev": "turn", "text": "go"}));
-        assert!(app.calls.is_empty(), "turn eagerly created Activity chrome");
+        assert!(app.sess.calls.is_empty(), "turn eagerly created Activity chrome");
 
         let waiting = paint(&mut app, 120, 34);
         assert!(rows_of(&waiting, app.input_area).contains("Inference"));
@@ -11278,7 +6925,7 @@ mod tests {
             json!({"ev": "thinking", "delta": true, "redacted": false, "text": "real plan"}),
         );
         let active = paint(&mut app, 120, 34);
-        assert_eq!(app.calls.len(), 1);
+        assert_eq!(app.sess.calls.len(), 1);
         assert!(rows_of(&active, app.call_area).contains("real plan"));
     }
 
@@ -11298,14 +6945,14 @@ mod tests {
             json!({"ev": "thinking", "delta": true, "redacted": false, "text": " world"}),
         );
         handle_event(&mut app, json!({"ev": "complete", "n": 1}));
-        let thinks: Vec<String> = (0..app.calls.len())
-            .filter_map(|i| match app.calls.entry(i).map(|e| &e.block) {
+        let thinks: Vec<String> = (0..app.sess.calls.len())
+            .filter_map(|i| match app.sess.calls.entry(i).map(|e| &e.block) {
                 Some(RenderBlock::Thinking(t)) => Some(t.text()),
                 _ => None,
             })
             .collect();
         assert_eq!(thinks, vec!["hello world".to_string()]);
-        assert!(!app.stream.live());
+        assert!(!app.sess.stream.live());
     }
 
     #[test]
@@ -11324,8 +6971,8 @@ mod tests {
             json!({"ev": "speech", "delta": true, "text": "</python> more"}),
         );
         handle_event(&mut app, json!({"ev": "complete", "n": 1}));
-        let spoken: Vec<String> = (0..app.story.len())
-            .filter_map(|i| match app.story.entry(i).map(|e| &e.block) {
+        let spoken: Vec<String> = (0..app.sess.story.len())
+            .filter_map(|i| match app.sess.story.entry(i).map(|e| &e.block) {
                 Some(RenderBlock::AgentMessage(m)) => Some(m.text()),
                 _ => None,
             })
@@ -11367,8 +7014,8 @@ mod tests {
                 "text": "hi"
             }),
         );
-        let outs: Vec<String> = (0..app.calls.len())
-            .filter_map(|i| match app.calls.entry(i).map(|e| &e.block) {
+        let outs: Vec<String> = (0..app.sess.calls.len())
+            .filter_map(|i| match app.sess.calls.entry(i).map(|e| &e.block) {
                 Some(RenderBlock::ToolCall(ToolCallBlock::Execute(b))) => {
                     Some(b.output.clone().unwrap_or_default())
                 }
@@ -11376,41 +7023,9 @@ mod tests {
             })
             .collect();
         assert_eq!(outs, vec!["hi".to_string()]);
-        assert!(app.exec.id.is_none());
+        assert!(app.sess.exec.id.is_none());
     }
 
-    #[test]
-    fn spoken_prefix_holds_an_unclosed_tag() {
-        assert_eq!(spoken_prefix("hello <python"), "hello ");
-        // The body goes with the call. It is already a card in the calls pane.
-        assert_eq!(spoken_prefix("hello <python>x</python>!"), "hello !");
-        // Held while the closer is still in flight, not shown then retracted.
-        assert_eq!(spoken_prefix("hello <bash>rm -rf /"), "hello ");
-    }
-    #[test]
-    fn a_less_than_in_prose_does_not_stall_the_stream() {
-        assert_eq!(
-            spoken_prefix("loop while a < b and keep going"),
-            "loop while a < b and keep going"
-        );
-    }
-
-    #[test]
-    fn open_fence_is_never_treated_as_markup() {
-        // A `<` that cannot open a tag never stalls anything, fence or no fence.
-        let live = "here:\n```python\nif a < b:\n    total = a + b\n";
-        assert_eq!(spoken_prefix(live), live);
-        // A tag under a fence that has not closed yet is the one case where the
-        // two readings differ: if the fence closes it is code, and if it never
-        // closes the kernel dispatches it. Mid-stream nobody knows which, so it
-        // is held -- printing it and retracting it a frame later is what left a
-        // truncated copy of the block in the story for good.
-        let held = "here:\n```python\nprint('<hi>')\n";
-        assert_eq!(spoken_prefix(held), "here:\n```python\nprint('");
-        // The hold lasts exactly as long as the fence is open.
-        let closed = "here:\n```python\nprint('<hi>')\n```\ndone";
-        assert_eq!(spoken_prefix(closed), closed);
-    }
 
     /// A folded work row is owed one git read: the one that saw its last
     /// syscall. Rewriting it from whichever snapshot arrives first prints a
@@ -11419,24 +7034,24 @@ mod tests {
     #[test]
     fn a_folded_row_waits_for_the_read_that_saw_its_last_call() {
         let mut app = App::new();
-        app.stream.run.call("bash", None);
-        app.stream.run.call("bash", None);
+        app.sess.stream.run.call("bash", None);
+        app.sess.stream.run.call("bash", None);
         // No read has landed at all, so the pane's generation is 0.
         assert_eq!(app.git.snap_gen(), 0);
-        app.stream.run.fresh_gen = 7;
-        app.stream.run.fold(&mut app.story);
-        assert!(app.stream.run.settled.is_some(), "fold owes a row");
-        app.stream.run.settle(&mut app.story, &app.git);
+        app.sess.stream.run.fresh_gen = 7;
+        app.sess.stream.run.fold(&mut app.sess.story);
+        assert!(app.sess.stream.run.settled.is_some(), "fold owes a row");
+        app.sess.stream.run.settle(&mut app.sess.story, &app.git);
         assert!(
-            app.stream.run.settled.is_some(),
+            app.sess.stream.run.settled.is_some(),
             "settled on a snapshot that predates the call it is reporting"
         );
         // A run whose calls forced no read is owed nothing and closes at once.
-        app.stream.run.call("read", None);
-        app.stream.run.call("read", None);
-        app.stream.run.fold(&mut app.story);
-        app.stream.run.settle(&mut app.story, &app.git);
-        assert!(app.stream.run.settled.is_none());
+        app.sess.stream.run.call("read", None);
+        app.sess.stream.run.call("read", None);
+        app.sess.stream.run.fold(&mut app.sess.story);
+        app.sess.stream.run.settle(&mut app.sess.story, &app.git);
+        assert!(app.sess.stream.run.settled.is_none());
     }
 
     /// A dead harness is not a step. The old no-bridge branch pushed a POST
@@ -11449,8 +7064,8 @@ mod tests {
         app.bridge_gone = true;
         start_step(None, &mut app, "carry on".into(), Vec::new()).unwrap();
         assert!(!app.running, "nothing is running");
-        assert_eq!(app.posts.len(), 0, "no POST group for a step that cannot run");
-        let last = app.story.entry(app.story.len() - 1).map(|e| e.block.clone());
+        assert_eq!(app.sess.posts.len(), 0, "no POST group for a step that cannot run");
+        let last = app.sess.story.entry(app.sess.story.len() - 1).map(|e| e.block.clone());
         assert!(
             matches!(last, Some(RenderBlock::System(ref b)) if b.text == BRIDGE_GONE),
             "the story must carry the death under the prompt, not a 4s notice: {last:?}"
@@ -11482,30 +7097,6 @@ mod tests {
         assert!(!ran("a\n```\nuse `<bash>ls</bash>` here\n"), "inline span under a stray fence");
     }
 
-    /// While the fence is open nobody can tell a stray fence from one whose
-    /// closer is still in flight, so a call under it is held rather than
-    /// printed and retracted -- a retraction the story cannot make, the chunk
-    /// having already been appended to a live block.
-    #[test]
-    fn a_call_under_a_live_fence_is_held_not_printed() {
-        let live = "here:\n```bash\ngit status\n\n<bash>ls</bash>\n";
-        let shown = spoken_prefix(live);
-        assert!(!shown.contains("<bash>"), "leaked into the story: {shown:?}");
-        assert_eq!(shown, "here:\n```bash\ngit status\n\n");
-    }
-
-    /// `scan_spans` on both of these is `[]`: an opener with no closer is
-    /// skipped, and `TAG_OPEN` cannot match a lone closer at all. Nothing is
-    /// dispatched, so nothing may be deleted -- text eaten here is text in
-    /// neither pane.
-    #[test]
-    fn an_inert_mention_keeps_its_markers() {
-        assert_eq!(strip_syscalls("use the <bash> tool for that"), "use the <bash> tool for that");
-        assert_eq!(strip_syscalls("that ends with </bash> ok"), "that ends with </bash> ok");
-        // A lone closer is not a call, so it does not stall the stream either.
-        assert_eq!(spoken_prefix("that ends with </bash> ok"), "that ends with </bash> ok");
-    }
-
     /// The stream holds a bare `<bash>` back in case its closer is still
     /// coming. When the message ends without one the kernel dispatches
     /// nothing, so the hold has to be released or the tail of the sentence is
@@ -11513,19 +7104,19 @@ mod tests {
     #[test]
     fn a_held_mention_is_released_when_the_stream_ends() {
         let mut app = App::new();
-        apply_speech(&mut app.story, &mut app.calls, &mut app.stream, "use the <bash> tool for that", true);
-        app.stream.flush(&mut app.story, &mut app.calls);
-        let held = (0..app.story.len())
-            .filter_map(|i| match app.story.entry(i).map(|e| &e.block) {
+        apply_speech(&mut app.sess.story, &mut app.sess.calls, &mut app.sess.stream, "use the <bash> tool for that", true);
+        app.sess.stream.flush(&mut app.sess.story, &mut app.sess.calls);
+        let held = (0..app.sess.story.len())
+            .filter_map(|i| match app.sess.story.entry(i).map(|e| &e.block) {
                 Some(RenderBlock::AgentMessage(m)) => Some(m.text()),
                 _ => None,
             })
             .collect::<Vec<_>>()
             .join("");
         assert!(!held.contains("tool for that"), "printed before the closer could arrive");
-        app.stream.finish(&mut app.story, &mut app.calls);
-        let text = (0..app.story.len())
-            .filter_map(|i| match app.story.entry(i).map(|e| &e.block) {
+        app.sess.stream.finish(&mut app.sess.story, &mut app.sess.calls);
+        let text = (0..app.sess.story.len())
+            .filter_map(|i| match app.sess.story.entry(i).map(|e| &e.block) {
                 Some(RenderBlock::AgentMessage(m)) => Some(m.text()),
                 _ => None,
             })
@@ -11534,112 +7125,10 @@ mod tests {
         assert_eq!(text.trim(), "use the <bash> tool for that");
     }
 
-    /// `scan_spans('<bash>echo "</bash>"</bash>')` is one call over the whole
-    /// string: the body ends at the first closer that is not quoted. Stopping
-    /// at the quoted one left `"</bash>` behind as prose while the kernel ran
-    /// the whole command.
-    #[test]
-    fn a_quoted_closer_does_not_end_the_body() {
-        assert_eq!(strip_syscalls("<bash>echo \"</bash>\"</bash>"), "");
-        assert_eq!(strip_syscalls("<python>print(\"</python>\")\nx = 1</python>"), "");
-        // `scan_spans('<bash>ls</bash >')` -> one call: the closer regex is
-        // `</name\s*>`.
-        assert_eq!(strip_syscalls("<bash>ls</bash >"), "");
-    }
-
-    /// An `end="TOKEN"` body runs to its token closer and nothing else, so the
-    /// story must hide all of it. Before this, the stripper looked only for a
-    /// bare closer, never found one, treated the opener as unterminated prose,
-    /// and painted the body and the trailing token closer into the pane --
-    /// which is exactly how `</python:R1>` reached a reader's screen.
-    ///
-    /// `desmos/scan.py::scan_spans` on each input, run for real:
-    ///     token body        -> [('python', 0, 35)]  dispatched
-    ///     bare closer inside-> [('python', 0, 38)]  dispatched, body opaque
-    ///     spaced closer     -> [('python', 0, 29)]  dispatched
-    ///     unclosed token    -> []                   inert
-    ///     bad token         -> []                   inert
-    ///     closer in prose   -> []                   inert
-    #[test]
-    fn an_end_token_body_is_stripped_whole() {
-        assert_eq!(strip_syscalls("<python end=\"X\">print(1)</python:X>"), "");
-        // The point of the token: bare closers inside are ordinary text.
-        assert_eq!(
-            strip_syscalls("<python end=\"X\">a</python>b</python:X>"),
-            ""
-        );
-        // Spaces where scan.py's custom closer allows them.
-        assert_eq!(strip_syscalls("<python end=X>a</python : X >"), "");
-        assert_eq!(strip_syscalls("<edit path=\"a.rs\" end='E1'>x</edit:E1>"), "");
-        // Never closed: the kernel drops the opener, so nothing ran and the
-        // text stays visible rather than vanishing from both panes.
-        let unclosed = "<python end=\"X\">print(1)</python>";
-        assert!(
-            strip_syscalls(unclosed).contains("print(1)"),
-            "{:?}",
-            strip_syscalls(unclosed)
-        );
-        // An unusable token is dropped too, not silently given a bare closer.
-        let bad = "<python end=\"a b\">print(1)</python>";
-        assert!(strip_syscalls(bad).contains("print(1)"), "{:?}", strip_syscalls(bad));
-        // A token closer written in prose is prose.
-        assert_eq!(
-            strip_syscalls("it ends with </python:X> ok"),
-            "it ends with </python:X> ok"
-        );
-    }
-
-    /// The quoting heuristic is for bodies that get executed. A commit message
-    /// is prose, and prose has apostrophes: one in "the TUI's stripper" opened
-    /// a quote that never closed, so every closer after it read as quoted, the
-    /// call read as unterminated, and the whole message was painted into the
-    /// story. scan.py restricts the heuristic to `_QUOTED_BODY` for exactly
-    /// this reason, at the cost of three lost commits; this is that set.
-    ///
-    /// `desmos/scan.py::scan_spans` on each input, run for real:
-    ///     commit with apostrophes -> [('commit', 0, 101)]  dispatched
-    ///     todo with an apostrophe -> [('todo', 0, 30)]     dispatched
-    ///     edit with apostrophes   -> [('edit', 0, 43)]     dispatched
-    ///     quoted closer in bash   -> [('bash', 0, 27)]     body not truncated
-    #[test]
-    fn prose_bodies_are_stripped_through_an_apostrophe() {
-        let msg = "the TUI's stripper looked for a bare closer, and scan.py's rule disagreed";
-        let src = format!("<commit add=\"a.rs\">{msg}</commit>");
-        assert_eq!(strip_syscalls(&src), "", "commit body leaked");
-        assert_eq!(strip_syscalls("<todo>x 1\ndon't drop it</todo>"), "");
-        assert_eq!(
-            strip_syscalls("<edit path=\"a\">it's old\n---\nit's new</edit>"),
-            ""
-        );
-        // Executed bodies keep the heuristic: a quoted closer does not end one.
-        assert_eq!(strip_syscalls("<bash>echo \"</bash>\"</bash>"), "");
-    }
-
-    /// The story must strip exactly what the dispatcher ran, or a call shows
-    /// up in both panes in two shapes (raw tag as prose plus its card) or in
-    /// neither (an inert sample eaten as if it had run).
-    ///
-    /// Each expectation below is `desmos/scan.py::scan_spans` on the same
-    /// input, run for real:
-    ///     stray backtick   -> [('bash', 6, 21)]  dispatched
-    ///     4-space indent   -> []                 inert
-    ///     list + 6 spaces  -> []                 inert
-    ///     list + 4 spaces  -> [('bash', 12, 27)] dispatched
-    ///     closed inline    -> []                 inert
-    #[test]
-    fn strip_syscalls_agrees_with_the_dispatcher_on_what_ran() {
-        let ran = |src: &str| !strip_syscalls(src).contains("<bash>");
-        assert!(ran("a ` b <bash>ls</bash> done"), "stray backtick is not a span");
-        assert!(!ran("text:\n\n    <bash>ls</bash>\n\nmore"), "indented code");
-        assert!(!ran("- item\n\n      <bash>ls</bash>\n\nmore"), "indented in a list");
-        assert!(ran("- item\n\n    <bash>ls</bash>\n\nmore"), "list item's own paragraph");
-        assert!(!ran("use `<bash>ls</bash>` here"), "closed inline span");
-    }
-
     fn first_speech(app: &App) -> Option<usize> {
-        (0..app.story.len()).find(|&i| {
+        (0..app.sess.story.len()).find(|&i| {
             matches!(
-                app.story.entry(i).map(|e| &e.block),
+                app.sess.story.entry(i).map(|e| &e.block),
                 Some(RenderBlock::AgentMessage(_))
             )
         })
@@ -11651,7 +7140,7 @@ mod tests {
         seed_demo(&mut app);
         app.set_focus(Focus::Story);
         let idx = first_speech(&app).expect("speech");
-        app.story.set_selected(Some(idx));
+        app.sess.story.set_selected(Some(idx));
         let _ = handle_key(
             None,
             &mut app,
@@ -11672,7 +7161,7 @@ mod tests {
         seed_demo(&mut app);
         app.set_focus(Focus::Story);
         let idx = first_speech(&app).expect("speech");
-        app.story.set_selected(Some(idx));
+        app.sess.story.set_selected(Some(idx));
         let _ = handle_key(
             None,
             &mut app,
@@ -11693,7 +7182,7 @@ mod tests {
         seed_demo(&mut app);
         app.set_focus(Focus::Story);
         let idx = first_speech(&app).expect("speech");
-        app.story.set_selected(Some(idx));
+        app.sess.story.set_selected(Some(idx));
         let _ = handle_key(
             None,
             &mut app,
@@ -11766,7 +7255,7 @@ mod tests {
         let mut app = App::new();
         app.story_push(RenderBlock::agent_message("ZOOMWRAP ".repeat(80)));
         app.set_focus(Focus::Story);
-        app.story.set_selected(Some(0));
+        app.sess.story.set_selected(Some(0));
         let _ = handle_key(
             None,
             &mut app,
@@ -11862,7 +7351,7 @@ mod tests {
             }),
         );
         assert!(
-            app.exec.live(),
+            app.sess.exec.live(),
             "exec must be live or meta has nothing to say about a syscall"
         );
         assert_eq!(input_signal(&app), Some(InputSignal::Tool));
@@ -11916,8 +7405,8 @@ mod tests {
         let _ = paint(&mut app, 140, 44);
         let _ = paint(&mut app, 140, 44);
 
-        let (_, story_vp, _) = app.story.scroll_info();
-        let (_, activity_vp, _) = app.calls.scroll_info();
+        let (_, story_vp, _) = app.sess.story.scroll_info();
+        let (_, activity_vp, _) = app.sess.calls.scroll_info();
         assert_eq!(story_vp, app.traj_area.height - 2);
         assert_eq!(activity_vp, app.call_area.height - 2);
     }
@@ -11998,7 +7487,7 @@ mod tests {
     fn a_local_slash_command_leaves_no_turn_in_the_story() {
         let mut app = App::new();
         seed_demo(&mut app);
-        let before = app.story.len();
+        let before = app.sess.story.len();
         // These commands write process-global appearance state. Put it back, or
         // this test silently re-themes whichever test runs next on this thread.
         let (theme0, ts0, dense0) = (
@@ -12016,7 +7505,7 @@ mod tests {
             let quit = submit_prompt(None, &mut app).expect("submit");
             assert!(!quit);
             assert_eq!(
-                app.story.len(),
+                app.sess.story.len(),
                 before,
                 "{cmd} put a turn in the story that never ran"
             );
@@ -12047,6 +7536,7 @@ mod tests {
         app.set_focus(Focus::Story);
         let _ = paint(&mut app, 120, 36);
         let line = app
+            .sess
             .story_sel
             .ranges
             .iter()
@@ -12059,17 +7549,17 @@ mod tests {
             &mut app,
             click(MouseEventKind::Down(MouseButton::Left), col, row),
         );
-        assert!(app.story_text.pending.is_some());
+        assert!(app.sess.story_text.pending.is_some());
         handle_mouse(
             &mut app,
             click(MouseEventKind::Drag(MouseButton::Left), col + 3, row),
         );
-        assert!(app.story_text.active.is_some());
+        assert!(app.sess.story_text.active.is_some());
         handle_mouse(
             &mut app,
             click(MouseEventKind::Up(MouseButton::Left), col + 3, row),
         );
-        assert!(app.story_text.persist.is_some());
+        assert!(app.sess.story_text.persist.is_some());
         assert_eq!(app.status, "copied");
 
         // The whole point of a notice: it is drawn, on the one piece of chrome
@@ -12129,16 +7619,16 @@ mod tests {
         // A scrollback has no rows to select until it has been laid out once.
         paint(&mut app, 100, 40);
         app.set_focus(Focus::Story);
-        app.story.goto_top();
+        app.sess.story.goto_top();
         handle_key(None, &mut app, press(KeyCode::Down)).unwrap();
-        let moved = app.story.selected();
+        let moved = app.sess.story.selected();
         assert!(moved.is_some(), "↓ selects in the story");
 
         app.set_focus(Focus::Meter);
         handle_key(None, &mut app, press(KeyCode::Down)).unwrap();
         handle_key(None, &mut app, press(KeyCode::Up)).unwrap();
         assert_eq!(
-            app.story.selected(),
+            app.sess.story.selected(),
             moved,
             "the meter has no cursor, so its arrows must not move the story's"
         );
@@ -12314,7 +7804,7 @@ mod tests {
         let mut inference = App::new();
         inference.running = true;
         inference.turn_started = Some(Instant::now());
-        start_thinking(&mut inference.calls, &mut inference.stream);
+        start_thinking(&mut inference.sess.calls, &mut inference.sess.stream);
         let (first, inference_color, first_mod) = paint_input_state(&mut inference, 140, 30);
         assert!(rows_of(&first, inference.input_area).contains("Inference"));
         let meta = rows_of(&first, inference.cache.area);
@@ -12323,7 +7813,7 @@ mod tests {
         assert!(inference.turn_cancel.is_some(), "running composer lost [stop] hit box");
 
         for _ in 0..6 {
-            inference.story.tick();
+            inference.sess.story.tick();
         }
         let (_, _, second_mod) = paint_input_state(&mut inference, 140, 30);
         assert_ne!(
@@ -12345,7 +7835,7 @@ mod tests {
         let mut busy = App::new();
         busy.running = true;
         busy.turn_started = Some(Instant::now());
-        start_thinking(&mut busy.calls, &mut busy.stream);
+        start_thinking(&mut busy.sess.calls, &mut busy.sess.stream);
         busy.queue.push("next prompt".into());
         let (busy_text, _, _) = paint_input_state(&mut busy, 140, 30);
         let busy_rows = rows_of(&busy_text, busy.input_area);
@@ -12440,7 +7930,7 @@ mod tests {
         app.running = true;
         app.turn_started = Some(Instant::now());
         app.status = "running".into();
-        start_thinking(&mut app.calls, &mut app.stream);
+        start_thinking(&mut app.sess.calls, &mut app.sess.stream);
         let _ = paint(&mut app, 140, 30);
         let area = app.turn_cancel.expect("cancel hit area");
         handle_mouse(
@@ -12543,20 +8033,20 @@ mod tests {
         let mut parent = Vec::new();
         for i in 0..8 {
             parent.push(wire_push(
-                &mut app.calls,
+                &mut app.sess.calls,
                 RenderBlock::agent_message(format!("P{i}")),
             ));
         }
-        app.calls.set_selected(Some(0));
+        app.sess.calls.set_selected(Some(0));
         pin_selected_wire(&mut app);
-        set_wire_mode(&mut app.calls, parent[0], DisplayMode::Collapsed);
+        set_wire_mode(&mut app.sess.calls, parent[0], DisplayMode::Collapsed);
 
         let mut kid = Vec::new();
         {
             let child = app.ensure_child("kid", "task");
             for i in 0..8 {
                 kid.push(wire_push(
-                    &mut child.calls,
+                    &mut child.sess.calls,
                     RenderBlock::agent_message(format!("C{i}")),
                 ));
             }
@@ -12565,12 +8055,12 @@ mod tests {
 
         app.viewing = Some("kid".into());
         set_wire_mode(
-            &mut app.children.get_mut("kid").unwrap().calls,
+            &mut app.children.get_mut("kid").unwrap().sess.calls,
             kid[0],
             DisplayMode::Expanded,
         );
         let _ = paint(&mut app, 140, 40);
-        let mode = app.children["kid"].calls.get_by_id(kid[0]).map(|e| e.display_mode);
+        let mode = app.children["kid"].sess.calls.get_by_id(kid[0]).map(|e| e.display_mode);
         assert_eq!(
             mode,
             Some(DisplayMode::Collapsed),
@@ -12579,21 +8069,21 @@ mod tests {
 
         // And a fold made inside the child survives the next frame.
         let last = *kid.last().unwrap();
-        app.children.get_mut("kid").unwrap().calls.set_selected(Some(7));
+        app.children.get_mut("kid").unwrap().sess.calls.set_selected(Some(7));
         pin_selected_wire(&mut app);
         set_wire_mode(
-            &mut app.children.get_mut("kid").unwrap().calls,
+            &mut app.children.get_mut("kid").unwrap().sess.calls,
             last,
             DisplayMode::Collapsed,
         );
         let _ = paint(&mut app, 140, 40);
-        let mode = app.children["kid"].calls.get_by_id(last).map(|e| e.display_mode);
+        let mode = app.children["kid"].sess.calls.get_by_id(last).map(|e| e.display_mode);
         assert_eq!(
             mode,
             Some(DisplayMode::Collapsed),
             "reflow re-expanded a card the reader folded in the child pane"
         );
-        assert_eq!(app.wire_manual.len(), 1, "a child fold landed in the parent's set");
+        assert_eq!(app.sess.wire_manual.len(), 1, "a child fold landed in the parent's set");
     }
 
     /// A subagent's POST is billed to the same key. It used to be spent and
@@ -12647,11 +8137,11 @@ mod tests {
             origin: SelectionOrigin::Drag,
             kind: SelectionKind::Linear,
         };
-        app.story_text.persist = Some(sel);
-        app.calls_text.persist = Some(sel);
+        app.sess.story_text.persist = Some(sel);
+        app.sess.calls_text.persist = Some(sel);
         handle_key(None, &mut app, press(KeyCode::Esc)).unwrap();
-        assert!(app.story_text.persist.is_none());
-        assert!(app.calls_text.persist.is_none(), "the wire pane kept its highlight");
+        assert!(app.sess.story_text.persist.is_none());
+        assert!(app.sess.calls_text.persist.is_none(), "the wire pane kept its highlight");
     }
 
     /// ctrl+←/→ on the POST panes moves a divider that draw ignored: the row

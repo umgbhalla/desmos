@@ -1,0 +1,13 @@
+[package]
+name = "desmos-events"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[[bin]]
+name = "desmos-events-validate"
+path = "src/bin/validate.rs"

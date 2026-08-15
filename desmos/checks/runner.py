@@ -11,7 +11,7 @@ import importlib
 import time
 import traceback
 
-GROUPS = ("layering", "kernel", "transport", "state", "agents", "front")
+GROUPS = ("layering", "kernel", "transport", "state", "agents", "front", "conformance")
 
 # The seconds tier: the scan/dispatch/persist/edit repros, with no localhost
 # SSE or auth-callback servers (transport), no subagent waits (agents), no

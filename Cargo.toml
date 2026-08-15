@@ -13,6 +13,7 @@ async-openai = { git = "https://github.com/our-forks/async-openai.git", rev = "9
 [workspace]
 resolver = "2"
 members = [
+    "crates/desmos-events",
     "crates/desmos-tui",
     "crates/xai-grok-markdown",
     "crates/xai-grok-markdown-core",
