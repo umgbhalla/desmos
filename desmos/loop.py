@@ -23,7 +23,7 @@ from desmos.dialect import family
 from desmos.generations import ensure_gen1, evolve, rollback
 from desmos.persist import load, save
 from desmos import pending
-from desmos.scan import clip, scan, scan_spans, trailing_residue
+from desmos.scan import clip, dropped_openers, scan, scan_spans, trailing_residue
 from desmos.spill import spill
 from desmos.types import Block, Tool, World
 
@@ -382,13 +382,25 @@ def turn(
     # apparently-finished turn. They need opposite advice, though: a truncated
     # reply should be resumed, and a reply that was stopped for going wrong
     # must not be.
+    # A cut reply is not a finished one even when some of its syscalls did
+    # run: the ones after the cut never existed. And an opener that never
+    # closed is dropped by scan in silence, which reads as a turn that simply
+    # chose not to call anything -- the single most expensive silence in this
+    # harness. Report both, and let the caller place the note after the
+    # results so the transcript reads in the order things happened.
     reason = resp.get("stop_reason")
-    if reason in CUT_REASONS and not blocks:
-        note = f"[{CUT_REASONS[reason]}]"
-        messages.append({"role": "user", "content": note})
-        fire({"ev": "error", "n": n, "text": note})
-        return speech, results, False, assistant
-    return speech, results, not blocks, assistant
+    parts: list[str] = []
+    if reason in CUT_REASONS:
+        parts.append(CUT_REASONS[reason])
+    lost = dropped_openers(speech) if not call else []
+    if lost:
+        parts.append(
+            "these tags opened and were never dispatched because no closing tag "
+            "was found: " + ", ".join(lost) + ' — re-issue them, and declare '
+            'end="TOKEN" if the body contains tag text'
+        )
+    note = f"[{'; '.join(parts)}]" if parts else None
+    return speech, results, (not blocks and note is None), assistant, note
 
 
 # Why a reply ended early, and what to tell the model about it. The first two
@@ -558,7 +570,7 @@ def _run_turns(
         if not quiet:
             print(f"\n===== turn {n} =====")
         try:
-            speech, results, done, assistant = turn(
+            speech, results, done, assistant, cut_note = turn(
                 world,
                 world.messages,
                 max_tokens,
@@ -602,6 +614,13 @@ def _run_turns(
             world.messages.append(
                 {"role": "user", "content": result_content(results, assistant, world.cwd)}
             )
+        # After the results, never before: the note explains what did not run,
+        # and reads as nonsense ahead of the output of what did.
+        if cut_note:
+            world.messages.append({"role": "user", "content": cut_note})
+            emit({"ev": "error", "n": n, "text": cut_note})
+            if not quiet:
+                print(cut_note)
         if done or stopped():
             if stopped():
                 # A stop left no trace in the transcript, so the next step read

@@ -865,7 +865,7 @@ def _run_checks() -> None:
         w_raise.complete_fn = raising_complete
         from desmos.loop import turn as _turn
 
-        _speech, raise_results, _done, _asst = _turn(w_raise, list(w_raise.messages), 512)
+        _speech, raise_results, _done, _asst, _note = _turn(w_raise, list(w_raise.messages), 512)
         assert [b.tag for b, _ in raise_results] == ["bash", "edit", "bash"], raise_results
         assert raise_results[0][1].strip() == "ranfirst", "a raise ate an earlier syscall's output"
         assert "ValueError" in raise_results[1][1], raise_results[1][1]
@@ -1547,6 +1547,63 @@ def _run_checks() -> None:
             assert any(e.get("ev") == "error" for e in s_evs), reason
             # never tell a reply that was stopped for going wrong to continue
             assert not any("continue from where" in x for x in notes), (reason, notes)
+
+        # scan drops an opener whose closer never arrived, in silence, and a
+        # turn that lost its only syscall then looks exactly like a turn that
+        # chose not to call one. Anthropic stop sequences make that routine:
+        # they cut generation at a line start anywhere in the reply, body
+        # included, and end="TOKEN" cannot help because it is parsed here long
+        # after the API stopped the stream.
+        w_lost = new_world(cwd, state_path=None, persist=False, ns={})
+        n_l = {"n": 0}
+
+        def lost_tag(_m, _s, _msgs, _mt, _n=n_l):
+            _n["n"] += 1
+            if _n["n"] == 1:
+                return {
+                    "content": [{"type": "text", "text": "I will run <bash>ls"}],
+                    "stop_reason": "end_turn",
+                    "usage": {},
+                }
+            return {"content": [{"type": "text", "text": "done"}], "usage": {}}
+
+        w_lost.complete_fn = lost_tag
+        _run(w_lost, "drop a tag", quiet=True)
+        assert n_l["n"] == 2, "a dropped opener must not read as a finished turn"
+        lost_notes = [str(m.get("content")) for m in w_lost.messages if m.get("role") == "user"]
+        assert any("bash (no closing tag)" in x for x in lost_notes), lost_notes
+
+        # And the note goes after the results, never before: it explains what
+        # did not run, which is nonsense ahead of the output of what did.
+        w_mix = new_world(cwd, state_path=None, persist=False, ns={})
+        n_m = {"n": 0}
+        half = "ok <bash>echo hi</" + "bash> and now <python>print(1)"
+
+        def mixed(_m, _s, _msgs, _mt, _n=n_m, _t=half):
+            _n["n"] += 1
+            if _n["n"] == 1:
+                return {
+                    "content": [{"type": "text", "text": _t}],
+                    "stop_reason": "stop_sequence",
+                    "usage": {},
+                }
+            return {"content": [{"type": "text", "text": "done"}], "usage": {}}
+
+        w_mix.complete_fn = mixed
+        _run(w_mix, "half a batch", quiet=True)
+        # Only user-role messages: the assistant turn quotes both the command
+        # and its own dropped tag, so matching on text alone always finds an
+        # earlier index and the ordering assertion can never fail.
+        rows = [
+            (i, str(m.get("content")))
+            for i, m in enumerate(w_mix.messages)
+            if m.get("role") == "user"
+        ]
+        note_at = [i for i, x in rows if "python (no closing tag)" in x]
+        res_at = [i for i, x in rows if "hi" in x and "no closing tag" not in x]
+        assert note_at and res_at, (note_at, res_at, rows)
+        assert min(note_at) > max(res_at), (note_at, res_at)
+        assert any("result block" in x for _, x in rows), rows
 
         # Hitting the cap is not finishing either.
         w_cap = new_world(cwd, state_path=None, persist=False, ns={})

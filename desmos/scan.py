@@ -264,8 +264,38 @@ def trailing_residue(text: str) -> str:
     return text[spans[-1][2] :].strip()
 
 
-def scan_spans(text: str) -> list[tuple[Block, int, int]]:
-    """Every syscall with the character range it occupied."""
+def dropped_openers(text: str) -> list[str]:
+    """Tags that opened in this reply and were skipped instead of dispatched.
+
+    scan_spans is deliberately conservative: an opener whose closer never
+    arrives is stepped over, because half-dispatching a cut-off reply is worse
+    than dispatching nothing. But it does that in complete silence, and a turn
+    that dropped its only syscall is indistinguishable from a turn that chose
+    not to call one. That silence has cost this harness three commits and a
+    rollback to generation 1.
+
+    Anthropic stop sequences make it routine rather than exotic: they cut
+    generation at a line start anywhere in the reply, body included, so a
+    <python> writing about this harness can be guillotined mid-body and vanish.
+    end="TOKEN" cannot save it -- that is parsed here, long after the API
+    already stopped the stream.
+    """
+    dropped: list[str] = []
+    scan_spans(text, dropped=dropped)
+    return dropped
+
+
+def scan_spans(
+    text: str, *, dropped: list[str] | None = None
+) -> list[tuple[Block, int, int]]:
+    """Every syscall with the character range it occupied.
+
+    Openers that never resolved to a call are reported through `dropped`.
+    """
+    def drop(tag: str, why: str) -> None:
+        if dropped is not None:
+            dropped.append(f"{tag} ({why})")
+
     blocks: list[tuple[Block, int, int]] = []
     pos = 0
     fence = _fence_span(text, 0)
@@ -308,11 +338,13 @@ def scan_spans(text: str) -> list[tuple[Block, int, int]]:
         if token:
             if not re.fullmatch(r"[\w.-]+", token):
                 pos = m.end()  # an unusable token is not a silent bare closer
+                drop(tag, f"unusable end token {token!r}")
                 continue
             custom = re.compile(rf"</{re.escape(tag)}\s*:\s*{re.escape(token)}\s*>")
             cm = custom.search(text, m.end())
             if not cm:
                 pos = m.end()
+                drop(tag, f"no closing </{tag}:{token}>")
                 continue
             blocks.append((Block(tag, text[m.end() : cm.start()], attrs), m.start(), cm.end()))
             pos = cm.end()
@@ -321,6 +353,7 @@ def scan_spans(text: str) -> list[tuple[Block, int, int]]:
         fm = closer.search(text, m.end())
         if not fm:
             pos = m.end()  # unterminated: a cut-off reply is not half-dispatched
+            drop(tag, "no closing tag")
             continue
         # The body ends at the first closer that is not inside a string, because
         # the only closer the model writes early is one it quoted: `print("
@@ -342,6 +375,7 @@ def scan_spans(text: str) -> list[tuple[Block, int, int]]:
             end, stop = fm.start(), fm.end()
         if stop == m.end():
             pos = m.end()
+            drop(tag, "every closing tag looked quoted")
             continue
         blocks.append((Block(tag, text[m.end() : end], attrs), m.start(), stop))
         pos = stop
