@@ -658,6 +658,10 @@ struct WorkRun {
 /// everything, and a line for one grep is worse than silence.
 const RUN_MIN_CALLS: usize = 2;
 
+/// How long a notice stays on the composer's edge. Long enough to read after
+/// the keystroke that caused it, short enough that it is never stale chrome.
+const NOTICE_TTL: Duration = Duration::from_secs(4);
+
 impl WorkRun {
     fn call(&mut self, tag: &str, target: Option<String>) {
         if self.head_at_start.is_none() {
@@ -892,6 +896,10 @@ struct App {
     activity_started_at: Option<Instant>,
     turn_cancel: Option<Rect>,
     status: String,
+    /// The last thing worth telling the user, and when. `status` alone was
+    /// written in twenty places and rendered in none of them; a notice is that
+    /// same string with a clock on it, so it can lapse instead of lingering.
+    notice: Option<(Instant, String)>,
     story: ScrollbackState,
     calls: ScrollbackState,
     post_in: JsonTree,
@@ -1211,6 +1219,7 @@ impl App {
             activity_started_at: None,
             turn_cancel: None,
             status: "idle".into(),
+            notice: None,
             story: ScrollbackState::new(),
             calls: ScrollbackState::new(),
             post_in: JsonTree::default(),
@@ -1558,6 +1567,25 @@ impl App {
         }
         let tab = if self.focus == Focus::PostOut { 1 } else { 0 };
         self.post_inspect = Some(PostInspect::open(tab));
+    }
+
+    /// Say something to the user. Sets `status` too, so the handful of places
+    /// that read it keep working, but stamps it so the composer can show it and
+    /// then drop it. Lifecycle words -- idle, running, stopping -- assign
+    /// `status` directly and raise no notice: they are the activity line's job,
+    /// and "idle" landing at the end of a turn would wipe "copied".
+    fn notify(&mut self, msg: impl Into<String>) {
+        let msg = msg.into();
+        self.notice = Some((Instant::now(), msg.clone()));
+        self.status = msg;
+    }
+
+    /// A notice that has had its few seconds. Checked on the idle tick, since
+    /// nothing else forces a repaint once the text stops being true.
+    fn notice_stale(&self) -> bool {
+        self.notice
+            .as_ref()
+            .is_some_and(|(t, _)| t.elapsed() > NOTICE_TTL)
     }
 
     fn set_focus(&mut self, focus: Focus) {
@@ -1926,7 +1954,7 @@ fn run(
                     }
                     Err(TryRecvError::Empty) => break,
                     Err(TryRecvError::Disconnected) => {
-                        app.status = "bridge died".into();
+                        app.notify("bridge died");
                         app.running = false;
                         app.turn_started = None;
                         app.ready = true;
@@ -1955,6 +1983,9 @@ fn run(
             app.git.poll(false);
         }
         if app.git.drain() {
+            dirty = true;
+        }
+        if expire_notice(app) {
             dirty = true;
         }
         let cache_live = app.cache.left().is_some();
@@ -2031,18 +2062,18 @@ fn wait_ready(bridge: Option<&mut Bridge>, app: &mut App) {
     while !app.ready {
         let left = deadline.saturating_duration_since(Instant::now());
         if left.is_zero() {
-            app.status = "bridge silent".into();
+            app.notify("bridge silent");
             app.ready = true;
             break;
         }
         match b.rx.recv_timeout(left) {
             Ok(ev) => handle_event(app, ev),
             Err(RecvTimeoutError::Timeout) => {
-                app.status = "bridge silent".into();
+                app.notify("bridge silent");
                 app.ready = true;
             }
             Err(RecvTimeoutError::Disconnected) => {
-                app.status = "bridge died".into();
+                app.notify("bridge died");
                 app.ready = true;
             }
         }
@@ -2416,7 +2447,7 @@ fn handle_event(app: &mut App, ev: Value) {
             // model's memory of this session just changed shape. Say so where
             // the human is actually reading, and say what it means.
             app.story_push(RenderBlock::system(&fold_notice(n, kept)));
-            app.status = "context folded".into();
+            app.notify("context folded");
         }
         "complete" => {
             app.stream.finish(&mut app.story);
@@ -2536,7 +2567,7 @@ fn apply_picker(
             // claiming the new model there would be a lie for the rest of the
             // step, so it stays pending until the bridge says otherwise.
             if app.running {
-                app.status = format!("{model} after this step");
+                app.notify(format!("{model} after this step"));
                 app.model_pending = Some((model, effort));
             } else {
                 app.model = model;
@@ -2704,7 +2735,7 @@ fn handle_key(
                         viewer.handle_paste(&text);
                     }
                 }
-                None => app.status = "clipboard empty".into(),
+                None => app.notify("clipboard empty"),
             }
             return Ok(false);
         }
@@ -2723,7 +2754,7 @@ fn handle_key(
                         v.handle_paste(&text);
                     }
                 }
-                None => app.status = "clipboard empty".into(),
+                None => app.notify("clipboard empty"),
             }
             return Ok(false);
         }
@@ -2733,14 +2764,14 @@ fn handle_key(
     if is_inline_paste_key(&key) {
         match clipboard_text() {
             Some(text) => apply_paste(app, &text, true),
-            None => app.status = "clipboard empty".into(),
+            None => app.notify("clipboard empty"),
         }
         return Ok(false);
     }
     if is_paste_key(&key) {
         match clipboard_text() {
             Some(text) => apply_paste(app, &text, false),
-            None => app.status = "clipboard empty".into(),
+            None => app.notify("clipboard empty"),
         }
         return Ok(false);
     }
@@ -3072,7 +3103,7 @@ fn send_now(mut bridge: Option<&mut Bridge>, app: &mut App) -> io::Result<bool> 
         return try_drain(bridge, app).map(|_| false);
     }
     app.send_now = true;
-    app.status = "send now".into();
+    app.notify("send now");
     if let Some(b) = bridge.as_mut() {
         b.send(&json!({"op": "stop"}))?;
         app.status = "stopping".into();
@@ -3103,7 +3134,7 @@ fn start_step(
     app.story_push(RenderBlock::user_prompt(&line));
     app.story.follow_new_turn(None, false);
     if app.viewing.is_some() {
-        app.status = "esc to leave session".into();
+        app.notify("esc to leave session");
         return Ok(());
     }
     if let Some(b) = bridge.as_mut() {
@@ -3135,7 +3166,7 @@ fn submit_prompt(mut bridge: Option<&mut Bridge>, app: &mut App) -> io::Result<b
     if let Some(name) = line.strip_prefix("/theme") {
         let name = name.trim();
         if name.is_empty() {
-            app.status = format!("theme {}", Theme::current_kind().display_name());
+            app.notify(format!("theme {}", Theme::current_kind().display_name()));
         } else if let Some(kind) = ThemeKind::from_name(name) {
             let kind = if kind.is_auto() {
                 theme_cache::resolve_initial_theme()
@@ -3144,20 +3175,15 @@ fn submit_prompt(mut bridge: Option<&mut Bridge>, app: &mut App) -> io::Result<b
             };
             theme_cache::set(kind);
             app.apply_grok_settings();
-            app.status = format!("theme {}", kind.display_name());
+            app.notify(format!("theme {}", kind.display_name()));
         } else {
-            app.status = "theme: groknight tokyonight grokday rosepine oscura auto".into();
+            app.notify("theme: groknight tokyonight grokday rosepine oscura auto");
         }
     } else if line == "/timestamps" {
         let on = !appearance_cache::load_timestamps();
         appearance_cache::set_timestamps(on);
         app.apply_grok_settings();
-        app.status = if on {
-            "timestamps on"
-        } else {
-            "timestamps off"
-        }
-        .into();
+        app.notify(if on { "timestamps on" } else { "timestamps off" });
     } else if line == "/compact" || line == "/dense" {
         // `/compact` reads like "fold the transcript" and does not — folding is
         // the server's, on its own trigger, and there is no client verb for it.
@@ -3166,12 +3192,11 @@ fn submit_prompt(mut bridge: Option<&mut Bridge>, app: &mut App) -> io::Result<b
         let on = !appearance_cache::load();
         appearance_cache::set(on);
         app.apply_grok_settings();
-        app.status = if on {
+        app.notify(if on {
             "dense rows on (this is spacing, not transcript folding)"
         } else {
             "dense rows off"
-        }
-        .into();
+        });
     } else if let Some(rest) = line.strip_prefix("/model") {
         // The bridge op has always existed; nothing typed to it. The picker is
         // still the discoverable path -- this is for people who already know
@@ -3182,7 +3207,7 @@ fn submit_prompt(mut bridge: Option<&mut Bridge>, app: &mut App) -> io::Result<b
             app.picker.open_for_change(&m, &e);
         } else if let Some(b) = bridge.as_mut() {
             b.send(&json!({"op": "model", "model": want, "effort": app.thinking}))?;
-            app.status = format!("model {want}");
+            app.notify(format!("model {want}"));
         }
     } else if let Some(level) = line.strip_prefix("/thinking") {
         let level = level.trim();
@@ -3218,7 +3243,7 @@ fn submit_prompt(mut bridge: Option<&mut Bridge>, app: &mut App) -> io::Result<b
     }
     if app.running {
         app.queue.push(line);
-        app.status = format!("queued #{}", app.queue.len());
+        app.notify(format!("queued #{}", app.queue.len()));
         return Ok(false);
     }
     start_step(bridge, app, line)?;
@@ -3592,7 +3617,7 @@ fn handle_scrollback_up(app: &mut App, calls: bool, _col: u16, _row: u16) {
         }
     };
     if copied.is_some() {
-        app.status = "copied".into();
+        app.notify("copied");
     }
 }
 
@@ -3666,7 +3691,7 @@ fn handle_viewer_key(app: &mut App, key: KeyEvent) {
     if let (Some(entry), Some(viewer)) = (entry, app.viewer.as_mut()) {
         if let Some(text) = viewer.process_pending_copy(&entry) {
             let _ = SystemClipboard::try_set(&text);
-            app.status = "copied".into();
+            app.notify("copied");
         }
     }
 }
@@ -3715,7 +3740,7 @@ fn handle_viewer_mouse(app: &mut App, m: MouseEvent) {
     };
     if let Some(text) = drag.or(key_text) {
         let _ = SystemClipboard::try_set(&text);
-        app.status = "copied".into();
+        app.notify("copied");
     }
 }
 
@@ -3920,7 +3945,7 @@ fn handle_post_inspect_key(app: &mut App, key: KeyEvent) {
                 .unwrap_or(0);
             let val = if tab == 0 { &req } else { &resp };
             let _ = SystemClipboard::try_set(&pretty_json(val));
-            app.status = "copied".into();
+            app.notify("copied");
             return;
         }
         _ => {}
@@ -4228,6 +4253,16 @@ fn stamp_footer(f: &mut Frame, area: Rect, label: &str, color: ratatui::style::C
         ))),
         spot,
     );
+}
+
+/// Drop a notice that has had its seconds. Returns whether the frame needs a
+/// repaint to erase it -- nothing else is live when a notice lapses.
+fn expire_notice(app: &mut App) -> bool {
+    if app.notice_stale() {
+        app.notice = None;
+        return true;
+    }
+    false
 }
 
 fn tick_scrollbacks(app: &mut App) -> bool {
@@ -5430,6 +5465,20 @@ fn draw_input(f: &mut Frame, area: Rect, app: &mut App) {
             ))
             .right_aligned(),
         );
+    }
+    // The left edge answers "did that do anything" -- copied, queued #3, theme
+    // changed, bridge died. Twenty places wrote that string and nothing ever
+    // drew it; this is where it lands, and it lapses on its own.
+    if let Some((_, msg)) = app.notice.as_ref() {
+        let room = card.width.saturating_sub(if app.running { stop_w + 3 } else { 2 }) as usize;
+        let mut text = msg.clone();
+        if UnicodeWidthStr::width(text.as_str()) > room {
+            text = text.chars().take(room.saturating_sub(1)).collect::<String>() + "\u{2026}";
+        }
+        block = block.title(Span::styled(
+            format!(" {text} "),
+            Style::default().fg(theme.text_secondary),
+        ));
     } else if app.prompt.is_multiline() {
         block = block.title(Span::styled(
             " multiline ",
@@ -9320,6 +9369,22 @@ mod tests {
         );
         assert!(app.story_text.persist.is_some());
         assert_eq!(app.status, "copied");
+
+        // The whole point of a notice: it is drawn, on the one piece of chrome
+        // that is always on screen, and then it lapses.
+        let text = paint(&mut app, 120, 36);
+        let top = rows_of(&text, Rect { height: 2, ..app.input_area });
+        assert!(
+            top.contains("copied"),
+            "a notice must land on the composer's top edge:\n{top}"
+        );
+        let (t, msg) = app.notice.clone().expect("notice");
+        app.notice = Some((t - NOTICE_TTL - Duration::from_secs(1), msg));
+        assert!(expire_notice(&mut app), "a stale notice must ask for a repaint");
+        assert!(app.notice.is_none());
+        let text = paint(&mut app, 120, 36);
+        let top = rows_of(&text, Rect { height: 2, ..app.input_area });
+        assert!(!top.contains("copied"), "a lapsed notice must be gone:\n{top}");
     }
 
     fn tab() -> KeyEvent {
