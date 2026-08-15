@@ -99,7 +99,10 @@ def capabilities() -> str:
             " (critic, read-only). fanout(tasks) spawns many. wait(*ids, timeout=600) blocks;"
             " gather(ids) waits and joins their output; status() lists running; result(id) reads"
             " one. A child is an isolated World with its own transcript and no persist.",
-            "step(prompt, max_turns=32) runs a nested turn loop on this same world.",
+            "step(prompt, max_turns=32, max_total_tokens=None) runs a nested turn loop on this"
+            " same world. max_total_tokens is a prompt+completion ceiling counted from the start"
+            " of that step; hitting it stops the loop, says so in the transcript, and reports"
+            " `stopped` rather than `done`.",
             "reset() clears the transcript when a poisoned turn would otherwise train the next one."
             " ns, notes, tools, and skills survive it.",
             "extensions: a .py under .desmos/extensions gets api.tool(name, doc, handler) to add a"
@@ -143,6 +146,10 @@ _ANTHROPIC = "\n".join(
         "Keep responses focused and brief; put the weight on the answer, not the preamble or the"
         " caveats. In the message that closes the task -- after the last result is in -- lead with"
         " the outcome: one sentence on what happened or what you found.",
+        "The transcript already carries every call, its body and its result, and the reader can"
+        " see them. Do not restate them in prose: no pasted commands, no grep counts, no"
+        " insertion counts, no bookkeeping about which check ran. Do the checks; report the"
+        " conclusion and the one number that changes a decision.",
         "Deliver what was asked, at the scope intended. Make routine judgment calls yourself and"
         " check in only when readings differ enough to change the work. If you think the ask is"
         " wrong, say so in a sentence and continue with it as asked. Finish the whole task; report"
@@ -177,6 +184,8 @@ _OPENAI = "\n".join(
         " readings would change the deliverable, ask.",
         "Decide reversible, low-impact things yourself. Ask first when an action is hard to undo,"
         " or when it is costly, public, or exposes data.",
+        "Close with the outcome in the first sentence. Then separate what you verified by running"
+        " it from what you are inferring, and name anything still unproven.",
     ]
 )
 
