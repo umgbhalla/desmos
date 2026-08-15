@@ -662,6 +662,12 @@ const RUN_MIN_CALLS: usize = 2;
 /// the keystroke that caused it, short enough that it is never stale chrome.
 const NOTICE_TTL: Duration = Duration::from_secs(4);
 
+/// Blank rows held back at the foot of the story. The pane follows its tail,
+/// so without them a streaming thought grows and folds against the border and
+/// the whole column jumps. The wire pane keeps none: nothing there collapses
+/// under the reader while it is being written.
+const STORY_PAD_BOTTOM: u16 = 2;
+
 impl WorkRun {
     fn call(&mut self, tag: &str, target: Option<String>) {
         if self.head_at_start.is_none() {
@@ -4332,6 +4338,7 @@ fn draw_scrollback(
     focused: bool,
     mouse: Option<(u16, u16)>,
     text: &TextSel,
+    pad_bottom: u16,
 ) {
     let theme = Theme::current();
     let border = if focused {
@@ -4342,10 +4349,20 @@ fn draw_scrollback(
     // Lay out before drawing the frame: the border title carries the count of
     // rows scrolled off the top, so it has to be known before the block is
     // rendered. Overflow below is stamped on the bottom border afterwards.
-    let inner = Block::default().borders(Borders::ALL).inner(area);
+    let mut inner = Block::default().borders(Borders::ALL).inner(area);
     if inner.width == 0 || inner.height == 0 {
         return;
     }
+    // Reserved floor. The story follows its tail, so the newest block sits
+    // flush on the border and every row it gains or loses while a thought
+    // streams and then folds drags the whole column with it. A couple of rows
+    // of slack keep the live block off the frame, so the motion reads as the
+    // block changing rather than the pane lurching. Taken out of the viewport
+    // before layout: prepare_layout, clamp_scroll and hidden_rows all have to
+    // agree on the height, or the "n more down" count lies about rows that
+    // are in fact painted.
+    let pad = pad_bottom.min(inner.height.saturating_sub(1));
+    inner.height -= pad;
     state.begin_frame();
     state.prepare_layout(inner.width, inner.height);
     clamp_scroll(state);
@@ -4753,6 +4770,7 @@ fn draw(f: &mut Frame, app: &mut App) {
             app.focus == Focus::Story,
             app.mouse,
             &child.story_text,
+            STORY_PAD_BOTTOM,
         );
         draw_scrollback(
             f,
@@ -4765,6 +4783,7 @@ fn draw(f: &mut Frame, app: &mut App) {
             app.focus == Focus::Calls,
             app.mouse,
             &child.calls_text,
+            0,
         );
     } else {
         draw_scrollback(
@@ -4778,6 +4797,7 @@ fn draw(f: &mut Frame, app: &mut App) {
             app.focus == Focus::Story,
             app.mouse,
             &app.story_text,
+            STORY_PAD_BOTTOM,
         );
         draw_scrollback(
             f,
@@ -4790,6 +4810,7 @@ fn draw(f: &mut Frame, app: &mut App) {
             app.focus == Focus::Calls,
             app.mouse,
             &app.calls_text,
+            0,
         );
     }
     let n = app.post_n;
@@ -10312,6 +10333,55 @@ mod tests {
             !body[prompt + 1].is_empty(),
             "blank row BELOW the prompt too -- the turn gap became a global entry gap"
         );
+    }
+
+    /// The story follows its tail, so the newest block lands on the border and
+    /// every row a streaming thought gains or loses drags the whole column.
+    /// A reserved floor keeps the live block off the frame. The rows have to
+    /// be held back *before* layout, or the viewport still ends at the border
+    /// and the pad is only a lie told after the fact.
+    #[test]
+    fn the_story_reserves_a_floor_the_wire_does_not() {
+        let mut app = App::new();
+        seed_demo(&mut app);
+        // Short enough that the story overflows: a pane with room to spare
+        // ends in blank rows whether or not anything reserved them.
+        let _ = paint(&mut app, 140, 44);
+        let text = paint(&mut app, 140, 44);
+        let strip = |r: Rect| -> Vec<String> {
+            let rows = rows_of(&text, r);
+            let all: Vec<&str> = rows.lines().collect();
+            all[1..all.len() - 1]
+                .iter()
+                .map(|l| l.trim_matches(|c| c == '\u{2502}' || c == ' ').to_string())
+                .collect()
+        };
+        let body = strip(app.traj_area);
+        let pad = STORY_PAD_BOTTOM as usize;
+        assert!(body.len() > pad + 1, "story pane too short to measure");
+        assert!(
+            body[body.len() - pad..].iter().all(|l| l.is_empty()),
+            "the story spent its reserved floor: {:?}",
+            &body[body.len() - pad - 1..]
+        );
+        assert!(
+            !body[body.len() - pad - 1].is_empty(),
+            "story never reached its floor, so the pad proves nothing: {body:?}"
+        );
+        // The reservation is geometry, not paint: the story's viewport is
+        // short by the pad, the wire's is not. Asserting on blank rows alone
+        // would pass on a pane that simply had room to spare.
+        let (_, story_vp, _) = app.story.scroll_info();
+        let (_, wire_vp, _) = app.calls.scroll_info();
+        // Literal 2, not STORY_PAD_BOTTOM: written against the constant this
+        // assertion follows any value the constant takes, including zero, and
+        // proves only that arithmetic works.
+        assert_eq!(
+            story_vp,
+            app.traj_area.height - 2 - 2,
+            "the story viewport did not give up its floor"
+        );
+        assert_eq!(wire_vp, app.call_area.height - 2, "the wire pane reserved a floor");
     }
 
     /// Blank rows are the story's largest single expense: grok gaps every
