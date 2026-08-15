@@ -790,8 +790,18 @@ def payload_diff() -> dict[str, Any]:
 
 
 def text_of(resp: dict[str, Any]) -> str:
-    parts = []
-    for block in resp.get("content") or []:
-        if block.get("type") == "text":
-            parts.append(block.get("text") or "")
-    return "".join(parts)
+    """Join the text blocks of a reply into the speech the harness scans.
+
+    Anthropic streams one text block per message, so concatenating was always
+    a no-op. A Responses model does not: sol emits a `phase: "commentary"`
+    preamble and a `phase: "final_answer"` as two separate message items, and
+    gluing them edge to edge produced "…checking the workspace first.Hey! What
+    would you like to work on?" -- two sentences fused mid-line. They are
+    separate utterances and are joined as such.
+    """
+    parts = [
+        (block.get("text") or "")
+        for block in resp.get("content") or []
+        if block.get("type") == "text" and (block.get("text") or "").strip()
+    ]
+    return "\n\n".join(parts)

@@ -898,6 +898,22 @@ def self_check() -> None:
         assert "<result" in str(w_ord.messages[-2]["content"]), "a stop must not eat results that ran"
         assert "stopped by the user" in str(w_ord.messages[-1]["content"]), w_ord.messages[-1]
 
+        # The two effort ladders are different lengths, so an effort that is
+        # fine on one provider does not exist on the other. Refusing the switch
+        # on that basis meant a session on sol at medium or max simply could
+        # not move to Opus. The model is what was asked for; the effort bends.
+        from desmos.settings import CATALOG as _CAT, clamp_effort
+
+        for provider, table in _CAT.items():
+            for effort in ("none", "low", "medium", "high", "xhigh", "max", "nonsense"):
+                got = clamp_effort(provider, effort)
+                assert got in table["efforts"], f"{provider}/{effort} -> {got}"
+        # An effort the target does have is never moved.
+        assert clamp_effort("anthropic", "high") == "high"
+        assert clamp_effort("openai", "medium") == "medium"
+        # A tie goes up: thinking less than asked is the worse surprise.
+        assert clamp_effort("anthropic", "medium") == "high"
+
         # A backgrounded grandchild inherits stdout and can hold the pipe open
         # for as long as it likes. The unbounded read that waited for it made
         # `sleep 20 & echo started` with timeout=3 return after 20 seconds, and

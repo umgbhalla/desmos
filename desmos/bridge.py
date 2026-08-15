@@ -144,7 +144,22 @@ def serve(cwd: Path) -> int:
                 from desmos import settings as _settings
 
                 model = str(msg.get("model") or world.model)
-                effort = str(msg.get("effort") or world.thinking)
+                asked = str(msg.get("effort") or world.thinking)
+                # The two ladders are different lengths -- OpenAI has medium and
+                # max, Anthropic does not -- so an effort that is fine on the
+                # provider being left may not exist on the one being joined. A
+                # session on sol at medium could not move to Opus at all: the
+                # switch was refused as "unknown model/effort". The model is
+                # what was asked for; the effort bends to fit it.
+                provider = _settings.provider_of(model)
+                effort = _settings.clamp_effort(provider, asked)
+                if effort != asked:
+                    _emit(
+                        {
+                            "ev": "notice",
+                            "text": f"{provider} has no {asked} effort; using {effort}",
+                        }
+                    )
                 was = _settings.provider_of(str(world.model or ""))
                 try:
                     notice = _settings.switch(world, model, effort)

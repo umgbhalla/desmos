@@ -40,6 +40,31 @@ class Settings:
         return bool(entry) and self.model in entry["models"] and self.effort in entry["efforts"]
 
 
+# Weakest to strongest. Only used to find the nearest rung on another ladder.
+_EFFORT_ORDER = ("none", "low", "medium", "high", "xhigh", "max")
+
+
+def clamp_effort(provider: str, effort: str) -> str:
+    """The nearest effort this provider actually offers.
+
+    The two ladders are different lengths -- OpenAI has medium and max,
+    Anthropic does not -- so an effort that is perfectly valid on one is
+    unknown on the other. Rejecting the switch on that basis meant a session
+    running sol at medium simply could not move to Opus: the bridge answered
+    "unknown model/effort" and stayed where it was. The effort is not what the
+    user asked to change, so it should bend rather than block.
+    """
+    have = CATALOG.get(provider, {}).get("efforts") or []
+    if not have or effort in have:
+        return effort if effort in have else (have[0] if have else effort)
+    if effort not in _EFFORT_ORDER:
+        return have[0]
+    want = _EFFORT_ORDER.index(effort)
+    # Nearest by intensity; a tie goes to the stronger rung, because quietly
+    # thinking less is the worse surprise.
+    return min(have, key=lambda e: (abs(_EFFORT_ORDER.index(e) - want), -_EFFORT_ORDER.index(e)))
+
+
 def provider_of(model: str) -> str:
     from desmos.openai import is_openai
 
