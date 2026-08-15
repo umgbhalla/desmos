@@ -831,10 +831,10 @@ struct ChildSess {
     exec: ExecStream,
     story_text: TextSel,
     calls_text: TextSel,
-    /// Group heads for this child's wire, same contract as `App::call_groups`.
-    /// A child runs its own POSTs, so it needs its own index — sharing the
-    /// parent's would step the cursor to entries that are not in this pane.
-    call_groups: Vec<EntryId>,
+    /// This child's POSTs, same contract as `App::posts`. A child runs its
+    /// own, so it needs its own index — sharing the parent's would step the
+    /// cursor to entries that are not in this pane.
+    posts: PostRows,
 }
 
 /// Grok text selection for one scrollback (drag, persist, double-click word).
@@ -938,14 +938,22 @@ struct App {
     /// Wire cards the reader folded or opened by hand. reflow_wire leaves
     /// these alone; without it the auto-open would fight every keystroke.
     wire_manual: HashSet<EntryId>,
-    /// First card of each call group, in order — one per `complete()` POST.
+    /// One row per `complete()` POST, and the wire pane's group index.
     ///
     /// The pager has turn navigation already, but it derives turns from
     /// `RenderBlock::UserPrompt` entries and the wire pane has none: its
     /// groups start at a POST card, which is a `ToolCall::Other`. So the
     /// boundaries are recorded where they are pushed rather than rebuilt from
     /// block shape, which would mean matching on the header string.
-    call_groups: Vec<EntryId>,
+    posts: PostRows,
+    /// Whether the `YOU POST` / `MODEL POST` cards are on the wire.
+    ///
+    /// Off by default: they are the turn's accounting, not its content, and
+    /// one per turn between the syscalls is most of the pane. The chip in the
+    /// calls title puts them back.
+    show_posts: bool,
+    /// Where that chip is, so a click on the border can hit it.
+    calls_chip: Option<Rect>,
     post_in_area: Rect,
     post_out_area: Rect,
     queue_area: Rect,
@@ -1254,7 +1262,9 @@ impl App {
             traj_area: Rect::default(),
             call_area: Rect::default(),
             wire_manual: HashSet::new(),
-            call_groups: Vec::new(),
+            posts: PostRows::default(),
+            show_posts: false,
+            calls_chip: None,
             post_in_area: Rect::default(),
             post_out_area: Rect::default(),
             queue_area: Rect::default(),
@@ -1329,7 +1339,7 @@ impl App {
                     exec: ExecStream::default(),
                     story_text: TextSel::default(),
                     calls_text: TextSel::default(),
-                    call_groups: Vec::new(),
+                    posts: PostRows::default(),
                 },
             );
         }
@@ -1455,22 +1465,41 @@ impl App {
     /// The wire pane on screen and its group index together, parent or child.
     /// Group navigation needs both halves of the same session or it steps the
     /// cursor to entries that live in the other one.
-    fn calls_and_groups(&mut self) -> (&mut ScrollbackState, &mut Vec<EntryId>) {
+    fn calls_and_posts(&mut self) -> (&mut ScrollbackState, &mut PostRows) {
         if let Some(id) = self.viewing.clone() {
             if let Some(c) = self.children.get_mut(&id) {
-                return (&mut c.calls, &mut c.call_groups);
+                return (&mut c.calls, &mut c.posts);
             }
         }
-        (&mut self.calls, &mut self.call_groups)
+        (&mut self.calls, &mut self.posts)
     }
 
-    fn calls_and_groups_ref(&self) -> (&ScrollbackState, &[EntryId]) {
+    fn calls_and_posts_ref(&self) -> (&ScrollbackState, &PostRows) {
         if let Some(id) = self.viewing.as_ref() {
             if let Some(c) = self.children.get(id) {
-                return (&c.calls, &c.call_groups);
+                return (&c.calls, &c.posts);
             }
         }
-        (&self.calls, &self.call_groups)
+        (&self.calls, &self.posts)
+    }
+
+    /// Put the `POST #n` cards on the wire, or take them off. Both panes on
+    /// screen follow the one flag: a child's wire is the same pane.
+    fn toggle_posts(&mut self) {
+        self.show_posts = !self.show_posts;
+        let shown = self.show_posts;
+        if shown {
+            self.posts.show(&mut self.calls);
+        } else {
+            self.posts.hide(&mut self.calls);
+        }
+        for c in self.children.values_mut() {
+            if shown {
+                c.posts.show(&mut c.calls);
+            } else {
+                c.posts.hide(&mut c.calls);
+            }
+        }
     }
 
     fn story_push(&mut self, block: RenderBlock) {
@@ -1487,9 +1516,9 @@ impl App {
 
     /// Push a card that opens a new call group. Every `complete()` POST starts
     /// one; the syscalls it produced land after it and belong to it.
-    fn call_push_group(&mut self, block: RenderBlock) {
-        let id = wire_push(&mut self.calls, block);
-        self.call_groups.push(id);
+    fn call_push_group(&mut self, args: PostArgs) {
+        let shown = self.show_posts;
+        self.posts.push(&mut self.calls, args, shown);
     }
 
     /// `(current, total)` group position, 1-based, for the wire pane title.
@@ -1498,20 +1527,16 @@ impl App {
     /// watched moving, and otherwise reports the newest group, which is what
     /// the tail the reader is staring at actually belongs to.
     fn call_group_pos(&self) -> Option<(usize, usize)> {
-        let (calls, groups) = self.calls_and_groups_ref();
-        let total = groups.len();
+        let (calls, posts) = self.calls_and_posts_ref();
+        let starts = posts.starts(calls);
+        let total = starts.len();
         if total == 0 {
             return None;
         }
         // Groups are pushed in entry order, so the group a card belongs to is
         // the last boundary at or above it.
         let cur = match calls.selected() {
-            Some(sel) => groups
-                .iter()
-                .filter_map(|id| calls.index_of_id(*id))
-                .filter(|start| *start <= sel)
-                .count()
-                .max(1),
+            Some(sel) => starts.iter().filter(|start| **start <= sel).count().max(1),
             None => total,
         };
         Some((cur, total))
@@ -1522,13 +1547,8 @@ impl App {
     /// Returns false when there is nowhere to go, so the caller can leave the
     /// selection alone rather than snapping to an end.
     fn select_call_group(&mut self, forward: bool) -> bool {
-        let (calls, groups) = self.calls_and_groups();
-        let mut starts: Vec<usize> = groups
-            .iter()
-            .filter_map(|id| calls.index_of_id(*id))
-            .collect();
-        starts.sort_unstable();
-        starts.dedup();
+        let (calls, posts) = self.calls_and_posts();
+        let starts = posts.starts(calls);
         if starts.is_empty() {
             return false;
         }
@@ -1771,7 +1791,7 @@ fn seed_demo(app: &mut App) {
         let id = app.story.push_block(card);
         set_wire_mode(&mut app.story, id, DisplayMode::Collapsed);
     }
-    app.call_push_group(wire_complete(
+    app.call_push_group(PostArgs::new(
         "user",
         1,
         "claude-opus-5",
@@ -1793,7 +1813,7 @@ fn seed_demo(app: &mut App) {
         &json!({}),
         "0001.json 0002.json 0003.json 0004.json",
     ));
-    app.call_push_group(wire_complete(
+    app.call_push_group(PostArgs::new(
         "llm",
         2,
         "claude-opus-5",
@@ -1806,7 +1826,7 @@ fn seed_demo(app: &mut App) {
         1,
         0,
     ));
-    app.call_push_group(wire_complete(
+    app.call_push_group(PostArgs::new(
         "user",
         3,
         "claude-opus-5",
@@ -1865,6 +1885,7 @@ fn seed_spawn(app: &mut App) {
     let eid = app.story.push_block(RenderBlock::Subagent(block));
     app.story.set_last_running(true);
     {
+        let shown = app.show_posts;
         let child = app.ensure_child(id, task);
         child.parent_entry = Some(eid);
         child.story.push_block(RenderBlock::thinking(
@@ -1873,18 +1894,16 @@ fn seed_spawn(app: &mut App) {
         child.story.push_block(RenderBlock::agent_message(
             "cache is last-user only. ABI is frozen. Speech is not memory.",
         ));
-        wire_push(
-            &mut child.calls,
-            wire_complete(
-                "user",
-                1,
-                "claude-opus-5",
-                "low",
-                &json!({"input_tokens": 400, "output_tokens": 80}),
-                1,
-                0,
-            ),
+        let args = PostArgs::new(
+            "user",
+            1,
+            "claude-opus-5",
+            "low",
+            &json!({"input_tokens": 400, "output_tokens": 80}),
+            1,
+            0,
         );
+        child.posts.push(&mut child.calls, args, shown);
         wire_push(
             &mut child.calls,
             wire_syscall("python", "list(world.notes)", &json!({}), "['cache']"),
@@ -2312,6 +2331,7 @@ fn handle_child(app: &mut App, ev: &Value) {
     let kind = ev.get("kind").and_then(Value::as_str).unwrap_or("");
     app.ensure_child(id, "");
     let mut last_post: Option<(u64, Value, Value)> = None;
+    let shown = app.show_posts;
     let child = app.children.get_mut(id).expect("child");
     match kind {
         "thinking" => {
@@ -2341,11 +2361,11 @@ fn handle_child(app: &mut App, ev: &Value) {
             let usage = ev.get("usage").cloned().unwrap_or(json!({}));
             let thoughts = ev.get("thoughts").and_then(Value::as_u64).unwrap_or(0);
             let redacted = ev.get("redacted").and_then(Value::as_u64).unwrap_or(0);
-            let head = wire_push(
+            child.posts.push(
                 &mut child.calls,
-                wire_complete(origin, n, model, thinking, &usage, thoughts, redacted),
+                PostArgs::new(origin, n, model, thinking, &usage, thoughts, redacted),
+                shown,
             );
-            child.call_groups.push(head);
             if let (Some(req), Some(resp)) = (ev.get("request"), ev.get("response")) {
                 last_post = Some((n, req.clone(), resp.clone()));
             }
@@ -2482,7 +2502,7 @@ fn handle_event(app: &mut App, ev: Value) {
             }
             let thoughts = ev.get("thoughts").and_then(Value::as_u64).unwrap_or(0);
             let redacted = ev.get("redacted").and_then(Value::as_u64).unwrap_or(0);
-            app.call_push_group(wire_complete(
+            app.call_push_group(PostArgs::new(
                 origin, n, model, thinking, &usage, thoughts, redacted,
             ));
             let empty = json!({});
@@ -3046,6 +3066,13 @@ fn handle_key(
             }
             // Group step. Arrows already mean fold in this pane, so walking
             // whole POST groups gets its own pair rather than overloading them.
+            // The POST rows are the turn's accounting, not its content, so
+            // they stay off until asked for — by this key or the title chip.
+            KeyCode::Char('p') if app.focus == Focus::Calls => {
+                app.toggle_posts();
+                let on = if app.show_posts { "on" } else { "off" };
+                app.notify(format!("POST rows {on}"));
+            }
             KeyCode::Char('[') if app.focus == Focus::Calls => {
                 app.select_call_group(false);
             }
@@ -3200,7 +3227,7 @@ fn start_step(
         app.status = "running".into();
         b.send(&json!({"op": "step", "text": line}))?;
     } else {
-        app.call_push_group(wire_complete("user", 0, "demo", "", &json!({}), 0, 0));
+        app.call_push_group(PostArgs::new("user", 0, "demo", "", &json!({}), 0, 0));
     }
     Ok(())
 }
@@ -3293,7 +3320,7 @@ fn submit_prompt(mut bridge: Option<&mut Bridge>, app: &mut App) -> io::Result<b
         }
         app.story.clear();
         app.calls.clear();
-        app.call_groups.clear();
+        app.posts.clear();
         app.wire_manual.clear();
         app.post_in.clear();
         app.post_out.clear();
@@ -3357,6 +3384,25 @@ fn git_tab_at(area: Rect, col: u16, row: u16) -> Option<side::GitTab> {
     None
 }
 
+/// Where a chip drawn inside a pane's border title lands on screen, so a
+/// click on the frame can hit it. Mirrors the heading in `draw_scrollback`:
+/// left border, the leading space, then the title.
+fn title_chip_rect(area: Rect, title: &str, chip: &str) -> Option<Rect> {
+    if area.height < 3 {
+        return None;
+    }
+    let at = title.find(chip)?;
+    let off = title[..at].chars().count() as u16;
+    let x = area.x.saturating_add(2).saturating_add(off);
+    let w = chip.chars().count() as u16;
+    (x.saturating_add(w) <= area.x.saturating_add(area.width)).then_some(Rect {
+        x,
+        y: area.y,
+        width: w,
+        height: 1,
+    })
+}
+
 /// Which content row of a bordered pane a screen row lands on. `None` for the
 /// two border rows, so a click on the frame never moves a cursor.
 fn pane_row(area: Rect, row: u16) -> Option<usize> {
@@ -3382,6 +3428,12 @@ fn handle_mouse(app: &mut App, m: MouseEvent) {
         if let Some(area) = app.turn_cancel {
             if hit(area, m.column, m.row) {
                 app.want_stop = true;
+                return;
+            }
+        }
+        if let Some(area) = app.calls_chip {
+            if hit(area, m.column, m.row) {
+                app.toggle_posts();
                 return;
             }
         }
@@ -4558,14 +4610,21 @@ fn draw(f: &mut Frame, app: &mut App) {
     // Two cells of gutter each side of the card, then its own border.
     let inner_w = body[0].width.saturating_sub(4);
     let queue_h = app.queue.display_height();
+    // The composer floats over the column: a blank row above it and a cell of
+    // gutter each side, so it reads as a card rather than one more stacked
+    // pane. An open queue is the top card of that same group, so the blank row
+    // belongs to it -- otherwise the gap lands *between* the two boxes, which
+    // is the one place it says nothing.
+    let queue_h = if queue_h > 0 { queue_h + 1 } else { 0 };
+    let float_rows: u16 = if queue_h > 0 { 0 } else { 1 };
     // Grow with what is typed, up to half the column. The old ceiling of ten
     // rows existed to leave a legend band matching it opposite; there is no
     // legend now, and a long prompt is worth more rows than a short story is.
     let cap = (body[0].height / 2).saturating_sub(3).max(2);
     let prompt_rows = app.prompt.display_rows(inner_w).clamp(2, cap);
-    let input_h = (3 + prompt_rows)
+    let input_h = (2 + float_rows + prompt_rows)
         .min(f.area().height.saturating_sub(8 + queue_h))
-        .max(5);
+        .max(4 + float_rows);
     let bottom_h = queue_h + input_h;
     let post_h = app
         .layout
@@ -4616,7 +4675,18 @@ fn draw(f: &mut Frame, app: &mut App) {
     app.call_area = panes[1];
     app.post_in_area = posts[0];
     app.post_out_area = posts[1];
-    app.queue_area = left[2];
+    // The card, not the slot: the float row above it is not part of the queue,
+    // so a click there does nothing and the row arithmetic below stays honest.
+    app.queue_area = if left[2].height > 1 {
+        Rect {
+            x: left[2].x.saturating_add(1),
+            y: left[2].y.saturating_add(1),
+            width: left[2].width.saturating_sub(2),
+            height: left[2].height.saturating_sub(1),
+        }
+    } else {
+        left[2]
+    };
     app.input_area = left[3];
 
     let viewing = app.viewing.clone();
@@ -4625,10 +4695,14 @@ fn draw(f: &mut Frame, app: &mut App) {
         .is_some_and(|id| app.children.contains_key(id));
     // Computed before the child borrow: call_group_pos already resolves to
     // whichever session is on screen, so both branches want the same string.
+    // The POST cards are off by default, so the pane says so where the switch
+    // is: a chip in its own border title, clickable, `p` from the keyboard.
+    let chip = if app.show_posts { "[-posts]" } else { "[+posts]" };
     let calls_title = match app.call_group_pos() {
-        Some((cur, total)) => format!("calls  #{cur}/{total}"),
-        None => "calls".to_string(),
+        Some((cur, total)) => format!("calls  #{cur}/{total}  {chip}"),
+        None => format!("calls  {chip}"),
     };
+    app.calls_chip = title_chip_rect(app.call_area, &calls_title, chip);
     if let (Some(id), true) = (viewing.as_deref(), child_ok) {
         let child = app.children.get_mut(id).expect("checked");
         let title = format!("session {id}");
@@ -5502,12 +5576,14 @@ fn draw_input(f: &mut Frame, area: Rect, app: &mut App) {
     let theme = Theme::current();
     // Float the box: a blank row above it and a cell of gutter each side, so it
     // reads as a card laid over the story column rather than one more pane
-    // stacked in the frame.
+    // stacked in the frame. The blank row is the group's, not this box's --
+    // with the queue open it sits above the queue and the two cards touch.
+    let float = if app.queue.is_empty() { 1 } else { 0 };
     let card = Rect {
         x: area.x.saturating_add(1),
-        y: area.y.saturating_add(1),
+        y: area.y.saturating_add(float),
         width: area.width.saturating_sub(2),
-        height: area.height.saturating_sub(1),
+        height: area.height.saturating_sub(float),
     };
     // Identity used to run along this box's bottom edge. It is not something
     // you type, and the box grows and shrinks under it; it lives in the meta
@@ -5611,6 +5687,7 @@ fn pane_keys(focus: Focus) -> (&'static str, &'static [(&'static str, &'static s
                 ("enter", "zoom into the viewer (a spawn row opens the child)"),
                 ("ctrl-f", "zoom, without moving the fold"),
                 ("[ ]", "previous / next POST group (calls)"),
+                ("p", "show / hide the POST rows (calls)"),
                 ("r", "raw text of the selected block"),
                 ("pgup pgdn", "scroll a page"),
                 ("i", "back to the composer"),
@@ -6245,6 +6322,177 @@ fn strip_syscalls(text: &str) -> String {
 ///
 /// `l` / Enter opens a card, `h` folds it; either marks it manual and
 /// `reflow_wire` stops managing it.
+/// The arguments one `POST #n` card is built from.
+///
+/// Held next to the pane rather than only inside it: POST rows are off by
+/// default now, and a row that is not on screen still has to be rebuildable
+/// the moment the reader asks for it back.
+#[derive(Clone)]
+struct PostArgs {
+    origin: String,
+    n: u64,
+    model: String,
+    thinking: String,
+    usage: Value,
+    thoughts: u64,
+    redacted: u64,
+}
+
+impl PostArgs {
+    fn new(
+        origin: &str,
+        n: u64,
+        model: &str,
+        thinking: &str,
+        usage: &Value,
+        thoughts: u64,
+        redacted: u64,
+    ) -> Self {
+        Self {
+            origin: origin.to_string(),
+            n,
+            model: model.to_string(),
+            thinking: thinking.to_string(),
+            usage: usage.clone(),
+            thoughts,
+            redacted,
+        }
+    }
+
+    fn block(&self) -> RenderBlock {
+        wire_complete(
+            &self.origin,
+            self.n,
+            &self.model,
+            &self.thinking,
+            &self.usage,
+            self.thoughts,
+            self.redacted,
+        )
+    }
+}
+
+struct PostRow {
+    args: PostArgs,
+    /// The live card, while the row is on screen.
+    id: Option<EntryId>,
+    /// The card this POST was pushed after — `None` when it opened the pane.
+    /// Recorded once, at push time, and never moved: it is what a hidden row
+    /// goes back in front of. The card *after* it cannot be used for that,
+    /// because streaming execute output and results append to the pane
+    /// without passing through here.
+    prev: Option<EntryId>,
+}
+
+/// Every `complete()` POST of one wire pane, on screen or held back.
+///
+/// This is also the pane's group index: a group starts at its POST card, or —
+/// when the POST rows are hidden — at the first card that followed it.
+#[derive(Default)]
+struct PostRows(Vec<PostRow>);
+
+impl PostRows {
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    fn clear(&mut self) {
+        self.0.clear();
+    }
+
+    fn push(&mut self, calls: &mut ScrollbackState, args: PostArgs, shown: bool) {
+        let prev = calls
+            .len()
+            .checked_sub(1)
+            .and_then(|i| calls.entry(i))
+            .map(|e| e.id);
+        let id = if shown {
+            Some(wire_push(calls, args.block()))
+        } else {
+            None
+        };
+        self.0.push(PostRow { args, id, prev });
+    }
+
+    /// Put every held-back card back where it was pushed.
+    fn show(&mut self, calls: &mut ScrollbackState) {
+        let mut after: Option<EntryId> = None;
+        for row in &mut self.0 {
+            if let Some(id) = row.id {
+                after = Some(id);
+                continue;
+            }
+            // Two POSTs in a row share a `prev` — the model answered without
+            // calling anything — so the second belongs after the first.
+            let prev = match (after, row.prev) {
+                (Some(a), None) => Some(a),
+                (Some(a), Some(p))
+                    if calls.index_of_id(a) >= calls.index_of_id(p) && a != p =>
+                {
+                    Some(a)
+                }
+                _ => row.prev,
+            };
+            let at = match prev {
+                Some(p) => calls.index_of_id(p).map(|i| i + 1),
+                None => Some(0),
+            };
+            let anchor = at.and_then(|i| calls.entry(i)).map(|e| e.id);
+            let id = match anchor {
+                Some(a) => calls.insert_block_before(a, row.args.block()),
+                None => calls.push_block(row.args.block()),
+            };
+            set_wire_mode(calls, id, DisplayMode::Collapsed);
+            row.id = Some(id);
+            after = Some(id);
+        }
+    }
+
+    /// Take every POST card off the pane, keeping the data to rebuild it.
+    fn hide(&mut self, calls: &mut ScrollbackState) {
+        // A POST pushed straight after another POST has that card as its
+        // `prev`; dropping the first would leave the second pointing at an id
+        // the pane no longer has, so the link is repaired as we go.
+        let mut dropped: Option<(EntryId, Option<EntryId>)> = None;
+        for row in &mut self.0 {
+            if let (Some((gone, gone_prev)), Some(p)) = (dropped, row.prev) {
+                if p == gone {
+                    row.prev = gone_prev;
+                }
+            }
+            if let Some(id) = row.id.take() {
+                calls.remove_entry(id);
+                dropped = Some((id, row.prev));
+            }
+        }
+    }
+
+    /// Index of the first card of each group, in pane order.
+    fn starts(&self, calls: &ScrollbackState) -> Vec<usize> {
+        let mut out: Vec<usize> = self
+            .0
+            .iter()
+            .filter_map(|row| match row.id {
+                Some(id) => calls.index_of_id(id),
+                None => {
+                    let at = match row.prev {
+                        Some(p) => calls.index_of_id(p)? + 1,
+                        None => 0,
+                    };
+                    (at < calls.len()).then_some(at)
+                }
+            })
+            .collect();
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+}
+
 fn wire_push(sb: &mut ScrollbackState, block: RenderBlock) -> EntryId {
     let eid = sb.push_block(block);
     set_wire_mode(sb, eid, DisplayMode::Collapsed);
@@ -6775,6 +7023,114 @@ mod tests {
         text.lines().position(|l| l.contains(needle))
     }
 
+    /// The POST cards are accounting, not content: one per turn, between the
+    /// syscalls, and most of the pane. They stay off until the chip in the
+    /// calls title is clicked, and clicking it again puts them away.
+    #[test]
+    fn the_post_rows_are_off_until_the_chip_is_clicked() {
+        let mut app = App::new();
+        seed_demo(&mut app);
+        let text = paint(&mut app, 100, 40);
+        let calls = rows_of(&text, app.call_area);
+        assert!(!calls.contains("POST #"), "POST rows are on by default:\n{calls}");
+        assert!(calls.contains("[+posts]"), "no switch in the title:\n{calls}");
+
+        let chip = app.calls_chip.expect("the chip has no hit box");
+        handle_mouse(
+            &mut app,
+            click(MouseEventKind::Down(MouseButton::Left), chip.x, chip.y),
+        );
+        let text = paint(&mut app, 100, 40);
+        let calls = rows_of(&text, app.call_area);
+        assert!(calls.contains("POST #"), "the chip did not put them back:\n{calls}");
+        assert!(calls.contains("[-posts]"), "{calls}");
+
+        handle_mouse(
+            &mut app,
+            click(MouseEventKind::Down(MouseButton::Left), chip.x, chip.y),
+        );
+        let text = paint(&mut app, 100, 40);
+        let calls = rows_of(&text, app.call_area);
+        assert!(!calls.contains("POST #"), "the chip is not a toggle:\n{calls}");
+    }
+
+    /// A hidden POST card is held, not dropped: it goes back in front of the
+    /// same syscall it opened. Two POSTs in a row share the card they were
+    /// pushed after, which is the case that reversed them.
+    #[test]
+    fn showing_the_posts_again_restores_the_pane_exactly() {
+        let mut app = App::new();
+        app.show_posts = true;
+        seed_demo(&mut app);
+        let before = rows_of(&paint(&mut app, 100, 40), app.call_area);
+        assert!(before.contains("POST #"), "{before}");
+
+        app.toggle_posts();
+        let hidden = rows_of(&paint(&mut app, 100, 40), app.call_area);
+        assert!(!hidden.contains("POST #"), "{hidden}");
+
+        app.toggle_posts();
+        let after = rows_of(&paint(&mut app, 100, 40), app.call_area);
+        assert_eq!(before, after, "a POST card came back in the wrong place");
+    }
+
+    /// The queue and the composer are one stack of cards, not two panes with
+    /// a gap. The composer floats -- a blank row above it, a cell of gutter
+    /// each side -- and when the queue is open that float belongs to the
+    /// queue, so the two boxes touch and share a left edge. It used to be the
+    /// composer's own, which put the blank row *between* them and left the
+    /// queue running a column wider on both sides.
+    #[test]
+    fn the_queue_and_the_composer_are_one_stack() {
+        let mut app = App::new();
+        app.queue.push("first follow-up".into());
+        app.queue.push("second follow-up".into());
+        let text = paint(&mut app, 100, 30);
+        let rows: Vec<&str> = text.lines().collect();
+
+        let last = app.queue_area.y as usize + app.queue_area.height as usize - 1;
+        assert!(
+            rows[last].trim_start().starts_with('\u{2514}'),
+            "queue_area does not end on the box's bottom edge: {:?}",
+            rows[last]
+        );
+        let below = rows[last + 1];
+        assert!(
+            below.trim_start().starts_with('\u{250c}'),
+            "a blank row sits between the queue and the composer: {below:?}"
+        );
+        assert_eq!(
+            rows[last].find('\u{2514}'),
+            below.find('\u{250c}'),
+            "the queue and the composer do not share a left edge",
+        );
+        // The slot lost the float row, so it must lose the height too, or the
+        // composer draws one blank row of its own instead.
+        assert_eq!(
+            app.input_area.height, 4,
+            "the composer kept a float row it no longer draws: {:?}",
+            app.input_area
+        );
+
+        // With no queue the float is still there -- the composer is the top
+        // card of the group then, and it is what separates it from the story.
+        let mut bare = App::new();
+        let text = paint(&mut bare, 100, 30);
+        let rows: Vec<&str> = text.lines().collect();
+        let top = bare.input_area.y as usize;
+        // Only the story column: the wire column paints its own panes there.
+        let left: String = rows[top].chars().take(bare.input_area.width as usize).collect();
+        assert!(
+            left.trim().is_empty(),
+            "the composer lost its float row: {left:?}"
+        );
+        assert!(
+            rows[top + 1].trim_start().starts_with('\u{250c}'),
+            "{:?}",
+            rows[top + 1]
+        );
+    }
+
     fn paint(app: &mut App, w: u16, h: u16) -> String {
         let backend = TestBackend::new(w, h);
         let mut term = Terminal::new(backend).unwrap();
@@ -7020,6 +7376,9 @@ mod tests {
     fn the_demo_paints_a_folded_edit_and_a_group_counter() {
         let mut app = App::new();
         seed_demo(&mut app);
+        // The POST rows are off by default; this test is about them, so put
+        // them back the way the chip does.
+        app.toggle_posts();
 
         let folded = paint(&mut app, 120, 40);
         // Folded, the card names the file by basename; opened, by full path.
@@ -7050,6 +7409,7 @@ mod tests {
     #[test]
     fn brackets_step_the_wire_through_post_groups() {
         let mut app = App::new();
+        app.show_posts = true;
         handle_event(&mut app, json!({"ev": "turn", "text": "go"}));
         for n in 1..=3u64 {
             handle_event(&mut app, json!({"ev": "complete", "n": n, "origin": "llm"}));
@@ -7059,13 +7419,9 @@ mod tests {
             );
         }
         let _ = paint(&mut app, 120, 34);
-        assert_eq!(app.call_groups.len(), 3, "one group per POST");
+        assert_eq!(app.posts.len(), 3, "one group per POST");
 
-        let starts: Vec<usize> = app
-            .call_groups
-            .iter()
-            .filter_map(|id| app.calls.index_of_id(*id))
-            .collect();
+        let starts: Vec<usize> = app.posts.starts(&app.calls);
 
         // A painted pane already has a cursor, so clear it to reach the
         // no-selection path: forward from nowhere lands on the first group.
@@ -7094,6 +7450,7 @@ mod tests {
     #[test]
     fn a_child_session_walks_its_own_groups() {
         let mut app = App::new();
+        app.show_posts = true;
         // Parent: two POSTs of its own, to prove the child does not see them.
         handle_event(&mut app, json!({"ev": "turn", "text": "go"}));
         for n in 1..=2u64 {
@@ -7118,9 +7475,9 @@ mod tests {
             );
         }
 
-        assert_eq!(app.call_groups.len(), 2, "parent groups");
+        assert_eq!(app.posts.len(), 2, "parent groups");
         assert_eq!(
-            app.children["deadbeef"].call_groups.len(),
+            app.children["deadbeef"].posts.len(),
             3,
             "the child's POSTs did not open groups of their own",
         );
@@ -7139,10 +7496,8 @@ mod tests {
         );
 
         let child_starts: Vec<usize> = app.children["deadbeef"]
-            .call_groups
-            .iter()
-            .filter_map(|id| app.children["deadbeef"].calls.index_of_id(*id))
-            .collect();
+            .posts
+            .starts(&app.children["deadbeef"].calls);
         // The parent was painted, so it already carries a cursor. Whatever it
         // is, a step taken inside the child must leave it exactly there.
         let parent_sel = app.calls.selected();
@@ -7176,11 +7531,7 @@ mod tests {
             }
         }
         let _ = paint(&mut app, 120, 34);
-        let starts: Vec<usize> = app
-            .call_groups
-            .iter()
-            .filter_map(|id| app.calls.index_of_id(*id))
-            .collect();
+        let starts: Vec<usize> = app.posts.starts(&app.calls);
 
         // Land inside group 1, two cards past its head.
         app.calls.set_selected(Some(starts[0] + 2));
@@ -7196,6 +7547,7 @@ mod tests {
     #[test]
     fn the_wire_title_counts_groups() {
         let mut app = App::new();
+        app.show_posts = true;
         assert_eq!(app.call_group_pos(), None, "no POSTs, no counter");
 
         handle_event(&mut app, json!({"ev": "turn", "text": "go"}));
@@ -7219,14 +7571,14 @@ mod tests {
         let mut app = App::new();
         handle_event(&mut app, json!({"ev": "turn", "text": "go"}));
         handle_event(&mut app, json!({"ev": "complete", "n": 1, "origin": "llm"}));
-        assert_eq!(app.call_groups.len(), 1);
+        assert_eq!(app.posts.len(), 1);
 
         app.prompt = PromptBuf::new();
         for c in "/reset".chars() {
             app.prompt.insert_char(c);
         }
         let _ = submit_prompt(None, &mut app);
-        assert!(app.call_groups.is_empty(), "group index survived /reset");
+        assert!(app.posts.is_empty(), "group index survived /reset");
         assert_eq!(app.call_group_pos(), None);
     }
 
@@ -8949,6 +9301,7 @@ mod tests {
     fn calls_pane_says_who_posted_and_which_syscall() {
         let mut app = App::new();
         seed_demo(&mut app);
+        app.toggle_posts();
         app.set_focus(Focus::Calls);
         let _ = paint(&mut app, 100, 36);
         expand_calls(&mut app);
@@ -9281,6 +9634,7 @@ mod tests {
     #[test]
     fn spawn_started_stays_on_parent_child_gets_the_transcript() {
         let mut app = App::new();
+        app.show_posts = true;
         handle_event(
             &mut app,
             json!({
