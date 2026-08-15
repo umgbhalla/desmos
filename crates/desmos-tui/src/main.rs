@@ -1285,6 +1285,11 @@ impl App {
         // carries an accent column and a bullet, which is what the gap was
         // saying. `/dense` keeps the row for anyone who wants the air.
         appearance_cache::set_entry_gap(0);
+        // ...except the row above a user prompt. Dense packing loses the turn
+        // boundary: with no blank row anywhere, a new prompt reads as one more
+        // block in the same run. One row there is the only spacing the story
+        // spends, and it is the one that says "this is where you spoke".
+        appearance_cache::set_turn_gap(1);
         self.story.set_appearance(cfg.clone());
         self.calls.set_appearance(cfg.clone());
         for child in self.children.values_mut() {
@@ -9344,6 +9349,38 @@ mod tests {
     }
 
 
+
+
+    /// Dense packing left no blank rows at all, so a new user prompt read as
+    /// one more block in the same run and the turn boundary vanished. The gap
+    /// above a prompt is the only spacing the story spends -- and it is a gap
+    /// ABOVE, so the reply below the prompt still packs tight against it.
+    #[test]
+    fn the_row_above_a_user_prompt_marks_the_turn() {
+        let mut app = App::new();
+        seed_demo(&mut app);
+        // Twice: the first paint builds the layout the second one measures.
+        let _ = paint(&mut app, 140, 120);
+        let text = paint(&mut app, 140, 120);
+        let rows = rows_of(&text, app.traj_area);
+        let body: Vec<String> = rows
+            .lines()
+            .map(|l| l.trim_matches(|c| c == '\u{2502}' || c == ' ').to_string())
+            .collect();
+        let prompt = body
+            .iter()
+            .position(|l| l.starts_with("ok check cache"))
+            .expect("seed_demo's second prompt is in the story");
+        assert!(
+            prompt > 0 && body[prompt - 1].is_empty(),
+            "no blank row above the prompt at row {prompt}: {:?}",
+            &body[prompt.saturating_sub(2)..=prompt]
+        );
+        assert!(
+            !body[prompt + 1].is_empty(),
+            "blank row BELOW the prompt too -- the turn gap became a global entry gap"
+        );
+    }
 
     /// Blank rows are the story's largest single expense: grok gaps every
     /// entry, which is ~10% of a chat column and was a third of this pane.

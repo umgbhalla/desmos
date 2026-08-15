@@ -1403,7 +1403,11 @@ impl ScrollbackState {
         {
             let both_groupable = prev_entry.block.is_groupable() && new_groupable;
             let both_collapsed = prev_entry.display_mode == DisplayMode::Collapsed && new_collapsed;
-            cache.entries[new_idx - 1].gap_after = if both_groupable && both_collapsed {
+            cache.entries[new_idx - 1].gap_after = if is_prompt {
+                // Same rule as `recompute_gap_after`: the row above a prompt is
+                // the turn boundary.
+                crate::appearance::cache::load_turn_gap()
+            } else if both_groupable && both_collapsed {
                 0
             } else {
                 crate::appearance::cache::load_entry_gap()
@@ -1558,6 +1562,7 @@ impl ScrollbackState {
 
         let show_thinking = crate::appearance::cache::load_show_thinking_blocks();
         let gap = crate::appearance::cache::load_entry_gap();
+        let turn_gap = crate::appearance::cache::load_turn_gap();
 
         for (i, cached) in cached_entries.iter_mut().enumerate() {
             let (_, a) = entries.get_index(i).unwrap();
@@ -1583,6 +1588,12 @@ impl ScrollbackState {
             }
 
             let (_, b) = entries.get_index(j).unwrap();
+            // A prompt opens a turn. The gap above it is the turn boundary, so
+            // it takes the turn gap and outranks the packed-group zero.
+            if b.block.is_user_prompt() {
+                cached.gap_after = turn_gap;
+                continue;
+            }
             let both_groupable = a.block.is_groupable() && b.block.is_groupable();
             let both_collapsed = a.display_mode == DisplayMode::Collapsed
                 && b.display_mode == DisplayMode::Collapsed;

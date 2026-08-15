@@ -344,6 +344,26 @@ pub fn set_entry_gap(rows: u16) {
     ENTRY_GAP_CURRENT.with(|c| c.set(rows.min(2)));
 }
 
+// -- Turn gap -----------------------------------------------------------------
+
+thread_local! {
+    static TURN_GAP_CURRENT: Cell<u16> = const { Cell::new(ENTRY_GAP_DEFAULT) };
+}
+
+/// Blank rows left immediately ABOVE a user prompt, in place of the ordinary
+/// entry gap. A host that packs entries to zero still wants to see where one
+/// turn ends and the next begins, and the prompt is the only block that marks
+/// that boundary. Defaults to the entry gap, so a host that never sets it sees
+/// no change.
+pub fn load_turn_gap() -> u16 {
+    TURN_GAP_CURRENT.with(|c| c.get())
+}
+
+/// Replace the cached turn gap. Same clamp as the entry gap.
+pub fn set_turn_gap(rows: u16) {
+    TURN_GAP_CURRENT.with(|c| c.set(rows.min(2)));
+}
+
 // -- Group tool verbs ---------------------------------------------------------
 
 thread_local! {
