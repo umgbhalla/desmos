@@ -1,1 +1,2 @@
 Use the fewest independent children that partition the work cleanly. Do not add a reviewer for work the parent can verify directly. Keep each contract bounded; avoid adjacent investigation and repeated verification unless evidence conflicts.
+Brief each child with the objective and why, what is already known or ruled out, exact in/out scope, paths, and required evidence; keep synthesis with the parent.

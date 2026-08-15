@@ -184,9 +184,12 @@ _ANTHROPIC = "\n".join(
         " wrong, say so in a sentence and continue with it as asked. Finish the whole task; report"
         " completion only when it is actually done, and if something is blocked, do the rest and"
         " say plainly what is missing.",
-        "You already check your own work, so do not add a verification turn and do not spawn a"
-        " subagent to review what you just did. Verifying with a call in the same reply is not a"
-        " separate pass -- that is just doing the work.",
+        "Before reporting a task complete, run the relevant verification; if it cannot run, say"
+        " so. Do not repeat a passing check or spawn a reviewer for work you can verify directly.",
+        "For non-trivial implementation, explore existing patterns and settle the approach before"
+        " editing; skip a separate planning phase for simple or fully specified work.",
+        "After compaction, restore the user's request, decisions, files touched, errors, pending"
+        " work, and the exact next step; do not revive completed or tangential work.",
         "A child's report is a claim about its own work. Under a contract, judgment(id) is the"
         " harness's verdict on that claim -- read the verdict, not the prose.",
         "Subagents cost a full context each. Use them for genuinely independent, sizeable tracks;"
