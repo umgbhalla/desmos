@@ -145,7 +145,7 @@ def dispatch(
     if block.tag == "shell":
         from desmos.shell import run as run_shell
 
-        return run_shell(world, block.body, block.attrs)
+        return run_shell(world, block.body, block.attrs, on_chunk=on_chunk)
     if block.tag == "edit":
         old, new = parse_edit_body(block.body, block.attrs)
         return apply_edit(block.attrs.get("path", ""), old, new, cwd=world.cwd)

@@ -52,6 +52,26 @@ def format_result_message(results: list[tuple[Block, str]], cwd: Path | None = N
     return "\n\n".join(parts)
 
 
+def malformed_call_note(raw: str, stray: list[str]) -> str:
+    """What the model reads when its syscall input did not parse.
+
+    It has to say three things or the retry is blind: nothing ran, which text
+    was outside the tags, and what a well-formed call looks like. The commonest
+    cause is a closing tag inside a body, which truncates the call at that byte
+    and dumps the remainder into the gap this reports.
+    """
+    if not stray:
+        detail = "no complete syscall was found in it"
+    else:
+        shown = " … ".join(clip(s.strip(), 200) for s in stray[:3])
+        detail = f"text outside any tag: {shown!r}"
+    return (
+        "[syscall input rejected — nothing ran. The input must be complete XML syscalls and"
+        f" nothing else; {detail}. Every tag must be opened and closed, and a body must never"
+        " contain its own closing tag (build it by concatenation instead). Send the call again.]"
+    )
+
+
 def syscall_call(assistant: list[dict[str, Any]]) -> dict[str, Any] | None:
     calls = [b for b in assistant if b.get("type") == "custom_tool_call"]
     if len(calls) > 1:
@@ -74,7 +94,7 @@ def result_content(
 _BUILTIN_DOCS = (
     ("python", "exec Python in the persistent kernel"),
     ("bash", "isolated one-shot command in cwd — no state kept; use only when reset is useful"),
-    ("shell", "preferred persistent pty: id= names the session, state/processes survive; default timeout=5 is a read window, not a kill; interrupt=1, close=1"),
+    ("shell", "preferred persistent pty: id= names the session, state/processes survive; long commands are monitored and resume you when they land; interrupt=1, close=1"),
     ("edit", "replace one occurrence: path= and body old\\n---\\nnew"),
     ("register", "install a tag: name= and doc=, body is def handle"),
     ("system", "write or delete a system note (name=, optional delete=1)"),

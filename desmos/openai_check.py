@@ -67,9 +67,28 @@ def self_check() -> None:
     live = [i["call_id"] for i in mixed if i.get("type") == "custom_tool_call_output"]
     assert live == ["call_b"], mixed
 
-    # An output must never be matched by a call that comes after it.
+    # An output must never be matched by a call that comes after it: the stray
+    # output degrades to text, and the call gets its own synthetic answer.
     backwards = to_input([_output("call_c", "early"), _call("call_c", "late")])
-    assert "custom_tool_call_output" not in _kinds(backwards), backwards
+    assert "early" in str(backwards[0]), backwards
+    assert _kinds(backwards)[1:] == ["custom_tool_call", "custom_tool_call_output"], backwards
+
+    # The mirror of the orphan: a call the transcript never answered. Left bare
+    # it is a fatal "No tool output found for custom tool call", and it wedges
+    # every later request in the session -- which is exactly how one malformed
+    # syscall body killed a live run. Every call must leave here answered.
+    from desmos.openai import UNANSWERED_CALL
+
+    wedged = to_input([_call("call_d", py_call), {"role": "user", "content": "next"}])
+    assert _kinds(wedged)[:2] == ["custom_tool_call", "custom_tool_call_output"], wedged
+    assert wedged[1]["call_id"] == "call_d" and wedged[1]["output"] == UNANSWERED_CALL, wedged
+    calls = [i["call_id"] for i in wedged if i.get("type") == "custom_tool_call"]
+    answers = [i["call_id"] for i in wedged if i.get("type") == "custom_tool_call_output"]
+    assert sorted(calls) == sorted(answers), wedged
+
+    # A properly answered call must not gain a second output.
+    once = to_input([_call("call_e", py_call), _output("call_e", "ok")])
+    assert _kinds(once).count("custom_tool_call_output") == 1, once
 
     print("openai input check ok")
 

@@ -55,6 +55,12 @@ new</edit>
 <evolve>why</evolve>
 <rollback n="1"/>
 
+Any tag takes end="TOKEN": the body then runs to </tag:TOKEN> and a bare
+</tag> inside it is ordinary text. Use it whenever the body contains tag
+syntax — editing this codebase, writing tests, quoting a call.
+
+<python end="X">print("</python> is just text here")</python:X>
+
 Peek with <python>. Don't dump the heap into chat.
 When you're done, speak without XML."""
 

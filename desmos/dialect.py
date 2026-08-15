@@ -137,16 +137,26 @@ def capabilities() -> str:
             "state: <python> calls share one kernel -- a name bound in one is there in the next,"
             " this turn and later turns. Prefer <shell id=\"main\"> for command work: its cwd,"
             " environment, interactive process, and unfinished build survive across calls."
-            " Its timeout is only the read window, never a task estimate or process kill. Use the"
-            " 5-second default for probes and polling, timeout=15 for a quiet test, timeout=30 for"
-            " a build, and timeout=60 only for a known quiet heavyweight command; when it reports"
-            " still running, poll the same shell instead of starting another command. Use <bash>"
-            " only for a quick hermetic one-shot where a fresh subprocess is the point.",
+            " There are no read windows to choose and nothing to poll: a command that outlives"
+            " the first look is taken over by a monitor that owns the terminal, and the step is"
+            " resumed with its output when it actually finishes. A result saying it is monitored"
+            " means the work is still going -- go do something else, or interrupt it. A program"
+            " that asks a question comes back saying so; answer it with another <shell> on the"
+            " same id. Use <bash> only for a quick hermetic one-shot where a fresh subprocess is"
+            " the point.",
             "a failing call does not stop the ones after it. Every tag in the turn runs, and you get"
             " every result. If a later call only makes sense when an earlier one succeeded, put it"
             " in the next turn instead.",
             "a tag you never close is dropped in silence -- no result, no error, and the turn looks"
             " like you called nothing. Close every tag you open.",
+            "a body ends at the first closing tag, so a body that contains its own closer is"
+            " cut there and the rest leaks out as speech -- which is what makes editing this"
+            " codebase hazardous, since its sources are full of literal tag text. Declare an"
+            " end token instead: <python end=\"X\"> runs to </python:X> and any bare"
+            " </python> inside it is ordinary text. It works on every tag, the token is any word,"
+            " and the attribute never reaches the handler. Use it for edits to harness code,"
+            " for tests that quote calls, and any time you would otherwise build a closing tag"
+            " by string concatenation.",
             "results arrive after your whole message, never mid-sentence. So do not write prose"
             " that predicts what a call will return, and do not branch in this reply on a value"
             " this reply is still computing. Read the results next turn.",

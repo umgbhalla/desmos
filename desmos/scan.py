@@ -130,6 +130,14 @@ def _indent_span(
     return None
 
 
+# Tags whose body is executed verbatim. Only for these is the closing-tag
+# quoting heuristic worth its cost: ending a body early there runs half a
+# program, or runs the prose after it. For every other tag the body is prose or
+# a patch, and an apostrophe in "the agent's own commits" used to make the
+# whole call vanish -- no dispatch, no error, three lost commits in one session.
+_QUOTED_BODY = frozenset({"python", "bash", "shell", "register"})
+
+
 def _in_string(body: str) -> bool:
     """Is the end of `body` inside an unclosed quote?
 
@@ -290,6 +298,25 @@ def scan_spans(text: str) -> list[tuple[Block, int, int]]:
             blocks.append((Block(tag, "", attrs), m.start(), m.end()))
             pos = m.end()
             continue
+        # An explicit end token makes the body opaque: `<python end="X">` runs
+        # to `</python:X>` and nothing else. Every other rule here is a
+        # heuristic about *which* `</python>` the model meant, and the one case
+        # no heuristic can solve is editing this codebase, whose sources are
+        # full of literal tag text. Declare a token and the question stops
+        # existing -- the body may contain as many bare closers as it likes.
+        token = attrs.pop("end", "")
+        if token:
+            if not re.fullmatch(r"[\w.-]+", token):
+                pos = m.end()  # an unusable token is not a silent bare closer
+                continue
+            custom = re.compile(rf"</{re.escape(tag)}\s*:\s*{re.escape(token)}\s*>")
+            cm = custom.search(text, m.end())
+            if not cm:
+                pos = m.end()
+                continue
+            blocks.append((Block(tag, text[m.end() : cm.start()], attrs), m.start(), cm.end()))
+            pos = cm.end()
+            continue
         closer = re.compile(rf"</{re.escape(tag)}\s*>")
         fm = closer.search(text, m.end())
         if not fm:
@@ -307,7 +334,7 @@ def scan_spans(text: str) -> list[tuple[Block, int, int]]:
         # line of prose then `</bash>` ran the prose. Quoting is what tells the
         # two apart, so ask about quoting rather than counting tags.
         end, stop = fm.start(), fm.end()
-        while _in_string(text[m.end() : end]):
+        while tag in _QUOTED_BODY and _in_string(text[m.end() : end]):
             fm = closer.search(text, stop)
             if not fm:
                 end, stop = m.end(), m.end()  # unterminated once quotes are honoured

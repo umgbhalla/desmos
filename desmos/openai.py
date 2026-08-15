@@ -89,6 +89,10 @@ EFFORTS = ("low", "medium", "high", "xhigh", "max")
 # api.anthropic.com while is_openai routed it to Anthropic. Prefixes for the
 # o-series, because a two-character substring is the wrong thing to route a
 # whole prompt dialect on.
+#: Stand-in output for a syscall call the transcript never answered. The wire
+#: needs *something* paired with every custom_tool_call; this says plainly that
+#: nothing ran, so the model does not read silence as success.
+UNANSWERED_CALL = "[no result — the harness failed before this syscall ran; nothing was executed]"
 OPENAI_PREFIXES = ("gpt-", "o3", "o4", "codex-")
 OPENAI_ALIASES = frozenset({"gpt", "sol", "terra", "luna", "daybreak", "codex"})
 
@@ -186,7 +190,22 @@ def to_input(messages: list[dict[str, Any]], model: str = "") -> list[dict[str, 
     # its call is present in this same input array; otherwise degrade it to
     # ordinary user text so the result content survives.
     seen_calls: set[str] = set()
-    for msg in messages:
+    # The mirror of the orphaned output, and just as fatal: a custom_tool_call
+    # with no output is "No tool output found for custom tool call ...", and it
+    # poisons every later request forever. It happens whenever the harness
+    # raises between appending the assistant turn and appending the result --
+    # one malformed syscall body wedged a whole session that way. Answer any
+    # call the transcript never answered, so the history stays replayable.
+    answered_at: dict[str, int] = {}
+    for i, msg in enumerate(messages):
+        if msg.get("role") != "user" or not isinstance(msg.get("content"), list):
+            continue
+        for block in msg["content"]:
+            if isinstance(block, dict) and block.get("type") == "custom_tool_call_output":
+                call_id = str(block.get("call_id") or "")
+                if call_id:
+                    answered_at.setdefault(call_id, i)
+    for index, msg in enumerate(messages):
         role = msg.get("role")
         content = msg.get("content")
         if role == "user":
@@ -228,7 +247,18 @@ def to_input(messages: list[dict[str, Any]], model: str = "") -> list[dict[str, 
             raw = block.get("openai")
             if isinstance(raw, dict):
                 if raw.get("type") == "custom_tool_call" and raw.get("call_id"):
-                    seen_calls.add(str(raw["call_id"]))
+                    call_id = str(raw["call_id"])
+                    seen_calls.add(call_id)
+                    items.append(dict(raw))
+                    if answered_at.get(call_id, -1) <= index:
+                        items.append(
+                            {
+                                "type": "custom_tool_call_output",
+                                "call_id": call_id,
+                                "output": UNANSWERED_CALL,
+                            }
+                        )
+                    continue
                 items.append(dict(raw))
                 continue
             kind = block.get("type")

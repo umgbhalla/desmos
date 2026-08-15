@@ -24,33 +24,36 @@ import os
 import pty
 import re
 import select
+import shlex
 import signal
 import secrets
 import struct
 import subprocess
+import tempfile
 import termios
+import threading
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
+
+from desmos import pending
 
 # Output the shell produced but nobody will read. Keeping both ends matters:
 # the head is what the command echoed and started doing, the tail is the error
 # or the prompt it is sitting at. Dropping either loses the half that mattered.
 MAX_BYTES = 12_000
-# Stop reading once the shell has said nothing for this long. Long enough that
-# a command pausing to think does not look finished, short enough that an
-# interactive prompt comes back promptly.
-QUIET = 0.35
-# Hard ceiling for one read, not for the command. Five seconds keeps the agent
-# loop responsive; a build that runs longer keeps running and the next shell
-# call picks up where the output left off. Callers can explicitly use 15s for a
-# quiet test, 30s for a build, or 60s only for a known quiet heavyweight job.
-DEADLINE = 5.0
-# A process that exits immediately still has output in the pty buffer.
+# Commands get one short foreground observation window. If they outlive it,
+# a monitor becomes the sole PTY reader and resumes the agent on completion.
+QUIET = 0.20
+INITIAL_WINDOW = 0.75
+# Kept as a compatibility alias for callers that imported the old constant.
+# It is no longer a model-selected read deadline.
+DEADLINE = INITIAL_WINDOW
 EARLY_EXIT_GRACE = 0.15
-# How long output must sit unterminated before it counts as a prompt rather
-# than a command that is merely slow.
-PROMPT_IDLE = 1.0
+# An explicit question with the cursor left on it is the one silence worth
+# believing. Short, because the foreground window is short: a prompt that loses
+# the race is answered by the monitor instead, which is correct but slower.
+PROMPT_IDLE = 0.3
 # What the shell prints to say a command finished, carrying its exit code.
 # Plain ASCII, and random per shell: a control byte in the command line is
 # something bash itself chokes on, and a fixed string could appear in real
@@ -86,7 +89,10 @@ class Shell:
 
     def __init__(self, cwd: Path, command: str | None = None) -> None:
         self.cwd = cwd
-        self.mark = f"__desmos_{secrets.token_hex(4)}_rc:"
+        self.mark = ""
+        self._lock = threading.RLock()
+        self._generation = 0
+        self.monitoring = False
         # False while a command is still running and reading stdin. Appending
         # the marker then does not reach bash at all -- the waiting program
         # reads it as its own input, which is how `; echo "...$?"` ended up
@@ -153,97 +159,180 @@ class Shell:
             out.extend(chunk)
         return bytes(out)
 
-    def _read_until_marker(
-        self, quiet: float, deadline: float, *, expect_marker: bool
-    ) -> tuple[bytes, bool]:
-        """Read until the shell says it is done. Returns (output, finished).
+    def _read_chunk(self, window: float) -> bytes:
+        return self._drain(window)
 
-        The marker is the real signal. Quiet only ends the read when there is
-        no marker coming -- a multi-line block, or a command sitting at a
-        prompt -- and even then only after the shell has actually gone silent.
-        """
-        out = bytearray()
-        hard = time.monotonic() + deadline
-        silent_since: float | None = None
-        while time.monotonic() < hard:
-            chunk = self._drain(min(quiet, hard - time.monotonic()))
-            if chunk:
-                out.extend(chunk)
-                silent_since = None
-                if expect_marker and self.mark.encode() in bytes(out):
-                    return bytes(out), True
-                continue
-            if not self.alive():
-                out.extend(self._drain(EARLY_EXIT_GRACE))
-                return bytes(out), True
-            if not expect_marker:
-                return bytes(out), True
-            # Silence with a marker still owed. Waiting is usually right --
-            # `python -m venv` says nothing for seconds and returning here
-            # reported it as still running while its output turned up attached
-            # to the next command. The exception is a prompt: a program asking
-            # a question leaves the cursor after it, so the output does not end
-            # in a newline. That is the one silence worth believing.
-            now = time.monotonic()
-            silent_since = silent_since or now
-            waiting_at_prompt = bool(out) and not bytes(out).rstrip(b" ").endswith(b"\n")
-            if waiting_at_prompt and now - silent_since >= PROMPT_IDLE:
-                return bytes(out), False
-        return bytes(out), False
-
-    # ---------------------------------------------------------------- writing
-
-    def send(self, text: str, *, quiet: float = QUIET, deadline: float = DEADLINE) -> str:
-        """Write a command and return its output.
-
-        Reading until the output goes quiet is not enough on its own: `python
-        -m venv` says nothing for several seconds, so a quiet window returns
-        before the command has produced anything and its output turns up
-        attached to whatever runs next. So the shell is asked to announce that
-        it finished. A single-line command gets a marker appended to the same
-        line -- one line, so bash parses it whole and a command that reads
-        stdin still reads from the tty rather than eating the marker.
-
-        When the marker never arrives and the shell has gone quiet, the
-        command is waiting for input. That is the case that has no completion
-        signal, and returning what arrived is the only honest answer: the
-        model reads the prompt and replies with another <shell>.
-        """
-        if not self.alive():
-            return "shell exited"
-        one_line = "\n" not in text.strip() and self.at_prompt
-        payload = (
-            f'{text.strip()}; echo "{self.mark}$?"\n' if one_line else text.rstrip("\n") + "\n"
+    @staticmethod
+    def _is_prompt(data: bytes) -> bool:
+        """Recognise explicit interactive questions, not generic silence."""
+        if not data or data.rstrip(b" ").endswith(b"\n"):
+            return False
+        line = strip_ansi(data.decode("utf-8", errors="replace")).splitlines()[-1].strip()
+        return bool(
+            re.search(
+                r"(?i)(?:password|passphrase|enter\b|input\b|continue\?|proceed\?|"
+                r"are you sure|\[[yn]/[yn]\]|\(y/n\)|\?)\s*$",
+                line,
+            )
         )
+
+    def _command_payload(self, text: str) -> bytes:
+        """Source a temporary script so multiline commands retain shell state."""
+        fd, raw_path = tempfile.mkstemp(prefix="desmos-shell-", suffix=".sh")
+        path = Path(raw_path)
         try:
-            os.write(self.master, payload.encode())
-        except OSError as exc:
-            return f"shell write failed: {exc}"
-        raw, done = self._read_until_marker(quiet, deadline, expect_marker=one_line)
-        self.at_prompt = done
+            os.write(fd, text.rstrip("\n").encode() + b"\n")
+        finally:
+            os.close(fd)
+        self.mark = f"__desmos_{secrets.token_hex(8)}_rc:"
+        quoted = shlex.quote(str(path))
+        payload = (
+            f"source {quoted}; __desmos_rc=$?; rm -f {quoted}; "
+            f"printf '\\n%s%s\\n' {shlex.quote(self.mark)} \"$__desmos_rc\"\n"
+        )
+        return payload.encode()
+
+    def _format(self, raw: bytes, *, waiting: bool = False) -> str:
         body = head_tail(raw)
-        # Everything from the marker onward is bookkeeping, not output.
         code = None
-        if self.mark in body:
+        if self.mark and self.mark in body:
             body, _, rest = body.partition(self.mark)
             code = rest.splitlines()[0].strip() if rest.strip() else None
         body = body.strip()
         if code not in (None, "0"):
             return f"{body}\n[exit {code}]".strip()
-        if not done and self.alive():
-            # Still running or waiting on input. Say so, or the model reads an
-            # empty result as "it finished and printed nothing".
-            note = "[still running — send more input, or <shell interrupt=\"1\"/>]"
+        if waiting:
+            note = "[waiting for input — reply through this shell, or interrupt it]"
             return f"{body}\n{note}".strip()
-        if not body and code is None and self.alive():
-            # A multi-line block is sent without the `; echo <mark>$?` suffix,
-            # because appending it would feed the marker to whatever the first
-            # line is reading from stdin. So there is no completion signal here:
-            # the shell going quiet is not the shell finishing. Saying
-            # "(no output)" claimed a `sleep 5` block had run and printed
-            # nothing, and the model moved on while it was still going.
-            return "[still running — no output yet; send more input, or <shell interrupt=\"1\"/>]"
         return body or "(no output)"
+
+    def _observe(
+        self,
+        *,
+        window: float | None,
+        on_chunk: Callable[[str], None] | None = None,
+        generation: int,
+    ) -> tuple[bytes, str]:
+        """Read until completion, an explicit prompt, or the foreground window."""
+        out = bytearray()
+        deadline = None if window is None else time.monotonic() + window
+        silent_since: float | None = None
+        marker = self.mark.encode()
+        while True:
+            if generation != self._generation:
+                return bytes(out), "replaced"
+            span = QUIET if deadline is None else min(QUIET, max(0.0, deadline - time.monotonic()))
+            if deadline is not None and span <= 0:
+                return bytes(out), "running"
+            chunk = self._read_chunk(span)
+            if chunk:
+                out.extend(chunk)
+                # Bound monitor memory while retaining both diagnostic ends.
+                if len(out) > MAX_BYTES * 2:
+                    half = MAX_BYTES // 2
+                    out[:] = out[:half] + b"\n...[monitor output omitted]...\n" + out[-half:]
+                silent_since = None
+                if on_chunk is not None:
+                    visible = strip_ansi(chunk.decode("utf-8", errors="replace"))
+                    if self.mark not in visible:
+                        on_chunk(visible)
+                if marker in out:
+                    return bytes(out), "done"
+                continue
+            if not self.alive():
+                out.extend(self._drain(EARLY_EXIT_GRACE))
+                return bytes(out), "done"
+            now = time.monotonic()
+            silent_since = silent_since or now
+            if self._is_prompt(bytes(out)) and now - silent_since >= PROMPT_IDLE:
+                return bytes(out), "prompt"
+            if deadline is not None and now >= deadline:
+                return bytes(out), "running"
+
+    def _monitor(
+        self,
+        world: Any,
+        name: str,
+        generation: int,
+        on_chunk: Callable[[str], None] | None,
+    ) -> str:
+        raw, state = self._observe(window=None, on_chunk=on_chunk, generation=generation)
+        with self._lock:
+            if generation != self._generation:
+                return f"shell {name} monitor superseded"
+            self.monitoring = False
+            self.at_prompt = state == "done" and self.alive()
+        if state == "prompt":
+            return self._format(raw, waiting=True)
+        if state == "replaced":
+            return f"shell {name} monitor superseded"
+        return self._format(raw)
+
+    def _start_monitor(
+        self,
+        world: Any,
+        name: str,
+        generation: int,
+        on_chunk: Callable[[str], None] | None,
+    ) -> None:
+        with self._lock:
+            if self.monitoring:
+                return
+            self.monitoring = True
+        pending.register(
+            world,
+            f"shell {name}",
+            lambda: self._monitor(world, name, generation, on_chunk),
+        )
+
+    # ---------------------------------------------------------------- writing
+
+    def send(
+        self,
+        world: Any,
+        name: str,
+        text: str,
+        *,
+        on_chunk: Callable[[str], None] | None = None,
+    ) -> str:
+        """Start a command or send input; long work is monitored automatically."""
+        if not self.alive():
+            return "shell exited"
+        with self._lock:
+            if not self.at_prompt:
+                try:
+                    os.write(self.master, text.rstrip("\n").encode() + b"\n")
+                except OSError as exc:
+                    return f"shell write failed: {exc}"
+                if self.monitoring:
+                    return "[input sent; the existing shell monitor will report the next event]"
+                generation = self._generation
+            else:
+                self._generation += 1
+                generation = self._generation
+                payload = self._command_payload(text)
+                self.at_prompt = False
+                try:
+                    os.write(self.master, payload)
+                except OSError as exc:
+                    self.at_prompt = True
+                    return f"shell write failed: {exc}"
+
+        raw, state = self._observe(
+            window=INITIAL_WINDOW,
+            on_chunk=on_chunk,
+            generation=generation,
+        )
+        with self._lock:
+            if state == "done":
+                self.at_prompt = self.alive()
+                return self._format(raw)
+            if state == "prompt":
+                return self._format(raw, waiting=True)
+        self._start_monitor(world, name, generation, on_chunk)
+        body = self._format(raw)
+        note = "[running; monitored automatically — do not poll this shell]"
+        return f"{body}\n{note}".strip()
 
     def interrupt(self) -> str:
         """Ctrl-C, for a call that is stuck and a next call that should not be."""
@@ -297,8 +386,14 @@ def close_all(world: Any) -> None:
     world.shells.clear()
 
 
-def run(world: Any, body: str, attrs: dict[str, str]) -> str:
-    """Dispatch entry for <shell>."""
+def run(
+    world: Any,
+    body: str,
+    attrs: dict[str, str],
+    *,
+    on_chunk: Callable[[str], None] | None = None,
+) -> str:
+    """Dispatch entry for the persistent monitored shell."""
     name = (attrs.get("id") or "main").strip() or "main"
     if attrs.get("close") in {"1", "true", "yes"}:
         live = world.shells.pop(name, None)
@@ -309,8 +404,4 @@ def run(world: Any, body: str, attrs: dict[str, str]) -> str:
     text = body.strip("\n")
     if not text.strip():
         return "(empty)"
-    try:
-        deadline = float(attrs.get("timeout") or DEADLINE)
-    except ValueError:
-        deadline = DEADLINE
-    return shell.send(text, deadline=max(0.5, min(deadline, 600.0)))
+    return shell.send(world, name, text, on_chunk=on_chunk)

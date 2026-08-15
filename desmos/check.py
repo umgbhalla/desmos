@@ -392,7 +392,11 @@ def _run_checks() -> None:
         from desmos.spill import SPILL_DIR as _spill_dir
         assert _spill_dir in caps, "the prompt does not say where a spilled result lands"
         assert 'Prefer <shell id="main">' in caps
-        assert "5-second default" in caps and "timeout=30 for a build" in caps
+        # The model must never be asked to size a read window; that was prompt
+        # noise describing transport, and it taught polling.
+        assert "no read windows to choose and nothing to poll" in caps
+        _state_line = next(l for l in caps.split("\n") if l.startswith("state: <python>"))
+        assert "timeout" not in _state_line, _state_line
         assert "Use <bash> only for a quick hermetic one-shot" in caps
         for _name in _sa.AGENTS:
             assert _name in caps, _name
@@ -625,6 +629,20 @@ def _run_checks() -> None:
         # loop as a message with no syscalls, which is exactly how it decides
         # the model is finished -- so the command never ran and the turn ended
         # with nothing printed to say so.
+        # An apostrophe in prose is not an unclosed string. The quoting
+        # heuristic exists so a code body does not end at a closer the model
+        # quoted. Applied to prose it made "the agent" plus an apostrophe
+        # swallow the closer, and the whole call vanished: no dispatch, no
+        # error, three lost commits in one session.
+        lt = chr(60)
+        prose = scan(lt + 'commit only="a.rs">' + "fix the agent" + chr(39) + "s own commits" + lt + "/commit>")
+        assert [b.tag for b in prose] == ["commit"], prose
+        assert chr(39) + "s own" in prose[0].body
+        # ... while a code body still ends at the first unquoted closer.
+        clp = lt + "/python>"
+        code = scan(lt + "python>" + chr(39) + clp + chr(39) + clp)
+        assert [b.tag for b in code] == ["python"], code
+        assert clp in code[0].body
         quoted = scan("<skill name='ping'/>\n<rollback n=1/>")
         assert [(b.tag, b.attrs) for b in quoted] == [
             ("skill", {"name": "ping"}),
@@ -1528,10 +1546,11 @@ def _run_checks() -> None:
         # persistent shell is the other half: state carries, exit codes come
         # back, and a program that asks a question can be answered -- which is
         # the case a one-shot subprocess cannot express at all.
-        from desmos.shell import DEADLINE as _shell_deadline
+        from desmos.shell import INITIAL_WINDOW as _fg_window
         from desmos.shell import close_all as _close_shells, head_tail, strip_ansi
+        from desmos import pending as _pending
 
-        assert _shell_deadline == 5.0, "the documented shell polling default drifted"
+        assert _fg_window <= 1.0, "the first look is snappy, not a task estimate"
 
         w_sh = new_world(cwd, state_path=None, persist=False, ns={})
         try:
@@ -1549,28 +1568,55 @@ def _run_checks() -> None:
             assert sh("pwd", id="other").strip() != "/etc"
             # The interactive round trip.
             asked = sh("python3 -c \"n=input('who? ');print('hi '+n)\"")
-            assert "who?" in asked and "still running" in asked, asked
+            assert "who?" in asked and "waiting for input" in asked, asked
             assert sh("desmos").strip() == "hi desmos", "the answer reached the waiting program"
             assert sh("echo recovered").strip() == "recovered", "and the shell came back"
-            # A command that never came back to a prompt has not finished, and
-            # it usually has not printed anything yet either. Answering that
-            # with "(no output)" is a lie the model acts on: it reads a command
-            # that ran and printed nothing, and moves on while the build is
-            # still going.
-            stuck = sh("sleep 5", id="stuck", timeout="1")
-            assert "(no output)" not in stuck and "still running" in stuck, stuck
-            # Same for the lines behind it: they were never written to the tty,
-            # so reporting the block as finished claims they ran. Ask the disk
-            # rather than the wording -- the second line leaves a file if it
-            # ever reached bash.
-            unsent = cwd / "second-line-ran"
-            queued = sh(f"sleep 5\ntouch {unsent}", id="queued", timeout="1")
-            assert not unsent.exists(), "a line the shell never got was reported as run"
-            assert "(no output)" not in queued and "still running" in queued, queued
+            # A command that outlives the first look is neither reported as
+            # finished nor handed back as a timeout for the model to poll. One
+            # monitor owns the pty from here and the step resumes when the work
+            # actually lands -- the model never picks a read window at all.
+            slow = sh("sleep 2; echo late-line", id="slow")
+            assert "monitored" in slow and "(no output)" not in slow.split("\n")[-1], slow
+            assert _pending.count(w_sh) == 1, "a long command leaves exactly one monitor"
+            landed = _pending.wait_next(w_sh, timeout=30)
+            assert landed and "late-line" in landed[0].output, landed
+            assert _pending.count(w_sh) == 0, "and it is delivered once"
+            assert sh("echo reusable", id="slow").strip() == "reusable", "the shell outlives it"
+            # A multi-line block runs whole. It used to be written raw to the
+            # tty, so a line queued behind a still-running one never reached
+            # bash at all while the transcript reported the block as run.
+            ran = cwd / "second-line-ran"
+            ran.unlink(missing_ok=True)
+            block = sh(f"sleep 1\ntouch {ran}", id="multi")
+            assert "monitored" in block, block
+            assert _pending.wait_next(w_sh, timeout=30), "the block must finish"
+            assert ran.exists(), "every line of a block must reach the shell"
+            ran.unlink(missing_ok=True)
             assert w_sh.shells, "sessions live on the world"
         finally:
             _close_shells(w_sh)
         assert not w_sh.shells
+
+        # A body that contains its own closing tag used to be cut there, and the
+        # remainder leaked into speech -- where a complete tag pair in the residue
+        # is dispatched for real. That is unfixable by heuristic: two calls and one
+        # body holding a closer are byte-identical. An explicit end token makes the
+        # body opaque, which is the only thing that makes editing this codebase safe.
+        from desmos.scan import scan as _scan
+
+        _tok = _scan('<python end="K">print("</python>")</python:K>')
+        assert len(_tok) == 1 and _tok[0].tag == 'python', _tok
+        assert _tok[0].body == 'print("</python>")', _tok[0].body
+        assert 'end' not in _tok[0].attrs, 'the token must not reach the handler'
+        # Without the token the same text still ends at the bare closer.
+        _bare = _scan('<python>print(1)</python> tail')
+        assert _bare[0].body == 'print(1)', _bare[0].body
+        # Other attributes survive alongside it, and a missing custom closer is an
+        # unterminated call rather than a silent fallback to the bare one.
+        _attr = _scan('<edit path="a.py" end="Z">o</edit>n</edit:Z>')
+        assert _attr[0].attrs == {'path': 'a.py'} and 'o</edit>n' == _attr[0].body, _attr
+        assert _scan('<python end="Q">x</python>') == [], 'a missing custom closer must not fall back'
+        assert _scan('<python end="bad token">x</python>') == [], 'an unusable token is not a bare closer'
 
         # Oversized output keeps both ends: the head says what it was doing,
         # the tail says how it ended.
