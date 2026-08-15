@@ -360,6 +360,9 @@ impl PromptBuf {
         let mut cursor_row = 0u16;
         let mut chips = Vec::new();
         let mut marked = false;
+        // Start column and span index of the word being laid down, so an
+        // overflow can carry the whole word to the next row.
+        let mut word: Option<(usize, usize)> = None;
 
         let mark = |x: usize, row: u16, marked: &mut bool, cc: &mut u16, cr: &mut u16| {
             if !*marked {
@@ -403,6 +406,7 @@ impl PromptBuf {
                     last.push(Span::styled(chip_label(body), fill));
                     last.push(Span::styled("]", bracket));
                     x += w;
+                    word = None;
                 }
                 Seg::Text(t) => {
                     let mut byte = 0usize;
@@ -412,10 +416,52 @@ impl PromptBuf {
                         }
                         if ch == '\n' {
                             newline(&mut lines, &mut x);
-                        } else {
+                            word = None;
+                        } else if ch == ' ' || ch == '\t' {
                             let cw = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+                            // A space that would overflow is absorbed by the
+                            // break rather than pushed to column zero of the
+                            // next row, where it reads as a stray indent.
                             if x + cw > width && x > hang {
                                 newline(&mut lines, &mut x);
+                            } else {
+                                lines
+                                    .last_mut()
+                                    .expect("row")
+                                    .push(Span::styled(ch.to_string(), Style::default().fg(theme.text_primary)));
+                                x += cw;
+                            }
+                            word = None;
+                        } else {
+                            let cw = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+                            if word.is_none() {
+                                word = Some((x, lines.last().expect("row").len()));
+                            }
+                            if x + cw > width && x > hang {
+                                // Carry the whole word down instead of cutting
+                                // it. The fragment already on this row is moved
+                                // to the next one, cursor and all -- a word only
+                                // breaks when it is wider than the box.
+                                let (wx, wi) = word.expect("set above");
+                                if wx > hang {
+                                    let row = (lines.len() - 1) as u16;
+                                    let frag: Vec<Span<'static>> =
+                                        lines.last_mut().expect("row").drain(wi..).collect();
+                                    let frag_w: usize = frag
+                                        .iter()
+                                        .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
+                                        .sum();
+                                    newline(&mut lines, &mut x);
+                                    if marked && cursor_row == row && cursor_col as usize >= wx {
+                                        cursor_col = (hang + (cursor_col as usize - wx)) as u16;
+                                        cursor_row = (lines.len() - 1) as u16;
+                                    }
+                                    lines.last_mut().expect("row").extend(frag);
+                                    x = hang + frag_w;
+                                } else {
+                                    newline(&mut lines, &mut x);
+                                }
+                                word = Some((hang, 1));
                             }
                             lines
                                 .last_mut()
@@ -805,6 +851,61 @@ fn next_boundary(s: &str, off: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn row_text(lay: &PromptLayout, row: usize) -> String {
+        lay.lines[row]
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect::<String>()
+    }
+
+    #[test]
+    fn wrapping_breaks_between_words_not_inside_them() {
+        let mut p = PromptBuf::new();
+        // "alpha bravo charlie" is 19 wide; at 12 the old per-character wrap
+        // cut "charlie" into "cha" / "rlie".
+        p.handle_paste("alpha bravo charlie");
+        let lay = p.layout(" ", 12);
+        let rows: Vec<String> = (0..lay.lines.len()).map(|i| row_text(&lay, i)).collect();
+        for r in &rows {
+            let body = r.trim();
+            for w in body.split_whitespace() {
+                assert!(
+                    ["alpha", "bravo", "charlie"].contains(&w),
+                    "a word was cut: {w:?} in {rows:?}"
+                );
+            }
+        }
+        assert!(rows.len() >= 2, "19 chars must not fit in 12: {rows:?}");
+    }
+
+    #[test]
+    fn a_word_wider_than_the_box_still_breaks() {
+        let mut p = PromptBuf::new();
+        p.handle_paste("supercalifragilistic");
+        let lay = p.layout(" ", 8);
+        assert!(lay.lines.len() >= 3, "an over-wide word must hard-break");
+    }
+
+    #[test]
+    fn the_cursor_rides_the_word_it_is_inside() {
+        let mut p = PromptBuf::new();
+        // Cursor sits at the end, inside "charlie", which gets carried down.
+        p.handle_paste("alpha bravo charlie");
+        let lay = p.layout(" ", 12);
+        let last = lay.lines.len() - 1;
+        assert_eq!(
+            lay.cursor_row, last as u16,
+            "cursor left behind on the row the word was moved off"
+        );
+        let tail = row_text(&lay, last);
+        assert!(
+            (lay.cursor_col as usize) <= tail.chars().count(),
+            "cursor {} past row {tail:?}",
+            lay.cursor_col
+        );
+    }
 
     #[test]
     fn normalize_cr_bare_and_crlf() {

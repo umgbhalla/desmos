@@ -94,9 +94,8 @@ use xai_grok_pager::views::modal_window::{
     ModalSizing, ModalWindowConfig, ModalWindowOutcome, ModalWindowState, Shortcut,
     handle_modal_key, handle_modal_mouse, render_modal_window,
 };
-use xai_grok_pager::views::turn_status::{
-    self, MouseButtons, TurnStatusArgs, Watchers,
-};
+use xai_grok_pager::glyphs;
+use xai_grok_pager::views::turn_status::Watchers;
 
 use json_tree::JsonTree;
 use prompt::{PromptBuf, clipboard_text, coalesce_events, is_inline_paste_key, is_paste_key, is_text_key};
@@ -261,7 +260,7 @@ impl Default for PaneLayout {
             // Three inner rows is everything the meter has to say now that the
             // sparkline is gone; +2 for the border. Anything taller is dead
             // space under the context bar.
-            meter_h: 5,
+            meter_h: 6,
             post_split: 50,
             // Both side panes start open. A pane you have to know about before
             // you can see it is a pane nobody sees; git state and the file it
@@ -891,7 +890,6 @@ struct App {
     want_stop: bool,
     last_activity: Option<TurnActivity>,
     activity_started_at: Option<Instant>,
-    turn_status_area: Rect,
     turn_cancel: Option<Rect>,
     status: String,
     story: ScrollbackState,
@@ -950,7 +948,6 @@ struct App {
     files: side::FilePane,
     git_area: Rect,
     files_area: Rect,
-    keys_area: Rect,
     layout: PaneLayout,
 }
 
@@ -1212,7 +1209,6 @@ impl App {
             want_stop: false,
             last_activity: None,
             activity_started_at: None,
-            turn_status_area: Rect::default(),
             turn_cancel: None,
             status: "idle".into(),
             story: ScrollbackState::new(),
@@ -1258,7 +1254,6 @@ impl App {
             files: side::FilePane::new(&std::env::current_dir().unwrap_or_default()),
             git_area: Rect::default(),
             files_area: Rect::default(),
-            keys_area: Rect::default(),
             layout: PaneLayout::load(),
         };
         app.apply_grok_settings();
@@ -4202,6 +4197,61 @@ fn current_turn_activity(app: &App) -> Option<TurnActivity> {
     Some(TurnActivity::Waiting(WaitingReason::Model))
 }
 
+/// One line of "what the turn is doing", for the meta pane.
+///
+/// This used to be a row of its own between the queue and the composer,
+/// rendered by grok's turn-status widget. It cost a full-width band to say
+/// four words, and it said them a long way from the meters that answer the
+/// next question — how much is this costing. Built here, before the meter
+/// borrow, so `draw_meta` stays a function of what it is handed.
+struct ActivityLine {
+    label: String,
+    /// None when idle: an idle spinner is a lie about work in flight.
+    spin: Option<String>,
+    phase: Option<Duration>,
+    turn: Option<Duration>,
+    subagents: usize,
+}
+
+fn activity_line(app: &App, activity: &Option<TurnActivity>) -> ActivityLine {
+    let running = app.running;
+    let label = if app.status == "stopping" {
+        "stopping".to_string()
+    } else {
+        match activity {
+            Some(TurnActivity::Thinking) => "thinking".to_string(),
+            Some(TurnActivity::Responding) => "responding".to_string(),
+            Some(TurnActivity::ToolRunning { title, .. }) => format!("run {title}"),
+            Some(TurnActivity::Waiting(_)) => "waiting".to_string(),
+            Some(_) => "working".to_string(),
+            None => "idle".to_string(),
+        }
+    };
+    let spin = if running {
+        let frames = glyphs::braille_spinner_frames();
+        frames
+            .get(app.story.animation_tick() as usize % frames.len().max(1))
+            .map(|f| (*f).to_string())
+    } else {
+        None
+    };
+    ActivityLine {
+        label,
+        spin,
+        phase: if running {
+            app.activity_started_at.map(|t| t.elapsed())
+        } else {
+            None
+        },
+        turn: if running {
+            app.turn_started.map(|t| t.elapsed())
+        } else {
+            None
+        },
+        subagents: current_watchers(app).subagents,
+    }
+}
+
 fn exec_activity_title(app: &App) -> String {
     if let Some(id) = app.exec.id {
         if let Some(entry) = app.calls.get_by_id(id) {
@@ -4252,30 +4302,16 @@ fn draw(f: &mut Frame, app: &mut App) {
         reflow_wire(&mut child.calls, &manual);
     }
 
-    let agent_st = current_agent_state(app);
     let activity = current_turn_activity(app);
     if activity.as_ref() != app.last_activity.as_ref() {
         app.last_activity = activity.clone();
         app.activity_started_at = Some(Instant::now());
     }
-    let watch = current_watchers(app);
-    let show_turn = turn_status::should_show(&agent_st, false, None, watch, false);
-    let turn_h = if show_turn { 1 } else { 0 };
 
-    let inner_w = f.area().width.saturating_sub(2);
-    // The composer grows with what you type, so an idle one has no reason to
-    // hold three rows open: two rows of border plus a hint row already frame
-    // it. Those two reclaimed rows go to the story, which is the pane that
-    // ever runs out.
-    let prompt_rows = app.prompt.display_rows(inner_w).clamp(2, 10);
-    let queue_h = app.queue.display_height();
-    let input_h = (3 + prompt_rows)
-        .min(f.area().height.saturating_sub(10 + turn_h + queue_h))
-        .max(5);
-    // Columns first, and both run the full height. The composer belongs to the
-    // story column -- it is where you type *about* the story -- and the wire
-    // column spends the same band on a key legend, so the two columns end on
-    // the same row. A full-width bar cutting across both is what this replaced.
+    // Columns first, because the composer wraps at the story column's width and
+    // not the terminal's. Measuring against the whole frame under-counted rows
+    // by the width of the wire column, so a paragraph overflowed a box that had
+    // decided three rows were enough.
     let body = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
@@ -4283,7 +4319,19 @@ fn draw(f: &mut Frame, app: &mut App) {
             Constraint::Percentage(app.layout.wire_pct),
         ])
         .split(f.area());
-    let bottom_h = queue_h + turn_h + input_h;
+
+    // Two cells of gutter each side of the card, then its own border.
+    let inner_w = body[0].width.saturating_sub(4);
+    let queue_h = app.queue.display_height();
+    // Grow with what is typed, up to half the column. The old ceiling of ten
+    // rows existed to leave a legend band matching it opposite; there is no
+    // legend now, and a long prompt is worth more rows than a short story is.
+    let cap = (body[0].height / 2).saturating_sub(3).max(2);
+    let prompt_rows = app.prompt.display_rows(inner_w).clamp(2, cap);
+    let input_h = (3 + prompt_rows)
+        .min(f.area().height.saturating_sub(8 + queue_h))
+        .max(5);
+    let bottom_h = queue_h + input_h;
     let post_h = app
         .layout
         .post_h
@@ -4294,14 +4342,14 @@ fn draw(f: &mut Frame, app: &mut App) {
             Constraint::Min(3),
             Constraint::Length(post_h),
             Constraint::Length(queue_h),
-            Constraint::Length(turn_h),
             Constraint::Length(input_h),
         ])
         .split(body[0]);
-    // The wire column stacks: calls, the meta pane, the two side panes — git
-    // and the file it points at — then the key legend, which takes exactly the
-    // band the composer takes opposite it.
-    let spare = body[1].height.saturating_sub(bottom_h + 3);
+    // The wire column stacks: calls, the meta pane — which now carries the
+    // turn's activity as well as the meters — then git and the file it points
+    // at. It runs to the bottom of the frame: the band it used to spend on a
+    // key legend opposite the composer is the calls pane's now.
+    let spare = body[1].height.saturating_sub(3);
     let meter_h = app.layout.meter_h.min(spare);
     let git_h = app.layout.git_h.min(spare.saturating_sub(meter_h));
     let files_h = app
@@ -4315,14 +4363,12 @@ fn draw(f: &mut Frame, app: &mut App) {
             Constraint::Length(meter_h),
             Constraint::Length(git_h),
             Constraint::Length(files_h),
-            Constraint::Length(bottom_h),
         ])
         .split(body[1]);
     let panes = [left[0], wire[0]];
     app.cache.area = wire[1];
     app.git_area = wire[2];
     app.files_area = wire[3];
-    app.keys_area = wire[4];
     let posts = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
@@ -4333,8 +4379,7 @@ fn draw(f: &mut Frame, app: &mut App) {
     app.post_in_area = posts[0];
     app.post_out_area = posts[1];
     app.queue_area = left[2];
-    app.turn_status_area = left[3];
-    app.input_area = left[4];
+    app.input_area = left[3];
 
     let viewing = app.viewing.clone();
     let child_ok = viewing
@@ -4429,47 +4474,11 @@ fn draw(f: &mut Frame, app: &mut App) {
         theme.accent_assistant,
         app.focus == Focus::PostOut,
     );
-    draw_meta(f, app.cache.area, &app.cache, app.focus == Focus::Meter);
+    let act = activity_line(app, &activity);
+    draw_meta(f, app.cache.area, &app.cache, app.focus == Focus::Meter, &act);
     draw_git(f, app.git_area, app);
     draw_files(f, app.files_area, app);
     draw_queue(f, app.queue_area, app);
-    if show_turn {
-        let cancel_hovered = app.mouse.is_some_and(|(c, r)| {
-            app.turn_cancel.is_some_and(|a| hit(a, c, r))
-        });
-        let out = turn_status::render_turn_status(
-            f.buffer_mut(),
-            app.turn_status_area,
-            TurnStatusArgs {
-                state: &agent_st,
-                activity: &activity,
-                turn_elapsed: app.turn_started.map(|t| t.elapsed()),
-                activity_started_at: app.activity_started_at,
-                tick: app.story.animation_tick(),
-                drain_blocked: false,
-                buttons: Some(MouseButtons {
-                    cancel_hovered,
-                    bg_hovered: false,
-                    watching_hovered: false,
-                }),
-                has_running_execute: false,
-                total_tokens: None,
-                mcp_init_progress: None,
-                is_bash_turn: false,
-                is_pending_user_input: false,
-                goal_verifying: false,
-                watchers: watch,
-                parked: false,
-                flat_background: false,
-                held_queue: app.queue.len(),
-                held_queue_top_sendable: !app.queue.is_empty(),
-            },
-        );
-        app.turn_cancel = out.cancel_button;
-    } else {
-        app.turn_cancel = None;
-    }
-    draw_keys(f, app.keys_area, app);
     draw_input(f, app.input_area, app);
     if app.post_inspect.is_some() {
         draw_post_inspect(f, app);
@@ -4557,9 +4566,9 @@ impl Tier {
     fn of(rows: u16) -> Self {
         match rows {
             0..=1 => Self::Line,
-            // Three rows is the whole meter now, so Full starts there. Dense
-            // is the one-row-short case that has to drop the cost line.
-            2..=2 => Self::Dense,
+            // Four rows is the whole meter now that activity sits on top of
+            // it: activity, context, cache, cost. Dense drops the cost line.
+            2..=3 => Self::Dense,
             _ => Self::Full,
         }
     }
@@ -4888,7 +4897,7 @@ fn draw_files(f: &mut Frame, area: Rect, app: &mut App) {
     f.render_widget(Paragraph::new(lines), inner);
 }
 
-fn draw_meta(f: &mut Frame, area: Rect, meter: &CacheMeter, focused: bool) {
+fn draw_meta(f: &mut Frame, area: Rect, meter: &CacheMeter, focused: bool, act: &ActivityLine) {
     if area.height == 0 || area.width == 0 {
         return;
     }
@@ -5031,14 +5040,58 @@ fn draw_meta(f: &mut Frame, area: Rect, meter: &CacheMeter, focused: bool) {
         ])
     };
 
+    // What the turn is doing, above the meters that say what it costs. Always
+    // present, idle included, so the rows under it never shift by one when a
+    // step starts.
+    let act_row = || {
+        let mut spans = vec![Span::styled(
+            act.spin.clone().unwrap_or_else(|| " ".into()),
+            Style::default().fg(theme.accent_assistant),
+        )];
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(
+            act.label.clone(),
+            Style::default()
+                .fg(if act.spin.is_some() {
+                    theme.accent_assistant
+                } else {
+                    theme.gray
+                })
+                .add_modifier(Modifier::BOLD),
+        ));
+        if let Some(p) = act.phase {
+            spans.push(label("  "));
+            spans.push(Span::styled(
+                human_secs(p.as_millis() as u64),
+                Style::default().fg(theme.text_secondary),
+            ));
+        }
+        if let Some(t) = act.turn {
+            spans.push(label(" / "));
+            spans.push(Span::styled(
+                human_secs(t.as_millis() as u64),
+                Style::default().fg(theme.gray),
+            ));
+        }
+        if act.subagents > 0 {
+            spans.push(label("   "));
+            spans.push(Span::styled(
+                format!("{} sub", act.subagents),
+                Style::default().fg(theme.accent_skill),
+            ));
+        }
+        Line::from(spans)
+    };
+
     // Degrade by which question matters most, not by what happens to fit. The
     // title already carries the TTL, so row one is context, not hit rate.
     let mut lines = match Tier::of(inner.height) {
+        // One row is not enough to say both; a squeezed meter is still a meter.
         Tier::Line => vec![ctx_row()],
-        Tier::Dense => vec![ctx_row(), cache_row(), money_row()],
+        Tier::Dense => vec![act_row(), ctx_row(), cache_row()],
         // The sparkline was the one row nobody read: a hit-rate trend restates
         // what the cache row already says, in less precise form.
-        Tier::Full => vec![ctx_row(), cache_row(), money_row()],
+        Tier::Full => vec![act_row(), ctx_row(), cache_row(), money_row()],
     };
     lines.truncate(inner.height as usize);
     f.render_widget(Paragraph::new(lines), inner);
@@ -5094,158 +5147,7 @@ fn draw_queue(f: &mut Frame, area: Rect, app: &App) {
     );
 }
 
-/// A key and the verb it fires, for the pane that has focus.
-///
-/// Two columns rather than one sentence: a cap and a verb are different kinds
-/// of thing, and `j/k move   h/l fold   enter/ctrl-f open` makes the eye do
-/// the separating. Caps use the glyph the keyboard prints where one exists,
-/// so a modifier reads as a modifier instead of a hyphenated word.
-fn key_rows(app: &App) -> Vec<(&'static str, String)> {
-    let mut rows: Vec<(&'static str, String)> = Vec::new();
-    match app.focus {
-        Focus::Input => {
-            let composer = !app.prompt.to_send().trim().is_empty();
-            let send = if app.running && composer {
-                Some("queues")
-            } else if app.running && !app.queue.is_empty() {
-                Some("send now")
-            } else if app.running {
-                None
-            } else {
-                Some("send")
-            };
-            if let Some(verb) = send {
-                rows.push(("⏎", verb.into()));
-            }
-            rows.push(("⇧⏎", "newline".into()));
-        }
-        // Arrows read the same everywhere: ↑↓ moves the cursor in this pane,
-        // ←→ drives whatever that pane's second axis is. j/k/h/l alias them.
-        Focus::Story | Focus::Calls => {
-            rows.push(("↑ ↓", "move".into()));
-            rows.push(("← →", "fold".into()));
-            rows.push(("⏎", "open".into()));
-            if app.focus == Focus::Calls && app.call_group_pos().is_some() {
-                rows.push(("[ ]", "group".into()));
-            }
-            rows.push(("r", "raw".into()));
-            rows.push(("i", "input".into()));
-        }
-        // No cursor and nothing to fold, so the meter's arrows are the resize
-        // ones and nothing else.
-        Focus::Meter => {
-            rows.push(("+ -", "rows".into()));
-            rows.push(("^← →", "width".into()));
-            rows.push(("i", "input".into()));
-        }
-        Focus::Git => {
-            rows.push(("↑ ↓", "move".into()));
-            rows.push(("← →", "tab".into()));
-            rows.push(("⏎", "open file".into()));
-            rows.push(("r", "refresh".into()));
-            rows.push(("+ -", "rows".into()));
-            rows.push(("i", "input".into()));
-        }
-        Focus::Files => {
-            rows.push(("↑ ↓", if app.files.in_file() { "scroll" } else { "move" }.into()));
-            rows.push((
-                "← →",
-                if app.files.in_file() {
-                    "back to dir"
-                } else {
-                    "up / into"
-                }
-                .into(),
-            ));
-            rows.push(("␛", "git".into()));
-            rows.push(("+ -", "rows".into()));
-            rows.push(("i", "input".into()));
-        }
-        Focus::PostIn | Focus::PostOut => {
-            rows.push(("↑ ↓", "move".into()));
-            rows.push(("← →", "fold".into()));
-            rows.push(("e", "inspect".into()));
-            rows.push(("+ -", "rows".into()));
-            rows.push(("^← →", "split".into()));
-            rows.push(("i", "input".into()));
-        }
-        Focus::Queue => {
-            rows.push(("↑ ↓", "select".into()));
-            rows.push(("← →", "reorder".into()));
-            rows.push(("d", "drop".into()));
-            rows.push(("⏎", "send now".into()));
-            rows.push(("i", "input".into()));
-        }
-    }
-    rows.push(("⇥", "panes".into()));
-    if app.focus != Focus::Input && !rows.iter().any(|(c, _)| *c == "+ -") {
-        rows.push(("+ -", "resize".into()));
-    }
-    if app.focus != Focus::Input {
-        rows.push(("0", "reset".into()));
-    }
-    if app.viewing.is_some() {
-        rows.push(("␛", "parent".into()));
-    }
-    rows
-}
 
-/// The key legend, in the band the composer occupies in the other column.
-///
-/// It titles itself with the focused pane, because the rows change with focus
-/// and a legend that silently re-writes itself is a legend you stop trusting.
-fn draw_keys(f: &mut Frame, area: Rect, app: &App) {
-    if area.height < 4 || area.width < 10 {
-        return;
-    }
-    // Inset exactly like the composer opposite it, so the two cards float on
-    // the same rows instead of one sitting a row proud of the other.
-    let area = Rect {
-        x: area.x.saturating_add(1),
-        y: area.y.saturating_add(1),
-        width: area.width.saturating_sub(2),
-        height: area.height.saturating_sub(1),
-    };
-    let theme = Theme::current();
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme.bg_base))
-        .title(Span::styled(
-            format!(" keys  {} ", focus_name(app.focus)),
-            Style::default().fg(theme.text_secondary),
-        ))
-        .style(Style::default().bg(theme.bg_base).fg(theme.text_primary));
-    let inner = block.inner(area);
-    f.render_widget(block, area);
-    if inner.width == 0 || inner.height == 0 {
-        return;
-    }
-    let rows = key_rows(app);
-    let cap_w = rows
-        .iter()
-        .map(|(c, _)| UnicodeWidthStr::width(*c))
-        .max()
-        .unwrap_or(0);
-    let lines: Vec<Line> = rows
-        .iter()
-        .take(inner.height as usize)
-        .map(|(cap, verb)| {
-            let pad = cap_w.saturating_sub(UnicodeWidthStr::width(*cap));
-            Line::from(vec![
-                Span::raw(" ".repeat(pad + 1)),
-                Span::styled(
-                    *cap,
-                    Style::default()
-                        .fg(theme.accent_user)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::raw("  "),
-                Span::styled(verb.clone(), Style::default().fg(theme.text_secondary)),
-            ])
-        })
-        .collect();
-    f.render_widget(Paragraph::new(lines), inner);
-}
 
 /// What to call the focused pane in the legend title.
 fn focus_name(focus: Focus) -> &'static str {
@@ -5314,17 +5216,42 @@ fn draw_input(f: &mut Frame, area: Rect, app: &mut App) {
     } else {
         theme.prompt_border
     };
-    let block = Block::default()
+    // The top edge is for the one control worth reaching for while a turn is
+    // running. "input" was a label on the box you are already typing in, and
+    // [stop] used to live a row away in a band of its own.
+    let stop = " [stop] ";
+    let stop_w = UnicodeWidthStr::width(stop) as u16;
+    let stop_area = Rect {
+        x: card.x + card.width.saturating_sub(1 + stop_w),
+        y: card.y,
+        width: stop_w,
+        height: 1,
+    };
+    app.turn_cancel = if app.running { Some(stop_area) } else { None };
+    let mut block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(border))
-        .title(Span::styled(
-            if app.prompt.is_multiline() {
-                " input  multiline "
-            } else {
-                " input "
-            },
+        .border_style(Style::default().fg(border));
+    if app.running {
+        let hovered = app.mouse.is_some_and(|(c, r)| hit(stop_area, c, r));
+        block = block.title(
+            Line::from(Span::styled(
+                stop,
+                Style::default()
+                    .fg(if hovered {
+                        theme.accent_user
+                    } else {
+                        theme.text_secondary
+                    })
+                    .add_modifier(Modifier::BOLD),
+            ))
+            .right_aligned(),
+        );
+    } else if app.prompt.is_multiline() {
+        block = block.title(Span::styled(
+            " multiline ",
             Style::default().fg(theme.accent_success),
         ));
+    }
     let block = block
         .title_bottom(
             Line::from(Span::styled(
@@ -6995,10 +6922,9 @@ mod tests {
         assert_eq!(thoughts, 1, "a lone call must not fold the thought away");
     }
 
-    /// The composer belongs to the story column, and the legend takes the same
-    /// band opposite it. Asserted on the rects the layout hands out, because a
-    /// full-width bar and a column-width card paint the same words -- only the
-    /// geometry tells them apart.
+    /// The composer belongs to the story column. The wire column used to stop
+    /// short of the bottom to hold a key legend opposite it; that band is the
+    /// calls pane's now, so the wire column runs to the last row.
     #[test]
     fn the_composer_sits_under_the_story_column_only() {
         let mut app = App::new();
@@ -7010,13 +6936,16 @@ mod tests {
             "composer still spans the frame: {:?}",
             app.input_area
         );
-        assert_eq!(app.keys_area.x, app.call_area.x, "legend sits in the wire column");
         assert_eq!(
-            app.keys_area.y + app.keys_area.height,
-            app.input_area.y + app.input_area.height,
-            "columns must end on the same row"
+            app.files_area.y + app.files_area.height,
+            34,
+            "wire column must reach the bottom: {:?}",
+            app.files_area
         );
-        assert!(app.keys_area.height >= 5, "legend band too thin: {:?}", app.keys_area);
+        assert!(
+            !text.contains("keys "),
+            "the key legend is gone:\n{text}"
+        );
     }
 
     /// Code spans are protected: markup inside a fence or backticks is the
@@ -7671,8 +7600,11 @@ mod tests {
         let text = buffer_text(&term);
         assert!(text.contains("story"), "{text}");
         assert!(text.contains("calls"), "{text}");
+        // A block *stamped* `out`, not the POST card's `out 100` usage column
+        // — which is a real number and was only ever absent here because the
+        // calls pane used to be clipped a row above it.
         assert!(
-            !text.contains("out   ") && !text.lines().any(|l| l.trim_start().starts_with("out ")),
+            !text.lines().any(|l| l.trim_start().starts_with("out ")),
             "legacy 'out' stamp still present:\n{text}"
         );
         assert!(
@@ -7928,11 +7860,12 @@ mod tests {
         assert_eq!(Tier::of(0), Tier::Line);
         assert_eq!(Tier::of(1), Tier::Line);
         assert_eq!(Tier::of(2), Tier::Dense);
-        assert_eq!(Tier::of(3), Tier::Full);
+        assert_eq!(Tier::of(3), Tier::Dense);
+        assert_eq!(Tier::of(4), Tier::Full);
         assert_eq!(Tier::of(12), Tier::Full);
-        // The default hugs its content: three rows plus two border rows, and
-        // nothing below the context bar going to waste.
-        assert_eq!(PaneLayout::default().meter_h, 5);
+        // The default hugs its content: activity, context, cache and cost,
+        // plus two border rows.
+        assert_eq!(PaneLayout::default().meter_h, 6);
         let inner = PaneLayout::default().meter_h - 2;
         assert_eq!(Tier::of(inner), Tier::Full);
         // Both side panes are open out of the box. A saved `.desmos/tui.json`
@@ -7969,7 +7902,7 @@ mod tests {
             (3u16, "ctx", "trend"),
             // Three rows buy the cache split and the running cost. The trend
             // sparkline is gone at every height: it restated the cache row.
-            (5, "saved", "trend"),
+            (6, "saved", "trend"),
             (9, "saved", "trend"),
         ] {
             app.layout.meter_h = rows;
@@ -9341,24 +9274,97 @@ mod tests {
     }
 
     #[test]
-    fn turn_status_hosts_grok_widget() {
+    fn activity_lives_in_the_meta_pane_and_stop_on_the_composer() {
         let mut app = App::new();
         app.running = true;
         app.turn_started = Some(Instant::now());
         app.status = "running".into();
         start_thinking(&mut app.story, &mut app.stream);
         let text = paint(&mut app, 140, 30);
+
+        // Placement, not presence: "thinking" and a spinner painted anywhere on
+        // a 140x30 frame proves nothing, since the story's own thought block
+        // says Thinking too. Slice the rows the meter owns.
+        let meta = rows_of(&text, app.cache.area);
         assert!(
-            text.contains("Thinking"),
-            "grok turn-status must name Thinking:\n{text}"
+            meta.contains("thinking"),
+            "activity must be in the meta pane:\n{meta}"
         );
         let frames = glyphs::braille_spinner_frames();
         assert!(
-            frames.iter().any(|f| text.contains(*f)),
-            "turn-status must spin a grok braille frame:\n{text}"
+            frames.iter().any(|f| meta.contains(*f)),
+            "meta must spin a grok braille frame:\n{meta}"
         );
-        assert!(text.contains("[stop]"), "turn-status [stop] missing:\n{text}");
+
+        // [stop] rides the composer's own top edge now.
+        let top = rows_of(
+            &text,
+            Rect { height: 2, ..app.input_area },
+        );
+        assert!(top.contains("[stop]"), "stop is not on the composer:\n{top}");
+        assert!(
+            app.turn_cancel.is_some_and(|r| r.y == top_row(app.input_area)),
+            "cancel hit box is not on the composer's top edge: {:?}",
+            app.turn_cancel
+        );
+        assert!(!text.contains(" input "), "the input label is gone:\n{text}");
         assert!(!text.contains('❯'), "input must not show a chevron:\n{text}");
+    }
+
+    /// The composer grows with what is typed, and it measures against the
+    /// column it lives in. Rows used to be counted at the full frame width
+    /// while the box was painted at the story column's — roughly half of it —
+    /// so a paragraph overflowed a box that had decided it needed three rows.
+    #[test]
+    fn the_composer_grows_to_fit_at_its_own_width() {
+        let mut app = App::new();
+        let idle = {
+            let _ = paint(&mut app, 140, 40);
+            app.input_area.height
+        };
+        let body = "the quick brown fox jumps over the lazy dog and keeps \
+                    on running until the sentence is long enough to need \
+                    several rows of a composer that is only half the frame";
+        app.prompt.handle_paste(body);
+        let text = paint(&mut app, 140, 40);
+        assert!(
+            app.input_area.height > idle,
+            "composer did not grow: {} -> {}",
+            idle,
+            app.input_area.height
+        );
+        // Every row it claims to need must be a row it actually got.
+        let inner_w = app.input_area.width.saturating_sub(4);
+        let want = app.prompt.display_rows(inner_w);
+        assert!(
+            app.input_area.height >= want + 3,
+            "needs {want} text rows, box is {}",
+            app.input_area.height
+        );
+        // And the tail is on screen rather than clipped off the bottom.
+        let card = rows_of(&text, app.input_area);
+        assert!(card.contains("frame"), "composer clipped its tail:\n{card}");
+    }
+
+    /// The card floats one row down and one cell in from the band it is given.
+    fn top_row(area: Rect) -> u16 {
+        area.y + 1
+    }
+
+    /// The painted rows a rect covers, joined — for asserting *where* a string
+    /// landed rather than that it landed at all.
+    fn rows_of(text: &str, area: Rect) -> String {
+        text.lines()
+            .skip(area.y as usize)
+            .take(area.height.max(1) as usize)
+            .map(|l| {
+                l.chars()
+                    .skip(area.x as usize)
+                    .take(area.width as usize)
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     #[test]
