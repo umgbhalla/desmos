@@ -7180,7 +7180,7 @@ fn wire_syscall(tag: &str, body: &str, attrs: &Value, result: &str) -> RenderBlo
             };
             // Folded rows only show the description, so carry the command
             // there — a bare `<bash>` is not a preview of anything.
-            let preview = first_line(&cmd);
+            let preview = card_summary(&cmd);
             let desc = if preview.is_empty() {
                 tag.to_string()
             } else {
@@ -7224,7 +7224,7 @@ fn wire_syscall(tag: &str, body: &str, attrs: &Value, result: &str) -> RenderBlo
             RenderBlock::ToolCall(ToolCallBlock::Edit(block))
         }
         _ => {
-            let summary = {
+            let summary = card_summary(&{
                 let attrs_s = attr_summary(attrs);
                 if !body.trim().is_empty() {
                     first_line(body)
@@ -7233,13 +7233,13 @@ fn wire_syscall(tag: &str, body: &str, attrs: &Value, result: &str) -> RenderBlo
                 } else {
                     first_line(result)
                 }
-            };
+            });
             let payload = match (body.trim().is_empty(), result.trim().is_empty()) {
                 (true, _) => result.to_string(),
                 (_, true) => body.to_string(),
                 _ => format!("{body}\n\n→ {result}"),
             };
-            let target = attr_summary(attrs);
+            let target = card_summary(&attr_summary(attrs));
             let head = if target.is_empty() {
                 format!("{tag}: {summary}")
             } else {
@@ -7338,6 +7338,33 @@ fn attr_summary(attrs: &Value) -> String {
             .join(" "),
         _ => String::new(),
     }
+}
+
+/// One row of preview, never more.
+///
+/// A wrapped card header is what made the Activity pane look ragged. The
+/// wrapped rows land back at the header's own column, so continuation text
+/// reads as three new top-level entries rather than as more of the same row --
+/// and for an execute card the command was then printed a *second* time
+/// underneath as `$ cmd`, indented properly, which is what made the
+/// inconsistency obvious. A header is a label. The body is where the full text
+/// already lives.
+const CARD_SUMMARY_W: usize = 64;
+
+fn card_summary(text: &str) -> String {
+    let flat = first_line(text)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if flat.chars().count() <= CARD_SUMMARY_W {
+        return flat;
+    }
+    flat.chars()
+        .take(CARD_SUMMARY_W - 1)
+        .collect::<String>()
+        .trim_end()
+        .to_string()
+        + "\u{2026}"
 }
 
 fn first_line(text: &str) -> String {
@@ -9843,6 +9870,40 @@ mod tests {
             matches!(app.story.entry(0).map(|e| &e.block), Some(RenderBlock::System(_))),
             "a fold is not speech, but it must be said",
         );
+    }
+
+    #[test]
+    fn a_long_command_does_not_wrap_the_card_header() {
+        // A wrapped header lands its continuation rows back at the header's own
+        // column, so they read as new top-level entries -- and the execute card
+        // then prints the whole command a second time underneath, correctly
+        // indented. That mismatch is what made the pane look half-tabbed.
+        let mut app = App::new();
+        let cmd = "cd /Users/zeus/hub/desmos/crates/desmos-tui && cargo build 2>&1 \
+                   | grep -E '^(error|warning)' | head -10; echo SENTINEL_TAIL";
+        handle_event(
+            &mut app,
+            json!({
+                "ev": "result",
+                "tag": "bash",
+                "attrs": {},
+                "body": cmd,
+                "text": "ok",
+            }),
+        );
+        app.set_focus(Focus::Calls);
+        let text = paint(&mut app, 100, 60);
+        assert!(text.contains("bash"), "{text}");
+        // The header is a label: clipped, with the tail living only in the body.
+        assert!(text.contains('\u{2026}'), "header was not clipped:\n{text}");
+        assert!(
+            text.matches("SENTINEL_TAIL").count() <= 1,
+            "command echoed twice:\n{text}"
+        );
+        assert!(card_summary(cmd).chars().count() <= CARD_SUMMARY_W);
+        assert_eq!(card_summary("short one"), "short one");
+        // Flattened: a header is one row, so embedded newlines cannot make two.
+        assert!(!card_summary("a\nb").contains('\n'));
     }
 
     #[test]
