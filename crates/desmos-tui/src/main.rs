@@ -2479,16 +2479,26 @@ fn handle_key(
                 return Ok(false);
             }
             KeyCode::Enter => {
+                // Send anything that already runs. "Would accepting change the
+                // line" was the wrong question: /model takes an argument, so
+                // accept() appended a space, so Enter completed instead of
+                // sending -- and bare /model, which is how the picker opens,
+                // could never be submitted at all. verdict already knows which
+                // lines are runnable, including the ones whose argument is
+                // optional, so ask it.
                 let typed = app.prompt.to_send();
-                match app.slash.accept() {
-                    Some(line) if line != typed => {
+                if slash::verdict(&typed, &app.picker) == slash::Verdict::Ready {
+                    app.slash.close();
+                } else if let Some(line) = app.slash.accept() {
+                    if line != typed {
                         app.prompt.clear();
                         app.prompt.insert_str(&line);
                         app.slash.update(&app.prompt.to_send(), &app.picker);
                         return Ok(false);
                     }
-                    // Nothing to add. Dismiss and let this Enter send.
-                    _ => app.slash.close(),
+                    app.slash.close();
+                } else {
+                    app.slash.close();
                 }
             }
             KeyCode::Esc => {
@@ -8022,6 +8032,18 @@ mod tests {
         handle_key(None, &mut app, press(KeyCode::Enter)).unwrap();
         assert_eq!(app.prompt.to_send(), "/model ", "a prefix completes");
         assert!(app.slash.open, "and the argument list opens");
+
+        // But bare /model is itself runnable — it is how the picker opens —
+        // and Enter must send it rather than appending a space forever.
+        app.prompt.clear();
+        app.slash.close();
+        for c in "/model".chars() {
+            handle_key(None, &mut app, press(KeyCode::Char(c))).unwrap();
+        }
+        handle_key(None, &mut app, press(KeyCode::Enter)).unwrap();
+        assert_eq!(app.prompt.to_send(), "", "bare /model has to be sendable");
+        assert!(app.picker.open, "and sending it opens the picker");
+        app.picker.open = false;
 
         // Argument chosen: nothing left to add, so this Enter sends.
         for c in "gpt-5.6-sol".chars() {
