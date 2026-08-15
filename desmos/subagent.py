@@ -588,6 +588,22 @@ def spawn(
         }
     )
     _POOL.submit(_execute, run, parent)
+    # Nothing in the parent turn waits on this. The step ends normally and the
+    # loop resumes it when the child settles, so a spawn costs no idle turn and
+    # a queued follow-up is never stuck behind a sleeping call.
+    from desmos import pending as _pending
+
+    def _settle() -> str:
+        while run.state in ("pending", "running"):
+            time.sleep(0.05)
+        brief = run.brief()
+        return (
+            f"{cfg.agent} {run.id}: {brief['state']}/{brief['stage']}"
+            f" after {brief['turns']} turns."
+            f' Read it with result("{run.id}") or judgment("{run.id}").'
+        )
+
+    _pending.register(parent, f"subagent {cfg.agent} {run.id}", _settle)
     return run.id
 
 

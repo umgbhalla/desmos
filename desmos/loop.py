@@ -18,9 +18,11 @@ from desmos.complete import (
 )
 from desmos.const import FROZEN, MAX_TOKENS, PRIOR_KEEP
 from desmos.dispatch import dispatch
+from desmos.dialect import family
 from desmos.generations import ensure_gen1, evolve, rollback
 from desmos.persist import load, save
-from desmos.scan import clip, scan, trailing_residue
+from desmos import pending
+from desmos.scan import clip, scan, scan_spans, trailing_residue
 from desmos.spill import spill
 from desmos.types import Block, Tool, World
 
@@ -47,6 +49,25 @@ def format_result_message(results: list[tuple[Block, str]], cwd: Path | None = N
         body = spill(r, RESULT_CLIP, tag=b.tag, cwd=cwd)
         parts.append(f'<result tag="{b.tag}">{body}</result>')
     return "\n\n".join(parts)
+
+
+def syscall_call(assistant: list[dict[str, Any]]) -> dict[str, Any] | None:
+    calls = [b for b in assistant if b.get("type") == "custom_tool_call"]
+    if len(calls) > 1:
+        raise RuntimeError("OpenAI returned more than one syscall call")
+    if calls and not calls[0].get("call_id"):
+        raise RuntimeError("OpenAI returned a syscall call without call_id")
+    return calls[0] if calls else None
+
+
+def result_content(
+    results: list[tuple[Block, str]], assistant: list[dict[str, Any]], cwd: Path
+) -> str | list[dict[str, Any]]:
+    output = format_result_message(results, cwd)
+    call = syscall_call(assistant)
+    if call is None:
+        return output
+    return [{"type": "custom_tool_call_output", "call_id": call["call_id"], "output": output}]
 
 
 _BUILTIN_DOCS = (
@@ -243,7 +264,18 @@ def turn(
         }
     )
     results: list[tuple[Block, str]] = []
-    blocks = scan(speech)
+    call = syscall_call(assistant)
+    if call:
+        raw = call.get("input") or ""
+        spans = scan_spans(raw)
+        edges = zip((0, *(end for _, _, end in spans)), (start for _, start, _ in spans))
+        if not spans or any(raw[start:end].strip() for start, end in edges) or raw[spans[-1][2] :].strip():
+            raise RuntimeError("OpenAI syscall input must contain only complete XML syscalls")
+        blocks = [block for block, _, _ in spans]
+    elif family(world.model) == "openai" and scan(speech):
+        raise RuntimeError("OpenAI emitted XML as speech instead of calling syscall")
+    else:
+        blocks = scan(speech) if family(world.model) != "openai" else []
     if not stopped():
         for b in blocks:
             if stopped():
@@ -330,6 +362,7 @@ def run_turns(
     on_event: Callable[[dict[str, Any]], None] | None = None,
     should_stop: Callable[[], bool] | None = None,
     max_total_tokens: int | None = None,
+    has_input: Callable[[], bool] | None = None,
 ) -> str:
     """Run a step to its end, and always say how it ended.
 
@@ -369,6 +402,7 @@ def run_turns(
             on_event=on_event,
             should_stop=should_stop,
             max_total_tokens=max_total_tokens,
+            has_input=has_input,
             budget_hit=hit,
         )
     finally:
@@ -392,6 +426,7 @@ def _run_turns(
     on_event: Callable[[dict[str, Any]], None] | None = None,
     should_stop: Callable[[], bool] | None = None,
     max_total_tokens: int | None = None,
+    has_input: Callable[[], bool] | None = None,
     budget_hit: list[str] | None = None,
 ) -> str:
     def emit(ev: dict[str, Any]) -> None:
@@ -473,9 +508,10 @@ def _run_turns(
         # threw away the results of the ones that had already finished -- the
         # model's next context showed its own tags with no outcome and no
         # marker that they had been executed.
-        if results:
+        call = syscall_call(assistant)
+        if results or call:
             world.messages.append(
-                {"role": "user", "content": format_result_message(results, world.cwd)}
+                {"role": "user", "content": result_content(results, assistant, world.cwd)}
             )
         if done or stopped():
             if stopped():
@@ -484,6 +520,21 @@ def _run_turns(
                 # nothing saying it had been interrupted -- which reads as work
                 # that finished.
                 world.messages.append({"role": "user", "content": stop_note(n)})
+                _commit_step(world, prompt, speech)
+                return speech
+            # The model stopped calling syscalls, but background work it started
+            # is still running. Nothing waits on it while it runs: the turn is
+            # already over, a stop is still heard, and a queued follow-up still
+            # wins. When a task lands, the step resumes with its output as an
+            # ordinary user turn -- the same shape a syscall result arrives in.
+            if pending.count(world):
+                emit({"ev": "pending", "n": pending.count(world)})
+                landed = pending.wait_next(world, stop=stopped, interrupt=has_input)
+                if landed:
+                    text = pending.notice(landed)
+                    world.messages.append({"role": "user", "content": text})
+                    emit({"ev": "resumed", "n": n, "text": text})
+                    continue
             _commit_step(world, prompt, speech)
             return speech
     # Only reachable when a caller asked for a turn cap. Same for it as for the

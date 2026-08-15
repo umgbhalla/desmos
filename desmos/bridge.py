@@ -129,7 +129,17 @@ def serve(cwd: Path) -> int:
                     continue
                 cancel.clear()
                 # run_turns emits the terminator itself, on every path.
-                run_turns(world, text, quiet=True, on_event=_emit, should_stop=cancel.is_set)
+                # A queued follow-up outranks background work: if the user has
+                # already typed the next thing, stop waiting for a task to land
+                # and give the turn back.
+                run_turns(
+                    world,
+                    text,
+                    quiet=True,
+                    on_event=_emit,
+                    should_stop=cancel.is_set,
+                    has_input=lambda: not inbox.empty(),
+                )
                 _emit(_snapshot(world))
             elif op == "snapshot":
                 _emit(_snapshot(world))

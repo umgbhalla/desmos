@@ -158,6 +158,10 @@ def wire_content(content: Any) -> list[dict[str, Any]]:
             # it names turns this endpoint never folded.
             if not foreign:
                 blocks.append(dict(raw))
+        elif kind == "custom_tool_call":
+            text = raw.get("input") or ""
+            if text:
+                blocks.append({"type": "text", "text": text})
         elif kind == "text":
             text = raw.get("text") or ""
             if text:
@@ -186,6 +190,16 @@ def assistant_content(resp: dict[str, Any]) -> list[dict[str, Any]]:
             blocks.append(item)
         elif kind == "redacted_thinking":
             blocks.append({"type": "redacted_thinking", "data": raw.get("data") or ""})
+        elif kind == "custom_tool_call":
+            item = {
+                "type": "custom_tool_call",
+                "name": raw.get("name") or "syscall",
+                "call_id": raw.get("call_id") or "",
+                "input": raw.get("input") or "",
+            }
+            if isinstance(raw.get("openai"), dict):
+                item["openai"] = raw["openai"]
+            blocks.append(item)
         elif kind == "text":
             text = raw.get("text") or ""
             if text:
@@ -270,7 +284,10 @@ def cached_payload(
             blocks = []
             for raw in m["content"]:
                 if isinstance(raw, dict):
-                    block = {k: v for k, v in raw.items() if k != "cache_control"}
+                    if raw.get("type") == "custom_tool_call_output":
+                        block = {"type": "text", "text": raw.get("output") or ""}
+                    else:
+                        block = {k: v for k, v in raw.items() if k != "cache_control"}
                     blocks.append(block)
                 elif isinstance(raw, str) and raw:
                     blocks.append({"type": "text", "text": raw})

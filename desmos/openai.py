@@ -46,13 +46,13 @@ Do not print a stop word or attempt to write a result. Wait for the typed tool
 output, then continue on the next turn.
 
 Never describe a command as done, and never state its output, unless that
-output arrived in a result you were given. If you have not emitted the tag
-yet, you have not run anything.
+output arrived in a result you were given. If you have not passed the tag to
+`syscall` yet, you have not run anything.
 
 This is not a chat interface with a tool API that might be switched off. The
 XML tags are the interface, they are always available, and nothing in a turn
 can disable them. So do not say a dispatcher is unavailable, that tools cannot
-be invoked here, that XML calls cannot be emitted in this interface, or that an
+be invoked here, that XML cannot be passed to `syscall`, or that an
 operation is impossible from inside a reply. If you can put the tag in
 `syscall`, you can run it, and calling `syscall` is the whole mechanism.
 
@@ -61,7 +61,7 @@ avoid. If you write that you are about to read a file, trace a path, or switch
 a model, the `syscall` call belongs in that same response. Either call it or do
 not announce the action.
 
-A reply with no tags ends the step -- the harness reads "no syscalls" as "the
+A response with no `syscall` call ends the step -- the harness reads it as "the
 work is finished". So a message that says you are unable to proceed does not
 pause anything; it stops the task and hands back control. If you are genuinely
 blocked, say what is missing in one line, having first used a tag to find out.
@@ -156,10 +156,39 @@ def to_input(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     session) survive as plain text, which is lossy but never fatal.
     """
     items: list[dict[str, Any]] = []
+    # A custom_tool_call_output whose call was trimmed off the head of the
+    # transcript is a fatal 400 ("No tool call found for custom tool call
+    # output"), and it poisons every later request. Emit an output only when
+    # its call is present in this same input array; otherwise degrade it to
+    # ordinary user text so the result content survives.
+    seen_calls: set[str] = set()
     for msg in messages:
         role = msg.get("role")
         content = msg.get("content")
         if role == "user":
+            if isinstance(content, list):
+                orphaned: list[dict[str, Any]] = []
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "custom_tool_call_output":
+                        call_id = block.get("call_id") or ""
+                        if call_id and call_id in seen_calls:
+                            items.append(
+                                {
+                                    "type": "custom_tool_call_output",
+                                    "call_id": call_id,
+                                    "output": block.get("output") or "",
+                                }
+                            )
+                        else:
+                            text = block.get("output") or ""
+                            if isinstance(text, str) and text.strip():
+                                orphaned.append({"type": "text", "text": text})
+                content = orphaned + [
+                    block
+                    for block in content
+                    if not isinstance(block, dict)
+                    or block.get("type") != "custom_tool_call_output"
+                ]
             parts = _user_content(content)
             if parts:
                 items.append({"type": "message", "role": "user", "content": parts})
@@ -172,6 +201,8 @@ def to_input(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 continue
             raw = block.get("openai")
             if isinstance(raw, dict):
+                if raw.get("type") == "custom_tool_call" and raw.get("call_id"):
+                    seen_calls.add(str(raw["call_id"]))
                 items.append(dict(raw))
                 continue
             kind = block.get("type")
@@ -214,6 +245,18 @@ def payload_for(
         "include": ["reasoning.encrypted_content"],
         "max_output_tokens": max_tokens,
         "text": {"verbosity": "medium"},
+        "tools": [
+            {
+                "type": "custom",
+                "name": "syscall",
+                "description": (
+                    "Execute one or more Desmos XML syscalls. Input must contain only "
+                    "complete XML tags from the system prompt. Tags run in order and "
+                    "return result blocks."
+                ),
+            }
+        ],
+        "parallel_tool_calls": False,
     }
     if effort == "none":
         body["reasoning"] = {"effort": "none"}
@@ -524,7 +567,7 @@ def complete(
             # Drop exactly the field it names and try again; a session that
             # keeps working beats a correct-looking request that 400s.
             field = unsupported_field(detail)
-            if e.code == 400 and field and field in body:
+            if e.code == 400 and field and field != "tools" and field in body:
                 body.pop(field, None)
                 dropped.append(field)
                 log_payload(body, [])

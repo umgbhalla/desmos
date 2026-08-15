@@ -2422,8 +2422,14 @@ fn handle_child(app: &mut App, ev: &Value) {
         }
         _ => {}
     }
+    // The POST split is the parent's wire. A child's request/response only
+    // belongs there while the human is actually inside that child session;
+    // otherwise a background subagent silently overwrites the parent's meters
+    // and JSON panes with someone else's model and usage.
     if let Some((n, req, resp)) = last_post {
-        app.set_last_post(n, &req, &resp);
+        if app.viewing.as_deref() == Some(id) {
+            app.set_last_post(n, &req, &resp);
+        }
     }
 }
 
@@ -9735,6 +9741,64 @@ mod tests {
                 Some(RenderBlock::Subagent(_))
             )
         })
+    }
+
+    #[test]
+    fn a_background_child_post_never_touches_the_parent_wire() {
+        let mut app = App::new();
+        // Parent turn: this is what the POST split must keep showing.
+        handle_event(
+            &mut app,
+            json!({
+                "ev": "post",
+                "n": 7,
+                "request": {"model": "claude-opus-5", "input": []},
+            }),
+        );
+        assert_eq!(app.post_n, 7);
+        let parent_model = app
+            .post_req
+            .get("model")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+
+        // A subagent runs in the background. The human is not inside it.
+        assert!(app.viewing.is_none());
+        handle_event(
+            &mut app,
+            json!({
+                "ev": "child",
+                "id": "deadbeef",
+                "kind": "post",
+                "n": 99,
+                "request": {"model": "gpt-5.6-luna", "input": []},
+            }),
+        );
+        assert_eq!(app.post_n, 7, "child post overwrote the parent POST number");
+        assert_eq!(
+            app.post_req.get("model").and_then(Value::as_str),
+            Some(parent_model.as_str()),
+            "child request leaked into the parent POST pane"
+        );
+
+        // Inside that session, the child's wire is exactly what should show.
+        app.viewing = Some("deadbeef".to_string());
+        handle_event(
+            &mut app,
+            json!({
+                "ev": "child",
+                "id": "deadbeef",
+                "kind": "post",
+                "n": 99,
+                "request": {"model": "gpt-5.6-luna", "input": []},
+            }),
+        );
+        assert_eq!(app.post_n, 99);
+        assert_eq!(
+            app.post_req.get("model").and_then(Value::as_str),
+            Some("gpt-5.6-luna")
+        );
     }
 
     #[test]
