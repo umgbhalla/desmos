@@ -117,7 +117,6 @@ use xai_grok_pager::views::modal_window::{
     handle_modal_key, handle_modal_mouse, render_modal_window,
 };
 use xai_grok_pager::glyphs;
-use xai_grok_pager::views::turn_status::Watchers;
 
 use json_tree::JsonTree;
 use prompt::{PromptBuf, clipboard_text, coalesce_events, is_inline_paste_key, is_paste_key, is_text_key};
@@ -279,10 +278,9 @@ impl Default for PaneLayout {
         Self {
             wire_pct: 38,
             post_h: 12,
-            // Three inner rows is everything the meter has to say now that the
-            // sparkline is gone; +2 for the border. Anything taller is dead
-            // space under the context bar.
-            meter_h: 8,
+            // Five inner rows hold context, cache, cost, agent, and theme;
+            // +2 for the border. Runtime activity lives on the composer.
+            meter_h: 7,
             post_split: 50,
             // Both side panes start open. A pane you have to know about before
             // you can see it is a pane nobody sees; git state and the file it
@@ -1786,8 +1784,8 @@ impl App {
     /// Say something to the user. Sets `status` too, so the handful of places
     /// that read it keep working, but stamps it so the composer can show it and
     /// then drop it. Lifecycle words -- idle, running, stopping -- assign
-    /// `status` directly and raise no notice: they are the activity line's job,
-    /// and "idle" landing at the end of a turn would wipe "copied".
+    /// `status` directly and raise no notice: the composer's animated frame
+    /// carries runtime state, and "idle" landing would wipe "copied".
     fn notify(&mut self, msg: impl Into<String>) {
         let msg = msg.into();
         self.notice = Some((Instant::now(), msg.clone()));
@@ -4574,7 +4572,6 @@ fn draw_scrollback(
     focused: bool,
     mouse: Option<(u16, u16)>,
     text: &TextSel,
-    pad_bottom: u16,
 ) {
     let theme = Theme::current();
     let border = if focused {
@@ -4585,20 +4582,10 @@ fn draw_scrollback(
     // Lay out before drawing the frame: the border title carries the count of
     // rows scrolled off the top, so it has to be known before the block is
     // rendered. Overflow below is stamped on the bottom border afterwards.
-    let mut inner = Block::default().borders(Borders::ALL).inner(area);
+    let inner = Block::default().borders(Borders::ALL).inner(area);
     if inner.width == 0 || inner.height == 0 {
         return;
     }
-    // Reserved floor. The story follows its tail, so the newest block sits
-    // flush on the border and every row it gains or loses while a thought
-    // streams and then folds drags the whole column with it. A couple of rows
-    // of slack keep the live block off the frame, so the motion reads as the
-    // block changing rather than the pane lurching. Taken out of the viewport
-    // before layout: prepare_layout, clamp_scroll and hidden_rows all have to
-    // agree on the height, or the "n more down" count lies about rows that
-    // are in fact painted.
-    let pad = pad_bottom.min(inner.height.saturating_sub(1));
-    inner.height -= pad;
     state.begin_frame();
     state.prepare_layout(inner.width, inner.height);
     clamp_scroll(state);
@@ -4696,18 +4683,6 @@ fn tick_scrollbacks(app: &mut App) -> bool {
     need
 }
 
-fn current_watchers(app: &App) -> Watchers {
-    let subagents = app
-        .children
-        .values()
-        .filter(|c| c.stream.live() || c.exec.live())
-        .count();
-    Watchers {
-        subagents,
-        ..Watchers::default()
-    }
-}
-
 fn current_turn_activity(app: &App) -> Option<TurnActivity> {
     if !app.running {
         return None;
@@ -4728,52 +4703,25 @@ fn current_turn_activity(app: &App) -> Option<TurnActivity> {
     Some(TurnActivity::Waiting(WaitingReason::Model))
 }
 
-/// One line of "what the turn is doing", for the meta pane.
-///
-/// This used to be a row of its own between the queue and the composer,
-/// rendered by grok's turn-status widget. It cost a full-width band to say
-/// four words, and it said them a long way from the meters that answer the
-/// next question — how much is this costing. Built here, before the meter
-/// borrow, so `draw_meta` stays a function of what it is handed.
-struct ActivityLine {
-    label: String,
-    /// None when idle: an idle spinner is a lie about work in flight.
-    spin: Option<String>,
-    elapsed: Option<Duration>,
-    subagents: usize,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InputSignal {
+    Inference,
+    Queued,
+    Tool,
 }
 
-fn activity_line(app: &App, activity: &Option<TurnActivity>) -> ActivityLine {
-    let running = app.running;
-    let label = if app.status == "stopping" {
-        "stopping".to_string()
-    } else {
-        match activity {
-            Some(TurnActivity::Thinking) => "thinking".to_string(),
-            Some(TurnActivity::Responding) => "responding".to_string(),
-            Some(TurnActivity::ToolRunning { title, .. }) => format!("run {title}"),
-            Some(TurnActivity::Waiting(_)) => "waiting".to_string(),
-            Some(_) => "working".to_string(),
-            None => "idle".to_string(),
-        }
-    };
-    let spin = if running {
-        let frames = glyphs::braille_spinner_frames();
-        frames
-            .get(app.story.animation_tick() as usize % frames.len().max(1))
-            .map(|f| (*f).to_string())
+fn input_signal(app: &App) -> Option<InputSignal> {
+    if matches!(
+        current_turn_activity(app),
+        Some(TurnActivity::ToolRunning { .. })
+    ) {
+        Some(InputSignal::Tool)
+    } else if !app.queue.is_empty() {
+        Some(InputSignal::Queued)
+    } else if app.running {
+        Some(InputSignal::Inference)
     } else {
         None
-    };
-    ActivityLine {
-        label,
-        spin,
-        elapsed: if running {
-            app.turn_started.map(|t| t.elapsed())
-        } else {
-            None
-        },
-        subagents: current_watchers(app).subagents,
     }
 }
 
@@ -4865,7 +4813,6 @@ fn draw(f: &mut Frame, app: &mut App) {
         reflow_wire(&mut c.calls, &c.wire_manual);
     }
 
-    let activity = current_turn_activity(app);
     // Columns first, because the composer wraps at the story column's width and
     // not the terminal's. Measuring against the whole frame under-counted rows
     // by the width of the wire column, so a paragraph overflowed a box that had
@@ -4911,8 +4858,7 @@ fn draw(f: &mut Frame, app: &mut App) {
             Constraint::Length(input_h),
         ])
         .split(body[0]);
-    // The wire column stacks: calls, the meta pane — which now carries the
-    // turn's activity as well as the meters — then git and the file it points
+    // The wire column stacks: Activity, cache/session Meta, then git and the file it points
     // at. It runs to the bottom of the frame: the band it used to spend on a
     // key legend opposite the composer is the calls pane's now.
     let spare = body[1].height.saturating_sub(3);
@@ -4984,7 +4930,7 @@ fn draw(f: &mut Frame, app: &mut App) {
     app.calls_chip = title_chip_rect(app.call_area, &calls_title, chip);
     if let (Some(id), true) = (viewing.as_deref(), child_ok) {
         let child = app.children.get_mut(id).expect("checked");
-        let title = format!("session {id}");
+        let title = format!("Session {id}");
         draw_scrollback(
             f,
             panes[0],
@@ -4996,7 +4942,6 @@ fn draw(f: &mut Frame, app: &mut App) {
             app.focus == Focus::Story,
             app.mouse,
             &child.story_text,
-            0,
         );
         draw_scrollback(
             f,
@@ -5009,7 +4954,6 @@ fn draw(f: &mut Frame, app: &mut App) {
             app.focus == Focus::Calls,
             app.mouse,
             &child.calls_text,
-            0,
         );
     } else {
         draw_scrollback(
@@ -5018,12 +4962,11 @@ fn draw(f: &mut Frame, app: &mut App) {
             &mut app.story,
             &mut app.story_scratch,
             &mut app.story_sel,
-            "story",
+            "Story",
             theme.accent_assistant,
             app.focus == Focus::Story,
             app.mouse,
             &app.story_text,
-            0,
         );
         draw_scrollback(
             f,
@@ -5036,7 +4979,6 @@ fn draw(f: &mut Frame, app: &mut App) {
             app.focus == Focus::Calls,
             app.mouse,
             &app.calls_text,
-            0,
         );
     }
     let n = app.post_n;
@@ -5069,14 +5011,12 @@ fn draw(f: &mut Frame, app: &mut App) {
         theme.accent_assistant,
         app.focus == Focus::PostOut,
     );
-    let act = activity_line(app, &activity);
     let ident = meta_id(app);
     draw_meta(
         f,
         app.cache.area,
         &app.cache,
         app.focus == Focus::Meter,
-        &act,
         &ident,
     );
     draw_git(f, app.git_area, app);
@@ -5173,8 +5113,7 @@ impl Tier {
     fn of(rows: u16) -> Self {
         match rows {
             0..=1 => Self::Line,
-            // Four rows is the whole meter now that activity sits on top of
-            // it: activity, context, cache, cost. Dense drops the cost line.
+            // Dense keeps only context and cache. Full adds cost and identity.
             2..=3 => Self::Dense,
             _ => Self::Full,
         }
@@ -5509,7 +5448,6 @@ fn draw_meta(
     area: Rect,
     meter: &CacheMeter,
     focused: bool,
-    act: &ActivityLine,
     id: &MetaId,
 ) {
     if area.height == 0 || area.width == 0 {
@@ -5519,18 +5457,13 @@ fn draw_meta(
     let left = meter.left();
     let secs = left.map(|l| (l * meter.ttl.as_secs_f32()).round() as u64);
     let ttl_label = if meter.ttl.as_secs() >= 3600 { "1h" } else { "5m" };
-    let title = match secs {
-        _ if !meter.ephemeral => {
-            // No declared window on this provider. Report what the last call
-            // actually got instead of inventing a deadline for it.
-            if meter.read + meter.write == 0 {
-                " meta  cache ".to_string()
-            } else {
-                format!(" meta  cache {}% ", meter.hit())
-            }
-        }
-        Some(s) => format!(" meta  cache {ttl_label} {}:{:02} ", s / 60, s % 60),
-        None => " meta  cache cold ".to_string(),
+    // Cache status belongs on the cache row, not jammed into the pane title.
+    // That keeps Meta's chrome aligned with every other pane.
+    let cache_value = match secs {
+        _ if !meter.ephemeral && meter.read + meter.write == 0 => "cold".to_string(),
+        _ if !meter.ephemeral => format!("{}% cached", meter.hit()),
+        Some(s) => format!("{}% · {ttl_label} {}:{:02}", meter.hit(), s / 60, s % 60),
+        None => "cold".to_string(),
     };
     let border = if focused {
         theme.accent_tool
@@ -5541,7 +5474,7 @@ fn draw_meta(
         .borders(Borders::ALL)
         .border_style(Style::default().fg(border))
         .title(Span::styled(
-            title,
+            " Meta ",
             Style::default()
                 .fg(theme.accent_tool)
                 .add_modifier(Modifier::BOLD),
@@ -5613,7 +5546,7 @@ fn draw_meta(
         meter_row(
             inner.width,
             "cache",
-            &format!("{}% cached", meter.hit()),
+            &cache_value,
             &[
                 (meter.read, theme.accent_success),
                 (meter.write, theme.accent_tool),
@@ -5652,42 +5585,6 @@ fn draw_meta(
             Span::styled(money(meter.saved), Style::default().fg(theme.accent_success)),
             label(" saved"),
         ])
-    };
-
-    // What the turn is doing, above the meters that say what it costs. Always
-    // present, idle included, so the rows under it never shift by one when a
-    // step starts.
-    let act_row = || {
-        let mut spans = vec![Span::styled(
-            act.spin.clone().unwrap_or_else(|| " ".into()),
-            Style::default().fg(theme.accent_assistant),
-        )];
-        spans.push(Span::raw(" "));
-        spans.push(Span::styled(
-            act.label.clone(),
-            Style::default()
-                .fg(if act.spin.is_some() {
-                    theme.accent_assistant
-                } else {
-                    theme.gray
-                })
-                .add_modifier(Modifier::BOLD),
-        ));
-        if let Some(elapsed) = act.elapsed {
-            spans.push(label("  "));
-            spans.push(Span::styled(
-                human_secs(elapsed.as_millis() as u64),
-                Style::default().fg(theme.text_secondary),
-            ));
-        }
-        if act.subagents > 0 {
-            spans.push(label("   "));
-            spans.push(Span::styled(
-                format!("{} sub", act.subagents),
-                Style::default().fg(theme.accent_skill),
-            ));
-        }
-        Line::from(spans)
     };
 
     // What is running, and under what settings. A queued switch is named as
@@ -5762,11 +5659,10 @@ fn draw_meta(
     let mut lines = match Tier::of(inner.height) {
         // One row is not enough to say both; a squeezed meter is still a meter.
         Tier::Line => vec![ctx_row()],
-        Tier::Dense => vec![act_row(), ctx_row(), cache_row()],
+        Tier::Dense => vec![ctx_row(), cache_row()],
         // The sparkline was the one row nobody read: a hit-rate trend restates
         // what the cache row already says, in less precise form.
         Tier::Full => vec![
-            act_row(),
             ctx_row(),
             cache_row(),
             money_row(),
@@ -5810,7 +5706,7 @@ fn draw_queue(f: &mut Frame, area: Rect, app: &App) {
     } else {
         theme.bg_base
     };
-    let title = format!(" queue  {} ", app.queue.len());
+    let title = format!(" Queue  {} ", app.queue.len());
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(border))
@@ -5862,19 +5758,31 @@ fn draw_input(f: &mut Frame, area: Rect, app: &mut App) {
         width: area.width.saturating_sub(2),
         height: area.height.saturating_sub(float),
     };
-    // Identity used to run along this box's bottom edge. It is not something
-    // you type, and the box grows and shrinks under it; it lives in the meta
-    // pane now, with the theme swatches and the rest of the configuration.
     let prefix = " ";
     let focused = app.focus == Focus::Input;
-    let border = if focused {
-        theme.prompt_border_active
-    } else {
-        theme.prompt_border
+    let signal = input_signal(app);
+    let (signal_label, signal_color) = match signal {
+        Some(InputSignal::Inference) => (Some("Inference".to_string()), theme.accent_assistant),
+        Some(InputSignal::Queued) => (Some(format!("Queued {}", app.queue.len())), theme.accent_user),
+        Some(InputSignal::Tool) => (Some("Tool".to_string()), theme.accent_tool),
+        None => (
+            None,
+            if focused {
+                theme.prompt_border_active
+            } else {
+                theme.prompt_border
+            },
+        ),
     };
-    // The top edge is for the one control worth reaching for while a turn is
-    // running. "input" was a label on the box you are already typing in, and
-    // [stop] used to live a row away in a band of its own.
+    // The whole composer frame is the activity indicator. Runtime states keep
+    // their own hue while the bold pulse makes progress visible without adding
+    // another status row.
+    let pulse = (app.story.animation_tick() / 6) % 2 == 0;
+    let mut border_style = Style::default().fg(signal_color);
+    if signal.is_some() && pulse {
+        border_style = border_style.add_modifier(Modifier::BOLD);
+    }
+
     let stop = " [stop] ";
     let stop_w = UnicodeWidthStr::width(stop) as u16;
     let stop_area = Rect {
@@ -5886,7 +5794,49 @@ fn draw_input(f: &mut Frame, area: Rect, app: &mut App) {
     app.turn_cancel = if app.running { Some(stop_area) } else { None };
     let mut block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(border));
+        .border_style(border_style);
+
+    let mut left_title: Vec<Span> = Vec::new();
+    if let Some(label) = signal_label.as_ref() {
+        let frames = glyphs::braille_spinner_frames();
+        let frame = frames
+            .get(app.story.animation_tick() as usize % frames.len().max(1))
+            .copied()
+            .unwrap_or(" ");
+        left_title.push(Span::styled(
+            format!(" {frame} {label} "),
+            Style::default()
+                .fg(signal_color)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+    // Notices share the left title instead of replacing the runtime state.
+    if let Some((_, msg)) = app.notice.as_ref() {
+        let used = left_title
+            .iter()
+            .map(|span| UnicodeWidthStr::width(span.content.as_ref()) as u16)
+            .sum::<u16>();
+        let room = card
+            .width
+            .saturating_sub(if app.running { stop_w + 3 } else { 2 })
+            .saturating_sub(used + 2) as usize;
+        let mut text = msg.clone();
+        if UnicodeWidthStr::width(text.as_str()) > room {
+            text = text.chars().take(room.saturating_sub(1)).collect::<String>() + "\u{2026}";
+        }
+        left_title.push(Span::styled(
+            format!(" {text} "),
+            Style::default().fg(theme.text_secondary),
+        ));
+    } else if app.prompt.is_multiline() {
+        left_title.push(Span::styled(
+            " multiline ",
+            Style::default().fg(theme.accent_success),
+        ));
+    }
+    if !left_title.is_empty() {
+        block = block.title(Line::from(left_title));
+    }
     if app.running {
         let hovered = app.mouse.is_some_and(|(c, r)| hit(stop_area, c, r));
         block = block.title(
@@ -5902,25 +5852,6 @@ fn draw_input(f: &mut Frame, area: Rect, app: &mut App) {
             ))
             .right_aligned(),
         );
-    }
-    // The left edge answers "did that do anything" -- copied, queued #3, theme
-    // changed, bridge died. Twenty places wrote that string and nothing ever
-    // drew it; this is where it lands, and it lapses on its own.
-    if let Some((_, msg)) = app.notice.as_ref() {
-        let room = card.width.saturating_sub(if app.running { stop_w + 3 } else { 2 }) as usize;
-        let mut text = msg.clone();
-        if UnicodeWidthStr::width(text.as_str()) > room {
-            text = text.chars().take(room.saturating_sub(1)).collect::<String>() + "\u{2026}";
-        }
-        block = block.title(Span::styled(
-            format!(" {text} "),
-            Style::default().fg(theme.text_secondary),
-        ));
-    } else if app.prompt.is_multiline() {
-        block = block.title(Span::styled(
-            " multiline ",
-            Style::default().fg(theme.accent_success),
-        ));
     }
     let block = block.style(Style::default().bg(theme.bg_base));
     let inner = block.inner(card);
@@ -7052,26 +6983,33 @@ fn wire_push(sb: &mut ScrollbackState, block: RenderBlock) -> EntryId {
 const WIRE_OPEN: usize = 3;
 
 /// Keep the tail of the wire pane open: the last `WIRE_OPEN` cards, plus any
-/// card still running, are Expanded; everything above them collapses. Cards
-/// in `manual` were folded or opened by hand and are never touched.
+/// card still running, are Expanded; everything above them collapses. Finished
+/// thoughts start collapsed even at the tail. Cards in `manual` were folded or
+/// opened by hand and are never touched.
 ///
 /// Runs every frame. It is a fold-state reconcile, not an event handler, so a
 /// card that arrives while another is streaming still ends up in the right
 /// state without every push site remembering to call it.
 fn reflow_wire(sb: &mut ScrollbackState, manual: &HashSet<EntryId>) {
     let n = sb.len();
-    let mut rows: Vec<(EntryId, bool)> = Vec::with_capacity(n);
+    let mut rows: Vec<(EntryId, bool, bool)> = Vec::with_capacity(n);
     for i in 0..n {
         if let Some(e) = sb.entry(i) {
-            rows.push((e.id, e.is_running));
+            rows.push((
+                e.id,
+                e.is_running,
+                matches!(e.block, RenderBlock::Thinking(_)),
+            ));
         }
     }
     let cut = rows.len().saturating_sub(WIRE_OPEN);
-    for (idx, (id, running)) in rows.into_iter().enumerate() {
+    for (idx, (id, running, thinking)) in rows.into_iter().enumerate() {
         if manual.contains(&id) {
             continue;
         }
-        let want = if running || idx >= cut {
+        let want = if thinking && !running {
+            DisplayMode::Collapsed
+        } else if running || idx >= cut {
             DisplayMode::Expanded
         } else {
             DisplayMode::Collapsed
@@ -7668,7 +7606,7 @@ mod tests {
         // The slot lost the float row, so it must lose the height too, or the
         // composer draws one blank row of its own instead.
         assert_eq!(
-            app.input_area.height, 4,
+            app.input_area.height, 10,
             "the composer kept a float row it no longer draws: {:?}",
             app.input_area
         );
@@ -7699,7 +7637,19 @@ mod tests {
         buffer_text(&term)
     }
 
-
+    fn paint_input_state(
+        app: &mut App,
+        w: u16,
+        h: u16,
+    ) -> (String, ratatui::style::Color, Modifier) {
+        let backend = TestBackend::new(w, h);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| draw(f, app)).unwrap();
+        let x = app.input_inner.x.saturating_sub(1);
+        let y = app.input_inner.y.saturating_sub(1);
+        let cell = &term.backend().buffer()[(x, y)];
+        (buffer_text(&term), cell.fg, cell.modifier)
+    }
     /// Prose after a syscall must not push its own timestamp onto a blank row.
     ///
     /// The stream is `<bash>…</bash>\n\nI'll wait.`, and stripping the call
@@ -7742,8 +7692,8 @@ mod tests {
     ///
     /// It used to open with three rows of chrome: a "Thinking…" header, the
     /// blank separator the header always drags with it, and grok's "…" marking
-    /// the clipped head. The turn-status row already says Thinking with a
-    /// spinner and the elapsed time, so the header was a copy and its blank was
+    /// the clipped head. The animated composer already signals inference, so
+    /// a second live header was a copy and its blank was
     /// waste; the marker only reads as a marker under that header. So a live
     /// thought streams Expanded -- whole body, no chrome, the pane's bottom edge
     /// doing the clipping, which is how grok minimal draws its live tail -- and
@@ -7772,8 +7722,10 @@ mod tests {
             text.contains("number 7"),
             "the newest reasoning must be on screen:\n{text}"
         );
-        // Truncated mode could never show more than three body rows.
-        let rows = text.lines().filter(|l| l.contains("number")).count();
+        // Truncated mode could never show more than three body rows. Count the
+        // thought's accent-column rows rather than source newlines: wrapping
+        // can place two source lines on one painted row.
+        let rows = text.lines().filter(|l| l.contains('\u{2503}')).count();
         assert!(
             rows > 3,
             "a live thought renders its body, not a 3-row window ({rows}):\n{text}"
@@ -8404,15 +8356,21 @@ mod tests {
         let buf = term.backend().buffer();
         // Top-left corner of the story pane (focused) and of the calls pane.
         let story_corner = buf.cell((0, 0)).unwrap().style().fg.unwrap();
-        let calls_x = (110 * (100 - app.layout.wire_pct) / 100) as u16;
-        let calls_corner = buf.cell((calls_x, 0)).unwrap().style().fg.unwrap();
+        let calls_x = app.call_area.x;
+        let calls_corner = buf.cell((calls_x, app.call_area.y)).unwrap().style().fg.unwrap();
+        let calls_bg = buf
+            .cell((calls_x + 1, app.call_area.y + 1))
+            .unwrap()
+            .style()
+            .bg
+            .unwrap();
         assert_ne!(
             story_corner, theme.bg_base,
             "the focused pane must show its frame"
         );
         assert_eq!(
-            calls_corner, theme.bg_base,
-            "an unfocused frame must vanish into the background, got {calls_corner:?}"
+            calls_corner, calls_bg,
+            "an unfocused frame must vanish into its pane background, got {calls_corner:?}"
         );
     }
 
@@ -8429,7 +8387,7 @@ mod tests {
             '<', '>', "</", '>'
         );
         handle_event(&mut app, json!({"ev": "speech", "text": speech}));
-        let text = paint(&mut app, 100, 24);
+        let text = paint(&mut app, 100, 40);
         assert!(text.contains("Checking the meter"), "prose missing:\n{text}");
         assert!(text.contains("All green"), "prose missing:\n{text}");
         assert!(
@@ -8947,7 +8905,7 @@ mod tests {
         let mut term = Terminal::new(backend).unwrap();
         term.draw(|f| draw(f, &mut app)).unwrap();
         let text = buffer_text(&term);
-        assert!(text.contains("story"), "{text}");
+        assert!(text.contains("Story"), "{text}");
         assert!(text.contains("Activity"), "{text}");
         // A block *stamped* `out`, not the POST card's `out 100` usage column
         // — which is a real number and was only ever absent here because the
@@ -9075,7 +9033,7 @@ mod tests {
         assert!(app.help, "? must open the sheet outside the composer");
         let text = paint(&mut app, 140, 60);
         assert!(
-            text.contains("story / calls keys"),
+            text.contains("story / Activity keys"),
             "the sheet has to name the pane it describes"
         );
         assert!(
@@ -9407,9 +9365,9 @@ mod tests {
         assert_eq!(Tier::of(3), Tier::Dense);
         assert_eq!(Tier::of(4), Tier::Full);
         assert_eq!(Tier::of(12), Tier::Full);
-        // The default hugs its content: activity, context, cache, cost, the
-        // agent config and the theme, plus two border rows.
-        assert_eq!(PaneLayout::default().meter_h, 8);
+        // The default hugs its content: context, cache, cost, agent config,
+        // and theme, plus two border rows. Activity lives on the composer.
+        assert_eq!(PaneLayout::default().meter_h, 7);
         let inner = PaneLayout::default().meter_h - 2;
         assert_eq!(Tier::of(inner), Tier::Full);
         // Both side panes are open out of the box. A saved `.desmos/tui.json`
@@ -9689,14 +9647,14 @@ mod tests {
         app.cache.observe(&usage, "gpt-5.6-luna");
         assert!(!app.cache.ephemeral);
         let painted = paint(&mut app, 130, 40);
-        assert!(painted.contains("cache 81%"), "{painted}");
-        assert!(!painted.contains("cache cold"), "{painted}");
+        assert!(painted.contains("81% cached"), "{painted}");
+        assert!(!painted.contains("cold"), "{painted}");
 
         handle_event(&mut app, json!({"ev": "snapshot", "provider": "anthropic"}));
         assert!(app.cache.ephemeral, "anthropic does declare one");
         app.cache.observe(&usage, "claude-opus-5");
         let painted = paint(&mut app, 130, 40);
-        assert!(painted.contains("cache 5m"), "{painted}");
+        assert!(painted.contains("81%") && painted.contains("5m"), "{painted}");
     }
 
     #[test]
@@ -10299,8 +10257,12 @@ mod tests {
         assert_eq!(app.calls.len(), 0, "child wire must not hit parent calls");
 
         let child = app.children.get("deadbeef").expect("child session");
-        assert!(child.story.len() >= 3, "task + thought + speech");
-        assert_eq!(child.calls.len(), 2, "complete + syscall stay on child calls");
+        assert!(child.story.len() >= 2, "task + speech stay in child Story");
+        assert_eq!(
+            child.calls.len(),
+            3,
+            "thought + complete + syscall stay in child Activity"
+        );
     }
 
     #[test]
@@ -10317,7 +10279,7 @@ mod tests {
         );
         assert_eq!(app.viewing.as_deref(), Some("a1b2c3d4"));
         let inside = paint(&mut app, 120, 30);
-        assert!(inside.contains("session a1b2c3d4"), "{inside}");
+        assert!(inside.contains("Session a1b2c3d4"), "{inside}");
         assert!(
             inside.contains("last-user") || inside.contains("CHILDONLY") || inside.contains("cache"),
             "child speech missing inside session:\n{inside}"
@@ -10329,8 +10291,8 @@ mod tests {
         );
         assert!(app.viewing.is_none());
         let back = paint(&mut app, 120, 30);
-        assert!(back.contains("story"), "{back}");
-        assert!(!back.contains("session a1b2c3d4"), "{back}");
+        assert!(back.contains("Story"), "{back}");
+        assert!(!back.contains("Session a1b2c3d4"), "{back}");
     }
 
     #[test]
@@ -10923,13 +10885,10 @@ mod tests {
         }
     }
 
-    /// The meta pane is a meter, not a second calls pane. It used to print the
-    /// first line of the running command, so a bash call painted its argv into
-    /// the status row -- paths, flags, whatever the body opened with -- and
-    /// then truncated it to a fragment. The body has one home and meta is not
-    /// it.
+    /// Runtime state belongs on the composer, but a tool body still has one
+    /// home: its Activity card. Neither the composer nor Meta may repeat it.
     #[test]
-    fn the_meta_row_names_the_syscall_and_never_its_body() {
+    fn the_tool_signal_never_repeats_the_syscall_body() {
         let mut app = App::new();
         app.running = true;
         handle_event(
@@ -10946,14 +10905,14 @@ mod tests {
             app.exec.live(),
             "exec must be live or meta has nothing to say about a syscall"
         );
-        let act = activity_line(&app, &current_turn_activity(&app));
-        assert_eq!(act.label, "run <bash>");
+        assert_eq!(input_signal(&app), Some(InputSignal::Tool));
+        let painted = paint(&mut app, 120, 28);
+        let input = rows_of(&painted, app.input_area);
+        let meta = rows_of(&painted, app.cache.area);
+        assert!(input.contains("Tool"), "{input}");
         for leak in ["secret", "sk-live", "curl", "Authorization", "example.com"] {
-            assert!(
-                !act.label.contains(leak),
-                "meta leaked {leak} out of the syscall body: {}",
-                act.label
-            );
+            assert!(!input.contains(leak), "composer leaked {leak}: {input}");
+            assert!(!meta.contains(leak), "Meta leaked {leak}: {meta}");
         }
     }
 
@@ -11306,65 +11265,59 @@ mod tests {
     }
 
     #[test]
-    fn activity_lives_in_the_meta_pane_and_stop_on_the_composer() {
+    fn runtime_state_animates_the_composer_in_three_distinct_colors() {
+        let mut inference = App::new();
+        inference.running = true;
+        inference.turn_started = Some(Instant::now());
+        start_thinking(&mut inference.calls, &mut inference.stream);
+        let (first, inference_color, first_mod) = paint_input_state(&mut inference, 140, 30);
+        assert!(rows_of(&first, inference.input_area).contains("Inference"));
+        let meta = rows_of(&first, inference.cache.area);
+        assert!(!meta.contains("idle") && !meta.contains("thinking"), "{meta}");
+        assert!(rows_of(&first, inference.input_area).contains("[stop]"));
+        assert!(inference.turn_cancel.is_some(), "running composer lost [stop] hit box");
+
+        for _ in 0..6 {
+            inference.story.tick();
+        }
+        let (_, _, second_mod) = paint_input_state(&mut inference, 140, 30);
+        assert_ne!(
+            first_mod.contains(Modifier::BOLD),
+            second_mod.contains(Modifier::BOLD),
+            "the live composer border did not pulse"
+        );
+
+        let mut queued = App::new();
+        queued.running = true;
+        queued.queue.push("next prompt".into());
+        let (queued_text, queued_color, _) = paint_input_state(&mut queued, 140, 30);
+        assert!(rows_of(&queued_text, queued.input_area).contains("Queued 1"));
+
+        let mut tool = App::new();
+        tool.running = true;
+        tool.queue.push("queued behind tool".into());
+        handle_event(
+            &mut tool,
+            json!({"ev":"result","phase":"start","tag":"bash","attrs":{},"body":"echo hi"}),
+        );
+        let (tool_text, tool_color, _) = paint_input_state(&mut tool, 140, 30);
+        assert!(rows_of(&tool_text, tool.input_area).contains("Tool"));
+        assert_ne!(inference_color, queued_color);
+        assert_ne!(queued_color, tool_color);
+        assert_ne!(inference_color, tool_color);
+    }
+
+    #[test]
+    fn pane_titles_share_one_chrome_style_and_meta_owns_no_runtime_state() {
         let mut app = App::new();
         app.running = true;
-        app.turn_started = Some(Instant::now() - Duration::from_secs(5));
-        app.status = "running".into();
-        start_thinking(&mut app.calls, &mut app.stream);
-        let text = paint(&mut app, 140, 30);
-
-        // Placement, not presence: "thinking" and a spinner painted anywhere on
-        // a 140x30 frame proves nothing, since the story's own thought block
-        // says Thinking too. Slice the rows the meter owns.
+        let text = paint(&mut app, 140, 34);
+        assert!(text.contains(" Story "), "{text}");
+        assert!(text.contains(" Activity "), "{text}");
+        assert!(text.contains(" Meta "), "{text}");
         let meta = rows_of(&text, app.cache.area);
-        assert!(
-            meta.contains("thinking"),
-            "activity must be in the meta pane:\n{meta}"
-        );
-        let frames = glyphs::braille_spinner_frames();
-        assert!(
-            frames.iter().any(|f| meta.contains(*f)),
-            "meta must spin a grok braille frame:\n{meta}"
-        );
-        let thinking_row = meta
-            .lines()
-            .find(|line| line.contains("thinking"))
-            .expect("thinking activity row");
-        assert!(thinking_row.contains("5."), "turn duration missing: {thinking_row}");
-        assert!(!thinking_row.contains('/'), "two competing clocks remain: {thinking_row}");
-
-        // Changing phase must not restart the one main-agent activity clock.
-        app.stream.speech_raw.push_str("answering");
-        let responding = paint(&mut app, 140, 30);
-        let responding_meta = rows_of(&responding, app.cache.area);
-        let responding_row = responding_meta
-            .lines()
-            .find(|line| line.contains("responding"))
-            .expect("responding activity row");
-        assert!(responding_row.contains("5."), "phase reset the duration: {responding_row}");
-        assert!(!responding_row.contains('/'), "two competing clocks remain: {responding_row}");
-
-        // [stop] rides the composer's own top edge now.
-        let top = rows_of(
-            &text,
-            Rect { height: 2, ..app.input_area },
-        );
-        assert!(top.contains("[stop]"), "stop is not on the composer:\n{top}");
-        assert!(
-            app.turn_cancel.is_some_and(|r| r.y == top_row(app.input_area)),
-            "cancel hit box is not on the composer's top edge: {:?}",
-            app.turn_cancel
-        );
-        assert!(!text.contains(" input "), "the input label is gone:\n{text}");
-        // The palette is shown, not named: the theme row carries swatches in
-        // the accents a block will actually be painted in.
-        assert!(
-            meta.contains(&Theme::current_kind().display_name().to_string())
-                && meta.contains('\u{2588}'),
-            "theme row missing its swatches:\n{meta}"
-        );
-        assert!(!text.contains('❯'), "input must not show a chevron:\n{text}");
+        assert!(!meta.contains("idle") && !meta.contains("waiting"), "{meta}");
+        assert!(!meta.lines().next().unwrap_or_default().contains("cache"), "{meta}");
     }
 
     /// The composer grows with what is typed, and it measures against the
@@ -11380,8 +11333,13 @@ mod tests {
         };
         let body = "the quick brown fox jumps over the lazy dog and keeps \
                     on running until the sentence is long enough to need \
-                    several rows of a composer that is only half the frame";
-        app.prompt.handle_paste(body);
+                    several rows of a composer that is only half the frame. \
+                    This second passage keeps going through another collection \
+                    of deliberately ordinary words so the prompt exceeds the \
+                    generous eight-row default and proves the composer still \
+                    grows when a genuinely long request needs the space."
+            .repeat(3);
+        app.prompt.handle_paste(&body);
         let text = paint(&mut app, 140, 40);
         assert!(
             app.input_area.height > idle,
@@ -11400,11 +11358,6 @@ mod tests {
         // And the tail is on screen rather than clipped off the bottom.
         let card = rows_of(&text, app.input_area);
         assert!(card.contains("frame"), "composer clipped its tail:\n{card}");
-    }
-
-    /// The card floats one row down and one cell in from the band it is given.
-    fn top_row(area: Rect) -> u16 {
-        area.y + 1
     }
 
     /// The painted rows a rect covers, joined — for asserting *where* a string
