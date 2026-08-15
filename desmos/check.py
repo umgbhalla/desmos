@@ -577,6 +577,28 @@ def self_check() -> None:
         assert "opaque-secret" not in str(evs_th)
         complete_ev = next(e for e in evs_th if e.get("ev") == "complete")
         assert complete_ev.get("thoughts") == 1 and complete_ev.get("redacted") == 1
+
+        # Residue has to reach the event, not just exist as a function. The
+        # message itself stays byte-exact: rewriting it would break the cached
+        # prefix on the next request, which is the whole reason we report
+        # instead of trimming.
+        junk = "<usage/> \n lousy?"
+
+        def residue_complete(_model, _system, _messages, _max_tokens, _c=[0]):
+            _c[0] += 1
+            return {"content": [{"type": "text", "text": junk if _c[0] == 1 else "done"}], "usage": {}}
+
+        w_res = new_world(cwd, state_path=cwd / "harness-residue.json", ns={})
+        w_res.complete_fn = residue_complete
+        evs_res: list[dict] = []
+        _run(w_res, "hi", quiet=True, on_event=lambda e: evs_res.append(e))
+        firsts = [e for e in evs_res if e.get("ev") == "complete"]
+        assert firsts[0].get("residue") == "lousy?", firsts[0].get("residue")
+        assert firsts[1].get("residue") == "", "clean speech reports no residue"
+        assert any(e.get("ev") == "result" and e.get("tag") == "usage" for e in evs_res)
+        stored = [m for m in w_res.messages if m.get("role") == "assistant"]
+        assert stored[0]["content"][0]["text"] == junk, "the stored message must not be rewritten"
+        assert (w_res.log[-2] if len(w_res.log) > 1 else w_res.log[-1]).get("residue") == "lousy?"
         req = complete_ev.get("request") or {}
         resp = complete_ev.get("response") or {}
         assert req.get("model") or req.get("messages") is not None
@@ -1728,6 +1750,62 @@ def self_check() -> None:
         assert back[0]["content"][0]["type"] == "input_text"
         assert reasoning_item in back, back
         assert msg_item in back, back
+        # sol splits a turn into a commentary preamble and a final_answer, and
+        # some models stream reasoning verbatim rather than as a summary. Both
+        # events were unhandled: the thinking pane stayed empty while reasoning
+        # tokens were billed, and a refusal arrived as an empty reply the loop
+        # read as "the model is done".
+        raw_items = [
+            {
+                "id": "msg_c",
+                "type": "message",
+                "role": "assistant",
+                "phase": "commentary",
+                "content": [{"type": "output_text", "text": "I'll look first."}],
+            },
+            {
+                "id": "msg_f",
+                "type": "message",
+                "role": "assistant",
+                "phase": "final_answer",
+                "content": [{"type": "refusal", "refusal": "I can't help with that."}],
+            },
+        ]
+        raw_events = [
+            {"type": "response.reasoning_text.delta", "delta": "step one"},
+            {"type": "response.refusal.delta", "delta": "I can't help with that."},
+            {
+                "type": "response.completed",
+                "response": {"id": "r2", "status": "completed", "output": raw_items, "usage": {}},
+            },
+        ]
+        sse2 = []
+        for ev in raw_events:
+            sse2.append("data: " + json.dumps(ev))
+            sse2.append("")
+        seen2: list[dict] = []
+        resp2 = _oai.read_sse(iter(sse2), "gpt-5.6-sol", on_event=seen2.append)
+        assert [e["text"] for e in seen2 if e["kind"] == "thinking_delta"] == ["step one"]
+        assert [e["text"] for e in seen2 if e["kind"] == "text_delta"] == ["I can't help with that."]
+        phases = [b.get("phase") for b in resp2["content"]]
+        assert phases == ["commentary", "final_answer"], phases
+        assert "I can't help with that." in text_of(resp2), "a refusal is the answer, not nothing"
+
+        # gpt-5.6-sol ended every message from the seventeenth on with a stray
+        # token after the closing tag. Nothing rewrites the message -- the
+        # stored bytes must stay exact for the cached prefix -- but the parser
+        # now reports what it left outside the calls.
+        from desmos.scan import trailing_residue as _residue
+
+        sol_tail = "<bash>rg -n data .</" + "bash> \n lousy? token. \n"
+        assert _residue(sol_tail) == "lousy? token.", _residue(sol_tail)
+        assert [b.tag for b in scan(sol_tail)] == ["bash"], "the call still dispatches"
+        assert _residue("<usage/>") == "" and _residue("just prose") == ""
+        assert _residue("prose before <usage/>") == "", "only what follows the last call counts"
+        assert "closing tag" in dialect("gpt-5.6-sol"), (
+            "the openai lane must license a syscall-only turn or it invents filler prose"
+        )
+
         # An attached screenshot has to survive the crossing. Anthropic's block
         # shape goes in, Responses' flat data-URL input_image comes out -- the
         # only image shape the Codex backend takes.

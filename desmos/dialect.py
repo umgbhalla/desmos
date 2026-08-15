@@ -208,6 +208,9 @@ _OPENAI = "\n".join(
         " A string task returns prose you then have to trust.",
         "Close with the outcome in the first sentence. Then separate what you verified by running"
         " it from what you are inferring, and name anything still unproven.",
+        "A turn that is nothing but syscalls is complete and correct. Write no text after the last"
+        " closing tag -- the sentence of intent goes before the calls, and the outcome goes in the"
+        " turn after the results arrive. If you have nothing to say, say nothing.",
     ]
 )
 

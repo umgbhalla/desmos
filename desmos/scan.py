@@ -102,7 +102,31 @@ def scan(text: str) -> list[Block]:
     stepped over whole, so a fence *inside* a syscall never masks the calls
     that follow it.
     """
-    blocks: list[Block] = []
+    return [b for b, _, _ in scan_spans(text)]
+
+
+def trailing_residue(text: str) -> str:
+    """Speech left over after the last syscall in a reply.
+
+    The scanner is a finder, not a partitioner: anything it does not recognise
+    as a call is speech by default, so a degenerate token appended after the
+    final closing tag is accepted in silence and replayed forever. gpt-5.6-sol
+    did exactly that for a whole session -- every message from the seventeenth
+    on ended in a stray `lousy?`, and nothing in the harness could see it
+    because nothing ever asked what was outside the tags.
+
+    This reports; it never rewrites. The stored message has to stay byte-exact
+    or the cached prefix breaks on the next request.
+    """
+    spans = scan_spans(text)
+    if not spans:
+        return ""
+    return text[spans[-1][2] :].strip()
+
+
+def scan_spans(text: str) -> list[tuple[Block, int, int]]:
+    """Every syscall with the character range it occupied."""
+    blocks: list[tuple[Block, int, int]] = []
     pos = 0
     fence = _fence_span(text, 0)
     while True:
@@ -121,7 +145,7 @@ def scan(text: str) -> list[Block]:
         tag, raw_attrs, self_close = m.group(1), m.group(2) or "", m.group(3)
         attrs = {k: v for k, v in ATTR.findall(raw_attrs)}
         if self_close:
-            blocks.append(Block(tag, "", attrs))
+            blocks.append((Block(tag, "", attrs), m.start(), m.end()))
             pos = m.end()
             continue
         close = f"</{tag}>"
@@ -129,6 +153,6 @@ def scan(text: str) -> list[Block]:
         if end < 0:
             pos = m.end()
             continue
-        blocks.append(Block(tag, text[m.end() : end], attrs))
+        blocks.append((Block(tag, text[m.end() : end], attrs), m.start(), end + len(close)))
         pos = end + len(close)
     return blocks

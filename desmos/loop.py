@@ -20,7 +20,7 @@ from desmos.const import FROZEN, MAX_TOKENS, PRIOR_KEEP
 from desmos.dispatch import dispatch
 from desmos.generations import ensure_gen1, evolve, rollback
 from desmos.persist import load, save
-from desmos.scan import clip, scan
+from desmos.scan import clip, scan, trailing_residue
 from desmos.spill import spill
 from desmos.types import Block, Tool, World
 
@@ -221,6 +221,12 @@ def turn(
             "",
         )
         fire({"ev": "compacted", "n": n, "kept": len(messages), "text": summary})
+    # What the model wrote after its last closing tag. Never rewritten -- the
+    # stored message must stay byte-exact for the cached prefix -- but recorded,
+    # so a degenerate suffix is visible the first time instead of the fiftieth.
+    residue = trailing_residue(speech)
+    if residue and world.log:
+        world.log[-1]["residue"] = residue
     fire(
         {
             "ev": "complete",
@@ -231,6 +237,7 @@ def turn(
             "thoughts": n_thoughts,
             "redacted": n_redacted,
             "usage": usage,
+            "residue": residue,
             "request": (world.log[-1] or {}).get("request") or {},
             "response": (world.log[-1] or {}).get("response") or {},
         }

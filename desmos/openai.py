@@ -35,9 +35,15 @@ CONTRACT = """
 
 # how you act here
 
-You have no built-in tools. The only way to make anything happen is to write
-the XML syscall in your reply, exactly as documented above, and then stop
-generating. The harness runs it and sends the output back as the next message.
+You have one tool, `syscall`. The only way to make anything happen is to call
+it with the raw XML syscalls documented above. Put one or more complete XML
+tags in its input and no prose. Do not write XML in an assistant message. The
+harness runs every tag in order and returns their result blocks as that tool's
+output.
+
+The `syscall` call ends your response. Generate no assistant message after it.
+Do not print a stop word or attempt to write a result. Wait for the typed tool
+output, then continue on the next turn.
 
 Never describe a command as done, and never state its output, unless that
 output arrived in a result you were given. If you have not emitted the tag
@@ -47,12 +53,12 @@ This is not a chat interface with a tool API that might be switched off. The
 XML tags are the interface, they are always available, and nothing in a turn
 can disable them. So do not say a dispatcher is unavailable, that tools cannot
 be invoked here, that XML calls cannot be emitted in this interface, or that an
-operation is impossible from inside a reply. If you can write the tag, you can
-run it, and writing it is the whole mechanism.
+operation is impossible from inside a reply. If you can put the tag in
+`syscall`, you can run it, and calling `syscall` is the whole mechanism.
 
 Announcing an action and then declining it in the same reply is the failure to
 avoid. If you write that you are about to read a file, trace a path, or switch
-a model, the tag for it belongs in that same reply. Either emit the tag or do
+a model, the `syscall` call belongs in that same response. Either call it or do
 not announce the action.
 
 A reply with no tags ends the step -- the harness reads "no syscalls" as "the
@@ -246,11 +252,29 @@ def _blocks_from_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
             )
         elif kind == "message":
             text = "".join(
-                part.get("text") or ""
+                (part.get("text") if part.get("type") in {"output_text", "text"} else part.get("refusal"))
+                or ""
                 for part in item.get("content") or []
-                if isinstance(part, dict) and part.get("type") in {"output_text", "text"}
+                if isinstance(part, dict)
+                and part.get("type") in {"output_text", "text", "refusal"}
             )
-            blocks.append({"type": "text", "text": text, "openai": item})
+            # sol splits a turn into a `commentary` preamble and a
+            # `final_answer`. Carrying the phase through means the harness can
+            # tell narration from answer instead of seeing one fused blob.
+            block = {"type": "text", "text": text, "openai": item}
+            if item.get("phase"):
+                block["phase"] = item["phase"]
+            blocks.append(block)
+        elif kind == "custom_tool_call" and item.get("name") == "syscall":
+            blocks.append(
+                {
+                    "type": "custom_tool_call",
+                    "name": "syscall",
+                    "call_id": item.get("call_id") or "",
+                    "input": item.get("input") or "",
+                    "openai": item,
+                }
+            )
         elif kind == "compaction":
             blocks.append({"type": COMPACT_BLOCK, "summary": item.get("summary") or "", "openai": item})
         else:
@@ -297,7 +321,22 @@ def apply_stream_event(
         if on_event is not None:
             on_event({"kind": "thinking_delta", "text": "\n\n"})
         return
+    if kind == "response.reasoning_text.delta":
+        # Not the same event as the summary. Models that return reasoning text
+        # verbatim (rather than a summarised paragraph) emit only this one, and
+        # ignoring it left the thinking pane empty while tokens were billed.
+        chunk = ev.get("delta") or ""
+        if chunk and on_event is not None:
+            on_event({"kind": "thinking_delta", "text": chunk})
+        return
     if kind == "response.output_text.delta":
+        chunk = ev.get("delta") or ""
+        if chunk and on_event is not None:
+            on_event({"kind": "text_delta", "text": chunk})
+        return
+    if kind == "response.refusal.delta":
+        # A refusal is the answer, not an error. Dropped, the turn looked like
+        # an empty reply and the loop treated it as "the model is done".
         chunk = ev.get("delta") or ""
         if chunk and on_event is not None:
             on_event({"kind": "text_delta", "text": chunk})
