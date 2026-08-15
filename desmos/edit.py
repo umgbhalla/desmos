@@ -45,13 +45,21 @@ def apply_edit(path: str, old_str: str, new_str: str, *, cwd: Path | None = None
     # copy of what it used to be. resolve() first, or os.replace would swap a
     # symlink for a regular file instead of editing what it points at.
     target = filepath.resolve()
+    data = next_text.encode("utf-8")
     tmp = target.with_name(f".{target.name}.desmos-{os.getpid()}")
     try:
-        tmp.write_bytes(next_text.encode("utf-8"))
+        tmp.write_bytes(data)
         shutil.copymode(target, tmp)
         os.replace(tmp, target)
-    finally:
+    except OSError:
+        # The rename needs a temp file next to the target, which a read-only
+        # directory will not have, and it gives the file a new inode: mode is
+        # carried across, hard links, xattrs, ACLs and ownership are not.
+        # Writing in place keeps all of those and the inode, and gives up the
+        # crash-safety -- so it is the fallback, not the default. If this write
+        # fails too, that error is the real one and it propagates.
         tmp.unlink(missing_ok=True)
+        target.write_bytes(data)
     return f"Edited {target}"
 
 

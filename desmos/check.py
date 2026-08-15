@@ -120,7 +120,55 @@ def _check_vendor_patch() -> None:
         )
 
 
+PINNED_MODEL = "claude-opus-5"
+
+
 def self_check() -> None:
+    """The floor, run against a fixed model on a machine with no settings.
+
+    Two doors let the developer's own configuration into this run. `session/new`
+    applies the user's saved ~/.desmos/settings.json to the world it hands
+    back, and `World.model` defaults to $DESMOS_MODEL -- so anyone whose last
+    switch() was to an OpenAI model ran the whole check in a dialect the fake
+    responses here are not written in (loop.turn does not scan XML out of
+    openai speech), and it failed for reasons that had nothing to do with the
+    thing being checked. Point both at a file this process wrote.
+    """
+    import json as _json
+    import os as _os
+    import tempfile
+
+    from desmos import acp as _acp, const as _const, types as _types
+
+    with tempfile.TemporaryDirectory() as home:
+        pin = Path(home) / "settings.json"
+        pin.write_text(
+            _json.dumps({"provider": "anthropic", "model": PINNED_MODEL, "effort": "low"}),
+            encoding="utf-8",
+        )
+        env = {"DESMOS_SETTINGS": str(pin), "DESMOS_MODEL": PINNED_MODEL}
+        old_env = {k: _os.environ.get(k) for k in env}
+        # DEFAULT_MODEL is read from the environment at import, which already
+        # happened, so the constant has to be pinned as well as the variable.
+        # Every module that reads it by name gets the same value.
+        mods = (_const, _types, _acp)
+        old_default = [m.DEFAULT_MODEL for m in mods]
+        _os.environ.update(env)
+        for mod in mods:
+            mod.DEFAULT_MODEL = PINNED_MODEL
+        try:
+            _run_checks()
+        finally:
+            for key, value in old_env.items():
+                if value is None:
+                    _os.environ.pop(key, None)
+                else:
+                    _os.environ[key] = value
+            for mod, was in zip(mods, old_default):
+                mod.DEFAULT_MODEL = was
+
+
+def _run_checks() -> None:
     import tempfile
 
     with tempfile.TemporaryDirectory() as tmp:
@@ -543,6 +591,30 @@ def self_check() -> None:
         # half the command ran and the rest became residue nobody read.
         nested = scan('<bash>echo "<bash>inner</bash>" && ls</bash>')
         assert [b.body for b in nested] == ['echo "<bash>inner</bash>" && ls'], nested
+        # The indented-code rule measures from the *content* column of the list
+        # item, not from column 0. A wrapped bullet indents its continuation,
+        # so a four-space call under it read as a code sample and the command
+        # the model asked for never ran.
+        wrapped = scan("- step one\n  continued here\n\n    <bash>ls</bash>")
+        assert [(b.tag, b.body) for b in wrapped] == [("bash", "ls")], wrapped
+        numbered = scan("1. step one\n   continued here\n\n    <bash>ls</bash>")
+        assert [(b.tag, b.body) for b in numbered] == [("bash", "ls")], numbered
+        # ... and a sample that really is deeper than the content column stays
+        # a sample, or the rule has just been deleted.
+        assert scan("- step one\n  continued here\n\n      <bash>ls</bash>") == []
+        # An opener quoted inside a body inflates the nesting count, so a
+        # stray same-name closer later in the message looked like the real
+        # end. The body then swallowed every call in between -- for <bash>,
+        # narration ran as shell.
+        swallow = scan(
+            '<python>t = "<python>"</python>\n<bash>ls</bash>\n'
+            "the closer is </python> by the way\n<bash>pwd</bash>"
+        )
+        assert [(b.tag, b.body) for b in swallow] == [
+            ("python", 't = "<python>"'),
+            ("bash", "ls"),
+            ("bash", "pwd"),
+        ], swallow
 
         lone = scan("<usage/>\n<reload/>\n<reload_sdk/>\n<rollback n=\"1\"/>\n<skill name=\"ping\"/>")
         assert [b.tag for b in lone] == ["usage", "reload", "reload_sdk", "rollback", "skill"]
@@ -625,6 +697,44 @@ def self_check() -> None:
         disabled_path = cwd / "disabled.sqlite3"
         new_world(cwd, state_path=disabled_path, persist=False)
         assert not disabled_path.exists()
+
+        # What a Ctrl+C leaves behind: a step is [prompt, assistant, result,
+        # assistant ...] and the stop note is a second user message straight
+        # after the last result. A turn_aligned that searched *forward* for
+        # that two-user pair to find a turn boundary landed on the stop note
+        # itself and persisted one message out of 124 -- the session gone, at
+        # the exact moment the user interrupted it. Alignment may widen past
+        # the flat tail; it may never cut below it, and the head it lands on
+        # has to be a user message or Anthropic rejects the next request.
+        from desmos.persist import KEEP_MESSAGES, save as _save_world, turn_aligned
+
+        interrupted = []
+        for i in range(31):
+            interrupted.append({"role": "user", "content": f"prompt {i}"})
+            interrupted.append({"role": "assistant", "content": f"<bash>echo {i}</bash>"})
+            interrupted.append({"role": "user", "content": f'<result tag="bash">{i}</result>'})
+            interrupted.append({"role": "assistant", "content": f"ran {i}"})
+        interrupted.append({"role": "user", "content": '<result tag="bash">last</result>'})
+        interrupted.append({"role": "user", "content": "[stopped by the user after turn 1]"})
+        for shape in (interrupted, interrupted[:-1], interrupted[:-2], interrupted[2:]):
+            aligned = turn_aligned(shape)
+            assert len(aligned) >= min(len(shape), KEEP_MESSAGES), (
+                f"alignment cut below the flat tail: {len(shape)} -> {len(aligned)}"
+            )
+            assert aligned[0]["role"] == "user", aligned[0]
+
+        stop_path = cwd / "interrupted.sqlite3"
+        stopped_world = new_world(cwd, state_path=stop_path)
+        stopped_world.messages = list(interrupted)
+        _save_world(stopped_world)
+        reloaded_stop = new_world(cwd, state_path=stop_path)
+        assert len(reloaded_stop.messages) >= KEEP_MESSAGES, (
+            f"a save/load round trip kept {len(reloaded_stop.messages)} of {len(interrupted)}"
+        )
+        assert reloaded_stop.messages == interrupted[-len(reloaded_stop.messages):], (
+            "the tail came back reordered or rewritten"
+        )
+        assert reloaded_stop.messages[0]["role"] == "user", reloaded_stop.messages[0]
 
         def fake_complete(model, system, messages, max_tokens):
             blob = __import__("json").dumps(messages)
@@ -1389,6 +1499,21 @@ def self_check() -> None:
             assert "who?" in asked and "still running" in asked, asked
             assert sh("desmos").strip() == "hi desmos", "the answer reached the waiting program"
             assert sh("echo recovered").strip() == "recovered", "and the shell came back"
+            # A command that never came back to a prompt has not finished, and
+            # it usually has not printed anything yet either. Answering that
+            # with "(no output)" is a lie the model acts on: it reads a command
+            # that ran and printed nothing, and moves on while the build is
+            # still going.
+            stuck = sh("sleep 5", id="stuck", timeout="1")
+            assert "(no output)" not in stuck and "still running" in stuck, stuck
+            # Same for the lines behind it: they were never written to the tty,
+            # so reporting the block as finished claims they ran. Ask the disk
+            # rather than the wording -- the second line leaves a file if it
+            # ever reached bash.
+            unsent = cwd / "second-line-ran"
+            queued = sh(f"sleep 5\ntouch {unsent}", id="queued", timeout="1")
+            assert not unsent.exists(), "a line the shell never got was reported as run"
+            assert "(no output)" not in queued and "still running" in queued, queued
             assert w_sh.shells, "sessions live on the world"
         finally:
             _close_shells(w_sh)
@@ -1469,7 +1594,23 @@ def self_check() -> None:
         assert scoped_file.read_text(encoding="utf-8") == "alpha\n", (
             f"a read-capability child edited a file on disk: {denied!r}"
         )
-        assert "edit" not in child.allowed_tags, child.allowed_tags
+        from desmos.dispatch import scope_of
+
+        assert "edit" not in (scope_of(child) or ()), scope_of(child)
+        # The scope cannot live on the World. bind_step -- which the loop runs
+        # before the child's first turn -- publishes the World into the very ns
+        # its <python> executes in, and <python> is a capability every persona
+        # has. As an attribute, one assignment from the child turned off the
+        # gate that assignment was under, and the <edit> refused a line earlier
+        # went through.
+        bind_step(child)
+        assert child.ns.get("world") is child
+        assert dispatch(child, Block("python", "world.allowed_tags = None", {})) == "ok"
+        assert "edit" not in (scope_of(child) or ()), scope_of(child)
+        disarmed = dispatch(child, Block("edit", "alpha\n---\nBETA", {"path": str(scoped_file)}))
+        assert scoped_file.read_text(encoding="utf-8") == "alpha\n", (
+            f"a child disarmed its own scope from <python>: {disarmed!r}"
+        )
         # Same gate, harness-level tags: a note written here would outlive the
         # child in the prompt the parent's own turn reads back.
         dispatch(child, Block("system", "pwn", {"name": "pwn-note"}))
@@ -1650,6 +1791,33 @@ def self_check() -> None:
         assert all(n["params"].get("_meta", {}).get("promptId") == "p-check" for n in notes if n.get("method") == "session/update")
         tool = next(n["params"]["update"] for n in notes if n.get("method") == "session/update" and n["params"]["update"]["sessionUpdate"] == "tool_call")
         assert tool["title"] == "python" and tool["kind"] == "execute"
+
+        # The pager opens a second session on the same cwd for every new
+        # thread. Sessions on one workspace share the World -- persist keys its
+        # rows off the cwd, so two of them take turns overwriting each other's
+        # ns, notes and tools -- but they must not share the transcript: the
+        # shared messages list put this session's prompt and reply verbatim
+        # into the next session's model call.
+        second = acp.handle({"jsonrpc": "2.0", "id": 12, "method": "session/new", "params": {"cwd": str(cwd)}})
+        sid2 = second["result"]["sessionId"]
+        assert acp.sessions[sid2] is acp.sessions[sid], "one world per workspace"
+        seen_prompts: list[str] = []
+
+        def watching(_model, _system, messages, _max_tokens):
+            seen_prompts.append(json.dumps(messages))
+            return {"content": [{"type": "text", "text": "ok"}], "usage": {}}
+
+        acp.sessions[sid2].complete_fn = watching
+        answered = acp.handle({
+            "jsonrpc": "2.0",
+            "id": 13,
+            "method": "session/prompt",
+            "params": {"sessionId": sid2, "prompt": [{"type": "text", "text": "second thread"}]},
+        })
+        assert answered["result"] == {"stopReason": "end_turn"}, answered
+        assert seen_prompts, "the second session never reached the model"
+        assert "add one" not in seen_prompts[0], seen_prompts[0][:400]
+        assert "second thread" in seen_prompts[0], seen_prompts[0][:400]
 
         # --- auth: file schema, credential precedence, masking (no network) ---
         import base64

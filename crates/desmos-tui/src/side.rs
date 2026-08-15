@@ -81,6 +81,16 @@ pub struct GitPane {
     pending: Option<Receiver<GitSnap>>,
     last: Option<Instant>,
     cwd: PathBuf,
+    /// Reads begun, ever. A caller that has just changed the repo needs to
+    /// know *which* read will see the change: the one already in flight
+    /// started before the change and does not count.
+    started: u64,
+    /// `started` at the moment `snap`'s read began.
+    snap_at: u64,
+    /// A forced read arrived while one was in flight. Dropping it silently is
+    /// how the work row ended up printing a pre-commit tail over a run that
+    /// committed; instead the next drain starts one more.
+    again: bool,
 }
 
 /// How often a visible git pane re-reads the repository. A status call on a
@@ -99,6 +109,9 @@ impl GitPane {
             pending: None,
             last: None,
             cwd: cwd.to_path_buf(),
+            started: 0,
+            snap_at: 0,
+            again: false,
         }
     }
 
@@ -180,15 +193,29 @@ impl GitPane {
         self.scroll = self.scroll.min(max);
     }
 
-    /// Start a read if one is due. `force` is the `r` key.
-    pub fn poll(&mut self, force: bool) {
+    /// Start a read if one is due. `force` is the `r` key, and a syscall
+    /// result that just changed the checkout.
+    ///
+    /// Answers with the generation of the first read that will see the
+    /// repository as it is at this call — compare it against [`Self::snap_gen`]
+    /// to tell a snapshot that observed your change from one that predates it.
+    /// A read already in flight began earlier, so it is never that read; a
+    /// forced call behind one queues another rather than being dropped.
+    pub fn poll(&mut self, force: bool) -> u64 {
         if self.pending.is_some() {
-            return;
+            self.again |= force;
+            return self.started + 1;
         }
         let due = self.last.is_none_or(|t| t.elapsed() >= REFRESH);
         if !(force || due) {
-            return;
+            // Nothing scheduled; the next timer read is the one that sees now.
+            return self.started + 1;
         }
+        self.start();
+        self.started
+    }
+
+    fn start(&mut self) {
         self.last = Some(Instant::now());
         let (tx, rx) = channel();
         let cwd = self.cwd.clone();
@@ -196,6 +223,19 @@ impl GitPane {
             let _ = tx.send(read_repo(&cwd));
         });
         self.pending = Some(rx);
+        self.started += 1;
+    }
+
+    /// Honour a forced read that arrived while one was already in flight.
+    fn restart(&mut self) {
+        if std::mem::take(&mut self.again) {
+            self.start();
+        }
+    }
+
+    /// The generation of the read `snap` came from. Zero until one lands.
+    pub fn snap_gen(&self) -> u64 {
+        self.snap_at
     }
 
     /// True when a read landed and the pane needs a repaint.
@@ -209,11 +249,16 @@ impl GitPane {
                 let len = self.rows().len();
                 self.sel = self.sel.min(len.saturating_sub(1));
                 self.pending = None;
+                self.snap_at = self.started;
+                self.restart();
                 true
             }
             Err(TryRecvError::Empty) => false,
             Err(TryRecvError::Disconnected) => {
+                // The worker died without sending. No snapshot, so `snap_at`
+                // stays where it was: nothing here observed anything.
                 self.pending = None;
+                self.restart();
                 true
             }
         }
@@ -527,6 +572,49 @@ impl FilePane {
 mod tests {
     use super::*;
 
+    /// A forced read behind one already in flight used to be dropped on the
+    /// floor. That is the `git commit` case: the commit's own read never runs,
+    /// the pre-commit snapshot lands instead, and the work row reports the
+    /// tree as it was before the run finished it.
+    #[test]
+    fn a_forced_read_behind_one_in_flight_is_not_lost() {
+        let dir = std::env::temp_dir().join("desmos-git-gen-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(
+            Command::new("git")
+                .args(["init", "-q"])
+                .current_dir(&dir)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let mut g = GitPane::new(&dir);
+        let first = g.poll(true);
+        assert_eq!(first, 1, "the read this call started");
+        let second = g.poll(true);
+        assert_eq!(
+            second, 2,
+            "a read already running began before the change; it cannot answer for it"
+        );
+
+        let settle = |g: &mut GitPane| {
+            for _ in 0..2000 {
+                if g.drain() {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            panic!("read never landed");
+        };
+        settle(&mut g);
+        assert_eq!(g.snap_gen(), first);
+        assert!(g.snap_gen() < second, "still owed the forced read");
+        settle(&mut g);
+        assert_eq!(g.snap_gen(), second, "the queued read ran on its own");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn tabs_wrap_both_ways_and_reset_the_cursor() {
         let mut g = GitPane::new(Path::new("."));
@@ -556,6 +644,36 @@ mod tests {
         g.select(-19);
         g.clamp(5);
         assert_eq!((g.sel, g.scroll), (0, 0));
+    }
+
+    /// The pane keeps `CAP` rows; the work row prints a count of files. Those
+    /// are two different numbers, and reusing the row count for the count made
+    /// a tree of 250 changed files read "199 files dirty" forever.
+    #[test]
+    fn the_dirty_count_is_not_the_row_cap() {
+        let dir = std::env::temp_dir().join("desmos-git-cap-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(
+            Command::new("git")
+                .args(["init", "-q"])
+                .current_dir(&dir)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let n = CAP + 50;
+        for i in 0..n {
+            std::fs::write(dir.join(format!("f{i}.txt")), "x").unwrap();
+        }
+        let snap = read_repo(&dir);
+        assert_eq!(snap.error, None);
+        assert_eq!(snap.status.len(), CAP, "the pane still holds only CAP rows");
+        assert_eq!(snap.dirty, n, "every changed file is counted");
+        let mut pane = GitPane::new(&dir);
+        pane.snap = snap;
+        assert_eq!(pane.dirty(), Some(n));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
