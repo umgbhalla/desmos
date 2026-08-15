@@ -232,6 +232,13 @@ def self_check() -> None:
             assert not reminder_responses
         finally:
             subagents.wait(timeout=5, poll=0.01)
+            # Every spawn above registered a settle notice on `parent`, and
+            # pending buckets by id(world): once this local world is freed, a
+            # later world can reuse its address and inherit the undelivered
+            # tasks — parallel_tool_check's notice count flaked exactly there.
+            from desmos.agents import pending as _pending
+
+            _pending.clear(parent)
             subagents.RUNS.clear()
             subagents.DIR = old_dir
             subagents.set_emitter(old_emitter)

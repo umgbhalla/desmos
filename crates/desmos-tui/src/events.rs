@@ -11,8 +11,25 @@ use xai_grok_pager::scrollback::{DisplayMode, RenderBlock, ScrollbackState};
 
 use crate::{
     App, ExecStream, PostArgs, StreamCursor, call_target, looks_failed, result_block, set_wire_mode,
-    strip_syscalls, wire_push,
+    wire_push,
 };
+
+/// The kernel's syscall spans off a `complete` event: UTF-8 byte ranges of the
+/// final speech that were dispatched (kernel/loop.py, Phase 3). None when the
+/// field is absent or malformed -- the stream cursor then falls back to its
+/// own grammar, same as on a turn that never completed.
+pub(crate) fn kernel_spans(ev: &Value) -> Option<Vec<(usize, usize)>> {
+    let arr = ev.get("spans")?.as_array()?;
+    let mut out = Vec::with_capacity(arr.len());
+    for pair in arr {
+        let pair = pair.as_array()?;
+        if pair.len() != 2 {
+            return None;
+        }
+        out.push((pair[0].as_u64()? as usize, pair[1].as_u64()? as usize));
+    }
+    Some(out)
+}
 
 /// Compact one-line title for a spawn: first non-empty line, parenthesised
 /// asides (usually an absolute path) dropped, first sentence only, capped so
@@ -86,6 +103,17 @@ pub(crate) fn subagent_verdict(ev: &Value) -> String {
     String::new()
 }
 
+/// The kernel's tree coordinates for one child (Phase 3): `parent` is the
+/// spawning run's id (null for a root spawn), `depth` its nesting level.
+fn set_tree(child: &mut crate::ChildSess, ev: &Value) {
+    if let Some(p) = ev.get("parent").and_then(Value::as_str) {
+        child.parent = Some(p.to_string());
+    }
+    if let Some(d) = ev.get("depth").and_then(Value::as_u64) {
+        child.depth = d;
+    }
+}
+
 pub(crate) fn handle_subagent(app: &mut App, ev: &Value) {
     let phase = ev.get("phase").and_then(Value::as_str).unwrap_or("");
     let id = ev.get("id").and_then(Value::as_str).unwrap_or("");
@@ -110,7 +138,9 @@ pub(crate) fn handle_subagent(app: &mut App, ev: &Value) {
             let block = SubagentBlock::started(&title, id, agent, persona, None, model, true);
             let eid = app.sess.story.push_block(RenderBlock::Subagent(block));
             app.sess.story.set_last_running(true);
-            app.ensure_child(id, &title).parent_entry = Some(eid);
+            let child = app.ensure_child(id, &title);
+            child.parent_entry = Some(eid);
+            set_tree(child, ev);
         }
         "progress" => {
             let stage = ev.get("stage").and_then(Value::as_str);
@@ -191,7 +221,9 @@ pub(crate) fn handle_child(app: &mut App, ev: &Value) {
         return;
     }
     let kind = ev.get("kind").and_then(Value::as_str).unwrap_or("");
-    app.ensure_child(id, "");
+    // Every child envelope carries the tree fields, so a session attached
+    // after the `started` event still learns where this child hangs.
+    set_tree(app.ensure_child(id, ""), ev);
     // A subagent's tokens are billed to the same key, so they belong in the
     // money row — they were spent and shown nowhere. Totals only: the context
     // and TTL bars describe the parent's transcript, not this child's.
@@ -235,7 +267,14 @@ pub(crate) fn handle_child(app: &mut App, ev: &Value) {
             }
         }
         "complete" => {
-            child.sess.stream.finish(&mut child.sess.story, &mut child.sess.calls);
+            match kernel_spans(ev) {
+                Some(spans) => child.sess.stream.finish_reconciled(
+                    &mut child.sess.story,
+                    &mut child.sess.calls,
+                    &spans,
+                ),
+                None => child.sess.stream.finish(&mut child.sess.story, &mut child.sess.calls),
+            }
             finish_exec(&mut child.sess.calls, &mut child.sess.exec);
             let n = ev.get("n").and_then(Value::as_u64).unwrap_or(0);
             let origin = ev.get("origin").and_then(Value::as_str).unwrap_or("llm");
@@ -341,6 +380,16 @@ pub(crate) fn handle_event(app: &mut App, ev: Value) {
             let phase = ev.get("phase").and_then(Value::as_str).unwrap_or("done");
             if phase != "start" && phase != "delta" {
                 let tag = ev.get("tag").and_then(Value::as_str).unwrap_or("?");
+                // The commit claim is the kernel's (result.repo.committed, set
+                // only when the command's own output named the sha). The row
+                // never again attributes a commit from a HEAD-snapshot diff.
+                if let Some(sha) = ev
+                    .get("repo")
+                    .and_then(|r| r.get("committed"))
+                    .and_then(Value::as_str)
+                {
+                    app.sess.stream.run.commit(sha);
+                }
                 // Every edit detail has one home: Activity. Do not duplicate
                 // either its diff card or an `edit xN` work row in Story.
                 if tag != "edit" {
@@ -391,7 +440,17 @@ pub(crate) fn handle_event(app: &mut App, ev: Value) {
             app.notify("context folded");
         }
         "complete" => {
-            app.sess.stream.finish(&mut app.sess.story, &mut app.sess.calls);
+            // The event that closes a turn's speech. Its `spans` are the
+            // kernel's dispatch verdict; reconcile the story against them
+            // instead of re-deriving with the local grammar.
+            match kernel_spans(&ev) {
+                Some(spans) => app.sess.stream.finish_reconciled(
+                    &mut app.sess.story,
+                    &mut app.sess.calls,
+                    &spans,
+                ),
+                None => app.sess.stream.finish(&mut app.sess.story, &mut app.sess.calls),
+            }
             finish_exec(&mut app.sess.calls, &mut app.sess.exec);
             let n = ev.get("n").and_then(Value::as_u64).unwrap_or(0);
             let origin = ev.get("origin").and_then(Value::as_str).unwrap_or("llm");
@@ -587,24 +646,19 @@ pub(crate) fn apply_thinking(
 }
 
 pub(crate) fn apply_speech(
-    story: &mut ScrollbackState,
+    _story: &mut ScrollbackState,
     activity: &mut ScrollbackState,
     stream: &mut StreamCursor,
     text: &str,
-    delta: bool,
+    _delta: bool,
 ) {
-    if delta {
-        stream.finish_think(activity);
-        stream.speech_raw.push_str(text);
-        return;
-    }
+    // Delta or whole, speech buffers until its turn closes: the unstreamed
+    // replay (kernel/loop.py fires one whole `speech` when nothing streamed)
+    // is followed by the same `complete` event as the delta path, and that
+    // event's kernel spans -- not the local grammar -- decide what of this
+    // text is prose. Finalizing here would decide one message early.
     stream.finish_think(activity);
-    stream.finish_speech(story);
-    // The story carries prose. A syscall goes to the calls pane, body and all.
-    let spoken = strip_syscalls(text);
-    if !spoken.trim().is_empty() {
-        story.push_block(RenderBlock::agent_message(spoken));
-    }
+    stream.speech_raw.push_str(text);
 }
 
 /// Plain-language story row for a fold. The wire card is evidence; this is the

@@ -141,6 +141,99 @@ def check() -> None:
         )
         S.set_emitter(None)
 
+        # --- the tree on the wire: a spawn inside a spawn records parent/depth.
+        # Three levels through the real pool with scripted complete_fns: the
+        # root spawns level-a; level-a's speech spawns level-b from a fresh
+        # thread (the code's documented route past the thread-local depth cap,
+        # whose semantics stay untouched until Phase 4's 2.1) handing spawn()
+        # its own world — _execute tags each child world with the run it
+        # executes; level-b does the same for level-c. The grandchild must
+        # record the child as its parent at depth 2 in RUNS, in the persisted
+        # record, and on every emitted subagent/child event.
+        import json
+        import os
+        import time
+
+        nest = (
+            "<python>\n"
+            "import threading\n"
+            "import desmos.agents.subagent as S\n"
+            "t = threading.Thread(target=lambda: S.spawn({task!r}, "
+            'agent="explore", model="claude-opus-5", parent=world, '
+            "_register_pending=False))\n"
+            "t.start(); t.join()\n"
+            'print("spawned")\n'
+            "</python>"
+        )
+
+        def tree_complete(_model, _system, messages, _max_tokens):
+            if any(m.get("role") == "assistant" for m in messages):
+                text = "settled"  # the turn after a syscall result
+            elif "level-a" in json.dumps(messages):
+                text = "spawning b\n" + nest.format(task="level-b nest")
+            elif "level-b" in json.dumps(messages):
+                text = "spawning c\n" + nest.format(task="level-c leaf")
+            else:
+                text = "leaf ok"
+            return {"content": [{"type": "text", "text": text}], "usage": {}}
+
+        evs_tree: list[dict] = []
+        S.set_emitter(evs_tree.append)
+        tree_root = new_world(cwd, state_path=None, persist=False)
+        tree_root.complete_fn = tree_complete
+        prev_dir = Path.cwd()
+        os.chdir(cwd)  # S.DIR is relative: keep .desmos/subagents in the tmp
+        try:
+            aid = S.spawn(
+                "level-a nest",
+                agent="explore",
+                model="claude-opus-5",
+                parent=tree_root,
+                _register_pending=False,
+            )
+
+            def by_task(task: str):
+                return next((r for r in S.RUNS.values() if r.task == task), None)
+
+            deadline = time.time() + 30.0
+            while time.time() < deadline:
+                grand = by_task("level-c leaf")
+                if grand is not None and grand.state not in ("pending", "running"):
+                    break
+                time.sleep(0.05)
+            a, b, c = S.RUNS[aid], by_task("level-b nest"), by_task("level-c leaf")
+            assert b is not None and c is not None, sorted(r.task for r in S.RUNS.values())
+            S.wait(aid, b.id, c.id, timeout=30.0)
+            assert (a.state, b.state, c.state) == ("done",) * 3, (
+                a.brief(), b.brief(), c.brief(),
+            )
+            assert a.parent is None and a.depth == 0, (a.parent, a.depth)
+            assert b.parent == aid and b.depth == 1, (b.parent, b.depth, aid)
+            assert c.parent == b.id and c.depth == 2, (c.parent, c.depth, b.id)
+            # Both emitters carry the tree: every subagent phase and every
+            # child envelope for the grandchild names the child at depth 2.
+            grand_sub = [
+                e for e in evs_tree if e.get("ev") == "subagent" and e.get("id") == c.id
+            ]
+            grand_child = [
+                e for e in evs_tree if e.get("ev") == "child" and e.get("id") == c.id
+            ]
+            assert grand_sub and grand_child, "the grandchild never reached the wire"
+            for e in grand_sub + grand_child:
+                assert e["parent"] == b.id and e["depth"] == 2, e
+            root_started = next(
+                e
+                for e in evs_tree
+                if e.get("ev") == "subagent" and e.get("phase") == "started" and e.get("id") == aid
+            )
+            assert root_started["parent"] is None and root_started["depth"] == 0, root_started
+            # Late-attach reconstruction reads the persisted record, not RUNS.
+            rec = json.loads((S.DIR / f"{c.id}.json").read_text(encoding="utf-8"))
+            assert rec["parent"] == b.id and rec["depth"] == 2, rec
+        finally:
+            os.chdir(prev_dir)
+            S.set_emitter(None)
+
         from desmos.checks import pending_check, subagent_check
 
         subagent_check.self_check()

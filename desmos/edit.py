@@ -10,6 +10,7 @@ from desmos.kernel.edit import *  # noqa: F401,F403
 __all__ = [
     "Path",
     "apply_edit",
+    "apply_edit_line",
     "handle",
     "parse_edit_body",
     "run",

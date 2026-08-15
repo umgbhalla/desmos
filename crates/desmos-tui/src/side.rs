@@ -123,16 +123,6 @@ impl GitPane {
         self.snap.error.as_deref()
     }
 
-    /// Short HEAD sha from the last read — `git log --oneline` starts at HEAD.
-    /// None until a read has landed, or in a repo with no commits.
-    pub fn head(&self) -> Option<&str> {
-        self.snap
-            .log
-            .first()
-            .map(|r| r.mark.as_str())
-            .filter(|s| !s.is_empty())
-    }
-
     /// Files with changes at the last read, None until one has landed. Counts
     /// what porcelain reported, not the `CAP` rows the pane kept.
     pub fn dirty(&self) -> Option<usize> {

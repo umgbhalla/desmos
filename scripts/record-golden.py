@@ -10,6 +10,11 @@ dict, one JSON object per line, to golden/<scenario>.jsonl.
 
 normalize_event() is the one normalization function, used at record time here
 and importable for compare time elsewhere.
+
+Coverage note: `login` is the one loop/bridge event kind the corpus cannot
+carry — it is emitted only by the bridge's interactive OAuth flow
+(front/bridge.py), which needs a browser. It stays covered by the live-bridge
+half of checks/conformance.py's vocabulary, not by a fixture.
 """
 
 from __future__ import annotations
@@ -34,6 +39,11 @@ for _key in [k for k in os.environ if k.startswith("DESMOS_")]:
 _HOME = tempfile.mkdtemp(prefix="desmos-golden-home-")
 os.environ["HOME"] = _HOME
 os.environ["DESMOS_SETTINGS"] = str(Path(_HOME) / "settings.json")
+# The commit scenario runs real git. Pin it off the machine's config (system
+# gitconfig, XDG paths) so hooks, signing, or a renamed default branch cannot
+# reshape the recorded output.
+os.environ["GIT_CONFIG_NOSYSTEM"] = "1"
+os.environ["GIT_CONFIG_GLOBAL"] = str(Path(_HOME) / "gitconfig-empty")
 
 MODEL = "claude-opus-5"
 OPENAI_MODEL = "gpt-5.6-sol"
@@ -55,6 +65,10 @@ _SCRUBS = [
     (re.compile(r"\b[0-9a-f]{32}\b"), "<UUID>"),
     # every temp dir this script makes carries this marker in its name
     (re.compile(r"/[^\s\"':]*?desmos-golden-[0-9A-Za-z_-]+"), "<TMP>"),
+    # git's commit summary line names the new short sha, which differs on
+    # every run: `[main (root-commit) abc1234] msg`. Before the <RID> rule so
+    # an 8-char sha cannot be half-claimed by it.
+    (re.compile(r"(\[[^\n\]]+ )[0-9a-f]{7,40}(\])"), r"\g<1><SHA>\g<2>"),
     # subagent run ids (uuid4().hex[:8])
     (re.compile(r"\b[0-9a-f]{8}\b"), "<RID>"),
     # durations in pending summaries / settle lines
@@ -88,6 +102,10 @@ def _walk(obj, key):
     if isinstance(obj, list):
         return [_walk(v, None) for v in obj]
     if isinstance(obj, str):
+        # result.repo.committed is a bare short sha with no bracket context
+        # for the text scrub to key on.
+        if key == "committed":
+            return "<SHA>"
         return _scrub(obj)
     if key == "secs" and isinstance(obj, (int, float)):
         return 0.0
@@ -103,6 +121,12 @@ def R(*blocks, stop="end_turn"):
 
 def text(t):
     return {"type": "text", "text": t}
+
+
+def think(t):
+    # A signature is what makes assistant_content keep the block as thinking
+    # rather than demoting it to text (transport/complete.py).
+    return {"type": "thinking", "thinking": t, "signature": "sig"}
 
 
 def scripted(script):
@@ -158,6 +182,45 @@ def multi(tmp):
 
 
 @scenario
+def thinking(tmp):
+    # The unstreamed replay path: a stub never streams, so the thinking block
+    # is fired whole from thought_blocks (kernel/loop.py), no delta field.
+    return {
+        "prompt": "Think first, then answer.",
+        "script": [R(think("Weighing the greeting."), text("Hello, after some thought."))],
+    }
+
+
+@scenario
+def compacted(tmp):
+    # A server-side fold: the response carries a compaction block, so the loop
+    # fires the compacted event with the block's summary.
+    return {
+        "prompt": "Carry on after the fold.",
+        "script": [
+            R(
+                {"type": "compaction", "summary": "folded: the early turns greeted and ran setup"},
+                text("Continuing from the fold."),
+            )
+        ],
+    }
+
+
+@scenario
+def guidance(tmp):
+    # on_continue fires between turns while the model keeps calling syscalls;
+    # the reminder goes into the transcript and out as the guidance event.
+    return {
+        "prompt": "Do one step, take the reminder, then finish.",
+        "script": [
+            R(text("Step one.\n<python>2 + 2</python>")),
+            R(text("Finished after the reminder.")),
+        ],
+        "on_continue": lambda n: "guidance: stay on the task and finish",
+    }
+
+
+@scenario
 def edit(tmp):
     (tmp / "target.txt").write_text("hello world\n", encoding="utf-8")
     return {
@@ -165,6 +228,27 @@ def edit(tmp):
         "script": [
             R(text('<edit path="target.txt">hello\n---\ngoodbye</edit>')),
             R(text("Replaced hello with goodbye.")),
+        ],
+    }
+
+
+@scenario
+def commit(tmp):
+    # A real git commit through the real loop: the kernel judges the claim
+    # from the command's own output, so the first result done event carries
+    # repo.committed (sha normalized to <SHA>) and the second — same command
+    # shape, nothing staged, exit 1 — carries no repo field at all.
+    import subprocess
+
+    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=tmp, check=True)
+    (tmp / "f.txt").write_text("one\n", encoding="utf-8")
+    git_commit = "git -c user.name=g -c user.email=g@x commit"
+    return {
+        "prompt": "Commit the file, try to commit again, then report.",
+        "script": [
+            R(text(f"<bash>git add f.txt && {git_commit} -m add-f</bash>")),
+            R(text(f"<bash>{git_commit} -m nothing-staged</bash>")),
+            R(text("One commit made; the second had nothing to commit.")),
         ],
     }
 
@@ -188,7 +272,14 @@ def spawn(tmp):
         "prompt": "Spawn a child that composes a greeting, then report.",
         "script": [
             R(text("Spawning.\n<python>\n" + body + "\n</python>")),
-            R(text("Hello from the child.")),  # the child's one turn
+            # The child's turns: a thinking block plus a syscall (child kinds
+            # thinking and result), then a raising turn (child kind error --
+            # the loop turns it into a value and returns the last speech).
+            # The syscall must be <bash>: a child <python> queues on the
+            # kernel's stdio-redirect lock, which the parent's own <python>
+            # holds while it sits in wait(rid), and times out.
+            R(think("Choosing a friendly tone."), text("Composing.\n<bash>echo hi</bash>")),
+            _raise_turn_two,
             R(text("Child finished; waiting on its notice.")),
             R(text("All done.")),  # after the pending notice resumes the step
         ],
@@ -280,6 +371,7 @@ def run_scenario(name):
             quiet=True,
             on_event=emit,
             should_stop=should_stop,
+            on_continue=spec.get("on_continue"),
             max_tokens=8192,
         )
     finally:

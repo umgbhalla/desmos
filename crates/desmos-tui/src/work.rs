@@ -48,22 +48,22 @@ pub(crate) fn call_target(tag: &str, ev: &Value) -> Option<String> {
 /// What the repo looks like at the seam, where prose starts.
 ///
 /// A run of invisible work is worth reading precisely because it changed
-/// something on disk, and the reader should not have to go look. A moved HEAD
-/// is the headline; otherwise the dirty count is.
+/// something on disk, and the reader should not have to go look. A commit the
+/// kernel reported (`result.repo.committed` — the syscall's own output named
+/// the sha) is the headline; otherwise the dirty count is.
 ///
-/// Read from the git pane's background snapshot. This used to fork
-/// `git rev-parse` plus `git status --porcelain` on the UI thread, from a
-/// function called after every syscall result and every finished thought —
-/// 0.28s warm per status call in this repo, seconds of frozen frame in a
-/// burst. The snapshot is stale by as much as one read, so a syscall result
-/// forces a fresh one and [`WorkRun::settle`] rewrites the row when it lands:
-/// the run's last call is usually the one that mattered, and `fold` runs the
-/// moment prose starts, well before the pane's own 4s timer comes round.
-fn git_tail(git: &side::GitPane, head_at_start: Option<&str>) -> Option<String> {
-    if let (Some(before), Some(now)) = (head_at_start, git.head()) {
-        if before != now {
-            return Some(format!("\u{00b7} committed {now}"));
-        }
+/// The dirty count is read from the git pane's background snapshot. This used
+/// to fork `git rev-parse` plus `git status --porcelain` on the UI thread,
+/// from a function called after every syscall result and every finished
+/// thought — 0.28s warm per status call in this repo, seconds of frozen frame
+/// in a burst. The snapshot is stale by as much as one read, so a syscall
+/// result forces a fresh one and [`WorkRun::settle`] rewrites the row when it
+/// lands. The commit claim never comes from that snapshot: comparing HEAD
+/// before/after raced the pane's worker and could attribute another
+/// terminal's commit to this run.
+fn git_tail(committed: Option<&str>, git: &side::GitPane) -> Option<String> {
+    if let Some(sha) = committed {
+        return Some(format!("\u{00b7} committed {sha}"));
     }
     match git.dirty()? {
         0 => Some("\u{00b7} tree clean".into()),
@@ -94,8 +94,9 @@ pub(crate) struct WorkRun {
     segs: Vec<Seg>,
     /// Thought blocks to fold away once the row replaces them.
     thoughts: Vec<EntryId>,
-    /// HEAD when the run opened, to spot a commit at the seam.
-    head_at_start: Option<String>,
+    /// Short sha of the last commit the kernel reported in this run
+    /// (`result.repo.committed`). The row's claim, never a HEAD-snapshot diff.
+    committed: Option<String>,
     /// The repo tail for this run, built from the git pane's background
     /// snapshot as events arrive. `sync` cannot reach the pane — it is called
     /// from deep inside the stream cursor — and it must not shell out itself.
@@ -106,10 +107,10 @@ pub(crate) struct WorkRun {
     /// Generation of the first git read that will see what the run's last
     /// syscall did — [`side::GitPane::poll`]'s answer, taken at the result.
     pub(crate) fresh_gen: u64,
-    /// The row a fold just closed: its id, its sentence, the HEAD the run
-    /// opened on, and the read generation its tail is owed. Held until a read
-    /// that old lands, because the tail written at the fold came from a
-    /// snapshot older than the run's last syscall.
+    /// The row a fold just closed: its id, its sentence, the commit the
+    /// kernel reported for it, and the read generation its tail is owed. Held
+    /// until a read that old lands, because the dirty count written at the
+    /// fold came from a snapshot older than the run's last syscall.
     pub(crate) settled: Option<(EntryId, String, Option<String>, u64)>,
 }
 
@@ -121,14 +122,16 @@ impl WorkRun {
     /// Take the repo state the git pane read on its worker thread. Called as
     /// events arrive, which is where `app.git` is reachable.
     pub(crate) fn note_repo(&mut self, git: &side::GitPane) {
-        // Until the run makes its first syscall nothing it did can have moved
-        // HEAD, so every read that lands before then is a better "before" than
-        // the one held. Pinning the first snapshot instead blamed this run for
-        // a commit another terminal made in the previous refresh window.
-        if self.calls() == 0 {
-            self.head_at_start = git.head().map(str::to_string);
-        }
-        self.tail = git_tail(git, self.head_at_start.as_deref());
+        self.tail = git_tail(self.committed.as_deref(), git);
+    }
+
+    /// The kernel reported a commit on a result event (`repo.committed`).
+    /// This is the only way the row earns a "committed" claim; the tail is
+    /// rewritten at once so the next sync paints it without waiting for a
+    /// git-pane read.
+    pub(crate) fn commit(&mut self, sha: &str) {
+        self.committed = Some(sha.to_string());
+        self.tail = Some(format!("\u{00b7} committed {sha}"));
     }
 
     pub(crate) fn call(&mut self, tag: &str, target: Option<String>) {
@@ -189,7 +192,7 @@ impl WorkRun {
             self.settled = Some((
                 id,
                 work_sentence(&self.segs),
-                self.head_at_start.clone(),
+                self.committed.clone(),
                 self.fresh_gen,
             ));
         }
@@ -199,20 +202,20 @@ impl WorkRun {
     /// Rewrite the folded row's tail from a git read that saw the run's last
     /// syscall.
     ///
-    /// This is the `git commit` case: the run's last syscall moves HEAD, prose
-    /// starts a fraction of a second later and folds the row from the snapshot
-    /// that preceded the commit, and without this the reader is left with
-    /// "· 4 files dirty" over a run that committed. Waiting on the generation
-    /// rather than on "the next read to land" is the difference between fixing
-    /// that and printing a second pre-commit answer: when the commit landed
-    /// behind a read already in flight, the next snapshot to arrive is the one
-    /// that started too early.
+    /// The dirty count is the racy part: the run's last syscall touches the
+    /// tree, prose starts a fraction of a second later and folds the row from
+    /// the snapshot that preceded it. Waiting on the generation rather than on
+    /// "the next read to land" matters because when the change landed behind a
+    /// read already in flight, the next snapshot to arrive is the one that
+    /// started too early. The commit claim needs no wait — it is the kernel's
+    /// verdict, carried through the fold — but the row still deserves the
+    /// fresh read when there is none.
     pub(crate) fn settle(&mut self, story: &mut ScrollbackState, git: &side::GitPane) {
-        let Some((id, sentence, head, need)) = self.settled.take() else {
+        let Some((id, sentence, committed, need)) = self.settled.take() else {
             return;
         };
-        if git.snap_gen() < need {
-            self.settled = Some((id, sentence, head, need));
+        if committed.is_none() && git.snap_gen() < need {
+            self.settled = Some((id, sentence, committed, need));
             return;
         }
         let Some(entry) = story.get_by_id_mut(id) else {
@@ -220,7 +223,7 @@ impl WorkRun {
         };
         entry.block = RenderBlock::system(row_line(
             &sentence,
-            git_tail(git, head.as_deref()).as_deref(),
+            git_tail(committed.as_deref(), git).as_deref(),
         ));
         story.mark_structurally_dirty(id);
         story.mark_height_dirty(id);
@@ -230,7 +233,7 @@ impl WorkRun {
         self.fresh_gen = 0;
         self.segs.clear();
         self.thoughts.clear();
-        self.head_at_start = None;
+        self.committed = None;
         self.tail = None;
         self.row = None;
     }

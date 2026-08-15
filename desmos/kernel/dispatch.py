@@ -6,7 +6,7 @@ from inspect import signature
 from typing import Any, Callable, Iterable
 
 from desmos.kernel.const import FROZEN
-from desmos.kernel.edit import apply_edit, parse_edit_body
+from desmos.kernel.edit import apply_edit, apply_edit_line, parse_edit_body  # noqa: F401  (apply_edit: facade re-export)
 from desmos.kernel.exec import register_tag, run_bash, run_python
 from desmos.kernel.const import RESULT_CAP
 from desmos.kernel.spill import spill
@@ -100,6 +100,7 @@ def dispatch(
     *,
     on_chunk: Callable[[str], None] | None = None,
     should_stop: Callable[[], bool] | None = None,
+    meta: dict[str, Any] | None = None,
 ) -> str:
     # Before the hooks and before the frozen chain: a denied tag must not reach
     # third-party code and must not run. Refuse in prose, never raise -- a raise
@@ -150,7 +151,13 @@ def dispatch(
         return run_shell(world, block.body, block.attrs, on_chunk=on_chunk)
     if block.tag == "edit":
         old, new = parse_edit_body(block.body, block.attrs)
-        return apply_edit(block.attrs.get("path", ""), old, new, cwd=world.cwd)
+        msg, line = apply_edit_line(block.attrs.get("path", ""), old, new, cwd=world.cwd)
+        # meta is the caller's out-channel for facts only the syscall can know
+        # at run time; the loop lifts them onto the result done event. A failed
+        # edit has no edit site, so it sets nothing.
+        if meta is not None and line is not None:
+            meta["line"] = line
+        return msg
     if block.tag == "register":
         return register_tag(world, block.body, block.attrs.get("name", ""), block.attrs.get("doc", ""))
     if block.tag == "system":

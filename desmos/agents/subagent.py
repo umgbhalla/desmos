@@ -135,6 +135,12 @@ class Run:
     cfg: EffectiveConfig
     contract: TaskContract | None = None
     structured: bool = False
+    # Tree coordinates, fixed at spawn time from the spawning run: `parent` is
+    # that run's id (None when the root world spawned this run) and `depth` is
+    # spawner.depth + 1 (root spawns are 0). Recorded and emitted here; budget
+    # semantics stay on _DEPTH until Phase 4's 2.1.
+    parent: str | None = None
+    depth: int = 0
     state: str = "pending"  # pending | running | done | stopped | failed
     stage: str = "queued"
     progress: str = ""
@@ -379,6 +385,8 @@ def _execute(run: Run, parent: Any) -> None:
                 "ev": "subagent",
                 "phase": "progress",
                 "id": run.id,
+                "parent": run.parent,
+                "depth": run.depth,
                 "task": run.task,
                 "stage": run.stage,
                 "progress": run.progress,
@@ -394,6 +402,10 @@ def _execute(run: Run, parent: Any) -> None:
             run.contract if run.structured else None,
             todo_actor=run.id,
         )
+        # The world remembers which run it executes. spawn() reads this off the
+        # `parent` world it is handed, so a nested spawn lands in the tree with
+        # the spawning run as parent and its depth + 1.
+        w.subagent_run = run.id
         if run.cfg.context == "resumed" and run.messages:
             w.messages = list(run.messages)
 
@@ -421,7 +433,16 @@ def _execute(run: Run, parent: Any) -> None:
                     run.progress = f"ignored unknown {tag} tag"
                 publish_progress()
             payload = {k: v for k, v in ev.items() if k != "ev"}
-            _emit({"ev": "child", "id": run.id, "kind": kind, **payload})
+            _emit(
+                {
+                    "ev": "child",
+                    "id": run.id,
+                    "parent": run.parent,
+                    "depth": run.depth,
+                    "kind": kind,
+                    **payload,
+                }
+            )
 
         def guidance_after_turn(n: int) -> str | None:
             interval = run.cfg.guidance_every_turns
@@ -533,6 +554,8 @@ def _execute(run: Run, parent: Any) -> None:
                 "ev": "subagent",
                 "phase": run.state,
                 "id": run.id,
+                "parent": run.parent,
+                "depth": run.depth,
                 "task": run.task,
                 "stage": run.stage,
                 "progress": run.progress,
@@ -618,12 +641,18 @@ def spawn(
     # Raises on a contract whose tool scope and capability do not overlap, here
     # rather than in the pool thread that would otherwise build the world.
     _scoped_tags(cfg.capability, contract if structured else None)
+    # The spawning run, read off the world this spawn was handed: _execute tags
+    # each child world with the run it executes. The root world carries no tag,
+    # so a root spawn records parent=None at depth 0.
+    spawner = RUNS.get(getattr(parent, "subagent_run", None) or "")
     run = Run(
         id=uuid.uuid4().hex[:8],
         task=contract.objective,
         cfg=cfg,
         contract=contract,
         structured=structured,
+        parent=spawner.id if spawner is not None else None,
+        depth=spawner.depth + 1 if spawner is not None else 0,
     )
     if resume:
         src = RUNS.get(resume)
@@ -640,6 +669,8 @@ def spawn(
             "ev": "subagent",
             "phase": "started",
             "id": run.id,
+            "parent": run.parent,
+            "depth": run.depth,
             "agent": cfg.agent,
             "persona": cfg.persona or "",
             "task": run.task,

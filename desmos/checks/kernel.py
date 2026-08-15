@@ -337,6 +337,98 @@ def check() -> None:
                 data = str(block.get("data") or "")
         assert data == "[redacted]" or data == ""
 
+        # complete.spans is the kernel's dispatch verdict, consumed by the
+        # TUI's turn-end reconcile: UTF-8 byte offsets into the final speech.
+        # The multibyte char ahead of the call catches an emitter that ships
+        # scan_spans' char offsets unconverted -- slicing the encoded speech
+        # must give back exactly the dispatched call, and each result event
+        # must name which span it came from.
+        span_speech = "héllo <bash>echo spanned</bash> done"
+
+        def spans_complete(_model, _system, _messages, _max_tokens, _c=[0]):
+            _c[0] += 1
+            text = span_speech if _c[0] == 1 else "all prose"
+            return {"content": [{"type": "text", "text": text}], "usage": {}}
+
+        w_sp = new_world(cwd, state_path=cwd / "harness-spans.json", ns={})
+        w_sp.complete_fn = spans_complete
+        evs_sp: list[dict] = []
+        _run(w_sp, "hi", quiet=True, on_event=lambda e: evs_sp.append(e))
+        completes = [e for e in evs_sp if e.get("ev") == "complete"]
+        ((a, z),) = completes[0]["spans"]
+        sliced = span_speech.encode("utf-8")[a:z].decode("utf-8")
+        assert sliced == "<bash>echo spanned</bash>", sliced
+        for phase in ("start", "done"):
+            (r,) = [e for e in evs_sp if e.get("ev") == "result" and e.get("phase") == phase]
+            assert r.get("span_idx") == 0, r
+        assert completes[1]["spans"] == [], "pure prose must advertise no spans"
+
+        # The edit result event carries the edit site: the 1-based line of the
+        # unique match, located by apply_edit at write time. The TUI paints the
+        # diff there from the event alone -- it no longer reads the file back,
+        # so a kernel that stops sending `line` un-anchors every edit card.
+        # A refused edit has no edit site and must not send one.
+        edited = cwd / "lined.txt"
+        edited.write_text("one\ntwo\nfindme three\nfour\n", encoding="utf-8")
+
+        def edit_complete(_model, _system, _messages, _max_tokens, _c=[0]):
+            _c[0] += 1
+            if _c[0] == 1:
+                return {
+                    "content": [{"type": "text", "text": '<edit path="lined.txt">findme three\n---\nfound three</edit>'}],
+                    "usage": {},
+                }
+            if _c[0] == 2:
+                return {
+                    "content": [{"type": "text", "text": '<edit path="lined.txt">absent\n---\nx</edit>'}],
+                    "usage": {},
+                }
+            return {"content": [{"type": "text", "text": "done"}], "usage": {}}
+
+        w_el = new_world(cwd, state_path=cwd / "harness-editline.json", ns={})
+        w_el.complete_fn = edit_complete
+        evs_el: list[dict] = []
+        _run(w_el, "edit it", quiet=True, on_event=lambda e: evs_el.append(e))
+        good, bad = [e for e in evs_el if e.get("ev") == "result" and e.get("phase") == "done"]
+        assert good.get("line") == 3, good
+        assert edited.read_text(encoding="utf-8").splitlines()[2] == "found three"
+        assert "line" not in bad, "a failed edit has no edit site to name"
+
+        # The commit claim on the result event is the kernel's verdict, judged
+        # from the command's own output: a real `git commit` through the real
+        # loop puts `repo.committed` on the done event and the sha is the
+        # repo's actual HEAD; a commit that fails (nothing staged) claims
+        # nothing, however git-shaped the command text is. The TUI's work row
+        # paints "committed <sha>" from this field alone.
+        import subprocess as _sp
+        repo = cwd / "gitrepo"
+        repo.mkdir()
+        _sp.run(["git", "init", "-q", "-b", "main"], cwd=repo, check=True)
+        (repo / "c.txt").write_text("v1\n", encoding="utf-8")
+        _git_commit = "git -c user.name=d -c user.email=d@x -c commit.gpgsign=false commit"
+
+        def commit_complete(_model, _system, _messages, _max_tokens, _c=[0]):
+            _c[0] += 1
+            if _c[0] == 1:
+                text = f"<bash>git add c.txt && {_git_commit} -m claim</bash>"
+            elif _c[0] == 2:
+                text = f"<bash>{_git_commit} -m nothing</bash>"
+            else:
+                text = "done"
+            return {"content": [{"type": "text", "text": text}], "usage": {}}
+
+        w_gc = new_world(repo, state_path=cwd / "harness-commit.json", ns={})
+        w_gc.complete_fn = commit_complete
+        evs_gc: list[dict] = []
+        _run(w_gc, "commit it", quiet=True, on_event=lambda e: evs_gc.append(e))
+        made, refused = [e for e in evs_gc if e.get("ev") == "result" and e.get("phase") == "done"]
+        claim = (made.get("repo") or {}).get("committed") or ""
+        head_sha = _sp.run(
+            ["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True, check=True
+        ).stdout.strip()
+        assert len(claim) >= 7 and head_sha.startswith(claim), (claim, head_sha)
+        assert "repo" not in refused, "a failed commit must not claim a sha"
+
         handshake = cwd / "go"
         chunks: list[str] = []
 

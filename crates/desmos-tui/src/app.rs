@@ -343,6 +343,15 @@ impl Sess {
 pub(crate) struct ChildSess {
     pub(crate) sess: Sess,
     pub(crate) parent_entry: Option<EntryId>,
+    /// Tree coordinates off the wire (every `subagent`/`child` event carries
+    /// them, Phase 3): the spawning run's id — `None` when the root world
+    /// spawned this child — and its nesting depth (root spawns are 0). Stored
+    /// here so the Phase 4 tree view (upgrade-paths 3.2) has the tree; nothing
+    /// renders them yet.
+    #[allow(dead_code)]
+    pub(crate) parent: Option<String>,
+    #[allow(dead_code)]
+    pub(crate) depth: u64,
 }
 
 /// Grok text selection for one scrollback (drag, persist, double-click word).
@@ -585,6 +594,8 @@ impl App {
                 ChildSess {
                     sess,
                     parent_entry: None,
+                    parent: None,
+                    depth: 0,
                 },
             );
         }

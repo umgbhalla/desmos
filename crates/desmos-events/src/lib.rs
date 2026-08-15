@@ -70,7 +70,20 @@ pub struct Current {
     pub effort: String,
 }
 
+/// `result.repo` — tag=bash/shell only, and only when the command's own output
+/// carried git's commit summary line (kernel/loop.py `committed_sha`). A failed
+/// commit produces no field at all, never an empty object.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Repo {
+    pub committed: String,
+}
+
 /// `result` — kernel/loop.py emits three phase shapes with different field sets.
+/// `span_idx` (Phase 3) is the call's position in its turn's dispatch order:
+/// `complete.spans[span_idx]` is the stretch of speech it came from when that
+/// list is non-empty (Anthropic family); start/done always carry it, delta
+/// stays minimal.
 #[derive(Debug, Deserialize)]
 #[serde(tag = "phase", rename_all = "lowercase", deny_unknown_fields)]
 pub enum ResultEvent {
@@ -79,6 +92,7 @@ pub enum ResultEvent {
         attrs: BTreeMap<String, String>,
         body: String,
         text: String, // always ""
+        span_idx: u64,
     },
     Delta {
         tag: String,
@@ -90,16 +104,29 @@ pub enum ResultEvent {
         attrs: BTreeMap<String, String>,
         body: String,
         text: String,
+        span_idx: u64,
+        /// tag=edit only, and only on success: 1-based line of the unique
+        /// match, located by kernel/edit.py at write time.
+        line: Option<u64>,
+        /// tag=bash/shell only, and only when the output proved a commit.
+        repo: Option<Repo>,
     },
 }
 
 /// `subagent` — agents/subagent.py emits started / progress / terminal, where the
 /// terminal phase is `run.state`: only ever `done` or `failed`.
+///
+/// Phase 3 tree fields, on every phase: `parent` is the spawning run's id
+/// (null when the root world spawned this run) and `depth` is the spawner's
+/// depth + 1 (root spawns are 0). Both are always written, so absence is drift.
 #[derive(Debug, Deserialize)]
 #[serde(tag = "phase", rename_all = "lowercase", deny_unknown_fields)]
 pub enum SubagentEvent {
     Started {
         id: String,
+        #[serde(deserialize_with = "required_nullable")]
+        parent: Option<String>,
+        depth: u64,
         agent: String,
         persona: String,
         task: String,
@@ -108,6 +135,9 @@ pub enum SubagentEvent {
     },
     Progress {
         id: String,
+        #[serde(deserialize_with = "required_nullable")]
+        parent: Option<String>,
+        depth: u64,
         task: String,
         stage: String,
         progress: String,
@@ -123,6 +153,9 @@ pub enum SubagentEvent {
 #[serde(deny_unknown_fields)]
 pub struct SubagentTerminal {
     pub id: String,
+    #[serde(deserialize_with = "required_nullable")]
+    pub parent: Option<String>,
+    pub depth: u64,
     pub task: String,
     pub stage: String,
     pub progress: String,
@@ -136,18 +169,25 @@ pub struct SubagentTerminal {
 }
 
 /// `child` — the child's whole event stream re-enveloped as
-/// `{ev:"child", id, kind: <inner ev>, **inner fields minus ev}`
-/// (agents/subagent.py:423-424). Every loop kind is forwarded, so every loop kind
-/// must parse here, including the ones handle_child drops.
+/// `{ev:"child", id, parent, depth, kind: <inner ev>, **inner fields minus ev}`
+/// (agents/subagent.py). Every loop kind is forwarded, so every loop kind
+/// must parse here, including the ones handle_child drops. The envelope stamps
+/// the Phase 3 tree fields (`parent`, `depth`) on every kind.
 #[derive(Debug, Deserialize)]
 #[serde(tag = "kind", rename_all = "lowercase", deny_unknown_fields)]
 pub enum ChildEvent {
     Turn {
         id: String,
+        #[serde(deserialize_with = "required_nullable")]
+        parent: Option<String>,
+        depth: u64,
         n: i64,
     },
     Post {
         id: String,
+        #[serde(deserialize_with = "required_nullable")]
+        parent: Option<String>,
+        depth: u64,
         n: i64,
         origin: Origin,
         model: String,
@@ -155,6 +195,9 @@ pub enum ChildEvent {
     },
     Complete {
         id: String,
+        #[serde(deserialize_with = "required_nullable")]
+        parent: Option<String>,
+        depth: u64,
         n: i64,
         origin: Origin,
         model: String,
@@ -163,78 +206,122 @@ pub enum ChildEvent {
         redacted: i64,
         usage: Obj,
         residue: String,
+        spans: Vec<(u64, u64)>,
         request: Obj,
         response: Obj,
     },
     Thinking {
         id: String,
+        #[serde(deserialize_with = "required_nullable")]
+        parent: Option<String>,
+        depth: u64,
         redacted: bool,
         text: String,
         delta: Option<bool>,
     },
     Speech {
         id: String,
+        #[serde(deserialize_with = "required_nullable")]
+        parent: Option<String>,
+        depth: u64,
         text: String,
         delta: Option<bool>,
     },
     Result(ChildResult),
     Error {
         id: String,
+        #[serde(deserialize_with = "required_nullable")]
+        parent: Option<String>,
+        depth: u64,
         text: String,
         n: Option<i64>,
     },
     Done {
         id: String,
+        #[serde(deserialize_with = "required_nullable")]
+        parent: Option<String>,
+        depth: u64,
     },
     Stopped {
         id: String,
+        #[serde(deserialize_with = "required_nullable")]
+        parent: Option<String>,
+        depth: u64,
         text: String,
     },
     Compacted {
         id: String,
+        #[serde(deserialize_with = "required_nullable")]
+        parent: Option<String>,
+        depth: u64,
         n: i64,
         kept: i64,
         text: String,
     },
     Pending {
         id: String,
+        #[serde(deserialize_with = "required_nullable")]
+        parent: Option<String>,
+        depth: u64,
         n: i64,
     },
     Resumed {
         id: String,
+        #[serde(deserialize_with = "required_nullable")]
+        parent: Option<String>,
+        depth: u64,
         n: i64,
         text: String,
     },
     Guidance {
         id: String,
+        #[serde(deserialize_with = "required_nullable")]
+        parent: Option<String>,
+        depth: u64,
         n: i64,
         text: String,
     },
 }
 
-/// A child's `result` event: ResultEvent's shapes plus the envelope `id`.
+/// A child's `result` event: ResultEvent's shapes plus the envelope
+/// `id`/`parent`/`depth`.
 #[derive(Debug, Deserialize)]
 #[serde(tag = "phase", rename_all = "lowercase", deny_unknown_fields)]
 pub enum ChildResult {
     Start {
         id: String,
+        #[serde(deserialize_with = "required_nullable")]
+        parent: Option<String>,
+        depth: u64,
         tag: String,
         attrs: BTreeMap<String, String>,
         body: String,
         text: String,
+        span_idx: u64,
     },
     Delta {
         id: String,
+        #[serde(deserialize_with = "required_nullable")]
+        parent: Option<String>,
+        depth: u64,
         tag: String,
         delta: bool,
         text: String,
     },
     Done {
         id: String,
+        #[serde(deserialize_with = "required_nullable")]
+        parent: Option<String>,
+        depth: u64,
         tag: String,
         attrs: BTreeMap<String, String>,
         body: String,
         text: String,
+        span_idx: u64,
+        /// tag=edit only, on success (same field the parent shape carries).
+        line: Option<u64>,
+        /// tag=bash/shell only, on a proven commit (same as the parent shape).
+        repo: Option<Repo>,
     },
 }
 
@@ -300,6 +387,9 @@ pub enum Event {
         redacted: i64,
         usage: Obj,
         residue: String, // dead but produced
+        /// Phase 3: UTF-8 byte ranges of the final speech that were dispatched
+        /// as calls; the story pane's turn-end reconcile strips exactly these.
+        spans: Vec<(u64, u64)>,
         request: Obj,
         response: Obj,
     },

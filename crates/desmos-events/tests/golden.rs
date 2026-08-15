@@ -35,7 +35,7 @@ fn every_golden_line_parses() {
             lines += 1;
         }
     }
-    assert_eq!(fixtures, 7, "expected the 7 recorded scenarios");
+    assert_eq!(fixtures, 11, "expected the 11 recorded scenarios");
     assert!(lines > 0, "golden fixtures were empty");
 }
 
@@ -70,6 +70,41 @@ fn unknown_ev_kind_is_rejected() {
     ] {
         assert!(parse(line).is_err(), "accepted unknown kind: {line}");
     }
+}
+
+/// Phase 3 tree fields are required, not optional: every recorded `subagent`
+/// and `child` line carries `parent` + `depth`, and the same line with either
+/// field deleted is rejected. Fails if the producer stops stamping the
+/// envelope or the enum quietly demotes the fields to defaulted options.
+#[test]
+fn subagent_and_child_lines_require_parent_and_depth() {
+    let text = std::fs::read_to_string(golden_dir().join("spawn.jsonl")).unwrap();
+    let mut checked = 0;
+    for line in text.lines().filter(|l| !l.trim().is_empty()) {
+        let obj: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(line).unwrap();
+        if !matches!(
+            obj.get("ev").and_then(|e| e.as_str()),
+            Some("subagent") | Some("child")
+        ) {
+            continue;
+        }
+        assert!(parse(line).is_ok(), "fixture line must parse clean: {line}");
+        for field in ["parent", "depth"] {
+            let mut doctored = obj.clone();
+            assert!(
+                doctored.remove(field).is_some(),
+                "recorded line stopped carrying {field}: {line}"
+            );
+            let doctored = serde_json::to_string(&doctored).unwrap();
+            assert!(
+                parse(&doctored).is_err(),
+                "a line missing {field} was accepted: {doctored}"
+            );
+        }
+        checked += 1;
+    }
+    assert!(checked > 0, "spawn.jsonl carried no subagent/child lines");
 }
 
 /// Per-phase field sets hold: a field from one phase smuggled onto another is

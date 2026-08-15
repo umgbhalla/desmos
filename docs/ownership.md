@@ -16,9 +16,9 @@ will arrive as; the first four are the moves ordered by upgrade-paths.md.
 
 | Fact | Rust computes it today | Kernel already knows it | Phase 3 field |
 |---|---|---|---|
-| Syscall span classification (which stretch of streamed speech is a call, not prose) | `main.rs:6181 spoken_prefix`, `main.rs:6775 strip_syscalls`, `main.rs:6658 next_tag`, `main.rs:6706 find_close`, `main.rs:6726 in_string` — a full port of kernel/scan.py's grammar, run per frame on the stream | `kernel/scan.py:228 scan`, `kernel/scan.py:259 scan_spans`, `kernel/scan.py:133 _in_string`; the loop computes the authoritative blocks per turn at `kernel/loop.py:287-298` | `spans` on the turn-end/`result` event; TUI keeps only a conservative mid-stream hold and reconciles |
-| `<edit>` card start line | `main.rs:7255 edit_start_line` re-reads the target file (`std::fs::read_to_string`, `main.rs:7259`) and searches for the unique match; wrong answer whenever the file changed again before the event painted | `kernel/edit.py:29-34 apply_edit` locates the unique occurrence at write time (`content.count` / `content.replace`) | `line` on the edit `result` event |
-| Work-row commit attribution ("· committed abc123") | `main.rs:633 git_tail` + `main.rs:709 note_repo` + `main.rs:796 settle` compare HEAD snapshots from the git pane worker (`side.rs:269` forks `git`), generation-gated because the snapshot races the commit | the kernel ran the syscall and holds its result: `kernel/loop.py:342-351` (result done), exit code written by `kernel/shell.py:232` | repo claim on the `result` event; the git *pane* stays a Rust-side environment viewer |
+| Syscall span classification (which stretch of streamed speech is a call, not prose) | **MOVED (Phase 3).** The grammar port (`stream.rs spoken_prefix` / `strip_syscalls` / `next_tag` / `find_close` / `in_string`) is now mid-stream hold and stop/error fallback only; a completed turn is reconciled from the kernel's verdict (`stream.rs finish_speech_spans`, consumed via `events.rs kernel_spans`) | `kernel/scan.py scan_spans` is the one scan; `kernel/loop.py` converts its char offsets to UTF-8 bytes and emits them where speech is final | landed as `spans` on `complete` (byte ranges of the final speech that dispatched) + `span_idx` on `result` start/done (index into that turn's dispatch order = into `spans` when non-empty) |
+| `<edit>` card start line | **MOVED (Phase 3).** `edit_start_line` (the `fs::read_to_string` + whole-file search) is deleted; `main.rs result_block` reads `line` off the event and `wire_syscall` anchors the diff there. No field → no hunks, no invented anchor (failed edit, start phase) | `kernel/edit.py apply_edit_line` locates the unique occurrence at write time and returns its 1-based line; `kernel/dispatch.py` lifts it into the dispatch `meta` out-channel; `kernel/loop.py` spreads `meta` onto the result done event | landed as `line` on the edit `result` done event (success only — a refused edit has no edit site) |
+| Work-row commit attribution ("· committed abc123") | **MOVED (Phase 3).** The HEAD-snapshot dance (`work.rs head_at_start` + the `git_tail` before/after compare, racing the git pane worker) is deleted; `events.rs` reads `repo.committed` off the result done event into `work.rs WorkRun::commit`, and the row claims a commit only when the kernel reported one. The dirty-count tail still reads the pane snapshot (generation-gated in `settle`); the git *pane* stays a Rust-side environment viewer | `kernel/loop.py committed_sha` judges from what the kernel alone holds — the command text and its output: a successful `git commit` names the short sha in its summary line, a failed one prints no such line, so a failed commit cannot claim | landed as `repo: {committed}` on the bash/shell `result` done event (present only when the output proved a commit) |
 | Cost and cache savings | `main.rs:1152 model_price` (hardcoded $/Mtok table), `main.rs:1265 bill`, `main.rs:1281` cost formula, 0.1x/1.25x/2x cache multipliers | kernel holds the usage (`kernel/loop.py:213-223`, emitted on `complete` at `kernel/loop.py:280`) but has no price table; Rust is the single implementation | stays in Rust while it remains the single implementation (upgrade-paths Phase 0) |
 | Syscall failure classification (red card or not) | `main.rs:7303 looks_failed` greps result text for `Traceback`/`SyntaxError`/`exit `; `main.rs:7216 edit_failed` greps for `error`/`no match`/…; applied at `main.rs:6312` and `main.rs:7145,7174` | the kernel produced the failure: `kernel/shell.py:232` appends `[exit N]`, `kernel/loop.py:340` captures the traceback as the result, `kernel/edit.py:11-42` returns `edit failed: …` strings | `ok`/`exit` on the `result` done event. (Latent bug the move erases: shell writes `[exit N]`, `looks_failed` tests `starts_with("exit ")` — brackets never match.) |
 | Edit body split into old/new | `main.rs:7232 split_edit_body` re-parses the `---` body, silently treating a no-separator body as pure insertion | `kernel/edit.py:66 parse_edit_body` is the authority and *rejects* ambiguous bodies the Rust splitter accepts | `old`/`new` (or hunks) on the edit `result` event |
@@ -139,6 +139,7 @@ produced by transport/complete.py:396-413 and transport/openai.py:392-418 and co
 | `redacted` | int | kernel/loop.py:279 | main.rs:2711 |
 | `usage` | obj | kernel/loop.py:280 | main.rs:2705-2706 (`cache.observe`); child bill main.rs:2503-2506; agents/subagent.py:410-412 |
 | `residue` | str | kernel/loop.py:281 | **nobody** (dead) |
+| `spans` | [[int,int]] | kernel/loop.py (byte-converted from `scan_spans(speech)` just above the fire; empty on the OpenAI family, whose calls ride the tool channel) | events.rs `kernel_spans` → stream.rs `finish_speech_spans` (turn-end story reconcile) |
 | `request` | obj | kernel/loop.py:282 | main.rs:2707-2708 (`observe_roles`), 2716 |
 | `response` | obj | kernel/loop.py:283 | main.rs:2717 |
 
@@ -151,6 +152,9 @@ produced by transport/complete.py:396-413 and transport/openai.py:392-418 and co
 | `body` | str (clipped) | start, done | main.rs:605, 7048 |
 | `text` | str | start(`""`), delta, done(clipped) | main.rs:6294, 6301; front/acp.py:344 |
 | `delta` | bool? | delta phase only (kernel/loop.py:321) | **nobody** (dead; `phase` decides) |
+| `span_idx` | int | start, done — the call's position in its turn's dispatch order; `complete.spans[span_idx]` is its speech range when that list is non-empty | typed in desmos-events; TUI correlation consumer pending (the reconcile strips whole turns, not per card) |
+| `line` | int? | done, tag=edit, success only — 1-based line of the unique match, located by kernel/edit.py `apply_edit_line` at write time and lifted through dispatch's `meta` out-channel | main.rs `result_block` → `wire_syscall` anchors the diff hunks; absent means the card carries no hunks and claims no line |
+| `repo` | obj? `{committed: str}` | done, tag=bash/shell, only when the command's own output carried git's commit summary line (kernel/loop.py `committed_sha` — command text and output both required, so a failed commit never claims) | events.rs → work.rs `WorkRun::commit`: the work row's "· committed <sha>" tail; absent means the row makes no commit claim |
 
 ### `turn` — kernel/loop.py:509
 | field | type | produced | consumed |
@@ -190,20 +194,32 @@ paints nothing in the TUI for either transition.
 Three shapes, keyed by `phase`. Consumer: main.rs:2624 → `handle_subagent`
 (main.rs:2395); check.py:1729 reads phases.
 
-`phase:"started"` — agents/subagent.py:638-649:
+Every phase carries the Phase 3 tree fields, fixed at spawn time from the
+spawning run (`Run.parent`/`Run.depth`, agents/subagent.py): `parent` is the
+spawner's run id — null when the root world spawned it — and `depth` is
+spawner depth + 1 (root spawns are 0). `_persist(run)` writes both, so
+late-attach reconstruction has the tree. Consumer: events.rs `set_tree` →
+`ChildSess.parent`/`ChildSess.depth` (stored for the Phase 4 tree view 3.2;
+nothing renders them yet).
+
+`phase:"started"` — agents/subagent.py `spawn()`:
 | field | type | consumed |
 |---|---|---|
 | `id` | str (8-hex) | main.rs:2397 |
+| `parent` | str\|null | events.rs `set_tree` → `ChildSess.parent` |
+| `depth` | int | events.rs `set_tree` → `ChildSess.depth` |
 | `agent` | str | main.rs:2404 |
 | `persona` | str | main.rs:2405-2409 |
 | `task` | str | main.rs:2403 (→ `task_title`) |
 | `structured` | bool | **nobody** (dead) |
 | `model` | str | main.rs:2410-2414 |
 
-`phase:"progress"` — agents/subagent.py:377-388 (`publish_progress`):
+`phase:"progress"` — agents/subagent.py (`publish_progress`):
 | field | type | consumed |
 |---|---|---|
 | `id` | str | main.rs:2397 |
+| `parent` | str\|null | **nobody on this phase** (set_tree reads started + child envelopes; required by the enum) |
+| `depth` | int | same |
 | `task` | str | **nobody on this phase** (dead) |
 | `stage` | str | main.rs:2422 |
 | `progress` | str | main.rs:2365-2372 (`subagent_status`) |
@@ -217,6 +233,8 @@ speculative branch until Track 3 interventions exist.
 | field | type | consumed |
 |---|---|---|
 | `id` | str | main.rs:2397 |
+| `parent` | str\|null | **nobody on this phase** (same as progress) |
+| `depth` | int | same |
 | `task` | str | **nobody on this phase** (dead) |
 | `stage` | str | main.rs:2382-2390 (verdict fallback) |
 | `progress` | str | main.rs:2365-2372 |
@@ -228,14 +246,16 @@ speculative branch until Track 3 interventions exist.
 | `result` | str (clipped :800) | **nobody** (dead) |
 | `error` | str\|null | main.rs:2441-2445, 2483-2487 |
 
-### `child` — agents/subagent.py:423-424
-`{ev:"child", id: run.id, kind: <inner ev>, **inner fields minus ev}` — the
-child's whole event stream re-enveloped. Consumer: main.rs:2625 →
-`handle_child` (main.rs:2493), which handles `kind` ∈ `thinking`, `speech`,
-`post`, `complete`, `result`, `turn` and **drops** `error`, `done`, `stopped`,
-`compacted`, `pending`, `resumed`, `guidance` (main.rs:2568 `_ => {}`) — a
-child's error text reaches the human only via the terminal `subagent` event's
-`error` field. Phase 3 adds `parent` + `depth` here (upgrade-paths, Phase 3).
+### `child` — agents/subagent.py (`child_event`)
+`{ev:"child", id: run.id, parent: run.parent, depth: run.depth, kind:
+<inner ev>, **inner fields minus ev}` — the child's whole event stream
+re-enveloped, stamped with the Phase 3 tree fields on every kind. Consumer:
+main.rs:2625 → `handle_child` (events.rs), which stores `parent`/`depth` on
+the `ChildSess` via `set_tree` (a late attach that never saw `started` still
+learns the tree), handles `kind` ∈ `thinking`, `speech`, `post`, `complete`,
+`result`, `turn` and **drops** `error`, `done`, `stopped`, `compacted`,
+`pending`, `resumed`, `guidance` (`_ => {}`) — a child's error text reaches
+the human only via the terminal `subagent` event's `error` field.
 
 ### Transport-internal delta channel (not `ev` events)
 `complete()`/OpenAI stream callbacks use `kind`, consumed only by

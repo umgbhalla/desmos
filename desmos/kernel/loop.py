@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import traceback
 from datetime import datetime, timezone
 from pathlib import Path
@@ -36,6 +37,28 @@ def format_result_message(results: list[tuple[Block, str]], cwd: Path | None = N
         body = spill(r, RESULT_CLIP, tag=b.tag, cwd=cwd)
         parts.append(f'<result tag="{b.tag}">{body}</result>')
     return "\n\n".join(parts)
+
+
+#: The summary line a successful `git commit` prints: `[branch shortsha] subject`
+#: (also `[main (root-commit) abc1234] …`, `[detached HEAD abc1234] …`). Only the
+#: command's own output can make this claim -- a failed commit prints no such
+#: line, so matching the command text alone would attribute commits that never
+#: happened.
+_COMMIT_LINE = re.compile(r"^\[[^\n\]]+ ([0-9a-f]{7,40})\](?: |$)", re.M)
+
+
+def committed_sha(command: str, output: str) -> str | None:
+    """Short sha of a commit `command` made, judged by its own output.
+
+    Both halves are required: the command must actually invoke `git … commit`
+    (so a cat of someone's log cannot claim), and the output must carry the
+    summary line git prints only when the commit succeeded. The last match
+    wins when one command commits more than once.
+    """
+    if not re.search(r"\bgit\b.*\bcommit\b", command, re.S):
+        return None
+    shas = _COMMIT_LINE.findall(output)
+    return shas[-1] if shas else None
 
 
 def malformed_call_note(raw: str, stray: list[str]) -> str:
@@ -353,6 +376,24 @@ def turn(
     residue = trailing_residue(speech)
     if residue and world.log:
         world.log[-1]["residue"] = residue
+    # Which stretches of the final speech are dispatched calls, as UTF-8 byte
+    # offsets (the consumer is the Rust story pane, which slices by byte). The
+    # complete event is the carrier because speech is final exactly here:
+    # every delta has streamed, the assistant message is appended, and
+    # dispatch has not begun -- so the TUI can reconcile its conservative
+    # mid-stream hold against this verdict before the first result card lands.
+    # OpenAI-family calls arrive on the tool channel, never in speech (XML in
+    # speech raises below), so the list is empty there.
+    # Typed-tool-call models carry syscalls on the tool channel; their speech
+    # is never scanned, so complete.spans is empty there by construction.
+    speech_spans = scan_spans(speech) if not tool_syscalls(world.model) else []
+    byte_spans: list[list[int]] = []
+    tail, tail_bytes = 0, 0  # convert char offsets left to right, once each
+    for _, start, end in speech_spans:
+        a = tail_bytes + len(speech[tail:start].encode("utf-8"))
+        z = a + len(speech[start:end].encode("utf-8"))
+        byte_spans.append([a, z])
+        tail, tail_bytes = end, z
     fire(
         {
             "ev": "complete",
@@ -364,6 +405,7 @@ def turn(
             "redacted": n_redacted,
             "usage": usage,
             "residue": residue,
+            "spans": byte_spans,
             "request": (world.log[-1] or {}).get("request") or {},
             "response": (world.log[-1] or {}).get("response") or {},
         }
@@ -404,6 +446,11 @@ def turn(
             failed = Block("syscall", raw, {})
             results.append((failed, problem))
             recoverable = True
+            # span_idx is the call's position in this turn's dispatch order,
+            # here trivially 0: the rejected payload is the turn's only call.
+            # complete.spans is empty on this path (tool channel, not speech),
+            # so the index correlates to no story text -- same as any openai
+            # call.
             fire(
                 {
                     "ev": "result",
@@ -412,6 +459,7 @@ def turn(
                     "attrs": {},
                     "body": clip(raw),
                     "text": "",
+                    "span_idx": 0,
                 }
             )
             fire(
@@ -422,6 +470,7 @@ def turn(
                     "attrs": {},
                     "body": clip(raw),
                     "text": clip(problem),
+                    "span_idx": 0,
                 }
             )
             blocks = []
@@ -430,9 +479,12 @@ def turn(
     elif tool_syscalls(world.model) and scan(speech):
         raise RuntimeError("the model emitted XML as speech instead of calling syscall")
     else:
-        blocks = [] if tool_syscalls(world.model) else scan(speech)
+        # The same scan that produced complete.spans, so the dispatched blocks
+        # and the advertised spans cannot diverge: spans[i] is the stretch of
+        # speech that result events with span_idx=i came from.
+        blocks = [block for block, _, _ in speech_spans]
     if not stopped():
-        for b in blocks:
+        for span_idx, b in enumerate(blocks):
             if stopped():
                 break
             fire(
@@ -443,6 +495,7 @@ def turn(
                     "attrs": dict(b.attrs),
                     "body": clip(b.body),
                     "text": "",
+                    "span_idx": span_idx,
                 }
             )
 
@@ -458,12 +511,17 @@ def turn(
                         }
                     )
 
+            # Facts only the syscall knows at run time (edit: the 1-based line
+            # of the unique match, located at write time). dispatch fills it;
+            # the keys land top-level on the done event.
+            meta: dict[str, Any] = {}
             try:
                 r = dispatch(
                     world,
                     b,
                     on_chunk=on_chunk,
                     should_stop=should_stop,
+                    meta=meta,
                 )
             except Exception:  # noqa: BLE001
                 # A raising syscall unwound the whole turn and took the results
@@ -473,6 +531,14 @@ def turn(
                 # ambiguous <edit> body did exactly this. A failure is this
                 # tag's result, like every other failure in this system.
                 r = traceback.format_exc()
+            # The commit claim rides the result event, not a TUI HEAD-snapshot
+            # race: the kernel ran the command and holds the output that names
+            # the sha, so the row downstream never attributes a commit the
+            # kernel did not report.
+            if b.tag in ("bash", "shell"):
+                sha = committed_sha(b.body, r)
+                if sha is not None:
+                    meta["repo"] = {"committed": sha}
             results.append((b, r))
             fire(
                 {
@@ -482,6 +548,8 @@ def turn(
                     "attrs": dict(b.attrs),
                     "body": clip(b.body),
                     "text": clip(r),
+                    "span_idx": span_idx,
+                    **meta,
                 }
             )
     # No syscalls usually means the model finished. It also looks exactly like

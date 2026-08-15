@@ -7,16 +7,24 @@ import shutil
 from pathlib import Path
 
 
-def apply_edit(path: str, old_str: str, new_str: str, *, cwd: Path | None = None) -> str:
+def apply_edit_line(
+    path: str, old_str: str, new_str: str, *, cwd: Path | None = None
+) -> tuple[str, int | None]:
+    """apply_edit plus the 1-based line where the unique match starts.
+
+    The line is located here, at write time, because this is the only moment
+    anyone can know it: the file is about to change. Failures carry None —
+    there is no edit site to name.
+    """
     if not path:
-        return "edit failed: path required"
+        return "edit failed: path required", None
     if not old_str:
-        return "edit failed: old string required"
+        return "edit failed: old string required", None
     filepath = Path(path).expanduser()
     if not filepath.is_absolute() and cwd is not None:
         filepath = cwd / filepath
     if not filepath.is_file():
-        return f"edit failed: {path} not found"
+        return f"edit failed: {path} not found", None
     # read_bytes, not read_text: read_text translates newlines, so editing one
     # word in a CRLF file wrote the whole file back as LF and a one-line change
     # showed up as a whole-file diff. And a file that is not text at all has to
@@ -25,12 +33,13 @@ def apply_edit(path: str, old_str: str, new_str: str, *, cwd: Path | None = None
     try:
         content = filepath.read_bytes().decode("utf-8")
     except UnicodeDecodeError:
-        return f"edit failed: {path} is not utf-8 text — <edit> only replaces text"
+        return f"edit failed: {path} is not utf-8 text — <edit> only replaces text", None
     count = content.count(old_str)
     if count == 0:
-        return f"edit failed: string not found in {path}"
+        return f"edit failed: string not found in {path}", None
     if count > 1:
-        return f"edit failed: found {count} occurrences in {path}, need exactly 1 — widen the snippet"
+        return f"edit failed: found {count} occurrences in {path}, need exactly 1 — widen the snippet", None
+    line = content.count("\n", 0, content.index(old_str)) + 1
     next_text = content.replace(old_str, new_str, 1)
     if filepath.suffix == ".py":
         try:
@@ -39,7 +48,7 @@ def apply_edit(path: str, old_str: str, new_str: str, *, cwd: Path | None = None
             # A null byte has no line number, and "line None" reads like the
             # gate is broken rather than like the source is.
             where = f" line {exc.lineno}" if exc.lineno else ""
-            return f"edit failed: SyntaxError{where}: {exc.msg} — not written"
+            return f"edit failed: SyntaxError{where}: {exc.msg} — not written", None
     # Written beside the target and renamed over it: write_text truncated first,
     # so a crash or a full disk mid-write left the file half-there with no
     # copy of what it used to be. resolve() first, or os.replace would swap a
@@ -60,7 +69,11 @@ def apply_edit(path: str, old_str: str, new_str: str, *, cwd: Path | None = None
         # fails too, that error is the real one and it propagates.
         tmp.unlink(missing_ok=True)
         target.write_bytes(data)
-    return f"Edited {target}"
+    return f"Edited {target}", line
+
+
+def apply_edit(path: str, old_str: str, new_str: str, *, cwd: Path | None = None) -> str:
+    return apply_edit_line(path, old_str, new_str, cwd=cwd)[0]
 
 
 def parse_edit_body(body: str, attrs: dict[str, str]) -> tuple[str, str]:

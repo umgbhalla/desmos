@@ -1,8 +1,11 @@
 //! The speech stream: what the reader sees of a turn while it is still
 //! arriving. `StreamCursor` buffers thinking/speech deltas; `spoken_prefix`
 //! and `strip_syscalls` decide, with `scan.py`'s eyes, which bytes are prose
-//! and which are a syscall the calls pane already owns. Moved verbatim out of
-//! main.rs.
+//! and which are a syscall the calls pane already owns -- *mid-stream only*.
+//! At turn end the kernel's own verdict arrives as `complete.spans` and
+//! `finish_speech_spans` strips exactly those bytes; the local grammar port is
+//! the hold and the fallback (stop/error turns), never the final word on a
+//! completed turn. Moved verbatim out of main.rs.
 
 use std::borrow::Cow;
 
@@ -107,7 +110,50 @@ impl StreamCursor {
         // it. Without this pass the hold is never lifted -- `speech_raw` is
         // cleared three lines down -- and the tail of the message is printed
         // in neither pane.
+        //
+        // This is the *fallback* final pass, for the turns that end without a
+        // kernel verdict: a user stop or an error kills the step before the
+        // complete event fires. A turn that completes normally is finalized by
+        // `finish_speech_spans` instead, from `complete.spans` -- the local
+        // grammar port never gets the last word there.
         let shown = strip_syscalls(&self.speech_raw).trim_start().to_string();
+        self.show_speech(story, shown);
+        if let Some(id) = self.speech.take() {
+            story.finish_running(id);
+        }
+        self.speech_raw.clear();
+        self.speech_shown.clear();
+    }
+
+    /// Turn-end reconcile (Phase 3). `complete.spans` is the kernel saying,
+    /// byte for byte, which stretches of the final speech it dispatched --
+    /// authoritative where `strip_syscalls` is a port of the same grammar that
+    /// can drift. What disappears from the story is exactly those bytes.
+    ///
+    /// When the mid-stream hold already printed something the kernel
+    /// dispatched (the hold is conservative, not clairvoyant), the reconciled
+    /// text no longer extends what is on screen; appending through
+    /// `show_speech` would finish the stale block and print the whole message
+    /// again beside it. Remove the half-printed block and re-show from the
+    /// kernel's verdict instead.
+    pub(crate) fn finish_speech_spans(
+        &mut self,
+        story: &mut ScrollbackState,
+        spans: &[(usize, usize)],
+    ) {
+        let shown = match without_spans(&self.speech_raw, spans) {
+            Some(s) => s.trim_start().to_string(),
+            // Spans that do not fit this speech (a bridge/TUI version skew is
+            // the only way): the local grammar is the self-heal, as mid-stream.
+            None => strip_syscalls(&self.speech_raw).trim_start().to_string(),
+        };
+        if let Some(id) = self.speech {
+            if !shown.starts_with(&self.speech_shown) {
+                story.remove_entry(id);
+                self.speech = None;
+                self.speech_shown.clear();
+            }
+        }
         self.show_speech(story, shown);
         if let Some(id) = self.speech.take() {
             story.finish_running(id);
@@ -120,6 +166,36 @@ impl StreamCursor {
         self.finish_think(activity);
         self.finish_speech(story);
     }
+
+    /// `finish`, but the speech pass uses the kernel's spans (see
+    /// `finish_speech_spans`). Called on the `complete` event, the one carrier
+    /// of the authoritative spans.
+    pub(crate) fn finish_reconciled(
+        &mut self,
+        story: &mut ScrollbackState,
+        activity: &mut ScrollbackState,
+        spans: &[(usize, usize)],
+    ) {
+        self.finish_think(activity);
+        self.finish_speech_spans(story, spans);
+    }
+}
+
+/// `text` minus the given byte ranges. None when the ranges do not fit the
+/// text (out of order, out of bounds, or off a char boundary) -- the caller
+/// falls back to the local grammar rather than panicking on wire data.
+fn without_spans(text: &str, spans: &[(usize, usize)]) -> Option<String> {
+    let mut out = String::with_capacity(text.len());
+    let mut at = 0usize;
+    for &(start, end) in spans {
+        if start < at || end < start {
+            return None;
+        }
+        out.push_str(text.get(at..start)?);
+        at = end;
+    }
+    out.push_str(text.get(at..)?);
+    Some(out)
 }
 
 pub(crate) fn spoken_prefix(text: &str) -> String {
@@ -685,6 +761,10 @@ fn in_string(body: &str) -> bool {
 /// Deleting the markers alone is not enough: it leaves the command behind as
 /// if someone had said it. The command is not prose; it belongs to the calls
 /// pane, which already renders it as a card.
+///
+/// Mid-stream and fallback only. On a completed turn the final story text
+/// comes from the kernel's `complete.spans` (`finish_speech_spans`), not from
+/// this port of the grammar -- its former final-state role ended with Phase 3.
 ///
 /// Structure decides, not a list of names: an opener with a matching closer is
 /// a syscall whatever it is called, which means a tag registered later needs no

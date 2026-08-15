@@ -762,6 +762,7 @@ fn seed_demo(app: &mut App) {
         "attrs": {"path": "desmos/loop.py"},
         "body": "    if n < max_turns:\n---\n    if n <= max_turns:",
         "text": "ok",
+        "line": 212,
     });
     app.call_push_group(PostArgs::new(
         "user",
@@ -778,12 +779,14 @@ fn seed_demo(app: &mut App) {
         "sorted(k for k in world.ns if not k.startswith('_'))",
         &json!({}),
         "['CWD']",
+        None,
     ));
     app.call_push(wire_syscall(
         "bash",
         "ls .desmos/generations",
         &json!({}),
         "0001.json 0002.json 0003.json 0004.json",
+        None,
     ));
     app.call_push_group(PostArgs::new(
         "llm",
@@ -816,6 +819,7 @@ fn seed_demo(app: &mut App) {
         "",
         &json!({}),
         "3 calls  cache hit 87%  est $0.04",
+        None,
     ));
     app.set_last_post(
         3,
@@ -878,7 +882,7 @@ fn seed_spawn(app: &mut App) {
         child.sess.posts.push(&mut child.sess.calls, args, shown);
         wire_push(
             &mut child.sess.calls,
-            wire_syscall("python", "list(world.notes)", &json!({}), "['cache']"),
+            wire_syscall("python", "list(world.notes)", &json!({}), "['cache']", None),
         );
     }
     app.sess.story.finish_running(eid);
@@ -3478,7 +3482,10 @@ fn result_block(ev: &Value) -> RenderBlock {
     let text = ev.get("text").and_then(Value::as_str).unwrap_or("");
     let empty = json!({});
     let attrs = ev.get("attrs").unwrap_or(&empty);
-    wire_syscall(tag, body, attrs, text)
+    // The kernel located the edit at write time and says so on the done
+    // event; that is the only source of the diff's line numbers.
+    let line = ev.get("line").and_then(Value::as_u64);
+    wire_syscall(tag, body, attrs, text, line)
 }
 
 /// Wire card for one `complete()` POST. Grok's Other header splits on `: `
@@ -3519,7 +3526,13 @@ fn wire_complete(
 /// rows and not twenty diffs; `l` opens one, Enter zooms it into the viewer.
 ///
 /// Wire card for one XML syscall: the body that ran, then the result.
-fn wire_syscall(tag: &str, body: &str, attrs: &Value, result: &str) -> RenderBlock {
+///
+/// `line` is the kernel's verdict from the edit `result` event: the 1-based
+/// line where the unique match sat when the file was written. It is never
+/// derived here — reading the file back would race the next edit. Absent
+/// (failed edit, start phase, non-edit tags) the card carries no hunks and
+/// therefore claims no line, honestly.
+fn wire_syscall(tag: &str, body: &str, attrs: &Value, result: &str, line: Option<u64>) -> RenderBlock {
     match tag {
         "python" | "bash" => {
             let cmd = if body.trim().is_empty() {
@@ -3556,8 +3569,10 @@ fn wire_syscall(tag: &str, body: &str, attrs: &Value, result: &str) -> RenderBlo
                 .unwrap_or("")
                 .to_string();
             let (old, new) = split_edit_body(body);
-            let start = edit_start_line(&path, &old, &new);
-            let hunks = diff_hunks_from_strings(&old, &new, start);
+            let hunks = match line {
+                Some(l) => diff_hunks_from_strings(&old, &new, l as usize),
+                None => Vec::new(),
+            };
             let label = if path.is_empty() {
                 "edit".to_string()
             } else {
@@ -3640,33 +3655,6 @@ fn split_edit_body(body: &str) -> (String, String) {
         return (String::new(), body.to_string());
     }
     (before.join("\n"), after.join("\n"))
-}
-
-/// 1-based line where the edit lands, so the diff gutter shows real file line
-/// numbers instead of counting from 1.
-///
-/// The card is built both before the write (file still holds `old`) and after
-/// it (file holds `new`), so try both. An unreadable path or a match that is
-/// not unique falls back to 1 — a wrong offset is worse than an honest one.
-fn edit_start_line(path: &str, old: &str, new: &str) -> usize {
-    if path.is_empty() {
-        return 1;
-    }
-    let Ok(text) = std::fs::read_to_string(path) else {
-        return 1;
-    };
-    for probe in [old, new] {
-        if probe.is_empty() {
-            continue;
-        }
-        // One pass that stops at the second hit. `find` plus `count()` walked
-        // the whole file twice to answer "is there exactly one".
-        let mut hits = text.match_indices(probe);
-        if let (Some((byte, _)), None) = (hits.next(), hits.next()) {
-            return text[..byte].matches('\n').count() + 1;
-        }
-    }
-    1
 }
 
 fn syscall_label(tag: &str, attrs: &Value) -> String {
@@ -4878,6 +4866,62 @@ mod tests {
         );
     }
 
+    /// Turn-end reconcile follows the kernel, not the local grammar port.
+    /// scan.py's TAG_OPEN accepts `[A-Za-z_]`, so `<_probe>…</_probe>`
+    /// DISPATCHES — while the TUI's mid-stream hold (`looks_like_tag_start`)
+    /// reads `<_` as prose and prints the whole call into the live block.
+    /// The `complete` event's `spans` are the kernel's verdict; after it the
+    /// story must contain exactly the bytes outside those spans. Revert the
+    /// reconcile (strip_syscalls as the final pass) and this fails: the local
+    /// grammar keeps the call as prose.
+    #[test]
+    fn turn_end_reconcile_follows_the_kernel_spans() {
+        let mut app = App::new();
+        app.ready = true;
+        // Streamed as SSE would deliver it, split inside the tag.
+        handle_event(
+            &mut app,
+            json!({"ev": "speech", "delta": true, "text": "hold on <_probe>rm -rf"}),
+        );
+        handle_event(
+            &mut app,
+            json!({"ev": "speech", "delta": true, "text": " /tmp/x</_probe> done"}),
+        );
+        // A frame paints mid-stream: the conservative hold shows the call as
+        // prose. This is the disagreement the reconcile exists to repair.
+        flush_streams(&mut app);
+        // desmos/kernel/scan.py::scan_spans on this speech, run for real:
+        //   [('_probe', 8, 38)]  (ascii, so bytes == chars)
+        handle_event(&mut app, json!({"ev": "complete", "spans": [[8, 38]]}));
+        let text = paint(&mut app, 100, 40);
+        assert!(text.contains("hold on"), "prose before the call missing:\n{text}");
+        assert!(text.contains("done"), "prose after the call missing:\n{text}");
+        assert!(
+            !text.contains("<_probe>"),
+            "the kernel dispatched this call; the story kept it as prose:\n{text}"
+        );
+        assert!(!text.contains("rm -rf"), "a dispatched body survived reconcile:\n{text}");
+    }
+
+    /// The spans are UTF-8 *byte* offsets — the kernel converts scan.py's char
+    /// offsets before emitting. A multibyte char ahead of the call catches a
+    /// consumer that slices by chars.
+    #[test]
+    fn kernel_spans_are_byte_offsets() {
+        let mut app = App::new();
+        app.ready = true;
+        handle_event(
+            &mut app,
+            json!({"ev": "speech", "delta": true, "text": "héllo <bash>ls</bash> done"}),
+        );
+        // scan_spans chars: (6, 21); as UTF-8 bytes (é is two): (7, 22).
+        handle_event(&mut app, json!({"ev": "complete", "spans": [[7, 22]]}));
+        let text = paint(&mut app, 100, 40);
+        assert!(text.contains("héllo"), "prose missing:\n{text}");
+        assert!(text.contains("done"), "prose missing:\n{text}");
+        assert!(!text.contains("<bash>"), "call survived byte-span reconcile:\n{text}");
+    }
+
     #[test]
     fn a_sequence_bar_keeps_the_order_it_was_given() {
         use ratatui::style::Color;
@@ -5160,6 +5204,7 @@ mod tests {
                 "attrs": {"path": "notes.md"},
                 "body": "UNIQUEOLD\n---\nUNIQUENEW",
                 "text": "Edited notes.md",
+                "line": 3,
             }),
         );
         let text = paint(&mut app, 130, 34);
@@ -5168,20 +5213,39 @@ mod tests {
         assert!(text.contains("UNIQUENEW"), "added side missing:\n{text}");
     }
 
+    /// Paint-from-events discipline: the diff's line numbers come from the
+    /// event's `line` field alone. The path does not exist on disk, so any
+    /// surviving filesystem re-derivation would place the hunk at line 1.
     #[test]
-    fn a_non_unique_match_falls_back_to_line_one() {
-        // desmos/loop.py holds MAX_TOKENS twice, so the offset cannot be
-        // pinned and edit_start_line must say 1 rather than guess.
-        assert_eq!(edit_start_line("does/not/exist.rs", "a", "b"), 1);
-        assert_eq!(edit_start_line("", "a", "b"), 1);
+    fn edit_card_lands_at_the_kernels_line_without_touching_disk() {
+        let ev = json!({
+            "ev": "result",
+            "phase": "done",
+            "tag": "edit",
+            "attrs": {"path": "does/not/exist.rs"},
+            "body": "old text\n---\nnew text",
+            "text": "Edited does/not/exist.rs",
+            "span_idx": 0,
+            "line": 41,
+        });
+        let RenderBlock::ToolCall(ToolCallBlock::Edit(e)) = result_block(&ev) else {
+            panic!("expected an edit block");
+        };
+        let first = e.hunks.first().and_then(|h| h.first()).expect("hunks present");
+        assert_eq!(first.lo, 41, "diff must anchor at the kernel's line");
+        // No field, no line: an event without `line` must not invent one.
+        let mut bare = ev.clone();
+        bare.as_object_mut().unwrap().remove("line");
+        let RenderBlock::ToolCall(ToolCallBlock::Edit(e2)) = result_block(&bare) else {
+            panic!("expected an edit block");
+        };
+        assert!(e2.hunks.is_empty(), "an absent line field must not fabricate an anchor");
     }
-
-
 
     #[test]
     fn edit_tag_becomes_a_real_diff_block() {
         let attrs = json!({"path": "notes.txt"});
-        let block = wire_syscall("edit", "alpha\nbeta\n---\nalpha\nGAMMA\n", &attrs, "Edited notes.txt");
+        let block = wire_syscall("edit", "alpha\nbeta\n---\nalpha\nGAMMA\n", &attrs, "Edited notes.txt", Some(1));
         let RenderBlock::ToolCall(ToolCallBlock::Edit(e)) = block else {
             panic!("edit must render as a diff, not a generic Other card");
         };
@@ -5224,7 +5288,8 @@ mod tests {
     #[test]
     fn a_failed_edit_carries_its_error() {
         let attrs = json!({"path": "gone.txt"});
-        let block = wire_syscall("edit", "a\n---\nb", &attrs, "error: no such file");
+        // A refused edit has no edit site, so the kernel sends no line.
+        let block = wire_syscall("edit", "a\n---\nb", &attrs, "error: no such file", None);
         let RenderBlock::ToolCall(ToolCallBlock::Edit(e)) = block else {
             panic!("expected an edit block");
         };
@@ -6281,7 +6346,7 @@ mod tests {
         handle_event(
             &mut app,
             json!({"ev":"result","tag":"edit","attrs":{"path":"a.rs"},
-                   "body":"old\n---\nnew","text":"Edited a.rs"}),
+                   "body":"old\n---\nnew","text":"Edited a.rs","line":1}),
         );
         app.set_focus(Focus::Calls);
         let text = paint(&mut app, 90, 60);
@@ -6367,6 +6432,7 @@ mod tests {
                 "attrs": {"path": "notes/cache.md"},
                 "body": "old cache line\n---\nlast-user only",
                 "text": "wrote notes/cache.md",
+                "line": 1,
             }),
         );
         app.set_focus(Focus::Calls);
@@ -6869,6 +6935,9 @@ mod tests {
             &mut app,
             json!({"ev": "speech", "text": "final answer", "delta": false}),
         );
+        // Speech buffers until its turn closes; the complete event's kernel
+        // spans (none here — the reply is pure prose) finalize the story text.
+        handle_event(&mut app, json!({"ev": "complete", "spans": []}));
 
         let story_kinds: Vec<&str> = (0..app.sess.story.len())
             .filter_map(|i| app.sess.story.entry(i))
@@ -7052,6 +7121,68 @@ mod tests {
         app.sess.stream.run.fold(&mut app.sess.story);
         app.sess.stream.run.settle(&mut app.sess.story, &app.git);
         assert!(app.sess.stream.run.settled.is_none());
+    }
+
+    /// The work row's "committed" claim is the kernel's fact
+    /// (`result.repo.committed`), not a HEAD-snapshot diff: a result event
+    /// carrying the field paints the claim, and results without it never do —
+    /// even when the command and its output look exactly like a commit.
+    #[test]
+    fn the_work_row_claims_only_the_commit_the_kernel_reported() {
+        let rows = |app: &App| -> Vec<String> {
+            (0..app.sess.story.len())
+                .filter_map(|i| match app.sess.story.entry(i).map(|e| &e.block) {
+                    Some(RenderBlock::System(b)) => Some(b.text.clone()),
+                    _ => None,
+                })
+                .collect()
+        };
+        let mut app = App::new();
+        handle_event(
+            &mut app,
+            json!({
+                "ev": "result", "phase": "done", "tag": "bash",
+                "body": "git add -A && git commit -m x",
+                "text": "[main abc1234] x",
+            }),
+        );
+        handle_event(
+            &mut app,
+            json!({
+                "ev": "result", "phase": "done", "tag": "bash",
+                "body": "echo hi", "text": "hi",
+            }),
+        );
+        let before = rows(&app);
+        assert!(!before.is_empty(), "two calls earn a work row");
+        assert!(
+            !before.iter().any(|r| r.contains("committed")),
+            "output that merely looks like a commit must not claim one: {before:?}"
+        );
+        handle_event(
+            &mut app,
+            json!({
+                "ev": "result", "phase": "done", "tag": "bash",
+                "body": "git commit -m y",
+                "text": "[main beef123] y",
+                "repo": {"committed": "beef123"},
+            }),
+        );
+        let after = rows(&app);
+        assert!(
+            after.iter().any(|r| r.contains("committed beef123")),
+            "the kernel's repo claim must paint the row: {after:?}"
+        );
+        // The claim survives the fold: settle rewrites the tail from the
+        // carried verdict, never from a git snapshot.
+        handle_event(&mut app, json!({"ev": "done"}));
+        app.sess.stream.run.settle(&mut app.sess.story, &app.git);
+        assert!(app.sess.stream.run.settled.is_none(), "a kernel claim needs no git read");
+        let folded = rows(&app);
+        assert!(
+            folded.iter().any(|r| r.contains("committed beef123")),
+            "the claim must survive settle: {folded:?}"
+        );
     }
 
     /// A dead harness is not a step. The old no-bridge branch pushed a POST
@@ -8021,6 +8152,34 @@ mod tests {
         handle_event(&mut app, json!({"ev": "turn", "n": 2}));
         handle_event(&mut app, json!({"ev": "done"}));
         assert!(!app.running, "done is the terminator");
+    }
+
+    /// Phase 3 tree fields: every subagent/child event carries the kernel's
+    /// `parent` + `depth`, and the ChildSess keeps them so the Phase 4 tree
+    /// view (upgrade-paths 3.2) can nest children under their spawner.
+    #[test]
+    fn child_sessions_store_the_kernels_parent_and_depth() {
+        let mut app = App::new();
+        handle_event(
+            &mut app,
+            json!({"ev": "subagent", "phase": "started", "id": "aaaa1111",
+                   "parent": null, "depth": 0, "agent": "explore",
+                   "persona": "", "task": "root child", "structured": false,
+                   "model": "m"}),
+        );
+        let c = &app.children["aaaa1111"];
+        assert_eq!(c.parent, None, "a root spawn has no parent");
+        assert_eq!(c.depth, 0, "a root spawn sits at depth 0");
+        // A grandchild first seen through its child envelope (late attach:
+        // no `started` event observed) still lands at its spot in the tree.
+        handle_event(
+            &mut app,
+            json!({"ev": "child", "id": "cccc3333", "parent": "bbbb2222",
+                   "depth": 2, "kind": "speech", "text": "hi", "delta": false}),
+        );
+        let c = &app.children["cccc3333"];
+        assert_eq!(c.parent.as_deref(), Some("bbbb2222"));
+        assert_eq!(c.depth, 2);
     }
 
     /// EntryIds are handed out per ScrollbackState starting at 1, so one shared
