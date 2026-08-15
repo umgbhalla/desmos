@@ -1,0 +1,155 @@
+# Upgrade paths
+
+The execution plan for the ownership split, the library split, and the four
+upgrade tracks. This document is the constitution for the `upgrade/all`
+branch: every phase below lands as its own commit series, gated on the
+verification instruments in the last section. Read AGENTS.md first; nothing
+here overrides it.
+
+## Doctrine
+
+**Python is truth, Rust is paint.** `desmos-tui` never computes a fact the
+bridge could send. Every fact arrives as an event field; Rust decides only
+where pixels go. (Precedent: exo shipped two materializers and two cost
+tables across its Rust/TS boundary and the pair disagreed.)
+
+**Testing discipline.** Provider auth (API keys in the environment) may be
+used for live verification. All state is temporary: `mkdtemp` for `.desmos`,
+pinned temp settings files, temp dirs for filesystem tests. No test or check
+ever writes the repo's `.desmos/` or `~/.desmos/`.
+
+## Phase 0 — ownership doc + event vocabulary
+
+`docs/ownership.md`: the fact table (which side owns which fact) plus the
+event vocabulary — one entry per `ev` kind the bridge emits, with every
+field, where it is produced, and who consumes it. Facts that move from Rust
+to events (executed in Phase 3, documented now):
+
+- syscall span classification: kernel emits authoritative spans on the
+  turn-end/result event; the TUI keeps only a conservative mid-stream hold
+  and reconciles.
+- `<edit>` card start line: the edit result event carries `line`.
+- work-row commit attribution: the kernel knows which syscall was a
+  `git commit` from its own result; the git *pane* stays a Rust-side
+  environment viewer.
+- cost: stays in Rust only while it remains the single implementation.
+
+## Phase 5.1 — golden-stream recorder (before any move)
+
+`scripts/record-golden.py` runs canned sessions (stubbed `complete_fn`, no
+network) through the real loop and captures the NDJSON event stream to
+`golden/*.jsonl`. Normalization (timestamps, uuids, durations) lives in one
+function used by both record and compare. Deterministic: two consecutive
+recordings diff empty. Scenarios: plain turn, multi-syscall turn, edit,
+subagent spawn, error turn, user stop, openai-shaped turn.
+
+Phases 1–2 are pure moves: streams must stay byte-identical. Phase 3 changes
+them deliberately; the fixture diff is the review artifact per change.
+
+## Phase 1 — Python layers + SDK facade
+
+```
+desmos/
+├── kernel/      # const, types, scan, dispatch, exec, shell, edit, loop, catalog
+├── transport/   # complete, openai, auth, dialect, settings
+├── state/       # persist, memory, generations, skills, extensions
+├── agents/      # subagent, subagent_contracts, subagent_prompt, pending
+├── front/       # bridge, acp, cli
+└── checks/      # check.py split per subsystem + runner (--only, --fast)
+```
+
+Import direction is law: kernel imports nothing above it; transport imports
+kernel only; state imports kernel; agents import kernel+transport+state;
+front imports everything; checks import anything.
+
+**The SDK is the facade.** Grown tools in harness state, extensions and
+skills import `desmos.loop`, `desmos.types`, … — stored state imports these
+names, so they never break. The existing top-level modules become thin
+re-export facades with explicit `__all__`; implementation lives under the
+subpackages. The facades are the public API; subpackages are private.
+
+`reload_sdk` derives its reload order from the package topology (import
+graph), replacing the hand-maintained list that already went stale once
+(dialect was missing).
+
+`git mv` per layer, one commit per layer, imports updated in the same
+commit. No half-moved transition state.
+
+## Phase 5.3 — cross-language conformance
+
+Rust gets a typed `Event` enum (`serde(deny_unknown_fields)`). A check runs
+the real Python bridge over the check scenarios and asserts the enum parses
+every emitted event; a Rust test parses the committed golden fixtures. When
+the socket transport lands, the same suite runs over stdio and socket.
+
+## Phase 2 — Rust module split
+
+Pure moves, one module per commit, cargo test green each step. Order:
+`events.rs` first (protocol seam), then `app.rs` (App + ChildSess; collapse
+the duplicated fields and the six resolvers to two), `stream.rs`, `work.rs`,
+`wire.rs`, `input.rs` last. Tests move with their module.
+
+## Phase 3 — protocol moves
+
+Spans-on-result, edit line, repo claim, and `parent`+`depth` on
+`subagent`/`child` events. One commit per change: kernel/agents emitter +
+`events.rs` consumer + updated golden fixture + conformance entry.
+
+## Phase 4 — the tracks
+
+**Track 1, durability spine**
+- 1.1 Durable pending handoff: notice file written when a child settles,
+  renamed to delivered in the same step that appends it to the transcript,
+  replayed at load. The record carries the whole notice text, not a pointer.
+- 1.2 Orphan-call repair at load: synthesize a failed result for any call
+  with no output, in the persist load path. Never rebuild the prompt from
+  events (cache breakpoint requires a byte-stable prefix).
+- 1.3 Sequenced event log: every emitted event also appended to
+  `.desmos/events/<session>.jsonl` with a monotonic seq. Replay substrate
+  for remote attach; auditable history. No tamper-evidence claims.
+
+**Track 2, fork tree**
+- 2.1 `parent` + `depth` on `Run`; delete the `_DEPTH` thread-local. Depth
+  budget inherited and decremented; leaf scope has no spawn. A refused
+  spawn is a result string the parent reads — one terminator per step stays.
+- 2.2 `orchestrator` capability: spawn/wait/memory/system/skill + read-only
+  probes; no bash/python/edit/shell. Read-only, not pure.
+- 2.3 Briefs: the parent transcript receives a structured brief (~200
+  bytes), raw output stays in the child record + trajectory. Over-limit
+  handling is explicit in the result text.
+- No transcript-copying fork primitive; `resume=` is the primitive.
+
+**Track 3, remote bridge + debug TUI**
+- 3.1 Unix socket fan-out: `_WIRE` becomes a list of writers under the
+  existing lock; a socket reader feeds the same inbox queue (serialization
+  = the queue). Socket file permissions; no TCP; stdlib only. Late attach =
+  snapshot from `.desmos/subagents/` + replay from seq.
+- 3.2 Tree view in the existing TUI: nest `ensure_child` by `parent`. No
+  second renderer, no second binary.
+- 3.3 Interventions: kill-subtree, re-run-child-with-edited-contract, via
+  the same inbox; every intervention is also an event in the seq log.
+
+**Track 4, self-improvement hardening**
+- 4.1 `reload_sdk` gated on the fast check tier; refusal is a result
+  string, old modules stay live.
+- 4.2 `docs/identity.md`: every piece of state, where it lives, what
+  survives which reset; summary taught in the runtime block.
+- 4.3 Child generation lineage recorded on `Run` once 2.1 lands.
+
+## Verification instruments
+
+1. **Golden-stream replay** (5.1): byte-identical through pure-move phases;
+   deliberate diffs reviewed per protocol change.
+2. **Layering check**: walk imports with ast, assert the direction. Fails
+   the moment a lower layer imports a higher one.
+3. **Cross-language conformance** (5.3): the bridge's real output parses
+   into the typed Rust enum; both sides checked from one fixture corpus.
+4. **Paint-from-events-alone**: render a recorded stream in an empty temp
+   dir; story/wire panes identical to fixture. Git pane exempt (declared
+   environment viewer).
+5. **The floor**: `python -m desmos check` + `cargo test -p desmos-tui`
+   green at every phase boundary, plus one adversarial-verify pass per
+   phase diff.
+
+No check may assert that a string exists in prose. Every added check must
+fail when its fix is reverted — prove it, then restore.
