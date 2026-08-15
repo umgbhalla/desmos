@@ -127,7 +127,7 @@ def _text_of(content: Any) -> str:
     return "".join(parts)
 
 
-def _user_content(content: Any) -> list[dict[str, Any]]:
+def _user_content(content: Any, model: str = "") -> list[dict[str, Any]]:
     """Anthropic user blocks -> Responses input parts, images included.
 
     An image arrives here in Anthropic's shape -- a source dict with a media
@@ -138,11 +138,15 @@ def _user_content(content: Any) -> list[dict[str, Any]]:
     which is what this used to do, silently dropped every screenshot the
     moment the session was on an OpenAI model.
     """
+    from desmos.skills import filter_skill_dialects
+
     if isinstance(content, str):
+        content = filter_skill_dialects(content, model)
         return [{"type": "input_text", "text": content}] if content.strip() else []
     parts: list[dict[str, Any]] = []
     for block in content if isinstance(content, list) else []:
         if isinstance(block, str):
+            block = filter_skill_dialects(block, model)
             if block.strip():
                 parts.append({"type": "input_text", "text": block})
             continue
@@ -159,18 +163,22 @@ def _user_content(content: Any) -> list[dict[str, Any]]:
             elif src.get("url"):
                 parts.append({"type": "input_image", "image_url": src["url"]})
             continue
-        if kind == "text" and isinstance(block.get("text"), str) and block["text"].strip():
-            parts.append({"type": "input_text", "text": block["text"]})
+        if kind == "text" and isinstance(block.get("text"), str):
+            text = filter_skill_dialects(block["text"], model)
+            if text.strip():
+                parts.append({"type": "input_text", "text": text})
     return parts
 
 
-def to_input(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def to_input(messages: list[dict[str, Any]], model: str = "") -> list[dict[str, Any]]:
     """Anthropic-shaped transcript -> Responses input array.
 
     Assistant blocks that came from this provider are replayed as their own raw
     item. Blocks from another provider (a transcript that switched models mid
     session) survive as plain text, which is lossy but never fatal.
     """
+    from desmos.skills import filter_skill_dialects
+
     items: list[dict[str, Any]] = []
     # A custom_tool_call_output whose call was trimmed off the head of the
     # transcript is a fatal 400 ("No tool call found for custom tool call
@@ -192,11 +200,13 @@ def to_input(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
                                 {
                                     "type": "custom_tool_call_output",
                                     "call_id": call_id,
-                                    "output": block.get("output") or "",
+                                    "output": filter_skill_dialects(
+                                        block.get("output") or "", model
+                                    ),
                                 }
                             )
                         else:
-                            text = block.get("output") or ""
+                            text = filter_skill_dialects(block.get("output") or "", model)
                             if isinstance(text, str) and text.strip():
                                 orphaned.append({"type": "text", "text": text})
                 content = orphaned + [
@@ -205,7 +215,7 @@ def to_input(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
                     if not isinstance(block, dict)
                     or block.get("type") != "custom_tool_call_output"
                 ]
-            parts = _user_content(content)
+            parts = _user_content(content, model)
             if parts:
                 items.append({"type": "message", "role": "user", "content": parts})
             continue
@@ -255,7 +265,7 @@ def payload_for(
         # The system prompt is instructions, not the first input item. Put it in
         # input and it becomes a turn the model can compact away.
         "instructions": system + CONTRACT,
-        "input": to_input(messages),
+        "input": to_input(messages, model),
         "stream": True,
         "store": False,
         "include": ["reasoning.encrypted_content"],

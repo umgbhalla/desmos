@@ -275,6 +275,8 @@ def cached_payload(
     thinking: str | None = "low",
 ) -> dict[str, Any]:
     """Pi/Anthropic: cache ABI, cache catalog, cache last *user* only. Replay thinking."""
+    from desmos.skills import filter_skill_dialects
+
     cache = {"type": "ephemeral"}
     abi, catalog_text = split_system(system)
     sys_blocks: list[dict[str, Any]] = [{"type": "text", "text": abi, "cache_control": cache}]
@@ -286,15 +288,21 @@ def cached_payload(
         if role == "assistant":
             blocks = wire_content(m.get("content"))
         elif isinstance(m.get("content"), str):
-            blocks = [{"type": "text", "text": m["content"]}] if m["content"] else []
+            text = filter_skill_dialects(m["content"], model)
+            blocks = [{"type": "text", "text": text}] if text else []
         elif isinstance(m.get("content"), list):
             blocks = []
             for raw in m["content"]:
                 if isinstance(raw, dict):
                     if raw.get("type") == "custom_tool_call_output":
-                        block = {"type": "text", "text": raw.get("output") or ""}
+                        block = {
+                            "type": "text",
+                            "text": filter_skill_dialects(raw.get("output") or "", model),
+                        }
                     else:
                         block = {k: v for k, v in raw.items() if k != "cache_control"}
+                        if block.get("type") == "text" and isinstance(block.get("text"), str):
+                            block["text"] = filter_skill_dialects(block["text"], model)
                     blocks.append(block)
                 elif isinstance(raw, str) and raw:
                     blocks.append({"type": "text", "text": raw})

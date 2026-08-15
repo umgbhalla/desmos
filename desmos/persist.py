@@ -56,6 +56,23 @@ def atomic_write(path: Path, text: str) -> None:
         raise
 
 
+def _has_compaction(item: dict[str, Any]) -> bool:
+    content = item.get("content")
+    if not isinstance(content, list):
+        return False
+    return any(
+        isinstance(block, dict)
+        and (
+            block.get("type") == "compaction"
+            or (
+                isinstance(block.get("openai"), dict)
+                and block["openai"].get("type") == "compaction"
+            )
+        )
+        for block in content
+    )
+
+
 def turn_aligned(
     messages: list[dict[str, Any]], keep: int = KEEP_MESSAGES
 ) -> list[dict[str, Any]]:
@@ -74,6 +91,17 @@ def turn_aligned(
     if not messages:
         return []
     start = max(0, len(messages) - keep)
+    # A provider compaction item is the only representation of everything it
+    # folded. If it ages out while post-fold messages survive, resume has a
+    # plausible-looking tail with its historical context silently missing.
+    # Preserve the newest checkpoint and every message after it, then widen to
+    # a role-safe user boundary for Anthropic.
+    checkpoint = next(
+        (i for i in range(len(messages) - 1, -1, -1) if _has_compaction(messages[i])),
+        None,
+    )
+    if checkpoint is not None and checkpoint < start:
+        start = checkpoint
     while start > 0 and messages[start].get("role") != "user":
         start -= 1
     if messages[start].get("role") != "user":

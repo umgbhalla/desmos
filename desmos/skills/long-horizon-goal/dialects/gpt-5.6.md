@@ -1,0 +1,1 @@
+Batch independent sensing calls and keep the requirement ledger terse. Preserve the complete deliverable even when explanation is short. Feed failed validation back into the next action rather than ending with a plausible partial result.

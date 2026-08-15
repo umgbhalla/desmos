@@ -178,6 +178,25 @@ def _skill_dialect(model: str) -> tuple[str, str] | None:
     return None
 
 
+_SKILL_DIALECT_BLOCK = re.compile(
+    r"\n?\[desmos-skill-dialect:(?P<dialect>[^\]]+)\]\n.*?"
+    r"\n\[/desmos-skill-dialect\]",
+    re.S,
+)
+
+
+def filter_skill_dialects(text: str, model: str) -> str:
+    """Drop loaded skill overlays that do not apply to the active model."""
+
+    selected = _skill_dialect(model)
+    active = selected[1].removesuffix(".md") if selected else ""
+
+    def keep(match: re.Match[str]) -> str:
+        return match.group(0) if match.group("dialect") == active else ""
+
+    return _SKILL_DIALECT_BLOCK.sub(keep, text)
+
+
 def load_skill_body(skill: Skill, model: str = "") -> str:
     try:
         core = skill.file_path.read_text(encoding="utf-8")
@@ -201,7 +220,14 @@ def load_skill_body(skill: Skill, model: str = "") -> str:
         )
     if not overlay:
         return core
-    return core.rstrip() + f"\n\n# Model dialect overlay: {label}\n" + overlay + "\n"
+    dialect = filename.removesuffix(".md")
+    return (
+        core.rstrip()
+        + f"\n\n# Model dialect overlay: {label}\n"
+        + f"[desmos-skill-dialect:{dialect}]\n"
+        + overlay
+        + "\n[/desmos-skill-dialect]\n"
+    )
 
 
 def bind_python_skill(ns: dict[str, Any], skill: Skill) -> Any | None:

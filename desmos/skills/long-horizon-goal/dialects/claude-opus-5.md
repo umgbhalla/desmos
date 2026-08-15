@@ -1,0 +1,1 @@
+Keep the objective bounded and resist adjacent cleanup, extra artifacts, and repeated review passes. Use one authoritative verification per changed requirement, and delegate only genuinely independent work.
