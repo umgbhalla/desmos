@@ -376,6 +376,17 @@ def self_check() -> None:
 
         blocks = scan('<python>x = 1+1</python>\n<bash>echo hi</bash>')
         assert [b.tag for b in blocks] == ["python", "bash"]
+        fence = "```"
+        # A mermaid line-break tag in a diagram label is markup, not a call.
+        assert scan(fence + 'mermaid\nA["a<br/>b"] --> B\n' + fence) == []
+        assert scan("name it `<traj>` or bare") == []
+        # A fence inside a syscall body must not mask the calls after it.
+        masked = scan('<python>s = "' + fence + '"</python>\n<bash>ls</bash>')
+        assert [b.tag for b in masked] == ["python", "bash"], masked
+        # An unclosed fence never swallows the rest of the message.
+        assert [b.tag for b in scan(fence + " oops\n<python>1</python>")] == ["python"]
+        assert [b.tag for b in scan(fence + "\n<br/>\n" + fence + "\n<python>1</python>")] == ["python"]
+
         lone = scan("<usage/>\n<reload/>\n<reload_sdk/>\n<rollback n=\"1\"/>\n<skill name=\"ping\"/>")
         assert [b.tag for b in lone] == ["usage", "reload", "reload_sdk", "rollback", "skill"]
         assert lone[0].body == ""
