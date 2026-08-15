@@ -23,6 +23,7 @@ averaged block that is wrong for both.
 catalog never said out loud. Both families need it; neither infers it.
 """
 
+import os
 from typing import Any
 
 
@@ -37,6 +38,29 @@ def family(model: str) -> str:
     from desmos.openai import is_openai  # function-level, matching settings.provider_of
 
     return "openai" if is_openai(model) else "anthropic"
+
+
+def tool_syscalls(model: str) -> bool:
+    """Whether this model receives syscalls as a typed tool call.
+
+    OpenAI has always had one. The Anthropic path used to parse tags back out
+    of assistant prose, which is the same channel the model writes its own
+    narration on -- so it could run past its own call and invent the result,
+    and a reader saw raw XML in the story pane whenever the stripper and the
+    scanner disagreed about where a body ended. Both families now hand the
+    harness a typed call instead.
+
+    DESMOS_TOOL_SYSCALLS=0 puts the Anthropic side back on prose parsing. It
+    exists so a session that cannot issue a call has a way back in.
+    """
+    if family(model) == "openai":
+        return True
+    return (os.environ.get("DESMOS_TOOL_SYSCALLS") or "1").strip().lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }
 
 
 def growth() -> str:
@@ -242,9 +266,32 @@ _OPENAI = "\n".join(
 )
 
 
+# The Anthropic half of what openai.CONTRACT says. Shorter on purpose: Opus 5
+# does not need the "this is not a chat interface with a tool API" paragraph
+# that gpt-5.6 does, and every line here costs a cached-prefix token forever.
+_ANTHROPIC_TOOL_CONTRACT = "\n".join(
+    [
+        "# how you act here",
+        "You have one tool, `syscall`. Its `input` is raw XML: one or more complete tags from"
+        " the register above and nothing else -- no prose around them, no fence, no JSON. The"
+        " harness runs them in order and hands back their result blocks as that tool's output.",
+        "XML written in an assistant message is not dispatched. It is text; the reader sees the"
+        " raw tag and nothing runs. Every call goes in the tool.",
+        "The call ends your response. Write nothing after it, and never write a result block"
+        " yourself -- the real output arrives on the next turn.",
+        "A reply with no `syscall` call ends the step. Saying you are blocked does not pause"
+        " anything, it hands control back; find out with a tag first.",
+    ]
+)
+
+
 def dialect(model: str) -> str:
     """Family-specific working style. Deliberately short for openai."""
-    return _OPENAI if family(model) == "openai" else _ANTHROPIC
+    if family(model) == "openai":
+        return _OPENAI
+    if tool_syscalls(model):
+        return _ANTHROPIC + "\n\n" + _ANTHROPIC_TOOL_CONTRACT
+    return _ANTHROPIC
 
 
 def block(world: Any) -> str:

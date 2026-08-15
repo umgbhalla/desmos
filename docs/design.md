@@ -114,6 +114,35 @@ answer; asking GPT-5.6 the same shortens the artifact, so it is not asked.
 `complete.split_system()` cuts this into a stable prefix and a volatile tail so
 the prefix stays cacheable across a whole session.
 
+## How a syscall arrives
+
+Both wires hand the harness a typed call, not prose to parse.
+
+| | OpenAI Responses | Anthropic Messages |
+| --- | --- | --- |
+| call block | `custom_tool_call` | `tool_use` |
+| id field | `call_id` | `id` |
+| body | raw text (freeform custom tool) | `input.input`, a JSON string |
+| answer | `custom_tool_call_output` | `tool_result` |
+
+`loop.syscall_call()` accepts either and `loop.syscall_body()` unwraps it, so
+the rest of the turn is wire-agnostic. Anthropic has no freeform custom tool, so
+its body is JSON-escaped — the same bytes, more of them. The trade is worth it:
+when tags were parsed back out of assistant prose the model could keep writing
+past its own call and answer it itself, and the story pane painted raw XML
+whenever the stripper and the scanner disagreed about where a body ended.
+
+A reply that carries no call but does contain scannable XML ends the turn with
+an error rather than running it. `scan()` already ignores tags inside fences and
+code spans, so writing *about* a tag is safe; writing one loose is not.
+
+Unpaired blocks are a hard 400 on both wires and poison every later request, so
+each payload builder repairs them: a result whose call was folded away degrades
+to text, and a call nothing answered gets a stand-in output.
+
+`DESMOS_TOOL_SYSCALLS=0` puts the Anthropic side back on prose parsing. It
+exists so a session that cannot issue a call has a way back in.
+
 ## Dispatch
 
 `scan()` finds syscalls in a reply. It is not an XML parser — it deliberately

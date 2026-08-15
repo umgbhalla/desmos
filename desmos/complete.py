@@ -107,6 +107,60 @@ def apply_compaction(payload: dict[str, Any], model: str) -> list[str]:
     return [COMPACT_BETA]
 
 
+#: Stand-in output for a syscall call the transcript never answered. Both wires
+#: reject an unanswered call, so one has to exist; it says plainly that nothing
+#: ran, so the model does not read silence as success.
+UNANSWERED_CALL = "[no result — the harness failed before this syscall ran; nothing was executed]"
+
+#: The Anthropic half of the syscall ABI. Anthropic has no freeform custom-tool
+#: type, so the body is a JSON string field rather than raw text -- the same
+#: bytes, escaped. A typed call is still worth the escaping: prose parsing let
+#: the model run past its own tag and write the result itself.
+SYSCALL_TOOL: dict[str, Any] = {
+    "name": "syscall",
+    "description": (
+        "Execute one or more Desmos XML syscalls. Input must contain only complete XML "
+        "tags from the system prompt. Tags run in order and return result blocks."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "input": {
+                "type": "string",
+                "description": "One or more complete XML syscall tags, and nothing else.",
+            }
+        },
+        "required": ["input"],
+    },
+}
+
+
+def tool_result_text(raw: dict[str, Any]) -> str:
+    """Flatten a tool_result's content back to plain text."""
+    content = raw.get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = [
+            part.get("text") or ""
+            for part in content
+            if isinstance(part, dict) and part.get("type") == "text"
+        ]
+        return "\n".join(p for p in parts if p)
+    return ""
+
+
+def tool_use_block(raw: dict[str, Any]) -> dict[str, Any]:
+    """Normalize one Anthropic tool_use block to exactly the wire fields."""
+    value = raw.get("input")
+    return {
+        "type": "tool_use",
+        "id": raw.get("id") or "",
+        "name": raw.get("name") or "syscall",
+        "input": value if isinstance(value, dict) else {},
+    }
+
+
 def wire_content(content: Any) -> list[dict[str, Any]]:
     """Replay assistant blocks the way Pi convertMessages / tau _anthropic_message do."""
     if isinstance(content, str):
@@ -162,6 +216,12 @@ def wire_content(content: Any) -> list[dict[str, Any]]:
             text = raw.get("input") or ""
             if text:
                 blocks.append({"type": "text", "text": text})
+        elif kind == "tool_use":
+            # Ours, and it must replay verbatim: the next request pairs it with
+            # the tool_result that answered it, and an assistant turn that lost
+            # its tool_use leaves that result orphaned -- a hard 400 that
+            # poisons every later request.
+            blocks.append(tool_use_block(raw))
         elif kind == "text":
             text = raw.get("text") or ""
             if text:
@@ -190,6 +250,8 @@ def assistant_content(resp: dict[str, Any]) -> list[dict[str, Any]]:
             blocks.append(item)
         elif kind == "redacted_thinking":
             blocks.append({"type": "redacted_thinking", "data": raw.get("data") or ""})
+        elif kind == "tool_use":
+            blocks.append(tool_use_block(raw))
         elif kind == "custom_tool_call":
             item = {
                 "type": "custom_tool_call",
@@ -275,6 +337,7 @@ def cached_payload(
     thinking: str | None = "low",
 ) -> dict[str, Any]:
     """Pi/Anthropic: cache ABI, cache catalog, cache last *user* only. Replay thinking."""
+    from desmos.dialect import tool_syscalls
     from desmos.skills import filter_skill_dialects
 
     cache = {"type": "ephemeral"}
@@ -282,11 +345,30 @@ def cached_payload(
     sys_blocks: list[dict[str, Any]] = [{"type": "text", "text": abi, "cache_control": cache}]
     if catalog_text.strip():
         sys_blocks.append({"type": "text", "text": catalog_text, "cache_control": cache})
+    # A tool_result whose tool_use is gone is a hard 400, and so is a tool_use
+    # nothing answered. Both happen for real: a fold cuts the head off the
+    # transcript, or the harness raises between appending the assistant turn
+    # and appending the result. Pair them up here so history stays replayable.
+    answered: set[str] = set()
+    for m in messages:
+        if m.get("role") == "user" and isinstance(m.get("content"), list):
+            for raw in m["content"]:
+                if isinstance(raw, dict) and raw.get("type") == "tool_result":
+                    if raw.get("tool_use_id"):
+                        answered.add(str(raw["tool_use_id"]))
+    seen_calls: set[str] = set()
+    pending_results: list[dict[str, Any]] = []
     msgs: list[dict[str, Any]] = []
     for m in messages:
         role = m.get("role")
+        unanswered: list[str] = []
         if role == "assistant":
             blocks = wire_content(m.get("content"))
+            for block in blocks:
+                if block.get("type") == "tool_use" and block.get("id"):
+                    seen_calls.add(block["id"])
+                    if block["id"] not in answered:
+                        unanswered.append(block["id"])
         elif isinstance(m.get("content"), str):
             text = filter_skill_dialects(m["content"], model)
             blocks = [{"type": "text", "text": text}] if text else []
@@ -299,6 +381,17 @@ def cached_payload(
                             "type": "text",
                             "text": filter_skill_dialects(raw.get("output") or "", model),
                         }
+                    elif (
+                        raw.get("type") == "tool_result"
+                        and str(raw.get("tool_use_id") or "") not in seen_calls
+                    ):
+                        # Its call was folded away or came from another
+                        # provider. Degrade to text: the output survives, the
+                        # request stays valid.
+                        block = {
+                            "type": "text",
+                            "text": filter_skill_dialects(tool_result_text(raw), model),
+                        }
                     else:
                         block = {k: v for k, v in raw.items() if k != "cache_control"}
                         if block.get("type") == "text" and isinstance(block.get("text"), str):
@@ -308,9 +401,18 @@ def cached_payload(
                     blocks.append({"type": "text", "text": raw})
         else:
             blocks = []
+        if role != "assistant" and pending_results:
+            blocks = pending_results + blocks
+            pending_results = []
         if not blocks:
             continue
         msgs.append({"role": role, "content": blocks})
+        for call_id in unanswered:
+            pending_results.append(
+                {"type": "tool_result", "tool_use_id": call_id, "content": UNANSWERED_CALL}
+            )
+    if pending_results:
+        msgs.append({"role": "user", "content": pending_results})
     for m in reversed(msgs):
         if m["role"] == "user" and m["content"]:
             m["content"][-1]["cache_control"] = dict(cache)
@@ -338,6 +440,12 @@ def cached_payload(
         # loop.py still maps a `stop_sequence` stop_reason if an endpoint ever
         # returns one, so turning them back on is one line here.
     }
+    if tool_syscalls(model):
+        # Tools sit ahead of system in the cached prefix, so the cache_control
+        # already on the last system block covers them. Static text, one-time
+        # invalidation when it changes.
+        payload["tools"] = [dict(SYSCALL_TOOL)]
+        payload["tool_choice"] = {"type": "auto", "disable_parallel_tool_use": True}
     payload["_betas"] = apply_thinking(payload, model, thinking) + apply_compaction(payload, model)
     return payload
 
@@ -430,6 +538,14 @@ def apply_stream_event(
                     state["degenerate"] = True
         elif dtype == "signature_delta":
             block["signature"] = (block.get("signature") or "") + (delta.get("signature") or "")
+        elif dtype == "input_json_delta":
+            # tool_use arrives as an empty `input` object plus a stream of JSON
+            # fragments. Buffer them under a private key; content_block_stop
+            # parses the whole thing. Appending them to `input` directly would
+            # leave a dict field holding half a JSON document.
+            block["_partial_json"] = (block.get("_partial_json") or "") + (
+                delta.get("partial_json") or ""
+            )
         else:
             # A delta for a block type this harness does not special-case still
             # belongs to that block. Append its string fields rather than
@@ -440,6 +556,22 @@ def apply_stream_event(
                     block[field] = (block.get(field) or "") + value
         return
     if kind == "content_block_stop":
+        idx = int(ev.get("index") or 0)
+        blocks = state.get("blocks") or []
+        if 0 <= idx < len(blocks) and isinstance(blocks[idx], dict):
+            block = blocks[idx]
+            buffered = block.pop("_partial_json", None)
+            if isinstance(buffered, str) and buffered.strip():
+                try:
+                    parsed = json.loads(buffered)
+                except ValueError:
+                    # Leave `input` empty. loop.turn reads no syscall body out
+                    # of it, answers the call with the malformed-input note and
+                    # asks for a corrected call -- which is recoverable, where
+                    # a raise here would end the step.
+                    parsed = None
+                if isinstance(parsed, dict):
+                    block["input"] = parsed
         return
     if kind == "message_delta":
         message = state.setdefault("message", {})

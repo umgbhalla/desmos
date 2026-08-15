@@ -20,7 +20,7 @@ from desmos.complete import (
 )
 from desmos.const import FROZEN, MAX_TOKENS, PRIOR_KEEP
 from desmos.dispatch import dispatch
-from desmos.dialect import family
+from desmos.dialect import family, tool_syscalls
 from desmos.generations import ensure_gen1, evolve, rollback
 from desmos.persist import load, save
 from desmos import pending
@@ -101,13 +101,46 @@ def normalize_syscall_input(value: Any) -> tuple[str, str | None]:
     return value, None
 
 
+#: The one assistant block a turn may carry that is a call rather than speech.
+#: Responses calls it custom_tool_call and keys it by call_id; Anthropic calls
+#: it tool_use and keys it by id. Same contract, two wires.
+CALL_TYPES = {"custom_tool_call": "call_id", "tool_use": "id"}
+
+
 def syscall_call(assistant: list[dict[str, Any]]) -> dict[str, Any] | None:
-    calls = [b for b in assistant if b.get("type") == "custom_tool_call"]
+    calls = [
+        b
+        for b in assistant
+        if b.get("type") in CALL_TYPES and (b.get("name") or "syscall") == "syscall"
+    ]
     if len(calls) > 1:
-        raise RuntimeError("OpenAI returned more than one syscall call")
-    if calls and not calls[0].get("call_id"):
-        raise RuntimeError("OpenAI returned a syscall call without call_id")
+        raise RuntimeError("the model returned more than one syscall call")
+    if calls:
+        key = CALL_TYPES[calls[0]["type"]]
+        if not calls[0].get(key):
+            raise RuntimeError(f"the model returned a syscall call without {key}")
     return calls[0] if calls else None
+
+
+def syscall_body(call: dict[str, Any]) -> Any:
+    """The raw XML a call carries. Anthropic wraps it in a JSON object."""
+    value = call.get("input")
+    if call.get("type") == "tool_use":
+        return value.get("input") if isinstance(value, dict) else value
+    return value
+
+
+def set_syscall_body(call: dict[str, Any], raw: str) -> None:
+    """Write the normalized body back, keeping each wire's own shape.
+
+    The next request replays this item verbatim, so a shape the endpoint would
+    reject here is a 400 on every later turn, not just this one.
+    """
+    if call.get("type") == "tool_use":
+        value = call.get("input")
+        call["input"] = {**value, "input": raw} if isinstance(value, dict) else {"input": raw}
+    else:
+        call["input"] = raw
 
 
 def result_content(
@@ -117,6 +150,8 @@ def result_content(
     call = syscall_call(assistant)
     if call is None:
         return output
+    if call["type"] == "tool_use":
+        return [{"type": "tool_result", "tool_use_id": call["id"], "content": output}]
     return [{"type": "custom_tool_call_output", "call_id": call["call_id"], "output": output}]
 
 
@@ -336,11 +371,11 @@ def turn(
     recoverable = False
     call = syscall_call(assistant)
     if call:
-        raw, shape_error = normalize_syscall_input(call.get("input") or "")
+        raw, shape_error = normalize_syscall_input(syscall_body(call) or "")
         # The next Responses request replays the provider item verbatim. Keep
         # that replay schema-valid even when this client exposed input as an
         # array or the model encoded a JSON array inside the custom string.
-        call["input"] = raw
+        set_syscall_body(call, raw)
         provider_call = call.get("openai")
         if isinstance(provider_call, dict) and provider_call.get("type") == "custom_tool_call":
             provider_call["input"] = raw
@@ -391,10 +426,10 @@ def turn(
             blocks = []
         else:
             blocks = [block for block, _, _ in spans]
-    elif family(world.model) == "openai" and scan(speech):
-        raise RuntimeError("OpenAI emitted XML as speech instead of calling syscall")
+    elif tool_syscalls(world.model) and scan(speech):
+        raise RuntimeError("the model emitted XML as speech instead of calling syscall")
     else:
-        blocks = scan(speech) if family(world.model) != "openai" else []
+        blocks = [] if tool_syscalls(world.model) else scan(speech)
     if not stopped():
         for b in blocks:
             if stopped():

@@ -1255,6 +1255,10 @@ impl CacheMeter {
                                 let bl = b.to_string().len() as u64;
                                 let kind = match b.get("type").and_then(Value::as_str) {
                                     Some("thinking" | "redacted_thinking") => 3,
+                                    // A syscall call is tool traffic, the same
+                                    // as its custom_tool_call twin on the
+                                    // Responses branch above -- not speech.
+                                    Some("tool_use") => 2,
                                     _ => 4,
                                 };
                                 chunks.push((bl, kind));

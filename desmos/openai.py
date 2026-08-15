@@ -25,7 +25,15 @@ import uuid
 from typing import Any, Callable, Iterable
 
 from desmos import auth
-from desmos.complete import COMPACT_BLOCK, _open_with_retry, iter_sse_lines, log_payload, redact_wire
+from desmos.complete import (
+    COMPACT_BLOCK,
+    UNANSWERED_CALL as _UNANSWERED_CALL,
+    tool_result_text,
+    _open_with_retry,
+    iter_sse_lines,
+    log_payload,
+    redact_wire,
+)
 
 # The ABI was written for a model that emits XML in prose. A Responses model
 # defaults to assuming it has real function tools, so without this it narrates
@@ -92,7 +100,7 @@ EFFORTS = ("low", "medium", "high", "xhigh", "max")
 #: Stand-in output for a syscall call the transcript never answered. The wire
 #: needs *something* paired with every custom_tool_call; this says plainly that
 #: nothing ran, so the model does not read silence as success.
-UNANSWERED_CALL = "[no result — the harness failed before this syscall ran; nothing was executed]"
+UNANSWERED_CALL = _UNANSWERED_CALL
 OPENAI_PREFIXES = ("gpt-", "o3", "o4", "codex-")
 OPENAI_ALIASES = frozenset({"gpt", "sol", "terra", "luna", "daybreak", "codex"})
 
@@ -157,6 +165,14 @@ def _user_content(content: Any, model: str = "") -> list[dict[str, Any]]:
         if not isinstance(block, dict):
             continue
         kind = block.get("type")
+        if kind == "tool_result":
+            # An Anthropic-shaped result in a transcript that switched
+            # providers. Its call is not in this input array and never will be,
+            # so pair-repair cannot help: keep the output as user text.
+            text = filter_skill_dialects(tool_result_text(block), model)
+            if text.strip():
+                parts.append({"type": "input_text", "text": text})
+            continue
         if kind == "image":
             src = block.get("source") or {}
             if src.get("type") == "base64" and src.get("data"):
@@ -264,6 +280,14 @@ def to_input(messages: list[dict[str, Any]], model: str = "") -> list[dict[str, 
             kind = block.get("type")
             if kind == "text" and (block.get("text") or "").strip():
                 spoken.append(block["text"])
+            elif kind == "tool_use":
+                # A syscall this session made on the Anthropic wire. Responses
+                # has no matching call item to replay it into, so the XML
+                # survives as assistant text rather than vanishing.
+                value = block.get("input")
+                text = value.get("input") if isinstance(value, dict) else ""
+                if isinstance(text, str) and text.strip():
+                    spoken.append(text)
             elif kind == "thinking" and not block.get("signature"):
                 # foreign thinking, unusable as reasoning: keep it as speech
                 if (block.get("thinking") or "").strip():
