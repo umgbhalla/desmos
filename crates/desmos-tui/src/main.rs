@@ -260,7 +260,7 @@ impl Default for PaneLayout {
             // Three inner rows is everything the meter has to say now that the
             // sparkline is gone; +2 for the border. Anything taller is dead
             // space under the context bar.
-            meter_h: 6,
+            meter_h: 8,
             post_split: 50,
             // Both side panes start open. A pane you have to know about before
             // you can see it is a pane nobody sees; git state and the file it
@@ -4252,6 +4252,42 @@ fn activity_line(app: &App, activity: &Option<TurnActivity>) -> ActivityLine {
     }
 }
 
+/// What the harness is configured as, for the meta pane's lower rows.
+///
+/// This used to be a strip of text on the composer's bottom border, which is
+/// the wrong place twice over: it is not something you type, and the composer
+/// grows and shrinks under it. The meta pane is where "what am I running"
+/// questions already get answered.
+struct MetaId {
+    model: String,
+    effort: String,
+    generation: String,
+    /// A switch that takes effect next turn, named as queued rather than as
+    /// current -- printing it as current is the pane claiming a model the wire
+    /// is not using.
+    pending: Option<(String, String)>,
+    theme: String,
+    session: Option<String>,
+}
+
+fn meta_id(app: &App) -> MetaId {
+    let dash = |s: &str| {
+        if s.is_empty() {
+            "—".to_string()
+        } else {
+            s.to_string()
+        }
+    };
+    MetaId {
+        model: dash(&app.model),
+        effort: dash(&app.thinking),
+        generation: dash(&app.generation),
+        pending: app.model_pending.clone(),
+        theme: Theme::current_kind().display_name().to_string(),
+        session: app.viewing.clone(),
+    }
+}
+
 fn exec_activity_title(app: &App) -> String {
     if let Some(id) = app.exec.id {
         if let Some(entry) = app.calls.get_by_id(id) {
@@ -4356,19 +4392,22 @@ fn draw(f: &mut Frame, app: &mut App) {
         .layout
         .files_h
         .min(spare.saturating_sub(meter_h + git_h));
+    // Meta sits last, in the bottom-right corner: it is the pane you glance at
+    // between turns rather than read during one, and it is where every piece
+    // of "what am I running" now lives -- model, effort, generation, theme.
     let wire = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(3),
-            Constraint::Length(meter_h),
             Constraint::Length(git_h),
             Constraint::Length(files_h),
+            Constraint::Length(meter_h),
         ])
         .split(body[1]);
     let panes = [left[0], wire[0]];
-    app.cache.area = wire[1];
-    app.git_area = wire[2];
-    app.files_area = wire[3];
+    app.git_area = wire[1];
+    app.files_area = wire[2];
+    app.cache.area = wire[3];
     let posts = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
@@ -4475,7 +4514,15 @@ fn draw(f: &mut Frame, app: &mut App) {
         app.focus == Focus::PostOut,
     );
     let act = activity_line(app, &activity);
-    draw_meta(f, app.cache.area, &app.cache, app.focus == Focus::Meter, &act);
+    let ident = meta_id(app);
+    draw_meta(
+        f,
+        app.cache.area,
+        &app.cache,
+        app.focus == Focus::Meter,
+        &act,
+        &ident,
+    );
     draw_git(f, app.git_area, app);
     draw_files(f, app.files_area, app);
     draw_queue(f, app.queue_area, app);
@@ -4897,7 +4944,14 @@ fn draw_files(f: &mut Frame, area: Rect, app: &mut App) {
     f.render_widget(Paragraph::new(lines), inner);
 }
 
-fn draw_meta(f: &mut Frame, area: Rect, meter: &CacheMeter, focused: bool, act: &ActivityLine) {
+fn draw_meta(
+    f: &mut Frame,
+    area: Rect,
+    meter: &CacheMeter,
+    focused: bool,
+    act: &ActivityLine,
+    id: &MetaId,
+) {
     if area.height == 0 || area.width == 0 {
         return;
     }
@@ -5083,6 +5137,73 @@ fn draw_meta(f: &mut Frame, area: Rect, meter: &CacheMeter, focused: bool, act: 
         Line::from(spans)
     };
 
+    // What is running, and under what settings. A queued switch is named as
+    // queued.
+    let agent_row = || {
+        let mut spans = vec![Span::styled(
+            id.model.clone(),
+            Style::default()
+                .fg(theme.accent_assistant)
+                .add_modifier(Modifier::BOLD),
+        )];
+        spans.push(label("  effort "));
+        spans.push(Span::styled(
+            id.effort.clone(),
+            Style::default().fg(theme.text_primary),
+        ));
+        spans.push(label("  gen "));
+        spans.push(Span::styled(
+            id.generation.clone(),
+            Style::default().fg(theme.text_primary),
+        ));
+        if let Some(s) = &id.session {
+            spans.push(label("   session "));
+            spans.push(Span::styled(
+                s.clone(),
+                Style::default().fg(theme.accent_skill),
+            ));
+        }
+        Line::from(spans)
+    };
+
+    // A switch that lands next turn gets the row the theme swatches were
+    // using. It is transient and it changes what the next request costs; a
+    // palette is neither.
+    let pending_row = || {
+        let (m, e) = id.pending.clone().unwrap_or_default();
+        Line::from(vec![
+            Span::styled("\u{2192} ", Style::default().fg(theme.accent_user)),
+            Span::styled(
+                format!("{m}/{e}"),
+                Style::default()
+                    .fg(theme.accent_user)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            label(" queued"),
+        ])
+    };
+
+    // The theme, shown rather than named: the palette a block will actually be
+    // painted in, in the order the panes use it.
+    let theme_row = || {
+        let mut spans = vec![Span::styled(
+            id.theme.clone(),
+            Style::default().fg(theme.text_secondary),
+        )];
+        spans.push(Span::raw("  "));
+        for c in [
+            theme.accent_user,
+            theme.accent_assistant,
+            theme.accent_tool,
+            theme.accent_skill,
+            theme.accent_success,
+            theme.gray,
+        ] {
+            spans.push(Span::styled("\u{2588}\u{2588}", Style::default().fg(c)));
+        }
+        Line::from(spans)
+    };
+
     // Degrade by which question matters most, not by what happens to fit. The
     // title already carries the TTL, so row one is context, not hit rate.
     let mut lines = match Tier::of(inner.height) {
@@ -5091,7 +5212,18 @@ fn draw_meta(f: &mut Frame, area: Rect, meter: &CacheMeter, focused: bool, act: 
         Tier::Dense => vec![act_row(), ctx_row(), cache_row()],
         // The sparkline was the one row nobody read: a hit-rate trend restates
         // what the cache row already says, in less precise form.
-        Tier::Full => vec![act_row(), ctx_row(), cache_row(), money_row()],
+        Tier::Full => vec![
+            act_row(),
+            ctx_row(),
+            cache_row(),
+            money_row(),
+            agent_row(),
+            if id.pending.is_some() {
+                pending_row()
+            } else {
+                theme_row()
+            },
+        ],
     };
     lines.truncate(inner.height as usize);
     f.render_widget(Paragraph::new(lines), inner);
@@ -5175,40 +5307,9 @@ fn draw_input(f: &mut Frame, area: Rect, app: &mut App) {
         width: area.width.saturating_sub(2),
         height: area.height.saturating_sub(1),
     };
-    // Identity lives on the box's own bottom edge now. It used to be a line of
-    // running text above the box, competing with the shortcuts for one row and
-    // losing the tail of both.
-    let identity = app
-        .viewing
-        .as_deref()
-        .map(|id| format!(" session {id} "))
-        .unwrap_or_else(|| {
-            // A queued switch is named as queued. The alternative — printing it
-            // as current — is the header claiming a model the wire is not using.
-            let queued = app
-                .model_pending
-                .as_ref()
-                .map(|(m, e)| format!("  → {m}/{e} queued"))
-                .unwrap_or_default();
-            format!(
-                " {}  effort:{}  gen {}{queued} ",
-                if app.model.is_empty() {
-                    "—"
-                } else {
-                    app.model.as_str()
-                },
-                if app.thinking.is_empty() {
-                    "—"
-                } else {
-                    app.thinking.as_str()
-                },
-                if app.generation.is_empty() {
-                    "—"
-                } else {
-                    app.generation.as_str()
-                },
-            )
-        });
+    // Identity used to run along this box's bottom edge. It is not something
+    // you type, and the box grows and shrinks under it; it lives in the meta
+    // pane now, with the theme swatches and the rest of the configuration.
     let prefix = " ";
     let focused = app.focus == Focus::Input;
     let border = if focused {
@@ -5252,22 +5353,7 @@ fn draw_input(f: &mut Frame, area: Rect, app: &mut App) {
             Style::default().fg(theme.accent_success),
         ));
     }
-    let block = block
-        .title_bottom(
-            Line::from(Span::styled(
-                identity,
-                Style::default().fg(theme.text_secondary),
-            ))
-            .left_aligned(),
-        )
-        .title_bottom(
-            Line::from(Span::styled(
-                format!(" {} ", Theme::current_kind().display_name()),
-                Style::default().fg(theme.text_secondary),
-            ))
-            .right_aligned(),
-        )
-        .style(Style::default().bg(theme.bg_base));
+    let block = block.style(Style::default().bg(theme.bg_base));
     let inner = block.inner(card);
     app.input_inner = inner;
     let lay = app.prompt.layout(prefix, inner.width);
@@ -6937,10 +7023,10 @@ mod tests {
             app.input_area
         );
         assert_eq!(
-            app.files_area.y + app.files_area.height,
+            app.cache.area.y + app.cache.area.height,
             34,
-            "wire column must reach the bottom: {:?}",
-            app.files_area
+            "meta must be the bottom-right pane: {:?}",
+            app.cache.area
         );
         assert!(
             !text.contains("keys "),
@@ -7863,9 +7949,9 @@ mod tests {
         assert_eq!(Tier::of(3), Tier::Dense);
         assert_eq!(Tier::of(4), Tier::Full);
         assert_eq!(Tier::of(12), Tier::Full);
-        // The default hugs its content: activity, context, cache and cost,
-        // plus two border rows.
-        assert_eq!(PaneLayout::default().meter_h, 6);
+        // The default hugs its content: activity, context, cache, cost, the
+        // agent config and the theme, plus two border rows.
+        assert_eq!(PaneLayout::default().meter_h, 8);
         let inner = PaneLayout::default().meter_h - 2;
         assert_eq!(Tier::of(inner), Tier::Full);
         // Both side panes are open out of the box. A saved `.desmos/tui.json`
@@ -8170,7 +8256,11 @@ mod tests {
         // The badge has to survive a composer that is not the whole screen —
         // the right column takes roughly a third of it.
         let painted = paint(&mut app, 120, 40);
-        assert!(painted.contains("→ gpt-5.6-sol/low queued"), "{painted}");
+        let meta = rows_of(&painted, app.cache.area);
+        assert!(
+            meta.contains("→ gpt-5.6-sol/low queued"),
+            "the queued badge belongs to the meta pane:\n{meta}"
+        );
 
         // The bridge's snapshot is what promotes it.
         handle_event(&mut app, json!({"ev": "snapshot", "model": "gpt-5.6-sol", "thinking": "low"}));
@@ -9249,7 +9339,7 @@ mod tests {
         assert!(!app.ready);
         let before = paint(&mut app, 120, 24);
         assert!(
-            before.contains("effort:—") && before.contains("gen —"),
+            before.contains("effort —") && before.contains("gen —"),
             "empty chrome before ready:\n{before}"
         );
         handle_event(
@@ -9266,11 +9356,19 @@ mod tests {
         assert_eq!(app.thinking, "low");
         assert_eq!(app.generation, "7");
         let after = paint(&mut app, 120, 24);
-        assert!(after.contains("claude-opus-5"), "{after}");
-        assert!(after.contains("effort:low"), "{after}");
-        assert!(after.contains("gen 7"), "{after}");
-        assert!(!after.contains("effort:—"), "{after}");
+        // In the meta pane, not on the composer's bottom border where it used
+        // to run — a strip of text under a box that grows as you type.
+        let meta = rows_of(&after, app.cache.area);
+        assert!(meta.contains("claude-opus-5"), "{meta}");
+        assert!(meta.contains("effort low"), "{meta}");
+        assert!(meta.contains("gen 7"), "{meta}");
+        assert!(!after.contains("effort —"), "{after}");
         assert!(!after.contains("gen —"), "{after}");
+        let card = rows_of(&after, app.input_area);
+        assert!(
+            !card.contains("gen 7"),
+            "the composer still carries identity:\n{card}"
+        );
     }
 
     #[test]
@@ -9308,6 +9406,13 @@ mod tests {
             app.turn_cancel
         );
         assert!(!text.contains(" input "), "the input label is gone:\n{text}");
+        // The palette is shown, not named: the theme row carries swatches in
+        // the accents a block will actually be painted in.
+        assert!(
+            meta.contains(&Theme::current_kind().display_name().to_string())
+                && meta.contains('\u{2588}'),
+            "theme row missing its swatches:\n{meta}"
+        );
         assert!(!text.contains('❯'), "input must not show a chevron:\n{text}");
     }
 
