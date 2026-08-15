@@ -631,6 +631,15 @@ def reload_sdk(world: World | None = None) -> str:
     import sys
 
     importlib.invalidate_caches()
+    old_subagent = sys.modules.get("desmos.subagent")
+    old_subagent_emit = getattr(old_subagent, "_EMIT", None)
+    if old_subagent_emit is None and world is not None:
+        # During a live turn the active bridge route is also installed here.
+        old_subagent_emit = getattr(world, "emit", None)
+    if old_subagent_emit is None:
+        # Import-based bridge launches keep the same module-level wire route.
+        old_subagent_emit = getattr(sys.modules.get("desmos.bridge"), "_emit", None)
+    old_subagent_runs = dict(getattr(old_subagent, "RUNS", {}))
     for name in list(sys.modules):
         if name == "edit" or name.startswith("desmos_skill_"):
             del sys.modules[name]
@@ -675,6 +684,15 @@ def reload_sdk(world: World | None = None) -> str:
         _seed(world)
         _reload(world)
         _bind(world)
+        # importlib.reload resets module globals in-place. Without restoring
+        # this binding, the next spawn silently creates an orphan World, so its
+        # pending completion can never resume the live TUI loop.
+        import desmos.subagent as _subagents
+
+        _subagents.bind(world)
+        _subagents.RUNS.update(old_subagent_runs)
+        if old_subagent_emit is not None:
+            _subagents.set_emitter(old_subagent_emit)
     return "sdk reloaded: " + ", ".join(reloaded)
 
 

@@ -411,8 +411,18 @@ def self_check() -> None:
         assert any(s.name == "later" for s in world.skills)
         assert dispatch(world, Block("skill", "", {"name": "later"})).endswith("ok\n")
 
+        from desmos import subagent as reload_subagent
+
+        reload_events = []
+        def reload_emit(ev):
+            reload_events.append(ev)
+
+        reload_subagent.bind(world)
+        reload_subagent.set_emitter(reload_emit)
         dispatch(world, Block("reload_sdk", "", {}))
         assert "reload_sdk" in world.tools
+        assert reload_subagent.PARENT is world, "SDK reload orphaned later subagent spawns"
+        assert reload_subagent._EMIT is reload_emit, "SDK reload dropped child event routing"
 
         blocks = scan('<python>x = 1+1</python>\n<bash>echo hi</bash>')
         assert [b.tag for b in blocks] == ["python", "bash"]
