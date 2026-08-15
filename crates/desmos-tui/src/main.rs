@@ -1214,9 +1214,45 @@ impl CacheMeter {
 
 }
 
+/// desmos launches on Oscura Midnight.
+///
+/// grok's `resolve_initial_theme` walks `GROK_THEME`, then the grok config's
+/// `[ui].theme`, and falls back to GrokNight -- which is grok's default, not
+/// ours. This keeps that whole precedence chain and replaces only the tail:
+/// anything the environment or the config names still wins, including an
+/// explicit `groknight`, and `auto` still resolves by system appearance. The
+/// only case we decide is the one nobody decided.
+fn initial_theme() -> ThemeKind {
+    let env = ["GROK_THEME", "LC_GROK_THEME"]
+        .into_iter()
+        .filter_map(|key| std::env::var(key).ok())
+        .find(|raw| ThemeKind::from_name(raw).is_some());
+    initial_theme_from(env.as_deref(), config_theme())
+}
+
+fn initial_theme_from(env: Option<&str>, config: Option<ThemeKind>) -> ThemeKind {
+    match env.and_then(ThemeKind::from_name).or(config) {
+        // Auto is a question, not an answer; grok knows how to ask the terminal.
+        Some(kind) if kind.is_auto() => theme_cache::resolve_initial_theme(),
+        Some(kind) => kind,
+        None => ThemeKind::OscuraMidnight,
+    }
+}
+
+fn config_theme() -> Option<ThemeKind> {
+    let root = xai_grok_config::load_effective_config_disk_only().ok()?;
+    let table = root.as_table()?;
+    table
+        .get("ui")
+        .and_then(|ui| ui.get("theme"))
+        .or_else(|| table.get("theme"))
+        .and_then(toml::Value::as_str)
+        .and_then(ThemeKind::from_name)
+}
+
 impl App {
     fn new() -> Self {
-        theme_cache::set(theme_cache::resolve_initial_theme());
+        theme_cache::set(initial_theme());
         let mut app = Self {
             prompt: PromptBuf::new(),
             model: String::new(),
@@ -10262,6 +10298,53 @@ mod tests {
     /// A local slash command never reaches the model: no turn runs, nothing
     /// lands in world.messages. It used to push a UserPrompt block anyway, so
     /// the story showed a turn that never happened.
+    /// The theme cache is process-global and cargo runs these on threads.
+    /// Any test that reads or writes it takes this first.
+    fn theme_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// The launch theme is Oscura Midnight, and it is the tail of the
+    /// precedence chain, not a clobber of it.
+    #[test]
+    fn nothing_named_a_theme_so_we_land_on_oscura_midnight() {
+        assert_eq!(initial_theme_from(None, None), ThemeKind::OscuraMidnight);
+        // An explicit groknight, from either source, still means groknight.
+        assert_eq!(
+            initial_theme_from(None, Some(ThemeKind::GrokNight)),
+            ThemeKind::GrokNight
+        );
+        assert_eq!(
+            initial_theme_from(Some("groknight"), None),
+            ThemeKind::GrokNight
+        );
+        // Env outranks config; an unparseable env name falls through to it.
+        assert_eq!(
+            initial_theme_from(Some("tokyonight"), Some(ThemeKind::GrokDay)),
+            ThemeKind::TokyoNight
+        );
+        assert_eq!(
+            initial_theme_from(Some("not-a-theme"), Some(ThemeKind::GrokDay)),
+            ThemeKind::GrokDay
+        );
+    }
+
+    /// Wiring: the resolver is what App::new actually installs. Testing the
+    /// function alone would pass just as well against the old call site.
+    #[test]
+    fn the_app_starts_on_the_theme_the_resolver_picked() {
+        let _pin = theme_lock();
+        let want = initial_theme();
+        let _app = App::new();
+        assert_eq!(Theme::current_kind(), want);
+        // On a machine that names no theme -- the default install -- that is
+        // Oscura Midnight, and grok's GrokNight fallback would fail here.
+        if config_theme().is_none() && std::env::var("GROK_THEME").is_err() {
+            assert_eq!(Theme::current_kind(), ThemeKind::OscuraMidnight);
+        }
+    }
+
     #[test]
     fn a_local_slash_command_leaves_no_turn_in_the_story() {
         let mut app = App::new();
@@ -10274,6 +10357,7 @@ mod tests {
             appearance_cache::load_timestamps(),
             appearance_cache::load(),
         );
+        let _pin = theme_lock();
         for cmd in ["/timestamps", "/dense", "/theme tokyonight", "/thinking high"] {
             app.prompt.clear();
             for ch in cmd.chars() {

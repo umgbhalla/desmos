@@ -11,5 +11,6 @@ ratatui = { workspace = true, features = ["crossterm"] }
 serde_json = { workspace = true }
 toml = { workspace = true }
 unicode-width = { workspace = true }
+xai-grok-config = { path = "../../vendor/grok-build/crates/codegen/xai-grok-config" }
 xai-grok-pager = { path = "../../vendor/grok-build/crates/codegen/xai-grok-pager" }
 xai-grok-pager-diff = { path = "../../vendor/grok-build/crates/codegen/xai-grok-pager-diff" }
