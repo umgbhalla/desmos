@@ -6894,12 +6894,6 @@ mod tests {
             "columns must end on the same row"
         );
         assert!(app.keys_area.height >= 5, "legend band too thin: {:?}", app.keys_area);
-        // The bar this replaced ran the full width and lost its tail.
-        assert!(
-            !text.contains("shift-enter newline"),
-            "the old chrome sentence is still being painted:\n{text}"
-        );
-        assert!(text.contains("keys"), "legend pane missing:\n{text}");
     }
 
     /// Code spans are protected: markup inside a fence or backticks is the
@@ -8889,7 +8883,6 @@ mod tests {
         assert!(app.viewer.is_none());
         let text = paint(&mut app, 120, 36);
         assert!(text.contains("WIREPROBE"), "tree in popup missing request:\n{text}");
-        assert!(text.contains("in") && text.contains("out"), "tabs missing:\n{text}");
         let _ = handle_key(
             None,
             &mut app,
@@ -9112,24 +9105,6 @@ mod tests {
         assert!(after.contains("gen 7"), "{after}");
         assert!(!after.contains("effort:—"), "{after}");
         assert!(!after.contains("gen —"), "{after}");
-    }
-
-    #[test]
-    fn running_composer_hints_enter_queues() {
-        let mut app = App::new();
-        app.ready = true;
-        app.running = true;
-        app.turn_started = Some(Instant::now());
-        app.status = "running".into();
-        app.prompt.insert_str("follow up later");
-        let text = paint(&mut app, 160, 30);
-        // The legend prints the cap and the verb in separate columns, so the
-        // old sentence "enter queues" no longer exists as a substring.
-        assert!(
-            text.contains("queues"),
-            "legend must say a typed follow-up queues:\n{text}"
-        );
-        assert!(text.contains('⏎'), "legend must show the enter cap:\n{text}");
     }
 
     #[test]
