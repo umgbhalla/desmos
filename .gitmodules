@@ -1,0 +1,3 @@
+[submodule "vendor/comet"]
+	path = vendor/comet
+	url = https://github.com/umgbhalla/comet.git

@@ -37,10 +37,12 @@ next `complete()` sees the change. No restart.
 uv venv && uv pip install -e ".[kernel]"
 source .venv/bin/activate
 ./scripts/vendor-setup.sh         # clone vendor/grok-build at the pinned rev + apply patches/
+git submodule update --init vendor/comet
 python -m desmos console          # IPython with step and world bound
 python -m desmos tui              # story | calls | input  (needs cargo + vendor/grok-build)
 python -m desmos tui --demo       # same layout, no API key
 python -m desmos tui --grok       # grok-build pager, desmos as ACP agent
+python -m desmos comet            # Comet desktop frontend via ACP
 python -m desmos kernel           # install a Jupyter kernelspec named Desmos
 ```
 
@@ -70,7 +72,9 @@ holding the syscalls that POST produced. The pane title counts them (`#2/5`).
 Arrows still mean fold, so the group step gets its own pair of keys.
 
 `--grok` launches grok-build's pager-bin (`--minimal --no-leader`) with
-`python -m desmos acp` on stdio.
+`python -m desmos acp` on stdio. `desmos comet` builds and launches the
+vendored Comet desktop frontend with Desmos registered as an ACP harness; see
+[the Comet frontend guide](docs/comet-frontend.md) for scope and setup.
 
 `vendor/grok-build` is gitignored, but `patches/` is not: `DESMOS_ACP` is our
 patch on the vendored pager, not upstream. Run `scripts/vendor-setup.sh` after

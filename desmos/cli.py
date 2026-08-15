@@ -79,12 +79,59 @@ def cmd_bridge(args: argparse.Namespace) -> int:
     return serve(Path(args.cwd).resolve())
 
 
-def cmd_acp(_args: argparse.Namespace) -> int:
+def cmd_acp(args: argparse.Namespace) -> int:
     _on_path()
     from desmos.acp import serve
 
-    cwd = Path(os.environ.get("DESMOS_CWD") or os.environ.get("PWD") or ".").resolve()
+    cwd = Path(args.cwd or os.environ.get("DESMOS_CWD") or os.environ.get("PWD") or ".").resolve()
     return serve(cwd=cwd)
+
+
+def cmd_comet(args: argparse.Namespace) -> int:
+    """Build and launch the vendored Comet frontend with Desmos over ACP."""
+    _on_path()
+    import shutil
+    import subprocess
+
+    root = _repo_root()
+    comet = root / "vendor" / "comet"
+    manifest = comet / "Cargo.toml"
+    if not manifest.is_file():
+        print("clone Comet into vendor/comet")
+        return 1
+
+    cargo = shutil.which("cargo")
+    if cargo is None:
+        print("desmos comet needs cargo")
+        return 1
+
+    desmos_executable = shutil.which("desmos")
+    sibling = Path(sys.executable).with_name("desmos")
+    if desmos_executable is None and sibling.is_file():
+        desmos_executable = str(sibling)
+    if desmos_executable is None:
+        print("install Desmos first (for example: uv pip install -e .)")
+        return 1
+
+    env = os.environ.copy()
+    env["DESMOS_ACP_EXECUTABLE"] = desmos_executable
+    if not args.no_build:
+        result = subprocess.run(
+            [cargo, "build", "--locked", "-p", "zeron"],
+            cwd=comet,
+            env=env,
+            check=False,
+        )
+        if result.returncode:
+            return result.returncode
+
+    binary = comet / "target" / "debug" / "zeron"
+    if not binary.is_file():
+        print("Comet is not built; omit --no-build for the first launch")
+        return 1
+
+    os.chdir(Path(args.cwd).resolve())
+    os.execve(binary, [str(binary)], env)
 
 
 def cmd_tui(args: argparse.Namespace) -> int:
@@ -371,6 +418,11 @@ def main() -> int:
     b.add_argument("--cwd", default=".")
     b.set_defaults(func=cmd_bridge)
 
+    co = sub.add_parser("comet", help="launch Comet with Desmos as an ACP agent")
+    co.add_argument("--cwd", default=".")
+    co.add_argument("--no-build", action="store_true", help="launch the existing debug binary")
+    co.set_defaults(func=cmd_comet)
+
     t = sub.add_parser("tui", help="three-pane TUI: trajectory | calls | input")
     t.add_argument("--cwd", default=".")
     t.add_argument("--demo", action="store_true", help="seed a fake turn (no API)")
@@ -384,7 +436,8 @@ def main() -> int:
     au.add_argument("--device", action="store_true", help="device code instead of the browser round trip")
     au.set_defaults(func=cmd_auth)
 
-    a = sub.add_parser("acp", help="ACP stdio server for grok-build's pager")
+    a = sub.add_parser("acp", help="ACP stdio server for external frontends")
+    a.add_argument("--cwd", default="", help="default cwd before session/new selects one")
     a.set_defaults(func=cmd_acp)
 
     args = p.parse_args()
