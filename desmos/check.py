@@ -264,7 +264,7 @@ def self_check() -> None:
         from desmos.dialect import capabilities as _caps
         from desmos import subagent as _sa
         from desmos.loop import RESULT_CLIP as _clip_cap
-        from desmos.subagent_contracts import Budget as _Budget, TaskContract as _TC
+        from desmos.subagent_contracts import TaskContract as _TC
         import inspect as _insp
 
         caps = _caps()
@@ -273,9 +273,8 @@ def self_check() -> None:
         # so the name is derived from the module that writes it.
         from desmos.spill import SPILL_DIR as _spill_dir
         assert _spill_dir in caps, "the prompt does not say where a spilled result lands"
-        for _name, _cfg in _sa.AGENTS.items():
+        for _name in _sa.AGENTS:
             assert _name in caps, _name
-            assert str(_cfg["max_turns"]) in caps, f"{_name} turn cap not in the prompt"
         # fanout's default agent is not spawn's. The prompt says so because a
         # reader would otherwise assume they match.
         # step()'s turn cap is quoted in the prompt, so the prompt has to be
@@ -291,8 +290,6 @@ def self_check() -> None:
         assert "resume" in _insp.signature(_sa.spawn).parameters and "resume" in caps
         for _f in _TC.__dataclass_fields__:
             assert _f in caps, f"TaskContract.{_f} is not described in the prompt"
-        for _f in _Budget.__dataclass_fields__:
-            assert _f in caps, f"Budget.{_f} is not described in the prompt"
         for _n in ("structured_result", "judgment", "spawn", "fanout", "wait", "gather", "status"):
             assert callable(getattr(_sa, _n)), _n
             assert _n in caps, f"prompt names {_n} but subagent does not export it"

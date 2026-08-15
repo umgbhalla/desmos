@@ -363,6 +363,7 @@ def run_turns(
     should_stop: Callable[[], bool] | None = None,
     max_total_tokens: int | None = None,
     has_input: Callable[[], bool] | None = None,
+    on_continue: Callable[[int], str | None] | None = None,
 ) -> str:
     """Run a step to its end, and always say how it ended.
 
@@ -403,6 +404,7 @@ def run_turns(
             should_stop=should_stop,
             max_total_tokens=max_total_tokens,
             has_input=has_input,
+            on_continue=on_continue,
             budget_hit=hit,
         )
     finally:
@@ -427,6 +429,7 @@ def _run_turns(
     should_stop: Callable[[], bool] | None = None,
     max_total_tokens: int | None = None,
     has_input: Callable[[], bool] | None = None,
+    on_continue: Callable[[int], str | None] | None = None,
     budget_hit: list[str] | None = None,
 ) -> str:
     def emit(ev: dict[str, Any]) -> None:
@@ -537,6 +540,11 @@ def _run_turns(
                     continue
             _commit_step(world, prompt, speech)
             return speech
+        if on_continue is not None:
+            reminder = on_continue(n)
+            if reminder:
+                world.messages.append({"role": "user", "content": reminder})
+                emit({"ev": "guidance", "n": n, "text": reminder})
     # Only reachable when a caller asked for a turn cap. Same for it as for the
     # rest: it was printed, and the bridge runs quiet=True, so the only signal
     # was a `done` event identical to a clean finish.

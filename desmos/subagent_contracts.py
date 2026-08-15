@@ -1,28 +1,8 @@
 from __future__ import annotations
 
 import json
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from typing import Any
-
-
-@dataclass(frozen=True)
-class Budget:
-    # Every ceiling is opt-in. Guidance reminders keep a long run aligned
-    # without killing it mid-tool-call or before it can write the deliverable.
-    max_turns: int | None = None
-    max_tokens: int | None = None
-    wall_seconds: float | None = None
-    max_retries: int = 0
-
-    def __post_init__(self) -> None:
-        if self.max_turns is not None and self.max_turns < 1:
-            raise ValueError("budget max_turns must be positive or None")
-        if self.max_tokens is not None and self.max_tokens < 1:
-            raise ValueError("budget max_tokens must be positive or None")
-        if self.wall_seconds is not None and self.wall_seconds <= 0:
-            raise ValueError("budget wall_seconds must be positive or None")
-        if self.max_retries < 0:
-            raise ValueError("budget max_retries cannot be negative")
 
 
 # Evidence kinds that assert something was observed at runtime. A child that
@@ -42,7 +22,6 @@ class TaskContract:
     allowed_tools: tuple[str, ...] = ()
     allowed_paths: tuple[str, ...] = ()
     write_paths: tuple[str, ...] = ()
-    budget: Budget = field(default_factory=Budget)
     dependencies: tuple[str, ...] = ()
     require_tool_use: bool = True
 
@@ -58,8 +37,8 @@ class TaskContract:
             raise ValueError(f"write paths are outside allowed_paths: {outside}")
 
     @classmethod
-    def legacy(cls, task: str, *, max_turns: int | None = None) -> TaskContract:
-        return cls(objective=task, budget=Budget(max_turns=max_turns))
+    def legacy(cls, task: str) -> TaskContract:
+        return cls(objective=task)
 
     def prompt(self) -> str:
         payload = {
@@ -71,7 +50,6 @@ class TaskContract:
             "allowed_tools": list(self.allowed_tools),
             "allowed_paths": list(self.allowed_paths),
             "write_paths": list(self.write_paths),
-            "budget": asdict(self.budget),
             "dependencies": list(self.dependencies),
             "require_tool_use": self.require_tool_use,
         }
