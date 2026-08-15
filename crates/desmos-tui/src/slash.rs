@@ -27,6 +27,14 @@ pub struct Command {
     pub name: &'static str,
     pub help: &'static str,
     pub param: Param,
+    /// Whether typing a space should offer a completion list for the argument.
+    /// Off for /model: the picker already shows provider, model, effort, live
+    /// auth status and a tick on what is running, so a flat list of model names
+    /// is a worse second surface for the same job -- and having both made
+    /// /model two levels deep on the way to the surface that does the work.
+    /// The param stays, so a typed-out `/model gpt-9` is still caught as a bad
+    /// argument rather than sent.
+    pub list: bool,
 }
 
 pub const THEMES: [&str; 6] = [
@@ -39,15 +47,15 @@ pub const THEMES: [&str; 6] = [
 ];
 
 pub const COMMANDS: [Command; 9] = [
-    Command { name: "/model", help: "switch model (empty opens the picker)", param: Param::Model },
-    Command { name: "/thinking", help: "reasoning effort", param: Param::Effort },
-    Command { name: "/theme", help: "colour scheme", param: Param::Theme },
-    Command { name: "/dense", help: "tighter rows (spacing, not transcript folding)", param: Param::None },
-    Command { name: "/timestamps", help: "show times on blocks", param: Param::None },
-    Command { name: "/reload", help: "rediscover skills and extensions", param: Param::None },
-    Command { name: "/reset", help: "clear the transcript, keep ns and notes", param: Param::None },
-    Command { name: "/quit", help: "leave", param: Param::None },
-    Command { name: "/exit", help: "leave", param: Param::None },
+    Command { name: "/model", help: "model and thinking level", param: Param::Model, list: false },
+    Command { name: "/thinking", help: "reasoning effort", param: Param::Effort, list: true },
+    Command { name: "/theme", help: "colour scheme", param: Param::Theme, list: true },
+    Command { name: "/dense", help: "tighter rows (spacing, not transcript folding)", param: Param::None, list: true },
+    Command { name: "/timestamps", help: "show times on blocks", param: Param::None, list: true },
+    Command { name: "/reload", help: "rediscover skills and extensions", param: Param::None, list: true },
+    Command { name: "/reset", help: "clear the transcript, keep ns and notes", param: Param::None, list: true },
+    Command { name: "/quit", help: "leave", param: Param::None, list: true },
+    Command { name: "/exit", help: "leave", param: Param::None, list: true },
 ];
 
 /// Live judgement on the line in the composer.
@@ -174,7 +182,7 @@ impl Slash {
                     self.close();
                     return;
                 };
-                if found.param == Param::None {
+                if found.param == Param::None || !found.list {
                     self.close();
                     return;
                 }
@@ -222,7 +230,7 @@ impl Slash {
             let takes_arg = COMMANDS
                 .iter()
                 .find(|c| c.name == item.text)
-                .is_some_and(|c| c.param != Param::None);
+                .is_some_and(|c| c.param != Param::None && c.list);
             return Some(if takes_arg { format!("{} ", item.text) } else { item.text.clone() });
         }
         Some(format!("{}{}", self.head, item.text))

@@ -17,7 +17,10 @@ from desmos import auth
 from desmos.openai import EFFORTS as OPENAI_EFFORTS, MODELS as OPENAI_MODELS
 
 ANTHROPIC_MODELS = ("claude-opus-5", "claude-sonnet-4-6")
-ANTHROPIC_EFFORTS = ("low", "high", "xhigh")
+# Probed against the API, which answers "Input should be 'low', 'medium',
+# 'high', 'xhigh' or 'max'" -- the same five rungs OpenAI offers. The old
+# three-value list was a guess that hid medium and max from the picker.
+ANTHROPIC_EFFORTS = ("low", "medium", "high", "xhigh", "max")
 
 CATALOG: dict[str, dict[str, Any]] = {
     "anthropic": {"models": list(ANTHROPIC_MODELS), "efforts": list(ANTHROPIC_EFFORTS)},

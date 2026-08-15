@@ -911,8 +911,28 @@ def self_check() -> None:
         # An effort the target does have is never moved.
         assert clamp_effort("anthropic", "high") == "high"
         assert clamp_effort("openai", "medium") == "medium"
-        # A tie goes up: thinking less than asked is the worse surprise.
-        assert clamp_effort("anthropic", "medium") == "high"
+        # A tie goes up: thinking less than asked is the worse surprise. Both
+        # live providers offer the same five rungs now, so a tie only exists
+        # against a ladder with a hole in it -- build one rather than assert
+        # nothing.
+        _CAT["_gap"] = {"models": [], "efforts": ["low", "high"]}
+        try:
+            assert clamp_effort("_gap", "medium") == "high"
+            assert clamp_effort("_gap", "xhigh") == "high"
+        finally:
+            del _CAT["_gap"]
+
+        # Every rung the picker offers has to survive to the wire as itself.
+        # xhigh was being rewritten to max, so choosing it ran a level the user
+        # did not pick and the settings file disagreed with the request. The
+        # API rejects anything outside these five, which is why the list is
+        # exactly this and why a silent rewrite is not harmless.
+        from desmos.complete import apply_thinking as _apply
+
+        for _level in _CAT["anthropic"]["efforts"]:
+            _payload: dict = {}
+            _apply(_payload, "claude-opus-5", _level)
+            assert _payload["output_config"]["effort"] == _level, (_level, _payload)
 
         # A backgrounded grandchild inherits stdout and can hold the pipe open
         # for as long as it likes. The unbounded read that waited for it made

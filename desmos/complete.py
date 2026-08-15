@@ -64,9 +64,10 @@ def apply_thinking(payload: dict[str, Any], model: str, level: str | None) -> li
         return []
     if adaptive_model(model):
         # Opus 5 / 4.6+: adaptive thinking already interleaves. No beta header.
-        effort = "max" if mode in {"xhigh", "max"} else mode
-        if effort == "minimal":
-            effort = "low"
+        # xhigh is a real rung the API accepts, not a synonym for max. Folding
+        # them together meant picking xhigh silently ran max. minimal is the
+        # only level with no wire equivalent.
+        effort = "low" if mode == "minimal" else mode
         payload["thinking"] = {"type": "adaptive", "display": "summarized"}
         payload["output_config"] = {"effort": effort}
         return []

@@ -7969,18 +7969,22 @@ mod tests {
         s.update("/mod", &pick);
         assert!(s.open);
         assert_eq!(s.items[0].text, "/model");
-        // A command that takes an argument leaves the cursor in the argument.
-        assert_eq!(s.accept().as_deref(), Some("/model "));
-
-        // Now the argument position offers real models from the catalog.
+        // /model is complete on its own -- no trailing space, because the
+        // picker is the argument surface. Appending one sent you to a second,
+        // worse list on the way to the screen that does the work.
+        assert_eq!(s.accept().as_deref(), Some("/model"));
         s.update("/model ", &pick);
-        let offered: Vec<&str> = s.items.iter().map(|i| i.text.as_str()).collect();
-        assert!(offered.contains(&"claude-opus-5") && offered.contains(&"gpt-5.6-sol"), "{offered:?}");
-        assert!(!offered.contains(&"never-offer-me"), "a provider with no credential is a guaranteed error");
+        assert!(!s.open, "no argument list stands in front of the picker");
 
-        s.update("/model gpt", &pick);
-        assert_eq!(s.items.len(), 2, "{:?}", s.items);
-        assert_eq!(s.accept().as_deref(), Some("/model gpt-5.6-sol"));
+        // A command whose argument has no better surface still lists it.
+        s.update("/the", &pick);
+        assert_eq!(s.accept().as_deref(), Some("/theme "));
+        s.update("/theme rose", &pick);
+        assert_eq!(s.accept().as_deref(), Some("/theme rosepine"));
+
+        s.update("/thinking ", &pick);
+        let offered: Vec<&str> = s.items.iter().map(|i| i.text.as_str()).collect();
+        assert!(offered.contains(&"xhigh"), "{offered:?}");
 
         // Tab and Esc belong to the global pane-cycle, so an open list has to
         // claim them before that runs — this was a real miss, caught live.
@@ -7993,7 +7997,7 @@ mod tests {
         assert!(app.slash.open, "typing a slash opens the list");
         handle_key(None, &mut app, tab()).unwrap();
         assert_eq!(app.focus, Focus::Input, "Tab must complete, not cycle panes");
-        assert_eq!(app.prompt.to_send(), "/model ");
+        assert_eq!(app.prompt.to_send(), "/model");
         handle_key(None, &mut app, press(KeyCode::Esc)).unwrap();
         assert!(!app.slash.open);
         assert_eq!(app.focus, Focus::Input, "Esc dismissed the list, not the pane");
@@ -8026,32 +8030,30 @@ mod tests {
         assert_eq!(app.prompt.to_send(), "", "Enter sent it instead of re-completing");
 
         // A prefix still has something to add, so Enter completes there.
+        for c in "/the".chars() {
+            handle_key(None, &mut app, press(KeyCode::Char(c))).unwrap();
+        }
+        handle_key(None, &mut app, press(KeyCode::Enter)).unwrap();
+        assert_eq!(app.prompt.to_send(), "/theme ", "a prefix completes");
+        assert!(app.slash.open, "and the argument list opens");
+        for c in "rosepine".chars() {
+            handle_key(None, &mut app, press(KeyCode::Char(c))).unwrap();
+        }
+        handle_key(None, &mut app, press(KeyCode::Enter)).unwrap();
+        assert_eq!(app.prompt.to_send(), "", "a chosen argument sends");
+
+        // /model is one keystroke from the picker: complete the name, send it,
+        // and the picker is up. It used to append a space, open a list of bare
+        // model names, and only reach the picker if you deleted the space.
         for c in "/mod".chars() {
             handle_key(None, &mut app, press(KeyCode::Char(c))).unwrap();
         }
         handle_key(None, &mut app, press(KeyCode::Enter)).unwrap();
-        assert_eq!(app.prompt.to_send(), "/model ", "a prefix completes");
-        assert!(app.slash.open, "and the argument list opens");
-
-        // But bare /model is itself runnable — it is how the picker opens —
-        // and Enter must send it rather than appending a space forever.
-        app.prompt.clear();
-        app.slash.close();
-        for c in "/model".chars() {
-            handle_key(None, &mut app, press(KeyCode::Char(c))).unwrap();
-        }
+        assert_eq!(app.prompt.to_send(), "/model", "no space, no second list");
         handle_key(None, &mut app, press(KeyCode::Enter)).unwrap();
-        assert_eq!(app.prompt.to_send(), "", "bare /model has to be sendable");
-        assert!(app.picker.open, "and sending it opens the picker");
+        assert_eq!(app.prompt.to_send(), "", "the next Enter sends it");
+        assert!(app.picker.open, "straight into the picker");
         app.picker.open = false;
-
-        // Argument chosen: nothing left to add, so this Enter sends.
-        for c in "gpt-5.6-sol".chars() {
-            handle_key(None, &mut app, press(KeyCode::Char(c))).unwrap();
-        }
-        handle_key(None, &mut app, press(KeyCode::Enter)).unwrap();
-        assert_eq!(app.prompt.to_send(), "");
-        assert!(!app.slash.open);
     }
 
     #[test]
