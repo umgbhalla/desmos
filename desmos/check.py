@@ -271,6 +271,13 @@ def self_check() -> None:
             assert str(_cfg["max_turns"]) in caps, f"{_name} turn cap not in the prompt"
         # fanout's default agent is not spawn's. The prompt says so because a
         # reader would otherwise assume they match.
+        # step()'s turn cap is quoted in the prompt, so the prompt has to be
+        # re-derived from the signature rather than remembered.
+        from desmos.loop import bind_step as _bind
+        _step_sig = _insp.signature(_bind(new_world(cwd, state_path=None, persist=False, ns={})))
+        assert f"max_turns={_step_sig.parameters['max_turns'].default}" in caps, (
+            "the prompt quotes a step() turn cap the loop does not apply"
+        )
         assert _insp.signature(_sa.spawn).parameters["agent"].default == "general"
         assert _insp.signature(_sa.fanout).parameters["agent"].default == "explore"
         assert "defaults to explore" in caps
@@ -1027,6 +1034,25 @@ def self_check() -> None:
         _run(w_cap, "loop forever", quiet=True, max_turns=3, on_event=cap_evs.append)
         assert any("max_turns" in str(m.get("content")) for m in w_cap.messages), "the cap must be said"
         assert any("max_turns" in e.get("text", "") for e in cap_evs if e.get("ev") == "error")
+
+        # ...but only when a caller asked for one. The default cut every long
+        # task off at 32 turns mid-work, which is not a budget: it bounds
+        # nothing that bills. Drive the real loop past the old ceiling and
+        # assert it ran to the model's own stop.
+        w_free = new_world(cwd, state_path=None, persist=False, ns={})
+        free_turns = {"n": 0}
+
+        def _free(*_a, **_k):
+            free_turns["n"] += 1
+            body = "<python>1</python>" if free_turns["n"] <= 40 else "finished"
+            return {"content": [{"type": "text", "text": body}], "usage": {}}
+
+        w_free.complete_fn = _free
+        free_evs: list[dict] = []
+        _run(w_free, "keep going", quiet=True, on_event=free_evs.append)
+        assert free_turns["n"] == 41, f"the loop stopped itself at {free_turns['n']} turns"
+        assert not any("max_turns" in str(m.get("content")) for m in w_free.messages), "capped anyway"
+        assert free_evs[-1].get("ev") == "done", free_evs[-1]
 
         # Neither is running out of money. A child gets a token ceiling from
         # its contract; the root loop had only max_turns, so four huge turns

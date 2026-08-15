@@ -110,8 +110,10 @@ def capabilities() -> str:
             " dependency holds a child until that run is accepted, and a rejected dependency"
             " stops it with an explicit reason. A string task skips all of it and gives you"
             " prose you have to take on trust.",
-            "step(prompt, max_turns=32, max_total_tokens=None) runs a nested turn loop on this"
-            " same world. max_total_tokens is a prompt+completion ceiling counted from the start"
+            "step(prompt, max_turns=None, max_total_tokens=None) runs a nested turn loop on this"
+            " same world. There is no turn cap unless you ask for one — a step ends when the"
+            " model stops calling syscalls, when the user stops it, or on the token ceiling."
+            " max_total_tokens is a prompt+completion ceiling counted from the start"
             " of that step; hitting it stops the loop, says so in the transcript, and reports"
             " `stopped` rather than `done`.",
             "reset() clears the transcript when a poisoned turn would otherwise train the next one."

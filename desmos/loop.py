@@ -315,7 +315,7 @@ def run_turns(
     world: World,
     prompt: str,
     *,
-    max_turns: int = 32,
+    max_turns: int | None = None,
     max_tokens: int = MAX_TOKENS,
     quiet: bool = False,
     on_event: Callable[[dict[str, Any]], None] | None = None,
@@ -323,6 +323,13 @@ def run_turns(
     max_total_tokens: int | None = None,
 ) -> str:
     """Run a step to its end, and always say how it ended.
+
+    ``max_turns`` is off by default. A turn count is not a budget: it bounds
+    nothing that costs money and it cut long tasks off mid-edit, which is the
+    one failure the loop cannot recover from. A step ends when the model stops
+    calling syscalls, when the user stops it, or when ``max_total_tokens`` --
+    the ceiling in the unit that is actually spent -- is reached. Pass an int
+    to cap turns anyway.
 
     Exactly one terminating event leaves here on every path, exception
     included: ``stopped`` if the cancel flag is up, ``done`` otherwise. The TUI
@@ -370,7 +377,7 @@ def _run_turns(
     world: World,
     prompt: str,
     *,
-    max_turns: int = 32,
+    max_turns: int | None = None,
     max_tokens: int = MAX_TOKENS,
     quiet: bool = False,
     on_event: Callable[[dict[str, Any]], None] | None = None,
@@ -406,7 +413,9 @@ def _run_turns(
 
     world.messages.append({"role": "user", "content": header(world, prompt) + "\n\n" + prompt})
     last = ""
-    for n in range(1, max_turns + 1):
+    n = 0
+    while max_turns is None or n < max_turns:
+        n += 1
         if stopped():
             if n > 1:
                 world.messages.append({"role": "user", "content": stop_note(n - 1)})
@@ -466,8 +475,9 @@ def _run_turns(
                 world.messages.append({"role": "user", "content": stop_note(n)})
             _commit_step(world, prompt, speech)
             return speech
-    # Same for the cap: it was printed, and the bridge runs quiet=True, so the
-    # only signal was a `done` event identical to a clean finish.
+    # Only reachable when a caller asked for a turn cap. Same for it as for the
+    # rest: it was printed, and the bridge runs quiet=True, so the only signal
+    # was a `done` event identical to a clean finish.
     note = f"[hit max_turns={max_turns} — the task was not finished]"
     world.messages.append({"role": "user", "content": note})
     emit({"ev": "error", "text": note})
@@ -500,7 +510,7 @@ def bind_step(world: World) -> Callable[..., str]:
     def step(
         prompt: str,
         *,
-        max_turns: int = 32,
+        max_turns: int | None = None,
         max_tokens: int = MAX_TOKENS,
         max_total_tokens: int | None = None,
     ) -> str:
@@ -626,7 +636,8 @@ def run(args: Any) -> int:
     run_dir = Path(args.out)
     run_dir.mkdir(parents=True, exist_ok=True)
     world.model = args.model
-    print(f"model={world.model} thinking={world.thinking} max_turns={args.max_turns} cwd={cwd}")
+    cap = args.max_turns if args.max_turns is not None else "unbounded"
+    print(f"model={world.model} thinking={world.thinking} max_turns={cap} cwd={cwd}")
     print(system_prompt(world))
     print("--------------")
     run_turns(

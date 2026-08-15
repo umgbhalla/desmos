@@ -355,7 +355,7 @@ def main() -> int:
     r = sub.add_parser("run", help="one-shot task, no IPython")
     r.add_argument("task")
     r.add_argument("--model", default=os.environ.get("DESMOS_MODEL") or "claude-opus-5")
-    r.add_argument("--max-turns", type=int, default=32)
+    r.add_argument("--max-turns", type=int, default=None)
     r.add_argument(
         "--max-total-tokens",
         type=int,
