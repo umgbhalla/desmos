@@ -6831,6 +6831,25 @@ fn next_tag(text: &str, from: usize, spans: &[(usize, usize)]) -> Option<TagHit>
         if inner.trim_end().ends_with('/') {
             return Some(TagHit { start, open_end, end: Some(open_end) });
         }
+        // An explicit end token makes the body opaque, exactly as in
+        // `scan.py`: the call runs to its `name:TOKEN` closer and every bare
+        // closer inside it is ordinary text. Miss this and the stripper hunts
+        // for a closer that is never written, calls the opener unterminated,
+        // and paints the whole body -- plus the token closer -- into the story.
+        if let Some(token) = end_token(inner) {
+            let usable = !token.is_empty()
+                && token
+                    .chars()
+                    .all(|c| c.is_alphanumeric() || c == '_' || c == '.' || c == '-');
+            // An unusable token is dropped by the kernel rather than falling
+            // back to a bare closer, so nothing ran and nothing is hidden.
+            let end = if usable {
+                find_custom_close(text, name, &token, open_end)
+            } else {
+                None
+            };
+            return Some(TagHit { start, open_end, end });
+        }
         // The body ends at the first closer that is not inside a quoted
         // string, which is `scan_spans`'s rule and its reason: the only closer
         // a model writes early is one it quoted (`echo "</bash>"`), and
@@ -6863,6 +6882,90 @@ fn find_close(text: &str, name: &str, from: usize) -> Option<(usize, usize)> {
             return Some((s, s + pat.len() + ws + 1));
         }
         i = s + pat.len();
+    }
+    None
+}
+
+/// The `name:TOKEN` closer at or after `from`, allowing the space `scan.py`'s
+/// custom closer allows around the colon and before the `>`. Returns the offset
+/// just past it.
+fn find_custom_close(text: &str, name: &str, token: &str, from: usize) -> Option<usize> {
+    let open = format!("</{name}");
+    let mut i = from;
+    while let Some(rel) = text[i..].find(&open) {
+        let s = i + rel;
+        let rest = &text[s + open.len()..];
+        let a = rest.len() - rest.trim_start().len();
+        if let Some(after) = rest[a..].strip_prefix(':') {
+            let b = after.len() - after.trim_start().len();
+            if let Some(tail) = after[b..].strip_prefix(token) {
+                let c = tail.len() - tail.trim_start().len();
+                if tail[c..].starts_with('>') {
+                    return Some(s + open.len() + a + 1 + b + token.len() + c + 1);
+                }
+            }
+        }
+        i = s + open.len();
+    }
+    None
+}
+
+/// The `end="TOKEN"` attribute of an opener, if it declared one. Values may be
+/// quoted or bare, which is what `scan.py::ATTR` accepts.
+fn end_token(inner: &str) -> Option<String> {
+    let b = inner.as_bytes();
+    let mut i = 0usize;
+    while i < b.len() {
+        if !(b[i].is_ascii_alphabetic() || b[i] == b'_') {
+            i += 1;
+            continue;
+        }
+        let s = i;
+        while i < b.len()
+            && (b[i].is_ascii_alphanumeric() || b[i] == b'_' || b[i] == b'.' || b[i] == b'-')
+        {
+            i += 1;
+        }
+        let name = &inner[s..i];
+        let mut j = i;
+        while j < b.len() && (b[j] as char).is_whitespace() {
+            j += 1;
+        }
+        if j >= b.len() || b[j] != b'=' {
+            continue;
+        }
+        j += 1;
+        while j < b.len() && (b[j] as char).is_whitespace() {
+            j += 1;
+        }
+        if j >= b.len() {
+            return None;
+        }
+        let (value, next) = if b[j] == b'"' || b[j] == b'\'' {
+            let quote = b[j];
+            let vs = j + 1;
+            let mut k = vs;
+            while k < b.len() && b[k] != quote {
+                k += 1;
+            }
+            (&inner[vs..k], (k + 1).min(b.len()))
+        } else {
+            let vs = j;
+            let mut k = j;
+            while k < b.len()
+                && !(b[k] as char).is_whitespace()
+                && b[k] != b'"'
+                && b[k] != b'\''
+                && b[k] != b'>'
+            {
+                k += 1;
+            }
+            (&inner[vs..k], k)
+        };
+        i = next;
+        if name == "end" {
+            return Some(value.to_string());
+        }
     }
     None
 }
@@ -10996,6 +11099,48 @@ mod tests {
         // `scan_spans('<bash>ls</bash >')` -> one call: the closer regex is
         // `</name\s*>`.
         assert_eq!(strip_syscalls("<bash>ls</bash >"), "");
+    }
+
+    /// An `end="TOKEN"` body runs to its token closer and nothing else, so the
+    /// story must hide all of it. Before this, the stripper looked only for a
+    /// bare closer, never found one, treated the opener as unterminated prose,
+    /// and painted the body and the trailing token closer into the pane --
+    /// which is exactly how `</python:R1>` reached a reader's screen.
+    ///
+    /// `desmos/scan.py::scan_spans` on each input, run for real:
+    ///     token body        -> [('python', 0, 35)]  dispatched
+    ///     bare closer inside-> [('python', 0, 38)]  dispatched, body opaque
+    ///     spaced closer     -> [('python', 0, 29)]  dispatched
+    ///     unclosed token    -> []                   inert
+    ///     bad token         -> []                   inert
+    ///     closer in prose   -> []                   inert
+    #[test]
+    fn an_end_token_body_is_stripped_whole() {
+        assert_eq!(strip_syscalls("<python end=\"X\">print(1)</python:X>"), "");
+        // The point of the token: bare closers inside are ordinary text.
+        assert_eq!(
+            strip_syscalls("<python end=\"X\">a</python>b</python:X>"),
+            ""
+        );
+        // Spaces where scan.py's custom closer allows them.
+        assert_eq!(strip_syscalls("<python end=X>a</python : X >"), "");
+        assert_eq!(strip_syscalls("<edit path=\"a.rs\" end='E1'>x</edit:E1>"), "");
+        // Never closed: the kernel drops the opener, so nothing ran and the
+        // text stays visible rather than vanishing from both panes.
+        let unclosed = "<python end=\"X\">print(1)</python>";
+        assert!(
+            strip_syscalls(unclosed).contains("print(1)"),
+            "{:?}",
+            strip_syscalls(unclosed)
+        );
+        // An unusable token is dropped too, not silently given a bare closer.
+        let bad = "<python end=\"a b\">print(1)</python>";
+        assert!(strip_syscalls(bad).contains("print(1)"), "{:?}", strip_syscalls(bad));
+        // A token closer written in prose is prose.
+        assert_eq!(
+            strip_syscalls("it ends with </python:X> ok"),
+            "it ends with </python:X> ok"
+        );
     }
 
     /// The story must strip exactly what the dispatcher ran, or a call shows
