@@ -56,5 +56,6 @@ evidence and acceptance checks.
 whole batch to the bounded shared executor. The `agents` XML tool exposes this
 as one JSON command with `op` set to `spawn_many` and a `tasks` array. Each
 item may contain a text `task` or a typed `contract`, an `agent`, and any
-launch override above. IDs are returned in input order; execution is
-concurrent.
+launch override above. IDs are returned in input order; execution is concurrent. The parent pending
+loop receives one grouped completion callback after every child settles;
+individual child lifecycle events still update the TUI as they happen.

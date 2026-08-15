@@ -107,7 +107,8 @@ def capabilities() -> str:
             " guidance_every_turns defaults to 8, is configurable per launch, and re-anchors"
             " long runs without stopping them; guidance_reminder overrides its text."
             " fanout(tasks) defaults to explore, not general;"
-            " spawn_many(specs) validates a whole batch before concurrent launch."
+            " spawn_many(specs) validates a whole batch before concurrent launch and registers one"
+            " parent-loop completion callback after every child settles."
             " wait(*ids, timeout=600) blocks; gather(ids) waits and joins their output; status()"
             " lists running; result(id) reads one; spawn(resume=id) continues a finished run."
             " A child is an isolated World with its own transcript and no persist.",

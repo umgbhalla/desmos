@@ -493,6 +493,7 @@ def spawn(
     guidance_every_turns: int | None = None,
     guidance_reminder: str | None = None,
     parent: Any = None,
+    _register_pending: bool = True,
     **over: Any,
 ) -> str:
     """Start a child immediately after its typed dependencies are accepted."""
@@ -567,7 +568,8 @@ def spawn(
             f' Read it with result("{run.id}") or judgment("{run.id}").'
         )
 
-    _pending.register(parent, f"subagent {cfg.agent} {run.id}", _settle)
+    if _register_pending:
+        _pending.register(parent, f"subagent {cfg.agent} {run.id}", _settle)
     return run.id
 
 
@@ -667,10 +669,37 @@ def spawn_many(specs: list[dict[str, Any]], *, parent: Any = None) -> list[str]:
         resume = item.pop("resume", None)
         resolve(agent, **item)
         prepared.append((task, agent, resume, item))
-    return [
-        spawn(task, agent=agent, resume=resume, parent=parent, **over)
+    parent = parent or _parent()
+    ids = [
+        spawn(
+            task,
+            agent=agent,
+            resume=resume,
+            parent=parent,
+            _register_pending=False,
+            **over,
+        )
         for task, agent, resume, over in prepared
     ]
+
+    # A batch is one parent decision. Child lifecycle events remain individual
+    # for the TUI, but the model loop resumes once, after the complete batch is
+    # available, rather than once per child with siblings still running.
+    from desmos import pending as _pending
+
+    def _settle_group() -> str:
+        while any(RUNS[i].state in ("pending", "running") for i in ids):
+            time.sleep(0.05)
+        rows = [
+            f"{RUNS[i].cfg.agent} {i}: {RUNS[i].state}/{RUNS[i].stage}"
+            f" after {RUNS[i].turns} turns"
+            for i in ids
+        ]
+        reads = ", ".join(f'result("{i}")' for i in ids)
+        return "subagent group settled:\n" + "\n".join(rows) + f"\nRead: {reads}"
+
+    _pending.register(parent, "subagent group " + " ".join(ids), _settle_group)
+    return ids
 
 
 def fanout(tasks: list[str | TaskContract], agent: str = "explore", **over: Any) -> list[str]:

@@ -241,6 +241,7 @@ def self_check() -> None:
 def parallel_tool_check() -> None:
     """The XML-facing batch waits at a barrier, proving both children started."""
     import threading
+    from desmos import pending
     from desmos.subagent_tool import handle
 
     with tempfile.TemporaryDirectory() as tmp:
@@ -302,6 +303,9 @@ def parallel_tool_check() -> None:
             }
             launched = json.loads(handle(json.dumps(command)))
             assert launched["count"] == 2 and len(launched["ids"]) == 2
+            notices = pending.outstanding(parent)
+            assert len(notices) == 1, "spawn_many registered one callback per child"
+            assert notices[0].name.startswith("subagent group "), notices[0].name
             settled = subagents.wait(*launched["ids"], timeout=5, poll=0.01)
             assert all(row["state"] == "done" for row in settled), settled
             assert {row[0] for row in seen} == {"gpt-5.6-sol", "gpt-5.6-luna"}
@@ -312,6 +316,7 @@ def parallel_tool_check() -> None:
             assert alpha.cfg.guidance_reminder == "KEEP ALPHA"
         finally:
             subagents.wait(timeout=5, poll=0.01)
+            pending.clear(parent)
             subagents.RUNS.clear()
             subagents.DIR = old_dir
             subagents.PARENT = old_parent
