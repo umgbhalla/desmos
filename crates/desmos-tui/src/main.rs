@@ -2564,7 +2564,6 @@ fn handle_child(app: &mut App, ev: &Value) {
         }
         "turn" => {
             child.stream.finish(&mut child.story, &mut child.calls);
-            start_thinking(&mut child.calls, &mut child.stream);
         }
         _ => {}
     }
@@ -2723,7 +2722,6 @@ fn handle_event(app: &mut App, ev: Value) {
         "turn" => {
             app.status = "running".into();
             app.stream.finish(&mut app.story, &mut app.calls);
-            start_thinking(&mut app.calls, &mut app.stream);
         }
         "done" => {
             app.stream.finish(&mut app.story, &mut app.calls);
@@ -10388,6 +10386,26 @@ mod tests {
         assert!(help.contains("story / Activity"), "{help}");
         assert!(help.contains("POST group (Activity)"), "{help}");
         assert!(!help.contains("story / calls"), "{help}");
+    }
+
+    #[test]
+    fn a_turn_waits_without_an_empty_thinking_card() {
+        let mut app = App::new();
+        app.running = true;
+        handle_event(&mut app, json!({"ev": "turn", "text": "go"}));
+        assert!(app.calls.is_empty(), "turn eagerly created Activity chrome");
+
+        let waiting = paint(&mut app, 120, 34);
+        assert!(rows_of(&waiting, app.input_area).contains("Inference"));
+        assert!(!rows_of(&waiting, app.call_area).contains("Thinking"));
+
+        handle_event(
+            &mut app,
+            json!({"ev": "thinking", "delta": true, "redacted": false, "text": "real plan"}),
+        );
+        let active = paint(&mut app, 120, 34);
+        assert_eq!(app.calls.len(), 1);
+        assert!(rows_of(&active, app.call_area).contains("real plan"));
     }
 
     #[test]
