@@ -3168,8 +3168,12 @@ fn submit_prompt(mut bridge: Option<&mut Bridge>, app: &mut App) -> io::Result<b
         return Ok(true);
     }
     if is_local_slash(&line) {
-        app.story_push(RenderBlock::user_prompt(&line));
-        app.story.follow_new_turn(None, false);
+        // No story row. A local command never reaches the model -- it is not
+        // in world.messages and no turn runs -- so pushing a UserPrompt block
+        // put a turn in the transcript that never happened. It was the only
+        // acknowledgement back when nothing drew app.status; the notice on the
+        // composer's edge is that acknowledgement now, and it lapses, which is
+        // the right lifetime for "theme changed".
     if let Some(name) = line.strip_prefix("/theme") {
         let name = name.trim();
         if name.is_empty() {
@@ -3223,6 +3227,7 @@ fn submit_prompt(mut bridge: Option<&mut Bridge>, app: &mut App) -> io::Result<b
                 b.send(&json!({"op":"thinking","level": level}))?;
             }
             app.thinking = level.into();
+            app.notify(format!("thinking {level}"));
         }
     } else if line == "/reset" {
         if let Some(b) = bridge.as_mut() {
@@ -3241,10 +3246,12 @@ fn submit_prompt(mut bridge: Option<&mut Bridge>, app: &mut App) -> io::Result<b
         app.post_out_n = 0;
         app.queue.clear();
         app.send_now = false;
+        app.notify("transcript cleared");
     } else if line == "/reload" {
         if let Some(b) = bridge.as_mut() {
             b.send(&json!({"op":"reload"}))?;
         }
+        app.notify("reloading skills and extensions");
     }
         return Ok(false);
     }
@@ -9365,6 +9372,46 @@ mod tests {
             "story is {blank}/{} blank rows; the gap knob is not reaching the layout",
             body.len()
         );
+    }
+
+
+    /// A local slash command never reaches the model: no turn runs, nothing
+    /// lands in world.messages. It used to push a UserPrompt block anyway, so
+    /// the story showed a turn that never happened.
+    #[test]
+    fn a_local_slash_command_leaves_no_turn_in_the_story() {
+        let mut app = App::new();
+        seed_demo(&mut app);
+        let before = app.story.len();
+        // These commands write process-global appearance state. Put it back, or
+        // this test silently re-themes whichever test runs next on this thread.
+        let (theme0, ts0, dense0) = (
+            Theme::current_kind(),
+            appearance_cache::load_timestamps(),
+            appearance_cache::load(),
+        );
+        for cmd in ["/timestamps", "/dense", "/theme tokyonight", "/thinking high"] {
+            app.prompt.clear();
+            for ch in cmd.chars() {
+                app.prompt.insert_char(ch);
+            }
+            assert!(is_local_slash(cmd), "{cmd} must be handled locally");
+            let quit = submit_prompt(None, &mut app).expect("submit");
+            assert!(!quit);
+            assert_eq!(
+                app.story.len(),
+                before,
+                "{cmd} put a turn in the story that never ran"
+            );
+            // Silent is worse than a stray row: every local command still says
+            // it did something, on the composer's edge, for a few seconds.
+            assert!(app.notice.is_some(), "{cmd} acknowledged nothing");
+            app.notice = None;
+        }
+        theme_cache::set(theme0);
+        appearance_cache::set_timestamps(ts0);
+        appearance_cache::set(dense0);
+        app.apply_grok_settings();
     }
 
     fn click(kind: MouseEventKind, col: u16, row: u16) -> MouseEvent {
