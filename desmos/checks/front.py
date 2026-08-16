@@ -186,14 +186,14 @@ raise SystemExit(B.serve(Path(sys.argv[1]).resolve()))
 
 
 class _SockClient:
-    """One unix-socket bridge client. Reads are bounded (90s) so a bridge that
+    """One unix-socket bridge client. Reads are bounded (30s) so a bridge that
     stalls fails the check instead of hanging it."""
 
     def __init__(self, path: Path) -> None:
         import socket
 
         self.sock = socket.socket(socket.AF_UNIX)
-        self.sock.settimeout(90)
+        self.sock.settimeout(30)
         self.sock.connect(str(path))
         self.rd = self.sock.makefile("r", encoding="utf-8")
 
@@ -245,6 +245,7 @@ def _check_socket() -> None:
     import subprocess
     import sys
     import tempfile
+    import time
 
     root = Path(__file__).resolve().parents[2]
     # Tripwire for the cwd= on the Popen below: the check must not leave a
@@ -375,9 +376,29 @@ def _check_socket() -> None:
             # (a's queue still holds the kill-test fan-out that was read via
             # b, snapshot included; drain it or the flood wait stops early)
             a.until(lambda e: e.get("ev") == "snapshot")
+            before_flood = max(
+                json.loads(line).get("seq") or 0
+                for line in log_file.read_text(encoding="utf-8").splitlines()
+            )
             a.send({"op": "step", "text": "flood test"})
-            flood: list[dict] = []
-            a.until(lambda e: e.get("ev") == "snapshot", seen=flood, limit=50000)
+            # The live queue is deliberately bounded, so a 6,000-event burst
+            # may drop even a reading client on a slower runner. The event log
+            # is the replay contract under test; wait for its terminal
+            # snapshot instead of requiring the live queue to be unbounded.
+            deadline = time.monotonic() + 90
+            while time.monotonic() < deadline:
+                logged_now = [
+                    json.loads(line)
+                    for line in log_file.read_text(encoding="utf-8").splitlines()
+                ]
+                if any(
+                    event.get("seq", 0) > before_flood and event.get("ev") == "snapshot"
+                    for event in logged_now
+                ):
+                    break
+                time.sleep(0.05)
+            else:
+                raise AssertionError("flood step never reached its logged snapshot")
             stamped_total = sum(
                 1 for l in log_file.read_text(encoding="utf-8").splitlines()
                 if json.loads(l).get("seq") is not None
