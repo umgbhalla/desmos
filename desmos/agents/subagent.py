@@ -886,7 +886,30 @@ def child_notice(run: Run) -> str:
     summary = summary or run.result or run.error or run.stop_reason
     summary = " ".join(summary.split())[:200]
     head = f"[{run.id} {run.state} depth={run.depth}] {run.task[:80]} — {verdict}: {summary}"
-    return head[:400]
+    hint = _inspect_hint(run)
+    return f"{head[:400]}\n{hint}" if hint else head[:400]
+
+
+def _inspect_hint(run: Run) -> str:
+    """How the parent opens this run's substructure, from the python kernel.
+
+    The notice is 200 characters of summary standing in for a run that may hold
+    claims, evidence, checks and a verdict. Without this line the parent reads
+    the summary and stops -- which is how a rejected run gets reported upward
+    as a success.
+    """
+    rid = run.id
+    if run.judgment is not None and not run.judgment.accepted:
+        return (
+            f"REJECTED. python: S.judgment('{rid}').reasons for why, "
+            f"S.structured_result('{rid}') for claims/checks, S.result('{rid}') raw."
+        )
+    if run.structured:
+        return (
+            f"python: S.structured_result('{rid}') for claims/checks/evidence, "
+            f"S.judgment('{rid}') for the verdict, S.result('{rid}') raw."
+        )
+    return f"python: S.result('{rid}') for the full report."
 
 
 def kill_subtree(rid: str) -> str:

@@ -65,6 +65,18 @@ class TaskContract:
         outside = [path for path in self.write_paths if path not in self.allowed_paths]
         if outside:
             raise ValueError(f"write paths are outside allowed_paths: {outside}")
+        # judge() matches these against the `kind` field of every EvidenceRef the
+        # child returns. A prose sentence or an invented token can never be
+        # satisfied, so the run is unjudgeable the moment it is spawned -- and
+        # that used to surface only as "missing required evidence kind" after
+        # the work was already done. Fail at the call site instead.
+        unknown = [k for k in self.required_evidence if k not in OBSERVABLE_EVIDENCE]
+        if unknown:
+            raise ValueError(
+                f"unknown required_evidence kinds {unknown}; these are matched "
+                "against EvidenceRef.kind, not read as prose. Use one or more of: "
+                + ", ".join(sorted(OBSERVABLE_EVIDENCE))
+            )
 
     @classmethod
     def legacy(cls, task: str) -> TaskContract:

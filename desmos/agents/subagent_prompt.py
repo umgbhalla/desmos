@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from desmos.transport.dialect import family
-from desmos.agents.subagent_contracts import TaskContract
+from desmos.agents.subagent_contracts import OBSERVABLE_EVIDENCE, TaskContract
 
 LT = chr(60)
 GT = chr(62)
@@ -60,22 +60,94 @@ def _tool_lines(world: Any) -> str:
     return "\n".join(lines)
 
 
+# One entry per CAPS mode. The child is told what it can do from the same
+# table that decides what it can do, so a new capability cannot ship with a
+# prompt that still describes the old one.
+_CAPABILITY_GUIDE: dict[str, str] = {
+    "read": (
+        "Read-only: investigate freely and change nothing. You have no edit "
+        "tag; do not propose a patch as though you had applied it."
+    ),
+    "edit": (
+        "Edit capability: make the smallest complete change, then run its real "
+        "entry point. Report the command you ran and what it printed -- a "
+        "change that was never executed is an unproven change."
+    ),
+    "orchestrator": (
+        "Orchestrator: you have no bash, python, edit, or shell -- you cannot "
+        "read files or run commands yourself. To look around, fork an explore "
+        "child through the agents syscall and read its report; fork worker "
+        "children for changes. Your job is decomposition, judgment, and the "
+        "integrated final answer."
+    ),
+    "full": (
+        "Full capability: you inherit every syscall the parent holds. Prefer "
+        "the narrowest tool that answers the question."
+    ),
+}
+
+_SCHEMA = """{
+  "summary": "one paragraph: what you found or changed",
+  "claims": [
+    {"text": "a finding",
+     "evidence": [{"kind": "file", "reference": "path/to/file.py:42", "detail": ""}]}
+  ],
+  "checks": [
+    {"name": "exact acceptance check name", "passed": true,
+     "evidence": [{"kind": "command", "reference": "python -m desmos check",
+                   "detail": "239 passed"}]}
+  ],
+  "artifacts": [],
+  "changed_paths": [],
+  "failures": [],
+  "unresolved": []
+}"""
+
+
+def _output_format(contract: TaskContract | None) -> str:
+    """The literal object the child must emit.
+
+    Naming the schema is not enough: the largest single rejection cause was
+    `invalid structured result` -- children returning prose because the prompt
+    only referred to "the JSON object required by the contract". Show it.
+    """
+    if contract is None:
+        return ""
+    lines = [
+        "# output format",
+        "Your final message is exactly one JSON object and nothing else: no "
+        "prose before or after it, no code fence, no commentary.",
+        "",
+        _SCHEMA,
+        "",
+        "`kind` must be one of: " + ", ".join(sorted(OBSERVABLE_EVIDENCE)) + ".",
+        "`reference` is the file:line, command, or artifact path you observed.",
+        "Omit a list rather than inventing entries for it, but `summary` is "
+        "never empty -- an empty summary is an automatic rejection.",
+    ]
+    if contract.acceptance_checks:
+        lines.append(
+            "Each acceptance check must appear in `checks` with its name copied "
+            "EXACTLY as written here:"
+        )
+        lines.extend(f"  - {name}" for name in contract.acceptance_checks)
+    if contract.required_evidence:
+        lines.append(
+            "At least one evidence entry of each of these kinds is required: "
+            + ", ".join(contract.required_evidence)
+        )
+    return "\n".join(lines)
+
+
 def _scope(cfg: Any, contract: TaskContract | None) -> str:
     lines = [
         "# scope",
         f"agent: {cfg.agent}",
         f"capability: {cfg.capability}",
     ]
-    if cfg.capability == "read":
-        lines.append("Read-only: investigate freely and change nothing.")
-    if cfg.capability == "orchestrator":
-        lines.append(
-            "Orchestrator: you have no bash, python, edit, or shell — you cannot "
-            "read files or run commands yourself. To look around, fork an explore "
-            "child through the agents syscall and read its report; fork worker "
-            "children for changes. Your job is decomposition, judgment, and the "
-            "integrated final answer."
-        )
+    guide = _CAPABILITY_GUIDE.get(cfg.capability)
+    if guide:
+        lines.append(guide)
     if contract is None:
         lines.append("Return a cited prose report.")
         return "\n".join(lines)
@@ -120,12 +192,12 @@ def child_system_prompt(
         f"model: {world.model}\n"
         "Nothing persists after this run."
     )
-    return "\n\n".join(
-        [
-            shared,
-            _tool_lines(world),
-            _scope(cfg, contract),
-            persona + lane,
-            runtime,
-        ]
-    )
+    sections = [
+        shared,
+        _tool_lines(world),
+        _scope(cfg, contract),
+        _output_format(contract),
+        persona + lane,
+        runtime,
+    ]
+    return "\n\n".join(section for section in sections if section)

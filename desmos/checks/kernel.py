@@ -70,6 +70,7 @@ def check() -> None:
         from desmos import subagent as _sa
         from desmos.loop import RESULT_CLIP as _clip_cap
         from desmos.subagent_contracts import TaskContract as _TC
+        from desmos.agents import subagent_prompt as _sp
         import inspect as _insp
 
         caps = _caps()
@@ -109,15 +110,47 @@ def check() -> None:
             paths="crates/x",
             write="crates/x",
             checks="cargo test",
-            evidence="file:line",
+            evidence="file",
         )
-        assert _one.required_evidence == ("file:line",), _one.required_evidence
+        assert _one.required_evidence == ("file",), _one.required_evidence
         assert _one.allowed_paths == ("crates/x",), _one.allowed_paths
         assert _one.write_paths == ("crates/x",), _one.write_paths
         assert _one.acceptance_checks == ("cargo test",), _one.acceptance_checks
         # Lists and tuples still work, and empties stay empty.
         _many = _TC.simple("do it", paths=["a", "b"], evidence=())
         assert _many.allowed_paths == ("a", "b") and _many.required_evidence == ()
+        # required_evidence is matched against EvidenceRef.kind, so a prose
+        # sentence is unsatisfiable. It must fail at construction, not survive
+        # to judgement as "missing required evidence kind: <the whole sentence>".
+        try:
+            _TC.simple("do it", evidence="every claim cites a file:line")
+        except ValueError as _exc:
+            assert "unknown required_evidence kinds" in str(_exc), str(_exc)
+        else:
+            raise AssertionError("prose required_evidence was accepted")
+        # The child is shown the schema it must emit, not just told it exists.
+        _fmt = _sp._output_format(_TC.simple("o", checks="cargo test", evidence="command"))
+        assert '"summary"' in _fmt and '"changed_paths"' in _fmt, _fmt
+        assert "cargo test" in _fmt, "acceptance check names are not shown verbatim"
+        assert _sp._output_format(None) == ""
+        # Wiring, not just the helper: the schema and the capability text must
+        # reach the prompt the child is actually launched with. Asserting on
+        # _output_format alone would pass against an unwired call site.
+        class _W:
+            cwd = "/tmp"
+            model = "gpt-5.6-luna"
+            tools: dict = {}
+
+        _full = _sp.child_system_prompt(
+            _W(), _sa.resolve("explore"), _TC.simple("o", evidence="command")
+        )
+        assert "# output format" in _full, "output format never reaches the child prompt"
+        assert '"changed_paths"' in _full, "schema body missing from the child prompt"
+        assert "Read-only" in _full, "capability guide never reaches the child prompt"
+        # Every CAPS mode has prompt text; a new capability cannot ship without it.
+        assert set(_sp._CAPABILITY_GUIDE) == set(_sa.CAPS), (
+            set(_sa.CAPS) ^ set(_sp._CAPABILITY_GUIDE)
+        )
         for _n in ("structured_result", "judgment", "spawn", "fanout", "wait", "gather", "status"):
             assert callable(getattr(_sa, _n)), _n
             assert _n in caps, f"prompt names {_n} but subagent does not export it"
