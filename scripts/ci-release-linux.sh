@@ -1,11 +1,12 @@
 #!/bin/sh
 set -eu
 
-export PATH="$HOME/.nix-profile/bin:$HOME/.cargo/bin:$PATH"
-
 tag=${1:?release tag required}
 state=${2:-/srv/desmos-ci}
 target=x86_64-unknown-linux-gnu
+export CARGO_HOME="$state/cargo"
+export RUSTUP_HOME="$state/rustup"
+export PATH="$state/nix-profile/bin:$CARGO_HOME/bin:$PATH"
 version=$(python3 -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')
 
 test "$tag" = "v$version"
