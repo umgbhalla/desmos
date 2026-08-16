@@ -111,6 +111,7 @@ jobs:
               curl -fsSL https://github.com/protocolbuffers/protobuf/releases/download/v30.2/protoc-30.2-linux-x86_64.zip -o "$DESMOS_STATE/protoc.zip"
               mkdir -p "$DESMOS_STATE/protobuf"
               python3 -m zipfile -e "$DESMOS_STATE/protoc.zip" "$DESMOS_STATE/protobuf"
+              chmod +x "$DESMOS_STATE/protobuf/bin/protoc"
             fi
             command -v rg >/dev/null
           '
