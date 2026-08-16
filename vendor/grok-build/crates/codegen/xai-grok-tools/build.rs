@@ -5,7 +5,7 @@
 use std::env;
 use std::fs;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 const RG_VER: &str = "15.0.0";
 const BFS_VER: &str = "4.1";
@@ -260,13 +260,11 @@ fn bundle_rg() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    // Expose cfg so the crate can include the bundled bytes.
-    println!("cargo:rustc-cfg=bundle_rg");
-    println!("cargo:rustc-env=GROK_TOOLS_RG_VER={}", RG_VER);
-
     // If a local rg binary is provided, copy it directly (skips target check).
     if let Some(path) = path_override {
         let dest = gen_dir.join(format!("rg-{}-override.bin", RG_VER));
+        println!("cargo:rustc-cfg=bundle_rg");
+        println!("cargo:rustc-env=GROK_TOOLS_RG_VER={}", RG_VER);
         println!("cargo:rustc-env=GROK_TOOLS_RG_TARGET=override");
         let _ = fs::remove_file(&dest);
         fs::copy(PathBuf::from(path.clone()), &dest).map_err(|e| {
@@ -294,7 +292,6 @@ fn bundle_rg() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    println!("cargo:rustc-env=GROK_TOOLS_RG_TARGET={}", asset_triple);
     let dest = gen_dir.join(format!("rg-{}-{}.bin", RG_VER, asset_triple));
     let _ = fs::remove_file(&dest);
 
@@ -304,22 +301,27 @@ fn bundle_rg() -> Result<(), Box<dyn std::error::Error>> {
         t = asset_triple
     );
 
-    let bytes: Vec<u8> = {
-        let resp = reqwest::blocking::get(&url).map_err(|e| {
-            format!(
-                "Failed to download ripgrep: {}\nSet GROK_TOOLS_BUNDLE_RG_PATH to a local rg for offline builds.",
-                e
-            )
-        })?;
-        if !resp.status().is_success() {
-            return Err(format!(
-                "HTTP {} downloading ripgrep. Set GROK_TOOLS_BUNDLE_RG_PATH for offline builds.",
-                resp.status()
-            )
-            .into());
+    let response = reqwest::blocking::get(&url);
+    let resp = match response {
+        Ok(resp) if resp.status().is_success() => resp,
+        failed => {
+            if bundle_path_rg(&gen_dir)? {
+                return Ok(());
+            }
+            return match failed {
+                Ok(resp) => Err(format!(
+                    "HTTP {} downloading ripgrep. Set GROK_TOOLS_BUNDLE_RG_PATH for offline builds.",
+                    resp.status()
+                )
+                .into()),
+                Err(e) => Err(format!(
+                    "Failed to download ripgrep: {e}\nSet GROK_TOOLS_BUNDLE_RG_PATH to a local rg for offline builds."
+                )
+                .into()),
+            };
         }
-        resp.bytes()?.to_vec()
     };
+    let bytes = resp.bytes()?.to_vec();
 
     let gz = flate2::read::GzDecoder::new(&bytes[..]);
     let mut ar = tar::Archive::new(gz);
@@ -347,5 +349,31 @@ fn bundle_rg() -> Result<(), Box<dyn std::error::Error>> {
         .into());
     }
 
+    println!("cargo:rustc-cfg=bundle_rg");
+    println!("cargo:rustc-env=GROK_TOOLS_RG_VER={RG_VER}");
+    println!("cargo:rustc-env=GROK_TOOLS_RG_TARGET={asset_triple}");
+
     Ok(())
+}
+
+fn bundle_path_rg(gen_dir: &Path) -> Result<bool, Box<dyn std::error::Error>> {
+    if env::var_os("HOST") != env::var_os("TARGET") {
+        return Ok(false);
+    }
+    let Some(path) = env::var_os("PATH").and_then(|paths| {
+        env::split_paths(&paths)
+            .map(|dir| dir.join("rg"))
+            .find(|path| path.is_file())
+    }) else {
+        return Ok(false);
+    };
+    fs::copy(&path, gen_dir.join("rg-path-path.bin"))?;
+    println!(
+        "cargo:warning=Could not download ripgrep; bundling {}",
+        path.display()
+    );
+    println!("cargo:rustc-cfg=bundle_rg");
+    println!("cargo:rustc-env=GROK_TOOLS_RG_VER=path");
+    println!("cargo:rustc-env=GROK_TOOLS_RG_TARGET=path");
+    Ok(true)
 }

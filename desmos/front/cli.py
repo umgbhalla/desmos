@@ -138,17 +138,31 @@ def cmd_tui(args: argparse.Namespace) -> int:
     import shutil
     import subprocess
 
+    root = _repo_root()
+    cwd = str(Path(args.cwd).resolve())
+    grok = root / "vendor" / "grok-build"
+    env = _tui_build_env()
+    release_binary = os.environ.get("DESMOS_TUI_BINARY")
+    if release_binary is None and not grok.is_dir():
+        release_binary = shutil.which("desmos-tui")
+    if release_binary and not args.debug and not args.grok:
+        bin_path = Path(release_binary).expanduser().resolve()
+        if not bin_path.is_file():
+            print(f"desmos-tui binary not found: {bin_path}", file=sys.stderr)
+            return 1
+        cmd = [str(bin_path), "--python", sys.executable, "--cwd", cwd]
+        if args.demo:
+            cmd.append("--demo")
+        os.execve(str(bin_path), cmd, env)
+        return 1
+
     cargo = shutil.which("cargo")
     if cargo is None:
         print("desmos tui needs cargo")
         return 1
-    root = _repo_root()
-    cwd = str(Path(args.cwd).resolve())
-    grok = root / "vendor" / "grok-build"
     if not grok.is_dir():
         print("clone grok-build into vendor/grok-build")
         return 1
-    env = _tui_build_env()
     if getattr(args, "grok", False):
         env["DESMOS_ACP"] = f"{sys.executable} -m desmos acp"
         env["DESMOS_CWD"] = cwd

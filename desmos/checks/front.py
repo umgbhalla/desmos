@@ -92,6 +92,36 @@ def _check_vendor_patch() -> None:
         )
 
 
+def _check_release_tui_launcher() -> None:
+    """An installed wheel launches its release TUI without Rust or vendored source."""
+    import os
+    import subprocess
+    import sys
+    import tempfile
+
+    root = Path(__file__).resolve().parents[2]
+    with tempfile.TemporaryDirectory() as tmp:
+        fake = Path(tmp) / "desmos-tui"
+        fake.write_text('#!/bin/sh\nprintf "%s\\n" "$@"\n', encoding="utf-8")
+        fake.chmod(0o755)
+        env = dict(os.environ)
+        env["PYTHONPATH"] = str(root)
+        env["DESMOS_TUI_BINARY"] = str(fake)
+        ran = subprocess.run(
+            [sys.executable, "-m", "desmos", "tui", "--demo", "--cwd", tmp],
+            env=env,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        assert ran.stdout.splitlines() == [
+            "--python",
+            sys.executable,
+            "--cwd",
+            str(Path(tmp).resolve()),
+            "--demo",
+        ], ran
+
 
 # The stubbed gland for the socket checks: the REAL bridge subprocess and the
 # REAL loop, with canned responses -- the record-golden pattern, one code path,
@@ -660,4 +690,5 @@ def check() -> None:
         # pager compiles either way and just runs grok's agent instead of ours.
         _check_path_deps_tracked()
         _check_vendor_patch()
+        _check_release_tui_launcher()
     _check_socket()
