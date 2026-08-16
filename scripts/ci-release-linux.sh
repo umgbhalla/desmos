@@ -43,7 +43,7 @@ if bad:
 PY
 
 rc=0
-git grep -InE --untracked \
+git grep -InE --no-recurse-submodules --untracked \
   'sk-ant-[A-Za-z0-9_-]{16,}|sk-proj-[A-Za-z0-9_-]{16,}|(ANTHROPIC|OPENAI|XAI)_API_KEY=[A-Za-z0-9_-]{16,}|(access|refresh|id)_token"?[[:space:]:=]+"?eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{16,}' \
   -- . || rc=$?
 case "$rc" in
