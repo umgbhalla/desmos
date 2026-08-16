@@ -621,6 +621,7 @@ def check() -> None:
 
         bridge_env = dict(os.environ)
         bridge_env["DESMOS_SETTINGS"] = str(cwd / "settings.json")
+        bridge_env["OPENAI_API_KEY"] = "check-only"
         bridge_env["PYTHONPATH"] = str(Path(__file__).resolve().parents[2])
         (cwd / "bridgecwd").mkdir(exist_ok=True)
         proc = _sp.Popen(

@@ -115,7 +115,11 @@ class Shell:
             fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 50, 200, 0, 0))
         except (OSError, termios.error):
             pass
-        argv = [command] if command else ["/bin/bash", "--norc", "--noprofile"]
+        # interrupt() targets the tty's foreground process group. Bash only
+        # gives foreground jobs their own group with monitor mode enabled;
+        # without it Linux puts bash and the job in one group, so Ctrl-C also
+        # aborts the sourced completion marker and the monitor never settles.
+        argv = [command] if command else ["/bin/bash", "--norc", "--noprofile", "-m"]
         env = dict(os.environ)
         env["PS1"] = ""
         env["PS2"] = ""
