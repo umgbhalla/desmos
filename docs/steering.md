@@ -8,6 +8,37 @@ The design rule that follows: **add stages, not tags.** Every capability
 below is a hook point or a carrier on a message that was already going to be
 sent. None of it is a new syscall family.
 
+## 0. What exo already does, and what it costs
+
+Exo rebuilds the tool registry and reassembles the prompt **before every
+model round** (`turn-loop.ts:112-136,189-194`); a newly installed tool
+reports availability "next round" behind a cache-busting import parameter
+(`built-in-tools.ts:511-590`). So "modify your own context by injecting new
+information as needed" is not the thing to invent. Exo has it, per round, as
+ordinary mechanics.
+
+What exo pays for it: reassembling the whole prompt every round forfeits any
+prefix cache. And exo has no per-agent capability enforcement at all — tools
+are hard-coded per executor (`executor/src/basic.rs:611-632`).
+
+Desmos is the mirror image. `split_system` already partitions the prompt into
+a cached ABI block, a cached catalog block, and an uncached tail; and the
+two-layer capability machinery exo lacks is built and shipped, for children
+only — prune `world.tools` so the prompt cannot advertise what is not held,
+then scope the dispatcher so it is refused even if reinstalled
+(`subagent.py`, `_scoped_tags`).
+
+| | exo | desmos today | target |
+| --- | --- | --- | --- |
+| context mutation | every round | never | every round, tail only |
+| cache discipline | none | strict | strict, unchanged |
+| tool surface | swapped per round | frozen, cached, forever | core cached, rest situational |
+| capability enforcement | none | two-layer, children only | two-layer, every session |
+| forgetting | coarse prefix delete | server fold | fold plus queryable record |
+
+The improvement over exo is therefore not a new capability. It is **exo's
+dynamism confined to the region where dynamism is free.**
+
 ## 1. The stages that already exist
 
 Measured in this tree, not proposed.
@@ -88,13 +119,58 @@ survives and no half-written `tool_use` is left to orphan.
 *Gate:* interrupt mid-stream, then assert the stored message replays through
 `cached_payload` with pairing intact and the partial text still present.
 
-### Phase D — retire tags into stages
+### Phase D — the tool surface becomes situational
 
-The "fewer tags" half, decided by measurement rather than taste. Use the
-usage rollup (constitution Phase 1.2) over `calls`/`events` per op. Anything
-never called is retired behind the stages above.
+The "fewer tags" half, and the reason it belongs here rather than in a
+cleanup ticket. Seven families are advertised in a *cached* block to every
+turn forever — the ABI's own warning about what a tag costs, paid
+permanently and by every session.
 
-*Gate:* catalog token count strictly decreases; suite stays green.
+Exo swaps its registry per round; we can do the same *and* enforce it, which
+exo cannot. Keep an irreducible core in the cached block, render the
+situational half into the live region, and govern it with the two-layer
+scoping already written for children. Which ops are core is decided by the
+usage rollup (constitution Phase 1.2), not by taste.
+
+Steering by withdrawing a capability is stronger than steering by asking for
+one to go unused.
+
+*Gate:* cached catalog tokens strictly decrease; a family absent from the
+live region is absent from the prompt *and* refused by the dispatcher; suite
+green.
+
+### Phase E — the record is queryable, not merely foldable
+
+Exo's best idea is in its RLM executor: the conversation is loaded into a
+sandboxed workspace as *data*, and the root model queries slices of it rather
+than paging all of it into a prompt (`executor/src/rlm.rs:70-98`,
+`309-348`). Exo's own forgetting is otherwise a coarse prefix delete
+(`basic.rs:1266-1303`).
+
+We already do this in exactly one place: a result over the cap spills to
+`.desmos/out/` and the reply is a pointer the agent greps. Nothing else gets
+the treatment. In particular the folded past is still sitting in sqlite and
+there is no way to ask it anything.
+
+*Gate:* after a fold, a query against the folded turns returns the matching
+slice, and answering from it costs a bounded number of tokens rather than a
+re-expansion of the transcript.
+
+**This may dissolve T1 rather than answer it.** Retention is only a hard
+choice while the context window is the record's only reader. If the record is
+queryable, "summarise or keep verbatim" collapses into "keep verbatim on
+disk, page in slices on demand", and the 692 recoverable messages stop being
+an argument about storage.
+
+### Phase F — refine and tombstone
+
+`docs/self-growth.md` already specifies the loop: a grown handler that is
+never called, or that errors twice, should be tombstoned. Nothing implements
+it. Exo has no equivalent either, so this is not catching up — it is the
+first half of the evaluation track the constitution is missing.
+
+*Gate:* a deliberately broken grown tool is tombstoned by the loop and leaves
+the catalog without a human turn.
 
 ## 5. Open, and honest
 
