@@ -124,6 +124,23 @@ def check() -> None:
             assert _db.execute("SELECT COUNT(*) FROM sessions").fetchone()[0] == 1
             assert _db.execute("PRAGMA foreign_key_check").fetchall() == []
 
+        # Compatible normalized schemas upgrade in place. A stale process may
+        # refuse the newer marker, but it must not force the live transcript
+        # through the corrupt-file recovery path.
+        with _sqlite3.connect(cwd / "harness.sqlite3") as _db:
+            _db.execute("UPDATE schema_migrations SET version = 5")
+        upgraded = new_world(cwd, state_path=cwd / "harness.sqlite3")
+        assert upgraded.notes["style"] == "prefer tests"
+        with _sqlite3.connect(cwd / "harness.sqlite3") as _db:
+            from desmos.state.persist import SCHEMA_VERSION
+
+            assert _db.execute("SELECT version FROM schema_migrations").fetchall() == [
+                (SCHEMA_VERSION,)
+            ]
+            assert _db.execute(
+                "SELECT COUNT(*) FROM pragma_table_info('channel_cursors')"
+            ).fetchone()[0] > 0
+
         # Legacy SQLite layouts are refused rather than guessed at.
         old_path = cwd / "legacy-layout.sqlite3"
         with _sqlite3.connect(old_path) as old_db:

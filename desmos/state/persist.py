@@ -25,7 +25,7 @@ from desmos.kernel.types import Tool, World
 _UMASK = os.umask(0)
 os.umask(_UMASK)
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 6
 #: One attach, one id, across SQL, provider routing, cache, presence, and wire.
 #: The environment survives reload_sdk; a new process gets a new session.
 SESSION_ID_ENV = "DESMOS_SESSION_ID"
@@ -453,11 +453,12 @@ def _migrate(conn: sqlite3.Connection) -> None:
                 "SELECT version FROM schema_migrations ORDER BY version"
             )
         ]
-        if versions and versions != [SCHEMA_VERSION]:
+        if versions and max(versions) > SCHEMA_VERSION:
             raise RuntimeError(
                 f"harness schema versions {versions}, expected [{SCHEMA_VERSION}]"
             )
-        if not versions:
+        if versions != [SCHEMA_VERSION]:
+            conn.execute("DELETE FROM schema_migrations")
             conn.execute(
                 "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
                 (SCHEMA_VERSION, datetime.now(timezone.utc).isoformat()),
