@@ -455,7 +455,11 @@ def _user_prompt(run: Run) -> str:
     rendered_task = (
         run.contract.prompt()
         if run.structured and run.contract is not None
-        else run.task
+        else (
+            f"{run.task}\n\n"
+            "Return concise prose covering the summary, evidence, unresolved items, "
+            "and checks. Do not return JSON."
+        )
     )
     if run.cfg.task_template is not None:
         if "{task}" not in run.cfg.task_template:
