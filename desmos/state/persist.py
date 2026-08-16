@@ -749,9 +749,25 @@ def _save_data(conn: sqlite3.Connection, world: World, data: dict[str, Any]) -> 
             " WHERE id = ?",
             (str(world.model), str(data["thinking"]), now, session),
         )
-        for table in ("messages", "prior_turns"):
-            conn.execute(f"DELETE FROM {table} WHERE session_id = ?", (session,))
-        conn.execute("DELETE FROM history_fts WHERE session_id = ?", (session,))
+        # Both transcripts are written as a slice from an offset marking this
+        # session's own contribution, and an offset can drift past the end of a
+        # list that was folded or truncated. When it does, the slice is empty --
+        # and an empty slice is not an instruction to forget. Deleting on it
+        # destroyed the stored transcript and then saved nothing over it, every
+        # turn, in silence. Stale is recoverable; erased is not.
+        if data["messages"]:
+            conn.execute("DELETE FROM messages WHERE session_id = ?", (session,))
+            conn.execute(
+                "DELETE FROM history_fts WHERE session_id = ?"
+                " AND kind LIKE 'message:%'",
+                (session,),
+            )
+        if data["prior"]:
+            conn.execute("DELETE FROM prior_turns WHERE session_id = ?", (session,))
+            conn.execute(
+                "DELETE FROM history_fts WHERE session_id = ? AND kind = 'prior'",
+                (session,),
+            )
         for table in ("notes", "tools"):
             conn.execute(f"DELETE FROM {table} WHERE workspace_id = ?", (workspace,))
 

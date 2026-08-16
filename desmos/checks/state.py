@@ -344,6 +344,7 @@ def check() -> None:
         _check_quarantine_manifest()
         _check_prune_manifest()
         _check_salvage()
+        _check_fold_keeps_transcript()
 
 
 #: The one fixture both languages price. `crates/desmos-tui/src/main.rs`
@@ -497,6 +498,91 @@ def _check_prune_manifest() -> None:
         assert left == 0, f"{left} messages survived their pruned session"
     finally:
         conn.close()
+
+
+def _check_fold_keeps_transcript() -> None:
+    """A fold must not erase the transcript of the session doing the folding.
+
+    Both transcripts are persisted as a slice from an offset marking where this
+    session's own contribution begins. Anything that shortens the list from the
+    front -- a fold, the prior-turn cap -- moves the data out from under that
+    offset. When the slice went empty the save deleted the stored rows and
+    wrote nothing back, so a session lost its history at the moment it grew
+    long enough to need it.
+
+    Driven through the real entry points: `compact.compact` and `_commit_step`.
+    """
+    import tempfile
+
+    from desmos.kernel import loop as kernel_loop
+    from desmos.kernel.const import PRIOR_KEEP
+    from desmos.state import compact, persist
+
+    root = Path(tempfile.mkdtemp())
+    live = new_world(root, persist=True)
+
+    def stored() -> tuple[int, list[str]]:
+        conn = persist._open(persist.state_file(live))
+        try:
+            session = persist.run_id()
+            count = conn.execute(
+                "SELECT count(*) FROM messages WHERE session_id = ?", (session,)
+            ).fetchone()[0]
+            prompts = [
+                str(row[0])
+                for row in conn.execute(
+                    "SELECT prompt FROM prior_turns WHERE session_id = ? ORDER BY seq",
+                    (session,),
+                )
+            ]
+            return int(count), prompts
+        finally:
+            conn.close()
+
+    for i in range(60):
+        live.messages.append(
+            {
+                "role": "user" if i % 2 == 0 else "assistant",
+                "content": f"turn {i} about the kingfisher ledger",
+            }
+        )
+    # A resumed session: the first thirty messages came from its parent.
+    live.session_message_start = 30
+    persist.save(live)
+    assert stored()[0] == 30, stored()[0]
+
+    folded = compact.compact(live)
+    assert folded["folded"] > 0, folded
+    assert live.session_message_start <= len(live.messages), live.session_message_start
+    assert stored()[0] == len(live.messages), (stored()[0], len(live.messages))
+
+    live.messages.append({"role": "user", "content": "written after the fold"})
+    persist.save(live)
+    conn = persist._open(persist.state_file(live))
+    try:
+        landed = conn.execute(
+            "SELECT count(*) FROM messages WHERE session_id = ?"
+            " AND content_json LIKE '%written after the fold%'",
+            (persist.run_id(),),
+        ).fetchone()[0]
+    finally:
+        conn.close()
+    assert landed == 1, "a turn written after a fold is not persisted"
+
+    # An offset that drifts anyway must leave the record stale, never erased.
+    keep = stored()[0]
+    live.session_message_start = len(live.messages) + 99
+    persist.save(live)
+    assert stored()[0] == keep, "an empty payload deleted the stored transcript"
+    live.session_message_start = 0
+
+    # The prior-turn cap drops from the front. Pinned at the cap, the offset
+    # never moves again and the session records none of its own turns.
+    live.prior = [{"prompt": f"inherited {i}", "speech": "x"} for i in range(PRIOR_KEEP)]
+    live.session_prior_start = PRIOR_KEEP
+    kernel_loop._commit_step(live, "the session's own ask", "its own answer")
+    prompts = stored()[1]
+    assert prompts == ["the session's own ask"], prompts
 
 
 def _check_salvage() -> None:

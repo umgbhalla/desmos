@@ -666,7 +666,13 @@ def _commit_step(world: World, prompt: str, last: str) -> None:
     from desmos.state.persist import save
 
     world.prior.append({"prompt": prompt, "speech": last})
+    dropped = max(0, len(world.prior) - PRIOR_KEEP)
     world.prior = world.prior[-PRIOR_KEEP:]
+    # The cap drops from the front, so the offset marking where this session's
+    # own turns begin has to drop with it. Left pinned at the cap it never
+    # moves again, the persisted slice is empty forever, and the session stops
+    # recording its own turns without any error.
+    world.session_prior_start = max(0, int(world.session_prior_start) - dropped)
     save(world)
 
 

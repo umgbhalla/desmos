@@ -38,6 +38,13 @@ def compact(world: Any, keep: int = 24, floor: int = 40) -> dict[str, int]:
         rows.append(f"- {message.get('role', '?')}{mark}: {' '.join(text.split())[:110]}")
     note = {"role": "user", "content": f"<compacted n={len(head)}>\\nEarlier turns, folded.\\n" + "\\n".join(rows) + "\\n</compacted>"}
     messages[:] = [note, *tail]
+    # Same invariant, other list: everything folded is now represented by the
+    # note at index 0, so an offset into the old list has to be rebased or the
+    # save below persists an empty slice -- which is how a fold came to erase
+    # the stored transcript of the session doing the folding.
+    world.session_message_start = max(
+        0, int(world.session_message_start) - (len(head) - 1)
+    )
     from desmos.state.persist import save
     save(world)
     return {"before": before, "after": _weight(messages), "folded": len(head)}
