@@ -3,6 +3,8 @@
 //! can follow, plus the repo tail that says what that work did to the tree.
 //! Moved verbatim out of main.rs (and `call_target` out of events.rs).
 
+use std::collections::HashMap;
+
 use serde_json::Value;
 use xai_grok_pager::scrollback::{EntryId, RenderBlock, ScrollbackState};
 
@@ -104,6 +106,10 @@ pub(crate) struct WorkRun {
     /// The row itself, once the run has earned one. Rewritten in place as the
     /// run grows, so it never moves and never stacks.
     row: Option<EntryId>,
+    /// Full ordered segment records for compact rows. Kept by entry id after a
+    /// run folds so the existing Story viewer can inspect what the one-line
+    /// sentence deliberately compressed or elided.
+    details: HashMap<EntryId, String>,
     /// Generation of the first git read that will see what the run's last
     /// syscall did — [`side::GitPane::poll`]'s answer, taken at the result.
     pub(crate) fresh_gen: u64,
@@ -148,6 +154,10 @@ impl WorkRun {
             .push(Seg::Thought(elapsed_ms.unwrap_or(0).max(0) as u64));
     }
 
+    pub(crate) fn detail(&self, id: EntryId) -> Option<&str> {
+        self.details.get(&id).map(String::as_str)
+    }
+
     pub(crate) fn calls(&self) -> usize {
         self.segs
             .iter()
@@ -171,16 +181,23 @@ impl WorkRun {
             story.remove_entry(id);
         }
         let live = self.row.filter(|id| story.get_by_id(*id).is_some());
-        match live {
+        let id = match live {
             Some(id) => {
                 if let Some(entry) = story.get_by_id_mut(id) {
                     entry.block = RenderBlock::system(line);
                 }
                 story.mark_structurally_dirty(id);
                 story.mark_height_dirty(id);
+                id
             }
-            None => self.row = Some(story.push_block(RenderBlock::system(line))),
-        }
+            None => {
+                let id = story.push_block(RenderBlock::system(line));
+                self.row = Some(id);
+                id
+            }
+        };
+        self.details
+            .insert(id, work_detail(&self.segs, self.tail.as_deref()));
     }
 
     /// Close the run at the seam, just before prose starts. The last sync
@@ -221,10 +238,18 @@ impl WorkRun {
         let Some(entry) = story.get_by_id_mut(id) else {
             return;
         };
-        entry.block = RenderBlock::system(row_line(
-            &sentence,
-            git_tail(committed.as_deref(), git).as_deref(),
-        ));
+        let tail = git_tail(committed.as_deref(), git);
+        entry.block = RenderBlock::system(row_line(&sentence, tail.as_deref()));
+        if let Some(detail) = self.details.get_mut(&id) {
+            while detail.lines().last().is_some_and(|line| line.starts_with("Repository:")) {
+                let keep = detail.rfind('\n').unwrap_or(0);
+                detail.truncate(keep);
+            }
+            if let Some(tail) = tail {
+                detail.push_str("\nRepository: ");
+                detail.push_str(tail.trim_start_matches('·').trim());
+            }
+        }
         story.mark_structurally_dirty(id);
         story.mark_height_dirty(id);
     }
@@ -246,6 +271,23 @@ fn row_line(sentence: &str, tail: Option<&str>) -> String {
         Some(t) => format!("{sentence}  {t}"),
         None => sentence.to_string(),
     }
+}
+
+/// The popup record: every segment in order, without grouping or elision.
+fn work_detail(segs: &[Seg], tail: Option<&str>) -> String {
+    let mut rows = vec!["Activity sequence".to_string()];
+    for (index, seg) in segs.iter().enumerate() {
+        let value = match seg {
+            Seg::Thought(ms) => format!("thought {} ({ms} ms)", human_secs(*ms)),
+            Seg::Call { tag, target: Some(target) } => format!("{tag} → {target}"),
+            Seg::Call { tag, target: None } => tag.clone(),
+        };
+        rows.push(format!("{:>2}. {value}", index + 1));
+    }
+    if let Some(tail) = tail {
+        rows.push(format!("Repository: {}", tail.trim_start_matches('·').trim()));
+    }
+    rows.join("\n")
 }
 
 /// Render a run as one line: thoughts as durations, calls compressed.
@@ -348,6 +390,24 @@ mod tests {
         let line = work_sentence(&segs);
         assert!(line.contains('\u{2026}'), "long run must elide: {line}");
         assert!(line.len() < 90, "still too long: {line}");
+    }
+
+    #[test]
+    fn detail_keeps_every_segment_that_the_summary_elides() {
+        let mut segs = Vec::new();
+        for i in 0..8 {
+            segs.push(Seg::Thought(1_000 * (i + 1)));
+            segs.push(call("read", Some(&format!("file-{i}.rs"))));
+        }
+        let summary = work_sentence(&segs);
+        let detail = work_detail(&segs, Some("· tree clean"));
+        assert!(summary.contains('\u{2026}'), "fixture must exercise summary elision");
+        assert!(!detail.contains('\u{2026}'), "detail must never elide: {detail}");
+        assert_eq!(detail.lines().filter(|line| line.contains(". ")).count(), 16);
+        for i in 0..8 {
+            assert!(detail.contains(&format!("file-{i}.rs")), "missing segment {i}: {detail}");
+        }
+        assert!(detail.ends_with("Repository: tree clean"));
     }
 
     #[test]

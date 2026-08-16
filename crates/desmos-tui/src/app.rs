@@ -690,15 +690,28 @@ impl App {
         } else {
             ViewerSrc::Story
         };
-        let pane = self.sess_mut().scroll(src == ViewerSrc::Calls);
-        let Some(idx) = pane.selected() else {
-            return false;
+        let entry = {
+            let pane = self.sess_mut().scroll(src == ViewerSrc::Calls);
+            let Some(idx) = pane.selected() else {
+                return false;
+            };
+            let Some(entry) = pane.entry(idx).cloned() else {
+                return false;
+            };
+            entry
         };
-        let Some(entry) = pane.entry(idx) else {
-            return false;
-        };
-        let Some(viewer) = viewer_for_entry(entry) else {
-            return false;
+        let detail = (src == ViewerSrc::Story)
+            .then(|| self.sess().stream.run.detail(entry.id))
+            .flatten()
+            .map(str::to_owned);
+        let viewer = match detail {
+            Some(body) => BlockViewerPane::for_plain_text("activity sequence", &body),
+            None => {
+                let Some(viewer) = viewer_for_entry(&entry) else {
+                    return false;
+                };
+                viewer
+            }
         };
         self.viewer_src = src;
         self.viewer = Some(viewer);

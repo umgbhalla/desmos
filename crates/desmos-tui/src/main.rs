@@ -4519,6 +4519,87 @@ mod tests {
     }
 
     #[test]
+    fn work_summary_enter_opens_scrollable_detail_and_escape_closes() {
+        let mut app = App::new();
+        app.ready = true;
+        handle_event(&mut app, json!({"ev": "turn", "text": "go"}));
+        handle_event(
+            &mut app,
+            json!({"ev": "result", "tag": "python", "body": "first()", "text": "ok"}),
+        );
+        handle_event(
+            &mut app,
+            json!({"ev": "result", "tag": "read", "attrs": {"path": "main.rs"}, "text": "ok"}),
+        );
+        let idx = (0..app.sess.story.len())
+            .find(|i| matches!(
+                app.sess.story.entry(*i).map(|entry| &entry.block),
+                Some(RenderBlock::System(_))
+            ))
+            .expect("work summary row");
+        let id = app.sess.story.entry(idx).unwrap().id;
+        let detail = app.sess.stream.run.detail(id).expect("archived detail");
+        assert!(detail.contains("1. python"), "{detail}");
+        assert!(detail.contains("2. read → main.rs"), "{detail}");
+
+        app.focus = Focus::Story;
+        app.sess.story.set_selected(Some(idx));
+        handle_key(
+            None,
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert_eq!(app.viewer.as_ref().map(|viewer| viewer.kind), Some(ViewerKind::PlainText));
+
+        handle_viewer_key(
+            &mut app,
+            KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE),
+        );
+        assert!(app.viewer.is_some(), "scrolling closed the detail popup");
+        handle_viewer_key(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.viewer.is_none(), "escape did not close the detail popup");
+        assert_eq!(app.focus, Focus::Story, "popup close changed pane focus");
+    }
+
+    #[test]
+    fn work_summary_double_click_opens_the_detail_popup() {
+        let mut app = App::new();
+        app.ready = true;
+        handle_event(&mut app, json!({"ev": "turn", "text": "go"}));
+        handle_event(&mut app, json!({"ev": "result", "tag": "python", "text": "ok"}));
+        handle_event(
+            &mut app,
+            json!({"ev": "result", "tag": "read", "attrs": {"path": "main.rs"}, "text": "ok"}),
+        );
+        let idx = (0..app.sess.story.len())
+            .find(|i| matches!(
+                app.sess.story.entry(*i).map(|entry| &entry.block),
+                Some(RenderBlock::System(_))
+            ))
+            .expect("work summary row");
+        let _ = paint(&mut app, 100, 40);
+        let area = app.traj_area;
+        let point = (area.y..area.bottom()).find_map(|row| {
+            (area.x..area.right()).find_map(|col| {
+                let block = app.sess.story_sel.hit_test_visible_block(col, row)?;
+                (block.entry_idx == idx
+                    && app.sess.story_sel.hit_test_text_exact(col, row).is_none())
+                    .then_some((col, row))
+            })
+        }).expect("summary block has no clickable non-text cell");
+
+        app.focus = Focus::Story;
+        handle_scrollback_down(&mut app, false, point.0, point.1);
+        handle_scrollback_down(&mut app, false, point.0, point.1);
+        assert_eq!(
+            app.viewer.as_ref().map(|viewer| viewer.kind),
+            Some(ViewerKind::PlainText),
+            "double-click did not open the archived activity detail",
+        );
+    }
+
+    #[test]
     fn invisible_work_folds_into_one_row_above_the_prose() {
         let mut app = App::new();
         handle_event(&mut app, json!({"ev": "turn", "text": "go"}));

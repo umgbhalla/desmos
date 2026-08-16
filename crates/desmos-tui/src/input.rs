@@ -1185,6 +1185,15 @@ pub(crate) fn handle_scrollback_down(app: &mut App, calls: bool, col: u16, row: 
         if !calls && app.open_selected_session() {
             return;
         }
+        let work_summary = !calls
+            && app
+                .sess()
+                .story
+                .entry(idx)
+                .is_some_and(|entry| app.sess().stream.run.detail(entry.id).is_some());
+        if work_summary && app.open_block_viewer() {
+            return;
+        }
         if calls {
             pin_selected_wire(app);
         }
