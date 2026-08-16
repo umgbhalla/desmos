@@ -354,12 +354,24 @@ def _session(world, op, body, attrs):
                 ),
                 default=str,
             )
+        target = str(
+            attrs.get("to") or attrs.get("session_id") or attrs.get("run_id") or ""
+        ).strip()
+        if target:
+            if target == persist.run_id():
+                return "session post: target is this session"
+            live = {row["run_id"] for row in persist.peers(world)}
+            if target not in live:
+                return f"session post: target {target!r} is not active"
+            channel = persist.peer_channel(target, "request")
         try:
             message = persist.channel_post(
                 world, body, channel=channel, author=attrs.get("author", "")
             )
         except ValueError as exc:
             return str(exc)
+        if target:
+            message.update({"to": target, "kind": "request"})
         return json.dumps(message, default=str)
     model = body.strip() or attrs.pop("model", "")
     if not model:

@@ -251,6 +251,8 @@ def _check_socket() -> None:
     import tempfile
     import time
 
+    from desmos.state.persist import peer_channel
+
     def read_log(path: Path, session_id: str) -> list[dict]:
         import sqlite3
 
@@ -347,6 +349,52 @@ def _check_socket() -> None:
                 "unread": 1,
                 "message_id": 1,
             }, channel
+
+            # A directed request must drive the real bridge loop without a local
+            # composer submit, then return exactly one final reply to its sender.
+            with sqlite3.connect(cwd / ".desmos" / "harness.sqlite3") as db:
+                db.execute(
+                    """
+                    INSERT INTO channel_messages(
+                        workspace_id, session_id, channel, run_id,
+                        author, body, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        owner[0], owner[1], peer_channel(owner[1], "request"),
+                        "peer-check", "peer-check", "please answer", "2026-01-02",
+                    ),
+                )
+            a.until(lambda e: e.get("ev") == "snapshot", seen=a_events)
+            with sqlite3.connect(cwd / ".desmos" / "harness.sqlite3") as db:
+                replies = db.execute(
+                    "SELECT run_id, body FROM channel_messages WHERE channel = ?",
+                    (peer_channel("peer-check", "reply"),),
+                ).fetchall()
+            assert replies == [(owner[1], "pong")], replies
+
+            # A returned reply wakes the sender to report it, but is not itself
+            # auto-replied. That makes the exchange bounded by construction.
+            with sqlite3.connect(cwd / ".desmos" / "harness.sqlite3") as db:
+                db.execute(
+                    """
+                    INSERT INTO channel_messages(
+                        workspace_id, session_id, channel, run_id,
+                        author, body, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        owner[0], owner[1], peer_channel(owner[1], "reply"),
+                        "peer-check", "peer-check", "thanks", "2026-01-03",
+                    ),
+                )
+            a.until(lambda e: e.get("ev") == "snapshot", seen=a_events)
+            with sqlite3.connect(cwd / ".desmos" / "harness.sqlite3") as db:
+                reply_count = db.execute(
+                    "SELECT COUNT(*) FROM channel_messages WHERE channel = ?",
+                    (peer_channel("peer-check", "reply"),),
+                ).fetchone()[0]
+            assert reply_count == 1, "a peer reply triggered an autonomous loop"
 
             a.send({"op": "step", "text": "ping"})
             a.until(lambda e: e.get("ev") == "snapshot", seen=a_events)

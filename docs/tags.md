@@ -95,7 +95,10 @@ lease, so crashed or exited peers are pruned without a heartbeat timeout.
 Inbox reports unread messages from other runs without advancing the cursor.
 Read returns ordered messages from the `conflicts` channel by default, accepts
 `channel`, `since`, and `limit`, and marks returned messages read unless
-`mark=false`. Post appends the body and accepts `channel` and `author`; dismiss
+`mark=false`. Post appends the body and accepts `channel` and `author`. With a
+live peer id in `to`, `session_id`, or `run_id`, post instead starts a bounded
+one-round exchange: the target wakes, its final response returns automatically,
+and the sender wakes once to report it. Replies are never auto-replied. Dismiss
 advances the unread cursor without replying. All channel data stays in the
 checkout's harness database.
 

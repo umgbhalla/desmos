@@ -843,6 +843,16 @@ def peers(world: World) -> list[dict[str, Any]]:
     return live
 
 
+def peer_channel(target_run: str, kind: str) -> str:
+    """Private directed channel for one bounded peer request or reply."""
+    target = str(target_run).strip()
+    if not target:
+        raise ValueError("session post: target is empty")
+    if kind not in {"request", "reply"}:
+        raise ValueError(f"session peer channel: unknown kind {kind!r}")
+    return f"peer:{target}:{kind}"
+
+
 def channel_post(
     world: World, body: str, channel: str = "conflicts", author: str = ""
 ) -> dict[str, Any]:

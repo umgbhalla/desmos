@@ -358,35 +358,79 @@ def _bind_socket(cwd: Path) -> socket.socket | None:
     return srv
 
 
-def _watch_channel(world: Any, stop: threading.Event) -> None:
-    """Emit one transient event per newly observed batch; SQLite owns unread state."""
-    from desmos.state.persist import channel_inbox
+def _watch_channel(
+    world: Any, inbox: queue.Queue, stop: threading.Event
+) -> None:
+    """Show shared activity and enqueue each directed peer exchange once."""
+    from desmos.state.persist import (
+        channel_dismiss,
+        channel_inbox,
+        peer_channel,
+        run_id,
+    )
 
     last_emitted = 0
+    last_peer = {"request": 0, "reply": 0}
     while not stop.wait(0.25):
         try:
             info = channel_inbox(world, limit=50)
-        except Exception:  # noqa: BLE001 -- a popup must never kill the bridge
+            fresh = [
+                message for message in info["messages"]
+                if int(message["id"]) > last_emitted
+            ]
+            if fresh:
+                last_emitted = max(int(message["id"]) for message in fresh)
+                latest = fresh[-1]
+                preview = " ".join(str(latest["body"]).split())
+                if len(preview) > 120:
+                    preview = preview[:119].rstrip() + "…"
+                _emit({
+                    "ev": "channel",
+                    "channel": info["channel"],
+                    "author": latest["author"],
+                    "preview": preview,
+                    "unread": info["unread"],
+                    "message_id": int(latest["id"]),
+                })
+
+            for kind in ("request", "reply"):
+                channel = peer_channel(run_id(), kind)
+                directed = channel_inbox(world, channel=channel, limit=20)
+                for message in directed["messages"]:
+                    message_id = int(message["id"])
+                    if message_id <= last_peer[kind]:
+                        continue
+                    sender = str(message["run_id"])
+                    body = str(message["body"])
+                    if kind == "request":
+                        text = (
+                            f"[Peer session {sender} requested a one-round exchange]\\n\\n"
+                            f"{body}\\n\\n"
+                            "Answer the request. Your final response will be returned "
+                            "automatically; do not post a separate peer reply."
+                        )
+                    else:
+                        text = (
+                            f"[Peer session {sender} replied to your request]\\n\\n"
+                            f"{body}\\n\\n"
+                            "Report this reply to your user. Do not contact the peer "
+                            "again unless the user explicitly asks."
+                        )
+                    inbox.put({
+                        "op": "step",
+                        "text": text,
+                        "_peer": {
+                            "kind": kind,
+                            "sender": sender,
+                            "message_id": message_id,
+                        },
+                    })
+                    last_peer[kind] = message_id
+                    # Queue first, then commit the durable cursor. A failure can
+                    # duplicate one exchange after restart, but cannot lose it.
+                    channel_dismiss(world, channel=channel, through=message_id)
+        except Exception:  # noqa: BLE001 -- peer activity must not kill the bridge
             continue
-        fresh = [
-            message for message in info["messages"]
-            if int(message["id"]) > last_emitted
-        ]
-        if not fresh:
-            continue
-        last_emitted = max(int(message["id"]) for message in fresh)
-        latest = fresh[-1]
-        preview = " ".join(str(latest["body"]).split())
-        if len(preview) > 120:
-            preview = preview[:119].rstrip() + "…"
-        _emit({
-            "ev": "channel",
-            "channel": info["channel"],
-            "author": latest["author"],
-            "preview": preview,
-            "unread": info["unread"],
-            "message_id": int(latest["id"]),
-        })
 
 
 def serve(cwd: Path) -> int:
@@ -471,7 +515,7 @@ def serve(cwd: Path) -> int:
             "live bridge or could not be bound",
         })
     threading.Thread(
-        target=_watch_channel, args=(world, channel_stop), daemon=True
+        target=_watch_channel, args=(world, inbox, channel_stop), daemon=True
     ).start()
     try:
         return _drive(world, inbox, cancel)
@@ -508,7 +552,7 @@ def _drive(world: Any, inbox: queue.Queue, cancel: threading.Event) -> int:
                 # A queued follow-up outranks background work: if the user has
                 # already typed the next thing, stop waiting for a task to land
                 # and give the turn back.
-                run_turns(
+                speech = run_turns(
                     world,
                     text,
                     quiet=True,
@@ -517,6 +561,16 @@ def _drive(world: Any, inbox: queue.Queue, cancel: threading.Event) -> int:
                     has_input=lambda: not inbox.empty(),
                     images=images,
                 )
+                peer = msg.get("_peer")
+                if isinstance(peer, dict) and peer.get("kind") == "request":
+                    from desmos.state.persist import channel_post, peer_channel
+
+                    response = str(speech).strip() or "(peer session returned no final response)"
+                    channel_post(
+                        world,
+                        response,
+                        channel=peer_channel(str(peer.get("sender") or ""), "reply"),
+                    )
                 _emit(_snapshot(world))
             elif op == "snapshot":
                 _emit(_snapshot(world))

@@ -525,6 +525,23 @@ def _check_session_channel(cwd: Path) -> None:
             )
         )
         assert posted["channel"] == "conflicts" and posted["id"] > 0, posted
+        directed = json.loads(
+            dispatch(
+                world,
+                Block(
+                    "session",
+                    "Can you inspect the overlap?",
+                    {"op": "post", "session_id": peer_id},
+                ),
+            )
+        )
+        assert directed["to"] == peer_id and directed["kind"] == "request", directed
+        assert directed["channel"] == persist.peer_channel(peer_id, "request"), directed
+        missing = dispatch(
+            world,
+            Block("session", "hello?", {"op": "post", "to": "not-a-live-run"}),
+        )
+        assert "not active" in missing, missing
         assert json.loads(
             dispatch(world, Block("session", "", {"op": "inbox"}))
         )["unread"] == 0, "a run must not notify itself"
