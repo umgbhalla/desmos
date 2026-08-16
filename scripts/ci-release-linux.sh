@@ -1,6 +1,8 @@
 #!/bin/sh
 set -eu
 
+export PATH="$HOME/.nix-profile/bin:$HOME/.cargo/bin:$PATH"
+
 tag=${1:?release tag required}
 state=${2:-/srv/desmos-ci}
 target=x86_64-unknown-linux-gnu
