@@ -173,6 +173,11 @@ class Run:
     # and spawn() answers with a refusal string. `generation` is the parent
     # world's generation at spawn.
     parent: str | None = None
+    #: The run this one inherited its transcript from (spawn(resume=id)), as
+    #: opposed to `parent`, which is who launched it. Two resumes off one
+    #: source are a split: same history, divergent futures, and without this
+    #: field the record says only `context="resumed"` and the lineage is gone.
+    source: str | None = None
     depth: int = 0
     budget: int = 0
     generation: int = 0
@@ -213,6 +218,7 @@ class Run:
             "agent": self.cfg.agent,
             "task": self.task[:160],
             "parent": self.parent,
+            "source": self.source,
             "depth": self.depth,
             "budget": self.budget,
             "state": self.state,
@@ -836,6 +842,7 @@ def spawn(
         if src.cfg.agent != cfg.agent:
             raise ValueError(f"resume identity mismatch: {src.cfg.agent} != {cfg.agent}")
         run.messages = list(src.messages)
+        run.source = src.id
         run.cfg.context = "resumed"
     _launch(run, parent, _register_pending)
     return run.id
@@ -1086,6 +1093,23 @@ def structured_result(rid: str) -> RunResult | None:
 def judgment(rid: str) -> Judgment | None:
     run = RUNS.get(rid)
     return run.judgment if run is not None else None
+
+
+def lineage(rid: str) -> list[str]:
+    """The resume chain ending at ``rid``, oldest context first.
+
+    A subagent is not a process that stays alive; it is a transcript on disk
+    that a later run can be launched over. So continuity is a chain of runs,
+    not one long-lived child, and this is how that chain is read back. A run
+    that started fresh returns just itself. Cycles are impossible (a source
+    must already be `done`) but the walk is bounded anyway.
+    """
+    seen: list[str] = []
+    cur: str | None = rid
+    while cur is not None and cur in RUNS and cur not in seen and len(seen) < 64:
+        seen.append(cur)
+        cur = RUNS[cur].source
+    return list(reversed(seen))
 
 
 def spawn_many(specs: list[dict[str, Any]], *, parent: Any = None) -> list[str]:

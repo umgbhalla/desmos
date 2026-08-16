@@ -406,6 +406,36 @@ def check() -> None:
             assert "— rejected:" in mute_notice, mute_notice
             assert "REJECTED." in mute_notice, mute_notice
 
+            # --- split: resume is the only continuity primitive, and calling
+            # it twice off one source is a fork -- one inherited transcript,
+            # two futures. `source` is what makes the chain readable after the
+            # fact; `parent` records only who launched it. Identity does not
+            # travel: a transcript written under one agent's prompt and tool
+            # scope cannot be worn by another.
+            left = S.spawn(
+                "carry on left", agent="explore", model="claude-opus-5",
+                resume=bid, parent=big_root,
+            )
+            right = S.spawn(
+                "carry on right", agent="explore", model="claude-opus-5",
+                resume=bid, parent=big_root,
+            )
+            S.wait(left, right, timeout=20.0)
+            assert S.RUNS[left].source == bid, S.RUNS[left].source
+            assert S.RUNS[right].source == bid, S.RUNS[right].source
+            assert S.RUNS[left].cfg.context == "resumed", S.RUNS[left].cfg.context
+            assert S.RUNS[left].messages, "resume inherited no transcript"
+            assert S.lineage(left) == [bid, left], S.lineage(left)
+            assert S.lineage(bid) == [bid], S.lineage(bid)
+            rec_left = json.loads((S.DIR / f"{left}.json").read_text(encoding="utf-8"))
+            assert rec_left["source"] == bid, rec_left.get("source")
+            try:
+                S.spawn("wrong seat", agent="general", resume=bid, parent=big_root)
+            except ValueError as exc:
+                assert "identity mismatch" in str(exc), exc
+            else:
+                raise AssertionError("resume crossed agent identity")
+
             # --- rerun (C3): a settled run respawns as a fresh id with the
             # same objective, wired to the same parent world. Unknown ids are
             # answered in prose, never raised.
