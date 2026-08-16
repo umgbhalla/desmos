@@ -65,3 +65,57 @@ def load(api):
         return None
     api.on("before_dispatch", before_dispatch)
 ```
+
+`api.hook` and `api.tool` are accepted spellings of `api.on` and
+`api.register_tool`. A file that raises on import no longer disappears: the
+error is collected and printed by `reload`.
+
+## Hook points
+
+| Event | Fired | Signature | Return |
+| --- | --- | --- | --- |
+| `before_dispatch` | `kernel/dispatch.py`, before a syscall runs | `(world, block)` | a string replaces the result and the call never runs |
+| `compacted` | `kernel/loop.py`, when the server folds the transcript | `(world, info)` with `n`, `kept`, `text` | ignored; a raise is recorded on the log entry |
+
+A session can register a hook straight from the kernel without writing a file,
+and it now survives `install_resources` — which runs at the top of every run:
+
+```python
+world.hooks.setdefault("compacted", []).append(fn)
+```
+
+The loader retires only the hooks it installed, so a reload replaces extension
+hooks and leaves session-registered ones alone.
+
+## Pattern: handing off across a fold
+
+A fold destroys earlier turns for the model that wakes up after it, and that
+model cannot read what went. Notes ride in every request, so a note survives a
+fold by construction — which makes a note the only place a pre-fold self can
+leave something for a post-fold self.
+
+Splitting the note in two is what makes this work. The agent writes what
+matters by hand and the hook never touches it; the hook writes only what
+cannot be known in advance — that a fold happened, and the volatile state that
+was true at that moment.
+
+```python
+# .desmos/extensions/handoff.py
+MARK = "--- above: written at each fold. below: mine, never rewritten ---"
+
+def on_fold(world, info):
+    body = world.notes.get("handoff", "")
+    mine = body.split(MARK, 1)[1].lstrip("\n") if MARK in body else body
+    world.notes["handoff"] = stamp(world, info) + "\n\n" + MARK + "\n" + mine
+    from desmos.state.persist import save
+    save(world)
+
+def load(api):
+    api.hook("compacted", on_fold)
+```
+
+`stamp` is free to collect whatever the transcript was carrying and the note
+was not: the fold counts, `HEAD`, the dirty files, the open todo rows, the
+server's summary. The general shape — *a hook fires at the moment state is
+destroyed, and copies the perishable part into something that outlives it* —
+is not specific to folds.
