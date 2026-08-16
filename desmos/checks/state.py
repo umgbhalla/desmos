@@ -345,6 +345,7 @@ def check() -> None:
 
         _check_prices()
         _check_call_ledger(cwd)
+        _check_session_channel(cwd)
 
 
 #: The one fixture both languages price. `crates/desmos-tui/src/main.rs`
@@ -419,3 +420,67 @@ def _check_call_ledger(cwd: Path) -> None:
     child.model = "gpt-5.6-luna"
     persist.record_call(child, {"usage": FIXTURE_USAGE})
     assert persist.runs(world)[0]["calls"] == 2
+
+
+def _check_session_channel(cwd: Path) -> None:
+    """Canonical session ops expose live peers and an ordered local channel."""
+    import fcntl
+    import json
+    import sqlite3
+
+    from desmos.state import persist
+
+    path = cwd / "channel.sqlite3"
+    world = new_world(cwd, state_path=path)
+    peer_id = "peer-run"
+    lease_path = persist._presence_path(world, peer_id)
+    lease_path.parent.mkdir(parents=True, exist_ok=True)
+    peer_lease = lease_path.open("a+")
+    fcntl.flock(peer_lease.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    try:
+        with sqlite3.connect(path) as db:
+            db.execute(
+                """
+                INSERT INTO active_runs(
+                    run_id, pid, cwd, generation, model, started_at, seen_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (peer_id, 99999, str(cwd), 1, "peer-model", "2026-01-01", "2026-01-01"),
+            )
+
+        peers = json.loads(dispatch(world, Block("session", "", {"op": "peers"})))
+        assert {row["run_id"] for row in peers} == {persist.run_id(), peer_id}, peers
+
+        posted = json.loads(
+            dispatch(
+                world,
+                Block(
+                    "session",
+                    "I am editing persist.py; please avoid it.",
+                    {"op": "post", "author": "worker-a"},
+                ),
+            )
+        )
+        assert posted["channel"] == "conflicts" and posted["id"] > 0, posted
+        messages = json.loads(
+            dispatch(world, Block("session", "", {"op": "read", "since": "0"}))
+        )
+        assert [row["body"] for row in messages] == [
+            "I am editing persist.py; please avoid it."
+        ], messages
+        assert json.loads(
+            dispatch(
+                world,
+                Block("session", "", {"op": "read", "since": str(posted["id"])}),
+            )
+        ) == []
+    finally:
+        fcntl.flock(peer_lease.fileno(), fcntl.LOCK_UN)
+        peer_lease.close()
+
+    peers = json.loads(dispatch(world, Block("session", "", {"op": "peers"})))
+    assert [row["run_id"] for row in peers] == [persist.run_id()], peers
+    with sqlite3.connect(path) as db:
+        assert db.execute(
+            "SELECT COUNT(*) FROM active_runs WHERE run_id = ?", (peer_id,)
+        ).fetchone()[0] == 0

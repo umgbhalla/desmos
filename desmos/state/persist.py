@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import sqlite3
@@ -23,7 +24,7 @@ from desmos.kernel.types import Tool, World
 _UMASK = os.umask(0)
 os.umask(_UMASK)
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 SESSION_ID = "default"
 #: One attach of the process. `sessions` is a singleton keyed to the cwd --
 #: it is the durable world, not a sitting -- so nothing named the thing a
@@ -35,6 +36,7 @@ RUN_ID_ENV = "DESMOS_RUN_ID"
 DB_FILENAME = "harness.sqlite3"
 LEGACY_FILENAME = "harness.json"
 KEEP_MESSAGES = 80
+_PRESENCE_LEASES: dict[str, Any] = {}
 
 
 def atomic_write(path: Path, text: str) -> None:
@@ -361,12 +363,31 @@ def _migrate(conn: sqlite3.Connection) -> None:
             cost_usd REAL NOT NULL DEFAULT 0,
             PRIMARY KEY (session_id, run_id, seq)
         );
+        CREATE TABLE IF NOT EXISTS active_runs (
+            run_id TEXT PRIMARY KEY,
+            pid INTEGER NOT NULL,
+            cwd TEXT NOT NULL,
+            generation INTEGER NOT NULL,
+            model TEXT NOT NULL,
+            started_at TEXT NOT NULL,
+            seen_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS channel_messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            channel TEXT NOT NULL,
+            run_id TEXT NOT NULL,
+            author TEXT NOT NULL,
+            body TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
         DROP TABLE IF EXISTS seat;
         DROP TABLE IF EXISTS seat_events;
         CREATE INDEX IF NOT EXISTS idx_messages_session_seq
             ON messages(session_id, seq);
         CREATE INDEX IF NOT EXISTS idx_calls_run
             ON calls(session_id, run_id, seq);
+        CREATE INDEX IF NOT EXISTS idx_channel_messages_channel_id
+            ON channel_messages(channel, id);
         """
     )
     versions = [int(row[0]) for row in conn.execute("SELECT version FROM schema_migrations")]
@@ -554,6 +575,131 @@ def run_id() -> str:
     return fresh
 
 
+def _presence_path(world: World, run: str) -> Path:
+    return state_file(world).parent / "presence" / f"{run}.lock"
+
+
+def announce(world: World, conn: sqlite3.Connection | None = None) -> None:
+    """Advertise this live process using a lock the OS releases on exit."""
+    if not world.persist:
+        return
+    run = run_id()
+    path = _presence_path(world, run)
+    key = str(path.resolve())
+    if key not in _PRESENCE_LEASES:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        lease = path.open("a+")
+        fcntl.flock(lease.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        _PRESENCE_LEASES[key] = lease
+    own = conn is None
+    db = conn or _open(state_file(world))
+    now = datetime.now(timezone.utc).isoformat()
+    try:
+        with db:
+            db.execute(
+                """
+                INSERT INTO active_runs(
+                    run_id, pid, cwd, generation, model, started_at, seen_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(run_id) DO UPDATE SET
+                    pid=excluded.pid, cwd=excluded.cwd,
+                    generation=excluded.generation, model=excluded.model,
+                    seen_at=excluded.seen_at
+                """,
+                (run, os.getpid(), str(world.cwd), int(world.generation),
+                 str(world.model), now, now),
+            )
+    finally:
+        if own:
+            db.close()
+
+
+def peers(world: World) -> list[dict[str, Any]]:
+    """Live runs in this checkout; stale rows are pruned by probing their leases."""
+    if not world.persist:
+        return []
+    announce(world)
+    db = _open(state_file(world))
+    current = run_id()
+    live: list[dict[str, Any]] = []
+    try:
+        rows = db.execute(
+            "SELECT * FROM active_runs ORDER BY started_at, run_id"
+        ).fetchall()
+        for row in rows:
+            item = dict(row)
+            item["self"] = item["run_id"] == current
+            if item["self"]:
+                live.append(item)
+                continue
+            path = _presence_path(world, item["run_id"])
+            path.parent.mkdir(parents=True, exist_ok=True)
+            probe = path.open("a+")
+            try:
+                fcntl.flock(probe.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                live.append(item)
+            else:
+                fcntl.flock(probe.fileno(), fcntl.LOCK_UN)
+                with db:
+                    db.execute("DELETE FROM active_runs WHERE run_id = ?", (item["run_id"],))
+            finally:
+                probe.close()
+    finally:
+        db.close()
+    return live
+
+
+def channel_post(
+    world: World, body: str, channel: str = "conflicts", author: str = ""
+) -> dict[str, Any]:
+    text = body.strip()
+    if not text:
+        raise ValueError("session post: message is empty")
+    announce(world)
+    db = _open(state_file(world))
+    now = datetime.now(timezone.utc).isoformat()
+    run = run_id()
+    try:
+        with db:
+            cur = db.execute(
+                """
+                INSERT INTO channel_messages(channel, run_id, author, body, created_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (channel or "conflicts", run, author.strip() or run, text, now),
+            )
+            message_id = int(cur.lastrowid)
+    finally:
+        db.close()
+    return {
+        "id": message_id, "channel": channel or "conflicts", "run_id": run,
+        "author": author.strip() or run, "body": text, "created_at": now,
+    }
+
+
+def channel_read(
+    world: World, channel: str = "conflicts", since: int = 0, limit: int = 50
+) -> list[dict[str, Any]]:
+    if not world.persist:
+        return []
+    announce(world)
+    db = _open(state_file(world))
+    try:
+        rows = db.execute(
+            """
+            SELECT id, channel, run_id, author, body, created_at
+            FROM channel_messages
+            WHERE channel = ? AND id > ?
+            ORDER BY id LIMIT ?
+            """,
+            (channel or "conflicts", int(since), max(1, min(int(limit), 200))),
+        ).fetchall()
+        return [dict(row) for row in rows]
+    finally:
+        db.close()
+
+
 def record_call(world: World, entry: dict[str, Any]) -> None:
     """Append one model round-trip to the durable ledger.
 
@@ -657,6 +803,7 @@ def save(world: World) -> None:
     conn = _open(state_file(world))
     try:
         _save_data(conn, world, _data_from_world(world))
+        announce(world, conn)
     finally:
         conn.close()
     try:
@@ -788,4 +935,5 @@ def load(world: World) -> None:
         if data is not None:
             _apply_data(world, data)
     finally:
+        announce(world, conn)
         conn.close()

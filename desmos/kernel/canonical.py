@@ -33,7 +33,7 @@ DIRECT_OPS = {
     "knowledge": ("todo", "plan"),
     "observe": ("usage", "trajectory", "error", "symbol", "threads"),
     "agents": ("spawn", "fanout", "status", "result", "structured-result", "judgment", "wait"),
-    "session": ("compact", "status", "switch"),
+    "session": ("compact", "status", "switch", "peers", "read", "post"),
 }
 
 
@@ -285,6 +285,27 @@ def _session(world, op, body, attrs):
             "model": world.model, "thinking": world.thinking,
             "generation": world.generation, "messages": len(world.messages),
         })
+    if op in {"peers", "read", "post"}:
+        from desmos.state import persist
+        if op == "peers":
+            return json.dumps(persist.peers(world), default=str)
+        channel = attrs.get("channel", "conflicts")
+        if op == "read":
+            return json.dumps(
+                persist.channel_read(
+                    world, channel=channel,
+                    since=int(attrs.get("since", 0)),
+                    limit=int(attrs.get("limit", 50)),
+                ),
+                default=str,
+            )
+        try:
+            message = persist.channel_post(
+                world, body, channel=channel, author=attrs.get("author", "")
+            )
+        except ValueError as exc:
+            return str(exc)
+        return json.dumps(message, default=str)
     model = body.strip() or attrs.pop("model", "")
     if not model:
         return "session switch: missing model"
