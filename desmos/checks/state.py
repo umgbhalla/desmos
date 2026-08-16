@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 from desmos.dispatch import dispatch
@@ -342,6 +343,7 @@ def check() -> None:
         _check_session_channel(cwd)
         _check_quarantine_manifest()
         _check_prune_manifest()
+        _check_salvage()
 
 
 #: The one fixture both languages price. `crates/desmos-tui/src/main.rs`
@@ -495,6 +497,72 @@ def _check_prune_manifest() -> None:
         assert left == 0, f"{left} messages survived their pruned session"
     finally:
         conn.close()
+
+
+def _check_salvage() -> None:
+    """A quarantined conversation must become answerable again.
+
+    Row counts are not the acceptance test. The point of salvage is that a
+    recall for something only the lost session said stops coming back empty,
+    so this drives `search_history` before and after and asserts on the flip.
+
+    Salvage is dry by default: the dry run must change nothing, and a second
+    apply must find nothing left to do.
+    """
+    import tempfile
+
+    from desmos.state import persist, salvage
+
+    root = Path(tempfile.mkdtemp())
+    rare = "peregrine telemetry cadence"
+    previous = os.environ.get(persist.SESSION_ID_ENV)
+    try:
+        lost = new_world(root, persist=True)
+        lost.messages.append({"role": "user", "content": f"about {rare} and nothing else"})
+        lost.messages.append({"role": "assistant", "content": "noted"})
+        persist.save(lost)
+        path = persist.state_file(lost)
+
+        # Quarantine it the way recovery does. Corrupting the header instead
+        # would make the dead file unreadable, which is not the case being
+        # repaired -- all ninety files in this workspace open cleanly.
+        moved = persist._move_sqlite_files(path, "corrupt")
+        assert moved, "nothing was moved aside"
+
+        # A different attach, on the empty replacement.
+        os.environ[persist.SESSION_ID_ENV] = "01a0salvage000000000000000000000"
+        live = new_world(root, persist=True)
+        live.messages.append({"role": "user", "content": "an unrelated later question"})
+        persist.save(live)
+
+        assert not persist.search_history(live, rare), "the lost session was never lost"
+
+        found = salvage.survey(path)
+        assert found["files"] >= 1, found
+        assert found["sessions"] == 1, found
+        assert found["messages"] >= 2, found
+        assert not found["unreadable"], found
+
+        dry = salvage.salvage(live)
+        assert dry["applied"] is False, dry
+        assert dry["sessions"] == 1, dry
+        assert not persist.search_history(live, rare), "a dry run wrote to the database"
+
+        done = salvage.salvage(live, apply=True)
+        assert done["applied"] is True, done
+        assert done["sessions"] == 1, done
+
+        hits = persist.search_history(live, rare)
+        assert hits, "salvaged history is still unreachable by recall"
+        assert any(rare in json.dumps(hit, default=str) for hit in hits), hits
+
+        again = salvage.salvage(live, apply=True)
+        assert again["sessions"] == 0, f"salvage is not idempotent: {again}"
+    finally:
+        if previous is None:
+            os.environ.pop(persist.SESSION_ID_ENV, None)
+        else:
+            os.environ[persist.SESSION_ID_ENV] = previous
 
 
 def _check_prices() -> None:
