@@ -344,6 +344,28 @@ ending the bridge is the stdio owner's alone.
 | `<cwd>/.desmos/pending/<task>-<uuid>.json` — Track 1.1 durable handoff: a settled background task's whole notice, written before `done` is visible, renamed into `pending/delivered/` in the same step that appends it to the transcript (the rename is the commit point), replayed exactly once by `pending.replay` at load. Root persistent world only — a child's tasks stay in memory by contract. | agents/pending.py `submit`/`_deliver_file` | agents/pending.py `replay` (kernel/loop.py `new_world` load path) |
 | `<cwd>/.desmos/subagents/<id>.json` — the run record: brief fields plus `parent`, `depth`, `budget`, `generation`, `killed`, and the raw `result` (what the C5 brief compressed). | agents/subagent.py `_persist` | late-attach reconstruction; checks |
 
+## Durable kernel state (files, not wire events)
+
+Kernel-owned files the bridge never touches. The fff LMDB is the one
+cross-process ranking channel: the kernel writes it (`<edit>` → `touch`), and a
+reader — the `<find>` engine today, the TUI fuzzy picker once wired — reads it
+one-way. It never flows the other direction.
+
+| surface | writer | reader |
+|---|---|---|
+| `<cwd>/.desmos/fff` — the fff frecency LMDB (path-search ranking). Recently-`<edit>`ed paths rank higher without the model asking. | `state/find.py touch()` at the `<edit>` dispatch choke point (`kernel/dispatch.py`, `line is not None` branch) → `track_access`; a live `FileFinder` writes it under `<find>` | `state/find.py find()` (`<find>` ranking); **one-way** to the TUI — `crates/desmos-tui/src/fuzzy.rs` reads scores cached at scan time (frame wiring pending), never writes |
+| `~/.desmos/registry` (`DESMOS_REGISTRY`) — resume hints: the cwds that ever hosted a persistent root world. | `state/persist.py _append_registry` via `save()` — root worlds only (children `persist=False` short-circuit), deduped + atomic, dead roots lazily pruned | the resume flow (fork template `cd {cwd} && python -m desmos tui`) |
+
+## Search & recall engines
+
+| engine | syscall | provenance | fault boundary |
+|---|---|---|---|
+| **fff** — fuzzy path search | `<find>` (`state/find.py`, dispatched at `kernel/dispatch.py`); `result` event, tag=`find` | **vendored extension module** — `fff._fff_python` (maturin, abi3-py310) built from `vendor/fff` by `scripts/build-fff-python.sh`, imported in-process | in-process with the kernel by design; an abort in fff-core's unsafe SIMD/mmap is uncatchable and kills the kernel (accepted, named risk — decision record) |
+| **memex** — BM25 history recall | `<recall>` (`state/recall.py`, dispatched at `kernel/dispatch.py`); `result` event, tag=`recall` | **external binary** — the `memex-desmos` fork (`scripts/memex-setup.sh`); shelled per call (`memex search --json-array`), tantivy+usearch+ort **never enter our build** | a separate process; absent/stock memex is a prose refusal, children pinned to `source=desmos`, output secret-scrubbed before it spills |
+
+Both ride the existing `result` event (no new `ev` kind); an absent engine is a
+refusal in prose naming its setup script, never a second search implementation.
+
 ## Dead fields and dead events (findings, not formatting)
 
 Produced and consumed by no UI (checks noted where they are the only reader):

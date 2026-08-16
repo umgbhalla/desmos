@@ -24,7 +24,8 @@ use crate::prompt::PromptBuf;
 use crate::queue::QueryQueue;
 use crate::{
     CacheMeter, ExecStream, NOTICE_TTL, PostInspect, PostRows, StreamCursor, ViewerSrc,
-    grok_appearance, initial_theme, picker, session, side, slash, viewer_for_entry, wire_push,
+    fuzzy, grok_appearance, initial_theme, picker, session, side, slash, viewer_for_entry,
+    wire_push,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -443,6 +444,10 @@ pub(crate) struct App {
     pub(crate) session_picker: session::SessionPicker,
     /// Onboarding / settings overlay. Modal when open.
     pub(crate) picker: picker::Picker,
+    /// The fuzzy file picker (ctrl-t), distinct from `picker` above (the
+    /// provider/model onboarding picker). A worker thread runs fff-search and
+    /// ranks by the frecency the kernel's <edit>s feed; a modal overlay when open.
+    pub(crate) file_picker: fuzzy::Picker,
     /// Inline-image state: what has been uploaded to the terminal, and where
     /// this frame wants it drawn. Populated during `draw`, consumed by
     /// `flush_media` right after the frame lands.
@@ -531,6 +536,7 @@ impl App {
             post_inspect: None,
             session_picker: session::SessionPicker::default(),
             picker: picker::Picker::default(),
+            file_picker: fuzzy::Picker::default(),
             media: Media::default(),
             post_n: 0,
             post_out_n: 0,

@@ -18,6 +18,11 @@ members = [
     "crates/xai-grok-markdown",
     "crates/xai-grok-markdown-core",
 ]
+# vendor/fff keeps its OWN [workspace]; exclude it so this workspace does not
+# try to absorb fff-core as a member. It is reached only via the fff-search
+# path dep below, which resolves against fff's nested workspace table
+# (git2 vendored-libgit2, zlob never enabled).
+exclude = ["vendor/fff"]
 
 [workspace.package]
 edition = "2024"
@@ -75,6 +80,7 @@ fastrace-opentelemetry = { version = "0.18" }
 fastrace-reqwest = { version = "0.2" }
 fastrace-tonic = { version = "0.1" }
 fastrand = "2"
+fff-search = { path = "vendor/fff/crates/fff-core" }
 filetime = "0.2.25"
 flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }
 fontdb = "0.23"

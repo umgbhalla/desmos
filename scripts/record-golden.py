@@ -275,6 +275,35 @@ def edit(tmp):
     }
 
 
+def _fff_built() -> bool:
+    try:
+        import fff  # noqa: F401
+    except Exception:
+        return False
+    return True
+
+
+# A real <find> through the loop over a live fff engine, path search only. The
+# score in the result is fff's own, deterministic for a fixed tree+query. Gated
+# on the extension: an absent fff would record the refusal instead, so a machine
+# without it must not carry (or compare) this fixture. Registered only when fff
+# imports, so record()/compare() drop it cleanly elsewhere; the committed
+# find.jsonl still parses in checks/conformance.py (JSON, fff-independent).
+if _fff_built():
+    @scenario
+    def find(tmp):
+        (tmp / "src").mkdir()
+        (tmp / "src" / "main.py").write_text("x = 1\n", encoding="utf-8")
+        (tmp / "src" / "other.py").write_text("y = 2\n", encoding="utf-8")
+        return {
+            "prompt": "Find the main file and report.",
+            "script": [
+                R(text('Searching.\n<find limit="5">mian.py</find>')),
+                R(text("Found src/main.py.")),
+            ],
+        }
+
+
 @scenario
 def commit(tmp):
     # A real git commit through the real loop: the kernel judges the claim
@@ -492,6 +521,14 @@ def run_scenario(name):
     finally:
         S.set_emitter(None)
         pending.clear(world)
+        # Close any live fff engine (the find scenario, or an <edit>'s touch)
+        # so its native watch threads do not outlive the scenario or block exit.
+        try:
+            from desmos.state import find as _find_mod
+
+            _find_mod.reset()
+        except Exception:
+            pass
     return lines
 
 

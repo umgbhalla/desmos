@@ -38,11 +38,12 @@ PERSONAS: dict[str, str] = {
 
 # capability modes: which tags the child may use
 CAPS: dict[str, tuple[str, ...]] = {
-    "read": ("python", "bash", "skill", "todo"),
-    "edit": ("python", "bash", "edit", "skill", "reload", "todo"),
+    "read": ("python", "bash", "skill", "todo", "find", "recall"),
+    "edit": ("python", "bash", "edit", "skill", "reload", "todo", "find", "recall"),
     # No bash, python, edit, or shell: an orchestrator delegates. It looks at
     # the world only through children it forks (until read-only probes land).
-    "orchestrator": ("agents", "memory", "system", "skill"),
+    # <find> is a read-only probe it may run without a child.
+    "orchestrator": ("agents", "memory", "system", "skill", "find"),
     "full": (),  # empty tuple == inherit everything
 }
 

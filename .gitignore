@@ -18,6 +18,11 @@ vendor/*
 vendor/grok-build/.git-upstream/
 vendor/grok-build/target/
 vendor/grok-build/**/target/
+# fff is committed too: desmos-tui and the fff-python extension both build
+# from this one tree (Phase 6). Its own workspace, reached via a path dep.
+!vendor/fff/
+vendor/fff/target/
+vendor/fff/**/target/
 # ~/.gitignore_global carries a bare `build/`, which matches
 # vendor/grok-build/crates/build/ -- the home of xai-proto-build, a workspace
 # member and a path dep of our root Cargo.toml. Committing the tree and then

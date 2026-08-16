@@ -11,7 +11,7 @@ import importlib
 import time
 import traceback
 
-GROUPS = ("layering", "kernel", "transport", "state", "agents", "front", "conformance")
+GROUPS = ("layering", "kernel", "transport", "state", "find_check", "recall_check", "agents", "front", "conformance")
 
 # The seconds tier: the scan/dispatch/persist/edit repros, with no localhost
 # SSE or auth-callback servers (transport), no subagent waits (agents), no
@@ -79,6 +79,9 @@ def _pinned(names: tuple[str, ...]) -> int:
             "DESMOS_SETTINGS": str(pin),
             "DESMOS_MODEL": PINNED_MODEL,
             "DESMOS_TOOL_SYSCALLS": "0",
+            # save() appends world.cwd here; pin it into the temp dir so no
+            # check group touches the developer's real ~/.desmos/registry.
+            "DESMOS_REGISTRY": str(Path(home) / "registry"),
         }
         old_env = {k: _os.environ.get(k) for k in env}
         # DEFAULT_MODEL is read from the environment at import, which already

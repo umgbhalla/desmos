@@ -179,6 +179,22 @@ Events stay untyped on the Python side by design (the vocabulary is
 model-growable); the typed Rust enum is a conformance instrument, not a
 constructor.
 
+A vendored third-party engine as a Python extension module is a different
+case and needs no tripwire. `fff` (Phase 6.1) is the `sqlite3` case: a mature
+external library we build against and import, not a rule of ours we duplicated
+in Rust for parity. There is no second implementation to keep in sync, so the
+scanner's promotion condition does not apply — fff ships as `fff._fff_python`
+(maturin, abi3-py310, its own `vendor/fff` workspace, `fff-search` a path dep
+of the kernel side only) from day one. The accepted risk is named, not
+tripwired: fff-core runs unsafe SIMD and mmap over the index, and an *abort*
+there takes the whole process down. `pyo3` turns a Rust `panic!` into a
+`PanicException` the kernel catches; a `std::process::abort` (or a SIGSEGV
+from a bad mmap) is not catchable — it kills the kernel, its ptys, and any
+in-flight subagents. This is why the render stack stays behind a process
+boundary (above) but fff does not: the search engine's fault surface is
+smaller and its value is being in-process with the kernel's own state, whereas
+the render loop is a viewer the kernel must outlive.
+
 ## Phase 6 — search and recall (fff + memex)
 
 Two engines. The doctrine applies unchanged: what the kernel learns arrives

@@ -34,6 +34,7 @@
 
 mod app;
 mod events;
+mod fuzzy;
 mod input;
 mod json_tree;
 mod picker;
@@ -1057,6 +1058,9 @@ fn run(
         // where a status call is a quarter second of disk.
         if app.layout.git_h > 0 || app.running || app.sess.stream.run.settled.is_some() {
             app.git.poll(false);
+        }
+        if app.file_picker.poll() {
+            dirty = true;
         }
         if app.git.drain() {
             // The row a fold left owing takes its tail from this read if this
@@ -2189,6 +2193,9 @@ fn draw(f: &mut Frame, app: &mut App) {
     draw_files(f, app.files_area, app);
     draw_queue(f, app.queue_area, app);
     draw_input(f, app.input_area, app);
+    if app.file_picker.is_open() {
+        draw_file_picker(f, app);
+    }
     if app.post_inspect.is_some() {
         draw_post_inspect(f, app);
     }
@@ -3415,6 +3422,65 @@ fn draw_help(f: &mut Frame, app: &App) {
             ])
         })
         .collect();
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
+/// The fuzzy file picker overlay (ctrl-t). A centered modal: query line, a
+/// ranked result list, and a notice when the engine is absent or still
+/// scanning. Reads only from the Picker's own worker state — paint, no IO.
+fn draw_file_picker(f: &mut Frame, app: &mut App) {
+    let theme = Theme::current();
+    let full = f.area();
+    let w = (full.width * 3 / 5).clamp(30, full.width.saturating_sub(2));
+    let h = (full.height * 3 / 5).clamp(6, full.height.saturating_sub(2));
+    let x = (full.width.saturating_sub(w)) / 2;
+    let y = (full.height.saturating_sub(h)) / 2;
+    let area = Rect { x, y, width: w, height: h };
+    f.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme.accent_tool))
+        .title(Span::styled(
+            " find file (ctrl-t) ",
+            Style::default().fg(theme.accent_tool).add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    if inner.height < 2 {
+        return;
+    }
+    // The result list gets the rows below the query line; clamp the scroll to it.
+    app.file_picker.clamp(inner.height.saturating_sub(1) as usize);
+    let mut lines: Vec<Line> = Vec::new();
+    lines.push(Line::from(vec![
+        Span::styled("> ", Style::default().fg(theme.accent_tool)),
+        Span::styled(
+            app.file_picker.query().to_string(),
+            Style::default().fg(theme.text_primary),
+        ),
+    ]));
+    if let Some(notice) = app.file_picker.notice() {
+        lines.push(Line::from(Span::styled(
+            notice.to_string(),
+            Style::default().fg(theme.text_secondary),
+        )));
+    }
+    let rows = inner.height.saturating_sub(1) as usize;
+    let sel = app.file_picker.sel();
+    let scroll = app.file_picker.scroll();
+    for (i, path) in app.file_picker.results().iter().enumerate().skip(scroll).take(rows) {
+        let shown = path.to_string_lossy().to_string();
+        let style = if i == sel {
+            Style::default().fg(theme.accent_success).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(theme.text_primary)
+        };
+        let mark = if i == sel { "> " } else { "  " };
+        lines.push(Line::from(vec![
+            Span::styled(mark, Style::default().fg(theme.accent_success)),
+            Span::styled(shown, style),
+        ]));
+    }
     f.render_widget(Paragraph::new(lines), inner);
 }
 

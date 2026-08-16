@@ -185,7 +185,24 @@ def _dispatch(
         # edit has no edit site, so it sets nothing.
         if meta is not None and line is not None:
             meta["line"] = line
+        # Feed the <find> frecency index at the one edit choke point every
+        # world (root and child) routes through. A successful edit has an edit
+        # site (line is not None); a failed one does not, so this never fires
+        # on a refusal. touch() is silent on a missing/broken engine -- the
+        # model called <edit>, not <find>.
+        if line is not None:
+            from desmos.state.find import touch
+
+            touch(world, block.attrs.get("path", ""))
         return msg
+    if block.tag == "find":
+        from desmos.state.find import find
+
+        return find(world, block.body, block.attrs.get("limit"))
+    if block.tag == "recall":
+        from desmos.state.recall import handle_recall
+
+        return handle_recall(world, block.body, block.attrs)
     if block.tag == "register":
         return register_tag(world, block.body, block.attrs.get("name", ""), block.attrs.get("doc", ""))
     if block.tag == "system":

@@ -35,7 +35,7 @@ fn every_golden_line_parses() {
             lines += 1;
         }
     }
-    assert_eq!(fixtures, 12, "expected the 12 recorded scenarios");
+    assert_eq!(fixtures, 13, "expected the 13 recorded scenarios");
     assert!(lines > 0, "golden fixtures were empty");
 }
 

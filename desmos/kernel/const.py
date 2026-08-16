@@ -8,6 +8,8 @@ FROZEN = frozenset(
         "bash",
     "shell",
         "edit",
+        "find",
+        "recall",
         "register",
         "system",
         "tool",
@@ -45,6 +47,8 @@ this for you.
 <edit path="file">old
 ---
 new</edit>
+<find limit="20">path fragment</find>
+<recall limit="10">search prior sessions</recall>
 <register name="tag" doc="one line">def handle(body, **attrs): ...</register>
 <system name="id">note</system>
 <system name="id" delete="1"/>

@@ -20,7 +20,10 @@ MAX_SEARCH_RESULTS = 12
 MAX_READ_CHARS = 5000
 
 _SECRET_PATTERNS = (
-    re.compile(r"\b(?:sk|rk|pk|ghp|github_pat)_[A-Za-z0-9_-]{16,}\b"),
+    # Separator is [-_], not _: this harness's own keys are hyphenated
+    # (sk-ant-api03-…, sk-proj-…), and the underscore-only form missed them,
+    # so a key in an old transcript surfaced in the clear through <recall>.
+    re.compile(r"\b(?:sk|rk|pk|ghp|github_pat)[-_][A-Za-z0-9_-]{16,}\b"),
     re.compile(r"\bBearer\s+[A-Za-z0-9._~+/-]{16,}", re.I),
     re.compile(
         r"(?i)\b(api[_ -]?key|access[_ -]?token|password|secret)\s*[:=]\s*"

@@ -49,6 +49,8 @@ ALLOWED_FN_EDGES = {
     ("desmos.kernel.catalog", "desmos.state.persist"),
     ("desmos.kernel.catalog", "desmos.transport.dialect"),
     ("desmos.kernel.dispatch", "desmos.skills"),
+    ("desmos.kernel.dispatch", "desmos.state.find"),  # <find> engine + <edit> frecency touch
+    ("desmos.kernel.dispatch", "desmos.state.recall"),  # <recall> shells the memex-desmos fork
     ("desmos.kernel.dispatch", "desmos.state.generations"),
     ("desmos.kernel.dispatch", "desmos.state.memory"),
     ("desmos.kernel.dispatch", "desmos.state.persist"),

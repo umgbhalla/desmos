@@ -168,6 +168,8 @@ _BUILTIN_DOCS = (
     ("bash", "isolated one-shot command in cwd — no state kept; use only when reset is useful"),
     ("shell", "preferred persistent pty: id= names the session, state/processes survive; long commands are monitored and resume you when they land; interrupt=1, close=1"),
     ("edit", "replace one occurrence: path= and body old\\n---\\nnew"),
+    ("find", "fuzzy path search (fff): body is a path fragment, limit= caps hits — path search only, bash/rg owns content grep"),
+    ("recall", "BM25 search of prior-session history via the external memex-desmos fork: body is the query, limit= caps hits, mode=hybrid|semantic opts into embeddings — absent fork refuses and names scripts/memex-setup.sh"),
     ("register", "install a tag: name= and doc=, body is def handle"),
     ("system", "write or delete a system note (name=, optional delete=1)"),
     ("tool", "rewrite a tool description: name= and doc="),

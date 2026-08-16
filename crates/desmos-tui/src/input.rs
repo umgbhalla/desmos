@@ -32,6 +32,40 @@ pub(crate) fn handle_key(
         let action = app.picker.key(key.code);
         return apply_picker(bridge.as_deref_mut(), app, action);
     }
+    // ctrl-t opens the fuzzy file picker from anywhere (ctrl-c/p/g/b are taken,
+    // ctrl-f is PostIn-local). While open it is modal: it wins every key before
+    // any pane sees it, same contract as the model picker above.
+    if key.modifiers.contains(KeyModifiers::CONTROL)
+        && key.code == KeyCode::Char('t')
+        && app.viewer.is_none()
+        && app.post_inspect.is_none()
+    {
+        if app.file_picker.is_open() {
+            app.file_picker.close();
+        } else {
+            // Same cwd source the git/file panes use.
+            app.file_picker.open(&std::env::current_dir().unwrap_or_default());
+        }
+        return Ok(false);
+    }
+    if app.file_picker.is_open() {
+        match key.code {
+            KeyCode::Esc => app.file_picker.close(),
+            KeyCode::Enter => {
+                app.file_picker.enter();
+                if let Some(path) = app.file_picker.take_chosen() {
+                    app.files.open(&path);
+                    app.set_focus(Focus::Files);
+                }
+            }
+            KeyCode::Up => app.file_picker.select(-1),
+            KeyCode::Down => app.file_picker.select(1),
+            KeyCode::Backspace => app.file_picker.backspace(),
+            KeyCode::Char(c) => app.file_picker.push_char(c),
+            _ => {}
+        }
+        return Ok(false);
+    }
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('p') {
         let (m, e) = (app.model.clone(), app.thinking.clone());
         app.picker.open_for_change(&m, &e);

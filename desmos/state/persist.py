@@ -468,6 +468,47 @@ def _save_data(conn: sqlite3.Connection, world: World, data: dict[str, Any]) -> 
                 )
 
 
+def registry_path() -> Path:
+    """The list of live desmos roots, one absolute cwd per line.
+
+    DESMOS_REGISTRY overrides, same seam as DESMOS_SETTINGS / DESMOS_AUTH: the
+    check floor points it at a temp file so a save() never touches the real
+    ~/.desmos/registry.
+    """
+    return Path(os.environ.get("DESMOS_REGISTRY") or (Path.home() / ".desmos" / "registry"))
+
+
+def _append_registry(cwd: Path) -> None:
+    """Record `cwd` as a resumable root: deduped, dead roots lazy-pruned.
+
+    Only reached from save(), which returns early when persist is False, so a
+    child never writes here by construction.
+
+    ponytail: read-modify-write with no lock, so two saves racing can lose one
+    append — the registry is a best-effort resume hint, and the loser reappears
+    on its next save. Add a flock lease only if a launcher starts trusting it as
+    authoritative.
+    """
+    reg = registry_path()
+    entry = str(Path(cwd).resolve())
+    old = reg.read_text(encoding="utf-8").splitlines() if reg.exists() else []
+    kept: list[str] = []
+    seen: set[str] = set()
+    for line in old:
+        line = line.strip()
+        # Drop blanks, dupes, and roots whose directory is gone (lazy prune).
+        if not line or line in seen or not Path(line).is_dir():
+            continue
+        seen.add(line)
+        kept.append(line)
+    if entry not in seen:
+        kept.append(entry)
+    text = "\n".join(kept) + "\n"
+    if old == kept:  # nothing changed; do not churn the file every save
+        return
+    atomic_write(reg, text)
+
+
 def save(world: World) -> None:
     if not world.persist:
         return
@@ -476,6 +517,10 @@ def save(world: World) -> None:
         _save_data(conn, world, _data_from_world(world))
     finally:
         conn.close()
+    try:
+        _append_registry(world.cwd)
+    except Exception:  # noqa: BLE001 -- a resume hint must never fail a save
+        pass
 
 
 def _apply_data(world: World, data: dict[str, Any]) -> None:
