@@ -1,3 +1,6 @@
 [submodule "vendor/comet"]
 	path = vendor/comet
 	url = https://github.com/umgbhalla/comet.git
+[submodule "vendor/memex"]
+	path = vendor/memex
+	url = git@github.com:umgbhalla/memex-desmos.git

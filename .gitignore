@@ -41,6 +41,11 @@ vendor/fff/crates/*
 vendor/fff/packages/*
 !vendor/fff/packages/fff-python/
 vendor/fff/**/target/
+# memex is the <recall> engine, kept as a submodule (its tantivy+ort deps
+# must stay out of the desmos build, so it is a pinned external repo, not a
+# vendored crate). The gitlink is tracked; the checkout's build output is not.
+!vendor/memex
+vendor/memex/target/
 # ~/.gitignore_global carries a bare `build/`, which matches
 # vendor/grok-build/crates/build/ -- the home of xai-proto-build, a workspace
 # member and a path dep of our root Cargo.toml. Committing the tree and then

@@ -34,11 +34,18 @@ probe() { "$MEMEX" search __probe__ --source desmos --limit 1 >/dev/null 2>&1; }
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 VENDOR_FORK="$REPO/vendor/memex"
 
+# The fork is a submodule (git@github.com:umgbhalla/memex-desmos, pinned in
+# .gitmodules). On a fresh clone the checkout is empty until inited.
+if [ ! -f "$VENDOR_FORK/src/sources/desmos.rs" ] && command -v git >/dev/null 2>&1; then
+  echo "memex-setup: initialising the vendor/memex submodule"
+  git -C "$REPO" submodule update --init vendor/memex || true
+fi
+
 if probe; then
   echo "memex-setup: memex-desmos fork already on PATH ($("$MEMEX" --version 2>/dev/null || echo memex))"
 elif [ -f "$VENDOR_FORK/src/sources/desmos.rs" ] && command -v cargo >/dev/null 2>&1; then
-  # The fork lives vendored (a gitignored clone with SourceKind::Desmos added,
-  # same as build-fff-python.sh builds fff from vendor/fff). Build from it.
+  # Build from the pinned submodule. memex stays an external binary — its
+  # tantivy+usearch+ort deps never enter the desmos build.
   echo "memex-setup: building memex-desmos from $VENDOR_FORK"
   cargo install --path "$VENDOR_FORK" --locked memex 2>/dev/null \
     || cargo install --path "$VENDOR_FORK" memex
