@@ -96,7 +96,7 @@ def _check_absent_refusal() -> None:
     saved = recall.MEMEX
     recall.MEMEX = "/nonexistent/desmos-memex-does-not-exist"
     try:
-        out = recall.handle_recall(world, "search me", {})
+        out = recall.handle_recall(world, "search me", {"source": "claude"})
     finally:
         recall.MEMEX = saved
     assert "memex-setup.sh" in out, f"refusal must name the setup script: {out!r}"
@@ -104,16 +104,25 @@ def _check_absent_refusal() -> None:
     assert "query required" in recall.handle_recall(world, "   ", {})
 
 
-def _check_roundtrip_if_fork() -> None:
-    if not _probe_fork():
-        print("[recall_check] no memex-desmos fork on PATH; round-trip skipped")
-        return
+def _check_sql_roundtrip() -> None:
     root = Path(tempfile.mkdtemp())
     world = new_world(root, persist=True)
-    out = recall.handle_recall(world, "the", {"source": "desmos", "limit": "1"})
-    # A live fork returns a JSON array (possibly empty), never our refusal.
-    assert "memex-setup.sh" not in out, out
-    assert out.lstrip().startswith("["), f"expected --json-array output: {out[:120]!r}"
+    world.messages.extend([
+        {"role": "user", "content": "find the cobalt narwhal"},
+        {"role": "assistant", "content": "cobalt narwhal acknowledged"},
+    ])
+    persist.save(world)
+
+    out = recall.handle_recall(world, "cobalt narwhal", {"limit": "2"})
+    assert "cobalt narwhal" in out, out
+    assert out.lstrip().startswith("["), out
+
+    # A child cannot redirect to another source, but may read this workspace.
+    child = new_world(root, persist=False)
+    child_out = recall.handle_recall(
+        child, "cobalt narwhal", {"source": "claude", "limit": "1"}
+    )
+    assert "cobalt narwhal" in child_out, child_out
 
 
 def _check_secret_scrub() -> None:
@@ -143,8 +152,10 @@ def _check_secret_scrub() -> None:
             from desmos.loop import new_world
 
             with tempfile.TemporaryDirectory() as cwd:
-                w = new_world(Path(cwd), persist=False)
-                out = recall.handle_recall(w, "old note", {})
+                w = new_world(Path(cwd), persist=True)
+                out = recall.handle_recall(
+                    w, "old note", {"source": "claude"}
+                )
             for k in keys:
                 assert k not in out, f"recall leaked a key in the clear: {k!r} in {out!r}"
             assert "[REDACTED_SECRET]" in out, f"recall did not redact: {out!r}"
@@ -165,7 +176,7 @@ def check() -> None:
     _check_child_source_pin()
     _check_absent_refusal()
     _check_secret_scrub()
-    _check_roundtrip_if_fork()
+    _check_sql_roundtrip()
 
 
 if __name__ == "__main__":

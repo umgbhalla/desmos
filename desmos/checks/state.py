@@ -30,7 +30,7 @@ def check() -> None:
             "- newest noise " + "x" * 4000 + "\n"
         )
         (memory_dir / "MEMORY.md").write_text(legacy, encoding="utf-8")
-        memory_world = new_world(memory_dir, state_path=memory_dir / "harness.json")
+        memory_world = new_world(memory_dir, state_path=memory_dir / "harness.sqlite3")
         memory_prompt = system_prompt(memory_world)
         assert memory_world.tools["memory"].frozen
         assert "Umang prefers actual tools before narration" in memory_prompt
@@ -76,7 +76,7 @@ def check() -> None:
         assert "[REDACTED_SECRET]" in secret_read
         assert "abcdefghijk123456789" not in secret_read
 
-        memory_world2 = new_world(memory_dir, state_path=memory_dir / "harness.json")
+        memory_world2 = new_world(memory_dir, state_path=memory_dir / "harness.sqlite3")
         assert memory_world2.tools["memory"].frozen
         assert "Umang's name is Umang" in system_prompt(memory_world2)
         dispatch(memory_world2, Block("memory", "forget user.umang.identity", {}))
@@ -91,7 +91,7 @@ def check() -> None:
             encoding="utf-8",
         )
         (ping / "skill.py").write_text("def handle(body, **a):\n    return 'pong:' + body\n", encoding="utf-8")
-        world = new_world(cwd, state_path=cwd / "harness.json")
+        world = new_world(cwd, state_path=cwd / "harness.sqlite3")
         assert dispatch(world, Block("skill", "", {"name": "ping"})).endswith("body\n")
         assert dispatch(world, Block("ping", "hi", {})) == "pong:hi"
 
@@ -115,52 +115,28 @@ def check() -> None:
         dispatch(world, Block("system", "prefer tests", {"name": "style"}))
         assert "prefer tests" in system_prompt(world)
 
-        world2 = new_world(cwd, state_path=cwd / "harness.json")
+        world2 = new_world(cwd, state_path=cwd / "harness.sqlite3")
         assert "echo" in world2.tools
         assert world2.notes["style"] == "prefer tests"
-        assert (cwd / "harness.json").read_bytes().startswith(b"SQLite format 3")
+        assert (cwd / "harness.sqlite3").read_bytes().startswith(b"SQLite format 3")
         import sqlite3 as _sqlite3
 
-        with _sqlite3.connect(cwd / "harness.json") as _db:
+        with _sqlite3.connect(cwd / "harness.sqlite3") as _db:
             assert _db.execute("SELECT COUNT(*) FROM sessions").fetchone()[0] == 1
             assert _db.execute("PRAGMA foreign_key_check").fetchall() == []
 
-        # A legacy snapshot imports exactly once and remains available as a backup.
-        import json as _json
-        legacy_path = cwd / "legacy-state.json"
-        legacy_path.write_text(
-            _json.dumps(
-                {
-                    "notes": {"legacy": "kept"},
-                    "tools": {},
-                    "docs": {},
-                    "prior": [{"prompt": "old", "speech": "answer"}],
-                    "generation": 3,
-                    "gen_reason": "legacy import",
-                    "thinking": "high",
-                    "messages": [{"role": "user", "content": "before sqlite"}],
-                }
-            ),
-            encoding="utf-8",
-        )
-        legacy_world = new_world(cwd, state_path=legacy_path)
-        assert legacy_world.notes["legacy"] == "kept"
-        assert legacy_world.messages == [{"role": "user", "content": "before sqlite"}]
-        assert legacy_world.generation == 3
-        assert legacy_path.read_bytes().startswith(b"SQLite format 3")
-        assert (cwd / "legacy-state.json.migrated").is_file()
-        legacy_again = new_world(cwd, state_path=legacy_path)
-        assert legacy_again.notes["legacy"] == "kept"
-
-        # The production default migrates .desmos/harness.json to harness.sqlite3.
-        default_root = cwd / "default-migration"
-        default_legacy = default_root / ".desmos" / "harness.json"
-        default_legacy.parent.mkdir(parents=True)
-        default_legacy.write_text(_json.dumps({"notes": {"default": "imported"}}), encoding="utf-8")
-        default_world = new_world(default_root)
-        assert default_world.notes["default"] == "imported"
-        assert (default_root / ".desmos" / "harness.sqlite3").is_file()
-        assert (default_root / ".desmos" / "harness.json.migrated").is_file()
+        # Legacy SQLite layouts are refused rather than guessed at.
+        old_path = cwd / "legacy-layout.sqlite3"
+        with _sqlite3.connect(old_path) as old_db:
+            old_db.execute(
+                "CREATE TABLE sessions(id TEXT PRIMARY KEY, cwd TEXT NOT NULL)"
+            )
+        try:
+            new_world(cwd, state_path=old_path)
+        except RuntimeError as exc:
+            assert "legacy harness database" in str(exc), exc
+        else:
+            raise AssertionError("legacy session layout was silently accepted")
 
         # Corruption is backed up and reported instead of masquerading as empty state.
         corrupt_path = cwd / "corrupt-state.sqlite3"
@@ -345,6 +321,7 @@ def check() -> None:
 
         _check_prices()
         _check_call_ledger(cwd)
+        _check_session_lineage(cwd)
         _check_session_channel(cwd)
 
 
@@ -387,6 +364,74 @@ def _check_prices() -> None:
         assert 'm if m.starts_with("claude-opus")' not in text, (
             "main.rs grew a second hardcoded price table"
         )
+
+
+def _check_session_lineage(cwd: Path) -> None:
+    """A restart creates a child session without copying message ownership."""
+    import os
+    import sqlite3
+
+    from desmos.state import persist
+
+    path = cwd / "lineage.sqlite3"
+    prior_env = os.environ.get(persist.SESSION_ID_ENV)
+    try:
+        first_id = "019100000000aaaaaaaaaaaaaaaaaaaa"
+        second_id = "019200000000bbbbbbbbbbbbbbbbbbbb"
+        os.environ[persist.SESSION_ID_ENV] = first_id
+        first = new_world(cwd, state_path=path)
+        first.messages.append({"role": "user", "content": "from first"})
+        first.prior.append({"prompt": "p1", "speech": "s1"})
+        persist.save(first)
+
+        os.environ[persist.SESSION_ID_ENV] = second_id
+        second = new_world(cwd, state_path=path)
+        assert second.messages == [{"role": "user", "content": "from first"}]
+        assert second.session_message_start == 1
+        assert second.session_prior_start == 1
+        second.messages.append({"role": "assistant", "content": "from second"})
+        second.prior.append({"prompt": "p2", "speech": "s2"})
+        persist.save(second)
+
+        with sqlite3.connect(path) as db:
+            db.row_factory = sqlite3.Row
+            sessions = db.execute(
+                "SELECT id, parent_id, kind, cache_key FROM sessions"
+                " ORDER BY started_at, id"
+            ).fetchall()
+            assert [row["id"] for row in sessions] == [first_id, second_id], sessions
+            assert sessions[1]["parent_id"] == first_id, sessions[1]
+            assert sessions[1]["kind"] == "resume", sessions[1]
+            assert sessions[1]["cache_key"] == f"desmos-{second_id[:16]}"
+            ownership = db.execute(
+                "SELECT session_id, COUNT(*) n FROM messages"
+                " GROUP BY session_id ORDER BY session_id"
+            ).fetchall()
+            assert [(row["session_id"], row["n"]) for row in ownership] == [
+                (first_id, 1), (second_id, 1)
+            ], ownership
+            assert db.execute("PRAGMA foreign_key_check").fetchall() == []
+
+        # Opaque provider content and giant request/response bodies never land.
+        secret = "ciphertext" * 10_000
+        persist.record_event(
+            second,
+            {"ev": "complete", "encrypted_content": secret, "body": secret},
+            ts_ms=1,
+            mono_ns=2,
+        )
+        assert persist.record_event(
+            second, {"ev": "timing", "phase": "delta"}, ts_ms=2, mono_ns=3
+        ) == 0
+        events = persist.read_events(second)
+        assert len(events) == 1 and events[0]["elided"] is True, events
+        assert secret not in str(events), events[0]
+        assert events[0]["payload_bytes"] > 100_000, events[0]
+    finally:
+        if prior_env is None:
+            os.environ.pop(persist.SESSION_ID_ENV, None)
+        else:
+            os.environ[persist.SESSION_ID_ENV] = prior_env
 
 
 def _check_call_ledger(cwd: Path) -> None:
@@ -439,13 +484,31 @@ def _check_session_channel(cwd: Path) -> None:
     fcntl.flock(peer_lease.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
     try:
         with sqlite3.connect(path) as db:
+            workspace = db.execute("SELECT id FROM workspaces").fetchone()[0]
+            parent = db.execute("SELECT id FROM sessions LIMIT 1").fetchone()[0]
+            db.execute(
+                """
+                INSERT INTO sessions(
+                    id, workspace_id, parent_id, kind, started_at,
+                    last_seen_at, model, thinking, cache_key)
+                VALUES (?, ?, ?, 'fork', ?, ?, ?, '', ?)
+                """,
+                (
+                    peer_id, workspace, parent, "2026-01-01",
+                    "2026-01-01", "peer-model", "desmos-peer",
+                ),
+            )
             db.execute(
                 """
                 INSERT INTO active_runs(
-                    run_id, pid, cwd, generation, model, started_at, seen_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                    run_id, workspace_id, session_id, pid, cwd, generation,
+                    model, started_at, seen_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (peer_id, 99999, str(cwd), 1, "peer-model", "2026-01-01", "2026-01-01"),
+                (
+                    peer_id, workspace, peer_id, 99999, str(cwd), 1,
+                    "peer-model", "2026-01-01", "2026-01-01",
+                ),
             )
 
         peers = json.loads(dispatch(world, Block("session", "", {"op": "peers"})))

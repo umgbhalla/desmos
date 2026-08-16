@@ -9,7 +9,6 @@ import socket
 import sys
 import threading
 import time
-import uuid
 from pathlib import Path
 from typing import Any
 
@@ -132,12 +131,9 @@ class _Client:
             pass
 
 # The event log (contract C2): every event this funnel sees is also appended
-# to <cwd>/.desmos/events/<session_id>.jsonl, stamped with a monotonic seq and
-# an int-ms ts. The stamps are the WRITER's -- producers never carry them and
-# the wire (stdout / sockets) stays unstamped; the file is the replay
-# substrate for late attach. Append-only, no rotation in this phase.
-_LOG: Any = None
-_LOG_PATH: Path | None = None
+# Durable replay lives in the harness database. The wire remains unstamped;
+# sequence/time belong to the bridge writer and are added only to SQL rows.
+_LOG_WORLD: Any = None
 _SEQ = 0
 
 
@@ -145,33 +141,38 @@ def _now_ms() -> int:
     return int(time.time() * 1000)
 
 
-def _open_log(cwd: Path) -> None:
-    global _LOG, _LOG_PATH, _SEQ
-    events = cwd / ".desmos" / "events"
-    events.mkdir(parents=True, exist_ok=True)
-    session_id = uuid.uuid4().hex
-    _LOG_PATH = events / f"{session_id}.jsonl"
-    _SEQ = 0
-    _LOG = _LOG_PATH.open("a", encoding="utf-8")
-    _LOG.write(
-        json.dumps(
-            {"ev": "session", "session_id": session_id, "cwd": str(cwd), "ts": _now_ms()},
-            default=str,
-        )
-        + "\n"
+def _open_log(world: Any) -> None:
+    global _LOG_WORLD, _SEQ
+    from desmos.state.persist import record_event
+
+    _LOG_WORLD = world
+    _SEQ = record_event(
+        world,
+        {
+            "ev": "session",
+            "session_id": os.environ.get("DESMOS_SESSION_ID", ""),
+            "cwd": str(world.cwd),
+        },
+        ts_ms=_now_ms(),
+        mono_ns=time.monotonic_ns(),
     )
-    _LOG.flush()
 
 
 def _log(ev: dict[str, Any]) -> None:
-    """Stamp and append one event. Caller holds _WIRE_LOCK, which is what
-    makes seq monotonic: every producer already funnels through _emit."""
+    """Append one replay-relevant event; caller holds _WIRE_LOCK."""
     global _SEQ
-    if _LOG is None:
+    if _LOG_WORLD is None:
         return
-    _SEQ += 1
-    _LOG.write(json.dumps({**ev, "seq": _SEQ, "ts": _now_ms()}, default=str) + "\n")
-    _LOG.flush()
+    from desmos.state.persist import record_event
+
+    seq = record_event(
+        _LOG_WORLD,
+        ev,
+        ts_ms=_now_ms(),
+        mono_ns=time.monotonic_ns(),
+    )
+    if seq:
+        _SEQ = max(_SEQ, seq)
 
 
 def _emit(ev: dict[str, Any]) -> None:
@@ -197,54 +198,32 @@ _REPLAY_STALL = 20.0
 
 
 def _replay(wire: "_Client", since: int) -> None:
-    """Stream the stamped log from seq `since` (exclusive) to one client,
-    then register it for the live fan-out. Runs on the client's own reader
-    thread and raises OSError if the client stops draining.
+    """Replay compact SQL events, then join the live fan-out gaplessly."""
+    from desmos.state.persist import read_events
 
-    The lock is NOT held across the file: an attach on a 100k-line session
-    would otherwise enqueue at memory speed into the bounded queue (silent
-    overflow at 4096) while blocking every producer. Instead the writer's seq
-    is snapshotted under the lock, the file is read and pushed with blocking
-    backpressure outside it, and the loop repeats until the client is caught
-    up -- registration happens under the lock in the same breath, so the
-    hand-off to live streaming stays gapless and duplicate-free: replay lines
-    and later live lines share the client's one ordered queue. The session
-    header line carries no seq and is replayed only for a from-the-top attach
-    (since <= 0).
-    """
-    last = since
-    fh = None
-    try:
-        while True:
-            with _WIRE_LOCK:
-                if _LOG_PATH is None or not _LOG_PATH.is_file() or last >= _SEQ:
-                    if wire not in _CLIENTS:
-                        _CLIENTS.append(wire)
-                    return
-                target = _SEQ
-            if fh is None:
-                fh = _LOG_PATH.open("rb")
-            while last < target:
-                pos = fh.tell()
-                raw = fh.readline()
-                if not raw.endswith(b"\n"):
-                    # racing the writer's flush: rewind, re-snapshot, retry
-                    fh.seek(pos)
-                    break
-                try:
-                    seq = json.loads(raw).get("seq")
-                except ValueError:
-                    continue
-                if seq is None:
-                    if since <= 0:
-                        wire.push_wait(raw, _REPLAY_STALL)
-                    continue
-                if seq > since:
-                    wire.push_wait(raw, _REPLAY_STALL)
-                    last = seq
-    finally:
-        if fh is not None:
-            fh.close()
+    last = int(since)
+    while True:
+        with _WIRE_LOCK:
+            if _LOG_WORLD is None or last >= _SEQ:
+                if wire not in _CLIENTS:
+                    _CLIENTS.append(wire)
+                return
+            target = _SEQ
+            world = _LOG_WORLD
+        rows = read_events(
+            world,
+            since=last,
+            limit=max(1, min(target - last, 20_000)),
+        )
+        if not rows:
+            last = target
+            continue
+        for event in rows:
+            wire.push_wait(
+                (json.dumps(event, default=str) + "\n").encode("utf-8"),
+                _REPLAY_STALL,
+            )
+            last = int(event["seq"])
 
 
 def _intervene(op: str, msg: dict[str, Any]) -> None:
@@ -395,7 +374,7 @@ def serve(cwd: Path) -> int:
     cancel = threading.Event()
     inbox: queue.Queue[dict[str, Any] | None] = queue.Queue()
     # The log first: ready and everything after it must be in the replay file.
-    _open_log(cwd)
+    _open_log(world)
     try:
         sock_srv = _bind_socket(cwd)
     except OSError:
@@ -465,13 +444,10 @@ def serve(cwd: Path) -> int:
         if sock_srv is not None:
             sock_srv.close()
             (cwd / ".desmos" / "bridge.sock").unlink(missing_ok=True)
-        global _LOG
+        global _LOG_WORLD
         with _WIRE_LOCK:
-            # Null before close so a straggler child thread's _emit sees "no
-            # log" instead of a write on a closed handle.
-            log, _LOG = _LOG, None
-        if log is not None:
-            log.close()
+            # Null first so a straggler child thread sees no durable writer.
+            _LOG_WORLD = None
 
 
 def _drive(world: Any, inbox: queue.Queue, cancel: threading.Event) -> int:

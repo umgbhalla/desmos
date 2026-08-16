@@ -12,12 +12,11 @@ one parser. A stubbed `step` is not drivable over the wire
 (`world.complete_fn` is in-process only), so the loop kinds are covered by
 the fixtures, not a live model call.
 
-Track 1.3 / 3.1 forms are validated through the same bin's `--log` mode: the
-event-log file the bridge writes (`.desmos/events/<session>.jsonl`) and the
-attach replay served over the unix socket are both the wire events stamped
-with `seq`+`ts` behind one `session` header, and both must parse as such —
-with the stamped bodies byte-equal to what stdout carried, in order, because
-the file IS the replay substrate.
+Track 1.3 / 3.1 forms are validated through the same bin's `--log` mode:
+the compact SQL event rows and the attach replay served over the unix socket
+are both wire events stamped with `seq`+`ts`, and both must parse as such.
+For small events their bodies remain byte-equivalent to stdout; giant
+request/response bodies and provider ciphertext are deliberately elided.
 
 Vendor-check pattern: SILENT SKIP when the validate bin was never built
 (cargo not run on this machine), LOUD when it exists and disagrees with what
@@ -131,28 +130,60 @@ def _drive_bridge(tmp: Path) -> tuple[str, str]:
     return "".join(lines), replay
 
 
-def _check_log_forms(binary: Path, tmp: Path, stream: str, replay: str) -> None:
-    """The event-log file and the attach replay both parse as the stamped
-    LogLine form, open with the session header, and carry exactly the wire
-    stream's events in order (the file is the replay substrate)."""
-    cwd = tmp / "bridgecwd"
-    logs = sorted((cwd / ".desmos" / "events").glob("*.jsonl"))
-    assert len(logs) == 1, f"expected one event log, found {logs}"
-    log_text = logs[0].read_text(encoding="utf-8")
+def _sql_log(cwd: Path, session_id: str) -> str:
+    import sqlite3
 
-    for what, text in ((str(logs[0]), log_text), ("the attach replay", replay)):
+    path = cwd / ".desmos" / "harness.sqlite3"
+    with sqlite3.connect(path) as db:
+        db.row_factory = sqlite3.Row
+        rows = db.execute(
+            "SELECT seq, ts_ms, mono_ns, payload_json,"
+            " payload_bytes, payload_sha256"
+            " FROM events WHERE session_id = ? ORDER BY seq",
+            (session_id,),
+        ).fetchall()
+    lines = []
+    for row in rows:
+        event = json.loads(row["payload_json"])
+        event.update({
+            "seq": row["seq"],
+            "ts": row["ts_ms"],
+            "mono_ns": row["mono_ns"],
+            "payload_bytes": row["payload_bytes"],
+            "payload_sha256": row["payload_sha256"],
+        })
+        lines.append(json.dumps(event, separators=(",", ":")))
+    return "\n".join(lines) + ("\n" if lines else "")
+
+
+def _check_log_forms(binary: Path, tmp: Path, stream: str, replay: str) -> None:
+    """SQL rows and socket replay are the same stamped event stream."""
+    cwd = tmp / "bridgecwd"
+    replay_lines = replay.splitlines()
+    assert replay_lines, "attach replay is empty"
+    session_id = str(json.loads(replay_lines[0]).get("session_id") or "")
+    assert session_id, replay_lines[0]
+    log_text = _sql_log(cwd, session_id)
+    assert log_text, "SQL event stream is empty"
+
+    for what, text in (("the SQL event stream", log_text), ("the attach replay", replay)):
         _validate(binary, text, what, log=True)
         head = json.loads(text.splitlines()[0])
         assert head.get("ev") == "session", f"{what} does not open with the header: {head}"
-        # resolve(): the bridge canonicalizes its cwd (macOS /var -> /private/var)
-        assert head.get("session_id"), head
+        assert head.get("session_id") == session_id, head
         assert Path(head.get("cwd", "")).resolve() == cwd.resolve(), head
-        assert logs[0].stem == head["session_id"], (logs[0], head)
-        stamped = [json.loads(l) for l in text.splitlines()[1:]]
-        wire = [json.loads(l) for l in stream.splitlines()]
-        bodies = [{k: v for k, v in e.items() if k not in ("seq", "ts")} for e in stamped]
+        stamped = [json.loads(line) for line in text.splitlines()]
+        wire = [json.loads(line) for line in stream.splitlines()]
+        stamp_keys = {
+            "seq", "ts", "mono_ns", "payload_bytes", "payload_sha256"
+        }
+        bodies = [
+            {key: value for key, value in event.items() if key not in stamp_keys}
+            for event in stamped[1:]
+        ]
         assert bodies == wire, (
-            f"{what} is not the wire stream: {len(bodies)} stamped vs {len(wire)} wire events"
+            f"{what} is not the wire stream: "
+            f"{len(bodies)} stamped vs {len(wire)} wire events"
         )
 
 

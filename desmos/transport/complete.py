@@ -93,18 +93,10 @@ _CACHE_KEY: str | None = None
 
 
 def session_cache_key() -> str:
-    """A stable key for this process, so the endpoint can reuse its prefix.
+    """The prompt-cache identity of this attach."""
+    from desmos.state.persist import run_id
 
-    Stable is the whole point: a fresh key per request is the same as no key.
-    It lives for the life of the bridge, which is also the life of the
-    transcript it is caching.
-    """
-    global _CACHE_KEY
-    if _CACHE_KEY is None:
-        import uuid
-
-        _CACHE_KEY = f"desmos-{uuid.uuid4().hex[:16]}"
-    return _CACHE_KEY
+    return f"desmos-{run_id()[:16]}"
 
 
 def apply_compaction(payload: dict[str, Any], model: str) -> list[str]:

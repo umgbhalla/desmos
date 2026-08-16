@@ -72,7 +72,9 @@ ALLOWED_FN_EDGES = {
     ("desmos.kernel.loop", "desmos.transport.dialect"),
     ("desmos.kernel.loop", "desmos.transport.settings"),
     ("desmos.transport.complete", "desmos.skills"),  # filter_skill_dialects, pure text
+    ("desmos.transport.complete", "desmos.state.persist"),  # attach cache identity
     ("desmos.transport.openai", "desmos.skills"),  # filter_skill_dialects, pure text
+    ("desmos.transport.openai", "desmos.state.persist"),  # provider session identity
     ("desmos.front.cli", "desmos.check"),  # the `check` subcommand runs the floor
 }
 

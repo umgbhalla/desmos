@@ -21,7 +21,6 @@ import re
 import time
 import urllib.error
 import urllib.request
-import uuid
 from typing import Any, Callable, Iterable
 
 from desmos.transport import auth
@@ -583,7 +582,14 @@ def session_id() -> str:
     """
     global _SESSION_ID
     if not _SESSION_ID:
-        _SESSION_ID = os.environ.get("DESMOS_SESSION_ID") or str(uuid.uuid4())
+        existing = os.environ.get("DESMOS_SESSION_ID")
+        if existing:
+            _SESSION_ID = existing
+        else:
+            from desmos.state.persist import run_id
+
+            _SESSION_ID = run_id()
+        os.environ["DESMOS_SESSION_ID"] = _SESSION_ID
     return _SESSION_ID
 
 

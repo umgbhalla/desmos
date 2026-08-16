@@ -1,27 +1,13 @@
-"""`<recall>` — search prior-session history through the memex-desmos fork.
+"""`<recall>` — SQLite session history by default, memex for external sources.
 
-memex is an EXTERNAL binary (tantivy + usearch + ort; it must never enter our
-build). We shell one `memex search ... --json-array` per call — no kernel-owned
-daemon; warm calls are ms-scale BM25, freshness is memex's own TTL+flock lease.
-
-memex upstream has no adapter mechanism (SourceKind is a closed clap enum), so
-the desmos events live only in a fork that adds `SourceKind::Desmos`. The probe
-that tells fork from stock is exactly `memex search --source desmos ...`: stock
-memex rejects the label with a clap error, the fork answers. Absent binary or
-stock memex => a refusal in prose naming scripts/memex-setup.sh; the model then
-falls back to `<bash>` + rg over `.desmos/events/*.jsonl` (reuse of the same
-data, not a second search engine).
-
-Doctrine: what the kernel learns arrives as a syscall result on the record.
-Results are spill-capped user-role text, and the same secret scrub every other
-result gets runs before they spill — recall reads the user's cross-agent
-history, so a leaked key in an old transcript must not surface here in the
-clear. A child (persist=False) is pinned to `source=desmos`: a prompt-injected
-subagent must not query the user's whole machine history.
+Desmos-owned history lives in the harness database and is ranked by FTS5.
+An explicit non-desmos `source=` still delegates to memex for cross-agent
+history. Children are always confined to the local Desmos database.
 """
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 
@@ -43,10 +29,8 @@ TIMEOUT = 30
 _SETUP = "scripts/memex-setup.sh"
 
 _REFUSAL = (
-    "recall unavailable: the memex-desmos fork is not installed (stock memex "
-    f"has no `desmos` source). Run {_SETUP} — it installs the pinned fork and "
-    "ends with `memex index` so first use is warm. Until then, search the raw "
-    "history with <bash>: rg over .desmos/events/*.jsonl."
+    "external recall unavailable: memex is not installed. "
+    f"Run {_SETUP}, then retry with the requested external source."
 )
 
 _COLD = (
@@ -99,12 +83,27 @@ def _is_unknown_source(stderr: str) -> bool:
     return "desmos" in s and ("invalid value" in s or "possible values" in s)
 
 
-def handle_recall(world: World, body: str, attrs: dict[str, str] | None = None) -> str:
+def handle_recall(
+    world: World, body: str, attrs: dict[str, str] | None = None
+) -> str:
     query = " ".join((body or "").split())
     if not query:
         return "recall failed: query required (put the search text in the body)."
     attrs = attrs or {}
-    cmd = _build_cmd(world, query, attrs)
+    source = (attrs.get("source") or "desmos").strip().lower()
+    if not world.persist:
+        source = "desmos"
+
+    if source == "desmos":
+        from desmos.state.persist import search_history
+
+        rows = search_history(world, query, _limit(attrs.get("limit")) or 12)
+        out = json.dumps(rows, ensure_ascii=False, separators=(",", ":"))
+        return spill(
+            scrub_secrets(out), RESULT_CAP, tag="recall", cwd=world.cwd
+        )
+
+    cmd = _build_cmd(world, query, {**attrs, "source": source})
     try:
         proc = subprocess.run(
             cmd,
@@ -119,13 +118,15 @@ def handle_recall(world: World, body: str, attrs: dict[str, str] | None = None) 
         return _COLD
 
     if proc.returncode != 0:
-        if _is_unknown_source(proc.stderr):
-            return _REFUSAL
-        # Scrub the diagnostic too: memex may echo the query or partial index
-        # content, and doctrine is that nothing recall spills bypasses the scrub.
-        err = scrub_secrets((proc.stderr or proc.stdout or "no output").strip())
-        return spill(f"recall failed (exit {proc.returncode}): {err}", RESULT_CAP,
-                     tag="recall", cwd=world.cwd)
+        err = scrub_secrets(
+            (proc.stderr or proc.stdout or "no output").strip()
+        )
+        return spill(
+            f"recall failed (exit {proc.returncode}): {err}",
+            RESULT_CAP,
+            tag="recall",
+            cwd=world.cwd,
+        )
 
     out = proc.stdout.strip() or "[]"
     return spill(scrub_secrets(out), RESULT_CAP, tag="recall", cwd=world.cwd)

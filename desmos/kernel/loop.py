@@ -1178,7 +1178,9 @@ def _reload_gate() -> str | None:
     if ran.returncode == 0:
         return None
     detail = ((ran.stderr or "") + (ran.stdout or "")).strip()
-    return detail[-2000:] or f"the reload tier exited {ran.returncode} with no output"
+    if len(detail) > 2000:
+        detail = detail[:1000] + "\n… reload output clipped …\n" + detail[-1000:]
+    return detail or f"the reload tier exited {ran.returncode} with no output"
 
 
 def reload_sdk(world: World | None = None) -> str:

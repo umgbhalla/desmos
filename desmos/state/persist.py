@@ -5,6 +5,7 @@ import json
 import os
 import sqlite3
 import tempfile
+import time
 import traceback
 import warnings
 from datetime import datetime, timezone
@@ -24,18 +25,14 @@ from desmos.kernel.types import Tool, World
 _UMASK = os.umask(0)
 os.umask(_UMASK)
 
-SCHEMA_VERSION = 5
-SESSION_ID = "default"
-#: One attach of the process. `sessions` is a singleton keyed to the cwd --
-#: it is the durable world, not a sitting -- so nothing named the thing a
-#: person means by "this session", and per-call usage lived only in
-#: `world.log`, in memory, gone on restart. The id goes in the environment
-#: rather than a module global so `reload_sdk` (which re-imports this module)
-#: keeps the same run, and a fresh process gets a fresh one.
-RUN_ID_ENV = "DESMOS_RUN_ID"
+SCHEMA_VERSION = 1
+#: One attach, one id, across SQL, provider routing, cache, presence, and wire.
+#: The environment survives reload_sdk; a new process gets a new session.
+SESSION_ID_ENV = "DESMOS_SESSION_ID"
+RUN_ID_ENV = SESSION_ID_ENV  # compatibility name for the public run_id() API
 DB_FILENAME = "harness.sqlite3"
-LEGACY_FILENAME = "harness.json"
 KEEP_MESSAGES = 80
+SESSION_KEEP = 24
 _PRESENCE_LEASES: dict[str, Any] = {}
 
 
@@ -271,12 +268,6 @@ def open_db(path: Path) -> sqlite3.Connection:
     return _open(path)
 
 
-def _legacy_file(world: World) -> Path:
-    if world.state_path:
-        return world.state_path
-    return world.cwd / ".desmos" / LEGACY_FILENAME
-
-
 def _backup_name(path: Path, label: str) -> Path:
     candidate = path.with_name(path.name + f".{label}")
     n = 1
@@ -307,100 +298,168 @@ def _connect(path: Path) -> sqlite3.Connection:
     return conn
 
 
+SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS schema_migrations (
+    version INTEGER PRIMARY KEY,
+    applied_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS workspaces (
+    id TEXT PRIMARY KEY,
+    cwd TEXT NOT NULL UNIQUE,
+    generation INTEGER NOT NULL DEFAULT 0,
+    gen_reason TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS sessions (
+    id TEXT PRIMARY KEY,
+    workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+    parent_id TEXT REFERENCES sessions(id) ON DELETE SET NULL,
+    kind TEXT NOT NULL CHECK (kind IN ('attach', 'resume', 'fork', 'child')),
+    started_at TEXT NOT NULL,
+    last_seen_at TEXT NOT NULL,
+    ended_at TEXT,
+    model TEXT NOT NULL DEFAULT '',
+    thinking TEXT NOT NULL DEFAULT '',
+    cache_key TEXT NOT NULL,
+    title TEXT NOT NULL DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS messages (
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    seq INTEGER NOT NULL,
+    role TEXT NOT NULL CHECK (role IN ('user', 'assistant')),
+    content_json TEXT NOT NULL,
+    PRIMARY KEY (session_id, seq)
+);
+CREATE TABLE IF NOT EXISTS prior_turns (
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    seq INTEGER NOT NULL,
+    prompt TEXT NOT NULL,
+    speech TEXT NOT NULL,
+    PRIMARY KEY (session_id, seq)
+);
+CREATE TABLE IF NOT EXISTS notes (
+    workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+    name TEXT NOT NULL,
+    body TEXT NOT NULL,
+    PRIMARY KEY (workspace_id, name)
+);
+CREATE TABLE IF NOT EXISTS tools (
+    workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+    name TEXT NOT NULL,
+    doc TEXT NOT NULL,
+    source TEXT,
+    frozen INTEGER NOT NULL CHECK (frozen IN (0, 1)),
+    PRIMARY KEY (workspace_id, name)
+);
+CREATE TABLE IF NOT EXISTS calls (
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    seq INTEGER NOT NULL,
+    ts TEXT NOT NULL,
+    model TEXT NOT NULL,
+    input_tokens INTEGER NOT NULL DEFAULT 0,
+    cache_read_input_tokens INTEGER NOT NULL DEFAULT 0,
+    cache_creation_input_tokens INTEGER NOT NULL DEFAULT 0,
+    output_tokens INTEGER NOT NULL DEFAULT 0,
+    cost_usd REAL NOT NULL DEFAULT 0,
+    PRIMARY KEY (session_id, seq)
+);
+CREATE TABLE IF NOT EXISTS events (
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    seq INTEGER NOT NULL,
+    ts_ms INTEGER NOT NULL,
+    mono_ns INTEGER NOT NULL,
+    kind TEXT NOT NULL,
+    payload_json TEXT NOT NULL DEFAULT '{}',
+    payload_bytes INTEGER NOT NULL DEFAULT 0,
+    payload_sha256 TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (session_id, seq)
+);
+CREATE VIRTUAL TABLE IF NOT EXISTS history_fts USING fts5(
+    workspace_id UNINDEXED,
+    session_id UNINDEXED,
+    kind UNINDEXED,
+    text,
+    source_seq UNINDEXED,
+    tokenize = 'porter unicode61'
+);
+CREATE TABLE IF NOT EXISTS active_runs (
+    run_id TEXT PRIMARY KEY,
+    workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    pid INTEGER NOT NULL,
+    cwd TEXT NOT NULL,
+    generation INTEGER NOT NULL DEFAULT 0,
+    model TEXT NOT NULL DEFAULT '',
+    started_at TEXT NOT NULL,
+    seen_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS channel_messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    channel TEXT NOT NULL,
+    run_id TEXT NOT NULL,
+    author TEXT NOT NULL,
+    body TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_messages_session
+    ON messages(session_id, seq);
+CREATE INDEX IF NOT EXISTS idx_calls_session
+    ON calls(session_id, seq);
+CREATE INDEX IF NOT EXISTS idx_events_session
+    ON events(session_id, seq);
+CREATE INDEX IF NOT EXISTS idx_sessions_workspace
+    ON sessions(workspace_id, started_at);
+CREATE INDEX IF NOT EXISTS idx_channel_messages
+    ON channel_messages(workspace_id, channel, id);
+"""
+
+
+def _execute_schema(conn: sqlite3.Connection) -> None:
+    statement = ""
+    for line in SCHEMA_SQL.splitlines(keepends=True):
+        statement += line
+        if sqlite3.complete_statement(statement):
+            if statement.strip():
+                conn.execute(statement)
+            statement = ""
+    if statement.strip():
+        raise sqlite3.DatabaseError("incomplete persistence schema")
+
+
 def _migrate(conn: sqlite3.Connection) -> None:
-    conn.executescript(
-        """
-        CREATE TABLE IF NOT EXISTS schema_migrations (
-            version INTEGER PRIMARY KEY,
-            applied_at TEXT NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS sessions (
-            id TEXT PRIMARY KEY,
-            cwd TEXT NOT NULL,
-            generation INTEGER NOT NULL,
-            gen_reason TEXT NOT NULL,
-            thinking TEXT NOT NULL,
-            updated_at TEXT NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS messages (
-            session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
-            seq INTEGER NOT NULL,
-            role TEXT NOT NULL CHECK (role IN ('user', 'assistant')),
-            content_json TEXT NOT NULL,
-            PRIMARY KEY (session_id, seq)
-        );
-        CREATE TABLE IF NOT EXISTS prior_turns (
-            session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
-            seq INTEGER NOT NULL,
-            prompt TEXT NOT NULL,
-            speech TEXT NOT NULL,
-            PRIMARY KEY (session_id, seq)
-        );
-        CREATE TABLE IF NOT EXISTS notes (
-            session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
-            name TEXT NOT NULL,
-            body TEXT NOT NULL,
-            PRIMARY KEY (session_id, name)
-        );
-        CREATE TABLE IF NOT EXISTS tools (
-            session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
-            name TEXT NOT NULL,
-            doc TEXT NOT NULL,
-            source TEXT,
-            frozen INTEGER NOT NULL CHECK (frozen IN (0, 1)),
-            PRIMARY KEY (session_id, name)
-        );
-        CREATE TABLE IF NOT EXISTS calls (
-            session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
-            run_id TEXT NOT NULL,
-            seq INTEGER NOT NULL,
-            ts TEXT NOT NULL,
-            model TEXT NOT NULL,
-            input_tokens INTEGER NOT NULL DEFAULT 0,
-            cache_read_input_tokens INTEGER NOT NULL DEFAULT 0,
-            cache_creation_input_tokens INTEGER NOT NULL DEFAULT 0,
-            output_tokens INTEGER NOT NULL DEFAULT 0,
-            cost_usd REAL NOT NULL DEFAULT 0,
-            PRIMARY KEY (session_id, run_id, seq)
-        );
-        CREATE TABLE IF NOT EXISTS active_runs (
-            run_id TEXT PRIMARY KEY,
-            pid INTEGER NOT NULL,
-            cwd TEXT NOT NULL,
-            generation INTEGER NOT NULL,
-            model TEXT NOT NULL,
-            started_at TEXT NOT NULL,
-            seen_at TEXT NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS channel_messages (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            channel TEXT NOT NULL,
-            run_id TEXT NOT NULL,
-            author TEXT NOT NULL,
-            body TEXT NOT NULL,
-            created_at TEXT NOT NULL
-        );
-        DROP TABLE IF EXISTS seat;
-        DROP TABLE IF EXISTS seat_events;
-        CREATE INDEX IF NOT EXISTS idx_messages_session_seq
-            ON messages(session_id, seq);
-        CREATE INDEX IF NOT EXISTS idx_calls_run
-            ON calls(session_id, run_id, seq);
-        CREATE INDEX IF NOT EXISTS idx_channel_messages_channel_id
-            ON channel_messages(channel, id);
-        """
-    )
-    versions = [int(row[0]) for row in conn.execute("SELECT version FROM schema_migrations")]
-    if versions and max(versions) > SCHEMA_VERSION:
+    """Create the current schema; old layouts are intentionally unsupported."""
+    existing = {
+        row[1] for row in conn.execute("PRAGMA table_info(sessions)")
+    }
+    if existing and "workspace_id" not in existing:
         raise RuntimeError(
-            f"harness database schema {max(versions)} is newer than supported {SCHEMA_VERSION}"
+            "legacy harness database: remove it; automatic migration was retired"
         )
-    if SCHEMA_VERSION not in versions:
-        conn.execute(
-            "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
-            (SCHEMA_VERSION, datetime.now(timezone.utc).isoformat()),
-        )
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        _execute_schema(conn)
+        versions = [
+            int(row[0])
+            for row in conn.execute(
+                "SELECT version FROM schema_migrations ORDER BY version"
+            )
+        ]
+        if versions and versions != [SCHEMA_VERSION]:
+            raise RuntimeError(
+                f"harness schema versions {versions}, expected [{SCHEMA_VERSION}]"
+            )
+        if not versions:
+            conn.execute(
+                "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
+                (SCHEMA_VERSION, datetime.now(timezone.utc).isoformat()),
+            )
         conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
 
 
 def _open(path: Path) -> sqlite3.Connection:
@@ -425,20 +484,10 @@ def _open(path: Path) -> sqlite3.Connection:
         return conn
 
 
-def _legacy_payload(path: Path) -> dict[str, Any] | None:
-    if not path.is_file():
-        return None
-    try:
-        raw = path.read_bytes()
-    except OSError:
-        return None
-    if raw.startswith(b"SQLite format 3"):
-        return None
-    try:
-        value = json.loads(raw.decode("utf-8"))
-    except (UnicodeDecodeError, ValueError):
-        return None
-    return value if isinstance(value, dict) else None
+def _uuid7() -> str:
+    """Time-ordered 128-bit id: 48-bit epoch milliseconds plus randomness."""
+    ms = int(time.time() * 1000) & 0xFFFFFFFFFFFF
+    return f"{ms:012x}{os.urandom(10).hex()}"
 
 
 def _data_from_world(world: World) -> dict[str, Any]:
@@ -450,40 +499,118 @@ def _data_from_world(world: World) -> dict[str, Any]:
             if not tool.frozen
         },
         "docs": {name: tool.doc for name, tool in world.tools.items() if tool.frozen},
-        "prior": world.prior[-PRIOR_KEEP:],
+        "prior": world.prior[max(0, int(world.session_prior_start)):],
         "generation": world.generation,
         "gen_reason": world.gen_reason,
         "thinking": world.thinking,
-        "messages": turn_aligned(world.messages),
+        "messages": world.messages[
+            max(0, int(world.session_message_start)):
+        ],
     }
+
+
+def _workspace_id(
+    conn: sqlite3.Connection, world: World, *, create: bool = True
+) -> str | None:
+    cwd = str(world.cwd.resolve())
+    row = conn.execute("SELECT id FROM workspaces WHERE cwd = ?", (cwd,)).fetchone()
+    if row is not None:
+        return str(row["id"])
+    if not create:
+        return None
+    now = datetime.now(timezone.utc).isoformat()
+    workspace = _uuid7()
+    conn.execute(
+        "INSERT INTO workspaces(id, cwd, generation, gen_reason, created_at, updated_at)"
+        " VALUES (?, ?, ?, ?, ?, ?)",
+        (workspace, cwd, int(world.generation), str(world.gen_reason), now, now),
+    )
+    return workspace
+
+
+def _session_id(
+    conn: sqlite3.Connection, world: World, workspace: str, *, create: bool = True
+) -> str | None:
+    current = run_id()
+    row = conn.execute(
+        "SELECT id FROM sessions WHERE id = ? AND workspace_id = ?",
+        (current, workspace),
+    ).fetchone()
+    now = datetime.now(timezone.utc).isoformat()
+    if row is not None:
+        conn.execute(
+            "UPDATE sessions SET last_seen_at = ?, model = ?, thinking = ?"
+            " WHERE id = ?",
+            (now, str(world.model), str(world.thinking), current),
+        )
+        return current
+    if not create:
+        return None
+    parent = conn.execute(
+        "SELECT id FROM sessions WHERE workspace_id = ?"
+        " ORDER BY started_at DESC, id DESC LIMIT 1",
+        (workspace,),
+    ).fetchone()
+    parent_id = str(parent["id"]) if parent else None
+    conn.execute(
+        "INSERT INTO sessions(id, workspace_id, parent_id, kind, started_at,"
+        " last_seen_at, model, thinking, cache_key)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            current,
+            workspace,
+            parent_id,
+            "resume" if parent_id else "attach",
+            now,
+            now,
+            str(world.model),
+            str(world.thinking),
+            f"desmos-{current[:16]}",
+        ),
+    )
+    return current
+
+
+def _content_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            for key in ("text", "thinking", "content", "result"):
+                value = block.get(key)
+                if isinstance(value, str):
+                    parts.append(value)
+        return "\n".join(parts)
+    return ""
 
 
 def _save_data(conn: sqlite3.Connection, world: World, data: dict[str, Any]) -> None:
     now = datetime.now(timezone.utc).isoformat()
     conn.execute("BEGIN IMMEDIATE")
-    with conn:
+    try:
+        workspace = _workspace_id(conn, world)
+        assert workspace is not None
+        session = _session_id(conn, world, workspace)
+        assert session is not None
         conn.execute(
-            """
-            INSERT INTO sessions(id, cwd, generation, gen_reason, thinking, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?)
-            ON CONFLICT(id) DO UPDATE SET
-                cwd=excluded.cwd,
-                generation=excluded.generation,
-                gen_reason=excluded.gen_reason,
-                thinking=excluded.thinking,
-                updated_at=excluded.updated_at
-            """,
-            (
-                SESSION_ID,
-                str(world.cwd),
-                int(data["generation"]),
-                str(data["gen_reason"]),
-                str(data["thinking"]),
-                now,
-            ),
+            "UPDATE workspaces SET generation = ?, gen_reason = ?, updated_at = ?"
+            " WHERE id = ?",
+            (int(data["generation"]), str(data["gen_reason"]), now, workspace),
         )
-        for table in ("messages", "prior_turns", "notes", "tools"):
-            conn.execute(f"DELETE FROM {table} WHERE session_id = ?", (SESSION_ID,))
+        conn.execute(
+            "UPDATE sessions SET model = ?, thinking = ?, last_seen_at = ?"
+            " WHERE id = ?",
+            (str(world.model), str(data["thinking"]), now, session),
+        )
+        for table in ("messages", "prior_turns"):
+            conn.execute(f"DELETE FROM {table} WHERE session_id = ?", (session,))
+        conn.execute("DELETE FROM history_fts WHERE session_id = ?", (session,))
+        for table in ("notes", "tools"):
+            conn.execute(f"DELETE FROM {table} WHERE workspace_id = ?", (workspace,))
+
         for seq, item in enumerate(data["messages"]):
             if not isinstance(item, dict) or item.get("role") not in {"user", "assistant"}:
                 continue
@@ -491,27 +618,55 @@ def _save_data(conn: sqlite3.Connection, world: World, data: dict[str, Any]) -> 
             if not isinstance(content, (str, list)):
                 continue
             conn.execute(
-                "INSERT INTO messages(session_id, seq, role, content_json) VALUES (?, ?, ?, ?)",
-                (SESSION_ID, seq, item["role"], json.dumps(content, separators=(",", ":"))),
+                "INSERT INTO messages(session_id, seq, role, content_json)"
+                " VALUES (?, ?, ?, ?)",
+                (
+                    session,
+                    seq,
+                    item["role"],
+                    json.dumps(content, separators=(",", ":")),
+                ),
             )
-        for seq, item in enumerate(data["prior"]):
-            if isinstance(item, dict) and isinstance(item.get("prompt"), str) and isinstance(item.get("speech"), str):
+            text = _content_text(content)
+            if text.strip():
                 conn.execute(
-                    "INSERT INTO prior_turns(session_id, seq, prompt, speech) VALUES (?, ?, ?, ?)",
-                    (SESSION_ID, seq, item["prompt"], item["speech"]),
+                    "INSERT INTO history_fts("
+                    " workspace_id, session_id, kind, text, source_seq)"
+                    " VALUES (?, ?, ?, ?, ?)",
+                    (workspace, session, f"message:{item['role']}", text, str(seq)),
+                )
+        for seq, item in enumerate(data["prior"]):
+            if (
+                isinstance(item, dict)
+                and isinstance(item.get("prompt"), str)
+                and isinstance(item.get("speech"), str)
+            ):
+                conn.execute(
+                    "INSERT INTO prior_turns(session_id, seq, prompt, speech)"
+                    " VALUES (?, ?, ?, ?)",
+                    (session, seq, item["prompt"], item["speech"]),
+                )
+                conn.execute(
+                    "INSERT INTO history_fts("
+                    " workspace_id, session_id, kind, text, source_seq)"
+                    " VALUES (?, ?, 'prior', ?, ?)",
+                    (
+                        workspace, session,
+                        item["prompt"] + "\n" + item["speech"], str(seq),
+                    ),
                 )
         for name, body in data["notes"].items():
             if isinstance(body, str):
                 conn.execute(
-                    "INSERT INTO notes(session_id, name, body) VALUES (?, ?, ?)",
-                    (SESSION_ID, str(name), body),
+                    "INSERT INTO notes(workspace_id, name, body) VALUES (?, ?, ?)",
+                    (workspace, str(name), body),
                 )
-        docs = data["docs"]
-        for name, doc in docs.items():
+        for name, doc in data["docs"].items():
             if isinstance(doc, str):
                 conn.execute(
-                    "INSERT INTO tools(session_id, name, doc, source, frozen) VALUES (?, ?, ?, NULL, 1)",
-                    (SESSION_ID, str(name), doc),
+                    "INSERT INTO tools(workspace_id, name, doc, source, frozen)"
+                    " VALUES (?, ?, ?, NULL, 1)",
+                    (workspace, str(name), doc),
                 )
         for name, spec in data["tools"].items():
             if not isinstance(spec, dict):
@@ -519,9 +674,14 @@ def _save_data(conn: sqlite3.Connection, world: World, data: dict[str, Any]) -> 
             doc, source = spec.get("doc"), spec.get("source")
             if isinstance(doc, str) and (isinstance(source, str) or source is None):
                 conn.execute(
-                    "INSERT INTO tools(session_id, name, doc, source, frozen) VALUES (?, ?, ?, ?, 0)",
-                    (SESSION_ID, str(name), doc, source),
+                    "INSERT INTO tools(workspace_id, name, doc, source, frozen)"
+                    " VALUES (?, ?, ?, ?, 0)",
+                    (workspace, str(name), doc, source),
                 )
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
 
 
 def registry_path() -> Path:
@@ -566,12 +726,12 @@ def _append_registry(cwd: Path) -> None:
 
 
 def run_id() -> str:
-    """The id of this attach of the process. Stable across `reload_sdk`."""
-    existing = os.environ.get(RUN_ID_ENV)
+    """The id of this attach, shared by every subsystem."""
+    existing = os.environ.get(SESSION_ID_ENV)
     if existing:
         return existing
-    fresh = f"{int(datetime.now(timezone.utc).timestamp())}-{os.getpid()}"
-    os.environ[RUN_ID_ENV] = fresh
+    fresh = _uuid7()
+    os.environ[SESSION_ID_ENV] = fresh
     return fresh
 
 
@@ -580,7 +740,7 @@ def _presence_path(world: World, run: str) -> Path:
 
 
 def announce(world: World, conn: sqlite3.Connection | None = None) -> None:
-    """Advertise this live process using a lock the OS releases on exit."""
+    """Advertise this live session using a lock the OS releases on exit."""
     if not world.persist:
         return
     run = run_id()
@@ -596,18 +756,29 @@ def announce(world: World, conn: sqlite3.Connection | None = None) -> None:
     now = datetime.now(timezone.utc).isoformat()
     try:
         with db:
+            workspace = _workspace_id(db, world)
+            assert workspace is not None
+            session = _session_id(db, world, workspace)
+            assert session is not None
             db.execute(
                 """
                 INSERT INTO active_runs(
-                    run_id, pid, cwd, generation, model, started_at, seen_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                    run_id, workspace_id, session_id, pid, cwd, generation,
+                    model, started_at, seen_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(run_id) DO UPDATE SET
-                    pid=excluded.pid, cwd=excluded.cwd,
-                    generation=excluded.generation, model=excluded.model,
+                    workspace_id=excluded.workspace_id,
+                    session_id=excluded.session_id,
+                    pid=excluded.pid,
+                    cwd=excluded.cwd,
+                    generation=excluded.generation,
+                    model=excluded.model,
                     seen_at=excluded.seen_at
                 """,
-                (run, os.getpid(), str(world.cwd), int(world.generation),
-                 str(world.model), now, now),
+                (
+                    run, workspace, session, os.getpid(), str(world.cwd.resolve()),
+                    int(world.generation), str(world.model), now, now,
+                ),
             )
     finally:
         if own:
@@ -615,7 +786,7 @@ def announce(world: World, conn: sqlite3.Connection | None = None) -> None:
 
 
 def peers(world: World) -> list[dict[str, Any]]:
-    """Live runs in this checkout; stale rows are pruned by probing their leases."""
+    """Live sessions in this workspace; stale rows are lease-pruned."""
     if not world.persist:
         return []
     announce(world)
@@ -623,8 +794,13 @@ def peers(world: World) -> list[dict[str, Any]]:
     current = run_id()
     live: list[dict[str, Any]] = []
     try:
+        workspace = _workspace_id(db, world, create=False)
+        if workspace is None:
+            return []
         rows = db.execute(
-            "SELECT * FROM active_runs ORDER BY started_at, run_id"
+            "SELECT * FROM active_runs WHERE workspace_id = ?"
+            " ORDER BY started_at, run_id",
+            (workspace,),
         ).fetchall()
         for row in rows:
             item = dict(row)
@@ -642,7 +818,18 @@ def peers(world: World) -> list[dict[str, Any]]:
             else:
                 fcntl.flock(probe.fileno(), fcntl.LOCK_UN)
                 with db:
-                    db.execute("DELETE FROM active_runs WHERE run_id = ?", (item["run_id"],))
+                    db.execute(
+                        "DELETE FROM active_runs WHERE run_id = ?",
+                        (item["run_id"],),
+                    )
+                    db.execute(
+                        "UPDATE sessions SET ended_at = COALESCE(ended_at, ?)"
+                        " WHERE id = ?",
+                        (
+                            datetime.now(timezone.utc).isoformat(),
+                            item["session_id"],
+                        ),
+                    )
             finally:
                 probe.close()
     finally:
@@ -662,19 +849,32 @@ def channel_post(
     run = run_id()
     try:
         with db:
+            workspace = _workspace_id(db, world)
+            assert workspace is not None
+            session = _session_id(db, world, workspace)
+            assert session is not None
             cur = db.execute(
                 """
-                INSERT INTO channel_messages(channel, run_id, author, body, created_at)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT INTO channel_messages(
+                    workspace_id, session_id, channel, run_id,
+                    author, body, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
-                (channel or "conflicts", run, author.strip() or run, text, now),
+                (
+                    workspace, session, channel or "conflicts", run,
+                    author.strip() or run, text, now,
+                ),
             )
             message_id = int(cur.lastrowid)
     finally:
         db.close()
     return {
-        "id": message_id, "channel": channel or "conflicts", "run_id": run,
-        "author": author.strip() or run, "body": text, "created_at": now,
+        "id": message_id,
+        "channel": channel or "conflicts",
+        "run_id": run,
+        "author": author.strip() or run,
+        "body": text,
+        "created_at": now,
     }
 
 
@@ -686,14 +886,22 @@ def channel_read(
     announce(world)
     db = _open(state_file(world))
     try:
+        workspace = _workspace_id(db, world, create=False)
+        if workspace is None:
+            return []
         rows = db.execute(
             """
             SELECT id, channel, run_id, author, body, created_at
             FROM channel_messages
-            WHERE channel = ? AND id > ?
+            WHERE workspace_id = ? AND channel = ? AND id > ?
             ORDER BY id LIMIT ?
             """,
-            (channel or "conflicts", int(since), max(1, min(int(limit), 200))),
+            (
+                workspace,
+                channel or "conflicts",
+                int(since),
+                max(1, min(int(limit), 200)),
+            ),
         ).fetchall()
         return [dict(row) for row in rows]
     finally:
@@ -701,56 +909,37 @@ def channel_read(
 
 
 def record_call(world: World, entry: dict[str, Any]) -> None:
-    """Append one model round-trip to the durable ledger.
-
-    Called from the loop the moment a response lands, not from `save`: a run
-    that is killed mid-turn still spent the money, and the whole point of the
-    table is that the number survives the process. Never raises -- a billing
-    row is not worth losing a turn over.
-    """
+    """Append one priced model round to the current session."""
     if not world.persist or not entry:
         return
     usage = entry.get("usage") or {}
     if not any(usage.get(key) for key in prices.USAGE_KEYS):
         return
     model = str(world.model or "")
-    run = run_id()
     try:
         conn = _open(state_file(world))
     except Exception:  # noqa: BLE001
         return
     try:
         with conn:
-            conn.execute(
-                """
-                INSERT OR IGNORE INTO sessions(
-                    id, cwd, generation, gen_reason, thinking, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    SESSION_ID,
-                    str(world.cwd),
-                    int(world.generation),
-                    str(world.gen_reason),
-                    str(world.thinking),
-                    datetime.now(timezone.utc).isoformat(),
-                ),
-            )
+            workspace = _workspace_id(conn, world)
+            assert workspace is not None
+            session = _session_id(conn, world, workspace)
+            assert session is not None
             row = conn.execute(
-                "SELECT COALESCE(MAX(seq), 0) FROM calls WHERE session_id = ? AND run_id = ?",
-                (SESSION_ID, run),
+                "SELECT COALESCE(MAX(seq), 0) FROM calls WHERE session_id = ?",
+                (session,),
             ).fetchone()
             conn.execute(
                 """
                 INSERT INTO calls(
-                    session_id, run_id, seq, ts, model,
-                    input_tokens, cache_read_input_tokens,
-                    cache_creation_input_tokens, output_tokens, cost_usd)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    session_id, seq, ts, model, input_tokens,
+                    cache_read_input_tokens, cache_creation_input_tokens,
+                    output_tokens, cost_usd)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
-                    SESSION_ID,
-                    run,
+                    session,
                     int(row[0]) + 1,
                     str(entry.get("ts") or datetime.now(timezone.utc).isoformat()),
                     model,
@@ -768,7 +957,7 @@ def record_call(world: World, entry: dict[str, Any]) -> None:
 
 
 def runs(world: World, limit: int = 20) -> list[dict[str, Any]]:
-    """Per-run rollups, newest last: what each attach of the process spent."""
+    """Per-session usage rollups, newest last."""
     if not world.persist:
         return []
     try:
@@ -776,25 +965,212 @@ def runs(world: World, limit: int = 20) -> list[dict[str, Any]]:
     except Exception:  # noqa: BLE001
         return []
     try:
+        workspace = _workspace_id(conn, world, create=False)
+        if workspace is None:
+            return []
         rows = conn.execute(
             """
-            SELECT run_id, COUNT(*) AS calls, MIN(ts) AS started, MAX(ts) AS ended,
-                   SUM(input_tokens) AS fresh,
-                   SUM(cache_read_input_tokens) AS read,
-                   SUM(cache_creation_input_tokens) AS write,
-                   SUM(output_tokens) AS out,
-                   SUM(cost_usd) AS cost,
-                   GROUP_CONCAT(DISTINCT model) AS models
-            FROM calls WHERE session_id = ?
-            GROUP BY run_id ORDER BY started DESC LIMIT ?
+            SELECT sessions.id AS run_id,
+                   COUNT(*) AS calls,
+                   MIN(calls.ts) AS started,
+                   MAX(calls.ts) AS ended,
+                   SUM(calls.input_tokens) AS fresh,
+                   SUM(calls.cache_read_input_tokens) AS read,
+                   SUM(calls.cache_creation_input_tokens) AS write,
+                   SUM(calls.output_tokens) AS out,
+                   SUM(calls.cost_usd) AS cost,
+                   GROUP_CONCAT(DISTINCT calls.model) AS models
+            FROM calls
+            JOIN sessions ON sessions.id = calls.session_id
+            WHERE sessions.workspace_id = ?
+            GROUP BY sessions.id
+            ORDER BY started DESC LIMIT ?
             """,
-            (SESSION_ID, int(limit)),
+            (workspace, int(limit)),
         ).fetchall()
     except Exception:  # noqa: BLE001
         return []
     finally:
         conn.close()
     return [dict(row) for row in reversed(rows)]
+
+
+def _prune_sessions(
+    conn: sqlite3.Connection,
+    workspace: str,
+    current: str,
+    keep: int = SESSION_KEEP,
+) -> int:
+    """Bound history without deleting a live peer or this attach."""
+    rows = conn.execute(
+        "SELECT id FROM sessions WHERE workspace_id = ?"
+        " ORDER BY started_at DESC, id DESC",
+        (workspace,),
+    ).fetchall()
+    live = {
+        str(row["run_id"])
+        for row in conn.execute(
+            "SELECT run_id FROM active_runs WHERE workspace_id = ?",
+            (workspace,),
+        )
+    }
+    doomed = [
+        str(row["id"])
+        for row in rows[max(1, int(keep)):]
+        if str(row["id"]) != current and str(row["id"]) not in live
+    ]
+    if doomed:
+        conn.executemany(
+            "DELETE FROM history_fts WHERE session_id = ?", [(sid,) for sid in doomed]
+        )
+        conn.executemany("DELETE FROM sessions WHERE id = ?", [(sid,) for sid in doomed])
+    return len(doomed)
+
+
+def _strip_opaque(value: Any) -> Any:
+    """Remove provider ciphertext recursively; it is replay-only and enormous."""
+    if isinstance(value, dict):
+        return {
+            str(key): ("" if key == "encrypted_content" else _strip_opaque(item))
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_strip_opaque(item) for item in value]
+    return value
+
+
+def search_history(
+    world: World, query: str, limit: int = 12
+) -> list[dict[str, Any]]:
+    """Rank this workspace's durable session history with SQLite FTS5."""
+    path = state_file(world)
+    if not path.is_file():
+        return []
+    terms = [term for term in query.split() if term]
+    if not terms:
+        return []
+    match = " AND ".join(
+        '"' + term.replace('"', '""') + '"' for term in terms
+    )
+    conn = _open(path)
+    try:
+        workspace = _workspace_id(conn, world, create=False)
+        if workspace is None:
+            return []
+        rows = conn.execute(
+            """
+            SELECT session_id, kind, text, source_seq,
+                   bm25(history_fts) AS score
+            FROM history_fts
+            WHERE history_fts MATCH ? AND workspace_id = ?
+            ORDER BY score LIMIT ?
+            """,
+            (match, workspace, max(1, min(int(limit), 100))),
+        ).fetchall()
+        return [dict(row) for row in rows]
+    finally:
+        conn.close()
+
+
+def record_event(
+    world: World,
+    event: dict[str, Any],
+    *,
+    ts_ms: int,
+    mono_ns: int,
+) -> int:
+    """Append one compact wire event and return its session-local sequence."""
+    if not world.persist:
+        return 0
+    kind = str(event.get("ev") or "unknown")
+    # These are live animation/telemetry streams, not replay state. Persisting
+    # them created 848k rows and hundreds of MB without helping late attach.
+    if kind in {"child", "timing"}:
+        return 0
+    import hashlib
+
+    raw = json.dumps(event, default=str, separators=(",", ":"))
+    clean = _strip_opaque(event)
+    if kind in {"post", "complete"} and len(raw) > 32_768:
+        clean = {
+            "ev": kind,
+            "model": event.get("model"),
+            "provider": event.get("provider"),
+            "message_count": event.get("message_count"),
+            "elided": True,
+        }
+    payload = json.dumps(clean, default=str, separators=(",", ":"))
+    digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    conn = _open(state_file(world))
+    try:
+        with conn:
+            workspace = _workspace_id(conn, world)
+            assert workspace is not None
+            session = _session_id(conn, world, workspace)
+            assert session is not None
+            row = conn.execute(
+                "SELECT COALESCE(MAX(seq), 0) FROM events WHERE session_id = ?",
+                (session,),
+            ).fetchone()
+            seq = int(row[0]) + 1
+            conn.execute(
+                "INSERT INTO events(session_id, seq, ts_ms, mono_ns, kind,"
+                " payload_json, payload_bytes, payload_sha256)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    session, seq, int(ts_ms), int(mono_ns), kind,
+                    payload, len(raw.encode("utf-8")), digest,
+                ),
+            )
+            if kind in {"prompt", "speech", "result", "notice", "error"}:
+                text = _content_text(clean) or payload
+                conn.execute(
+                    "INSERT INTO history_fts("
+                    " workspace_id, session_id, kind, text, source_seq)"
+                    " VALUES (?, ?, ?, ?, ?)",
+                    (workspace, session, f"event:{kind}", text, str(seq)),
+                )
+        return seq
+    finally:
+        conn.close()
+
+
+def read_events(
+    world: World,
+    since: int = 0,
+    limit: int = 4096,
+    session: str | None = None,
+) -> list[dict[str, Any]]:
+    """Read one session's compact replay stream."""
+    if not world.persist:
+        return []
+    conn = _open(state_file(world))
+    try:
+        sid = session or run_id()
+        rows = conn.execute(
+            """
+            SELECT seq, ts_ms AS ts, mono_ns, kind, payload_json,
+                   payload_bytes, payload_sha256
+            FROM events
+            WHERE session_id = ? AND seq > ?
+            ORDER BY seq LIMIT ?
+            """,
+            (sid, int(since), max(1, min(int(limit), 20_000))),
+        ).fetchall()
+        out: list[dict[str, Any]] = []
+        for row in rows:
+            item = json.loads(row["payload_json"])
+            item.update({
+                "seq": int(row["seq"]),
+                "ts": int(row["ts"]),
+                "mono_ns": int(row["mono_ns"]),
+                "payload_bytes": int(row["payload_bytes"]),
+                "payload_sha256": row["payload_sha256"],
+            })
+            out.append(item)
+        return out
+    finally:
+        conn.close()
 
 
 def save(world: World) -> None:
@@ -804,6 +1180,12 @@ def save(world: World) -> None:
     try:
         _save_data(conn, world, _data_from_world(world))
         announce(world, conn)
+        with conn:
+            workspace = _workspace_id(conn, world)
+            assert workspace is not None
+            session = _session_id(conn, world, workspace)
+            assert session is not None
+            _prune_sessions(conn, workspace, session)
     finally:
         conn.close()
     try:
@@ -840,6 +1222,9 @@ def _apply_data(world: World, data: dict[str, Any]) -> None:
             and isinstance(item.get("prompt"), str)
             and isinstance(item.get("speech"), str)
         ]
+        world.session_prior_start = max(
+            0, len(world.prior) - int(data.get("_current_prior") or 0)
+        )
     if isinstance(data.get("generation"), int) and data["generation"] > 0:
         world.generation = data["generation"]
     if isinstance(data.get("gen_reason"), str) and data["gen_reason"]:
@@ -852,88 +1237,124 @@ def _apply_data(world: World, data: dict[str, Any]) -> None:
         # every boundary test that ran ahead of it. Repair after alignment,
         # so the head alignment landed on cannot orphan a call the repair
         # already answered.
-        world.messages = repair_orphan_calls(
-            turn_aligned(
-                [
-                    {"role": item["role"], "content": item["content"]}
-                    for item in raw_msgs
-                    if isinstance(item, dict)
-                    and item.get("role") in {"user", "assistant"}
-                    and isinstance(item.get("content"), (str, list))
-                ]
-            )
+        aligned = turn_aligned(
+            [
+                {"role": item["role"], "content": item["content"]}
+                for item in raw_msgs
+                if isinstance(item, dict)
+                and item.get("role") in {"user", "assistant"}
+                and isinstance(item.get("content"), (str, list))
+            ]
         )
+        current_count = min(
+            len(aligned), int(data.get("_current_messages") or 0)
+        )
+        world.session_message_start = len(aligned) - current_count
+        world.messages = repair_orphan_calls(aligned)
 
 
-def _read_data(conn: sqlite3.Connection) -> dict[str, Any] | None:
-    session = conn.execute(
-        "SELECT generation, gen_reason, thinking FROM sessions WHERE id = ?",
-        (SESSION_ID,),
-    ).fetchone()
-    if session is None:
+def _read_data(
+    conn: sqlite3.Connection, world: World
+) -> dict[str, Any] | None:
+    workspace = _workspace_id(conn, world, create=False)
+    if workspace is None:
         return None
+    current = _session_id(conn, world, workspace)
+    assert current is not None
+    workspace_row = conn.execute(
+        "SELECT generation, gen_reason FROM workspaces WHERE id = ?",
+        (workspace,),
+    ).fetchone()
+    current_row = conn.execute(
+        "SELECT thinking FROM sessions WHERE id = ?", (current,)
+    ).fetchone()
+
+    message_rows = conn.execute(
+        """
+        SELECT messages.session_id, messages.role, messages.content_json
+        FROM messages
+        JOIN sessions ON sessions.id = messages.session_id
+        WHERE sessions.workspace_id = ?
+        ORDER BY sessions.started_at, sessions.id, messages.seq
+        """,
+        (workspace,),
+    ).fetchall()
     messages = [
         {"role": row["role"], "content": json.loads(row["content_json"])}
-        for row in conn.execute(
-            "SELECT role, content_json FROM messages WHERE session_id = ? ORDER BY seq",
-            (SESSION_ID,),
-        )
+        for row in message_rows
     ]
+    current_messages = sum(
+        1 for row in message_rows if str(row["session_id"]) == current
+    )
+
+    prior_rows = conn.execute(
+        """
+        SELECT prior_turns.session_id, prior_turns.prompt, prior_turns.speech
+        FROM prior_turns
+        JOIN sessions ON sessions.id = prior_turns.session_id
+        WHERE sessions.workspace_id = ?
+        ORDER BY sessions.started_at, sessions.id, prior_turns.seq
+        """,
+        (workspace,),
+    ).fetchall()
+    kept_prior = prior_rows[-PRIOR_KEEP:]
     prior = [
         {"prompt": row["prompt"], "speech": row["speech"]}
-        for row in conn.execute(
-            "SELECT prompt, speech FROM prior_turns WHERE session_id = ? ORDER BY seq",
-            (SESSION_ID,),
-        )
+        for row in kept_prior
     ]
+    current_prior = sum(
+        1 for row in kept_prior if str(row["session_id"]) == current
+    )
+
     notes = {
         row["name"]: row["body"]
-        for row in conn.execute("SELECT name, body FROM notes WHERE session_id = ?", (SESSION_ID,))
+        for row in conn.execute(
+            "SELECT name, body FROM notes WHERE workspace_id = ?", (workspace,)
+        )
     }
     docs: dict[str, str] = {}
     tools: dict[str, dict[str, Any]] = {}
     for row in conn.execute(
-        "SELECT name, doc, source, frozen FROM tools WHERE session_id = ?",
-        (SESSION_ID,),
+        "SELECT name, doc, source, frozen FROM tools WHERE workspace_id = ?",
+        (workspace,),
     ):
         if row["frozen"]:
-            docs[row["name"]] = row["doc"]
+            docs[str(row["name"])] = row["doc"]
         else:
-            tools[row["name"]] = {"doc": row["doc"], "source": row["source"]}
+            tools[str(row["name"])] = {
+                "doc": row["doc"], "source": row["source"]
+            }
     return {
-        "generation": session["generation"],
-        "gen_reason": session["gen_reason"],
-        "thinking": session["thinking"],
+        "generation": int(workspace_row["generation"]),
+        "gen_reason": str(workspace_row["gen_reason"]),
+        "thinking": str(current_row["thinking"]),
         "messages": messages,
         "prior": prior,
         "notes": notes,
         "docs": docs,
         "tools": tools,
+        "_current_messages": current_messages,
+        "_current_prior": current_prior,
     }
 
 
 def load(world: World) -> None:
     if not world.persist:
         return
-    db_path = state_file(world)
-    legacy_path = _legacy_file(world)
-    legacy = _legacy_payload(legacy_path) if not db_path.exists() or legacy_path == db_path else None
-
-    if legacy is not None and legacy_path == db_path:
-        backup = _backup_name(legacy_path, "migrated")
-        os.replace(legacy_path, backup)
-
-    conn = _open(db_path)
+    conn = _open(state_file(world))
     try:
-        if legacy is not None:
-            _apply_data(world, legacy)
-            _save_data(conn, world, _data_from_world(world))
-            if legacy_path != db_path and legacy_path.exists():
-                os.replace(legacy_path, _backup_name(legacy_path, "migrated"))
-            return
-        data = _read_data(conn)
+        conn.execute("BEGIN IMMEDIATE")
+        workspace = _workspace_id(conn, world)
+        assert workspace is not None
+        session = _session_id(conn, world, workspace)
+        assert session is not None
+        data = _read_data(conn, world)
+        conn.commit()
         if data is not None:
             _apply_data(world, data)
-    finally:
         announce(world, conn)
+    except BaseException:
+        conn.rollback()
+        raise
+    finally:
         conn.close()

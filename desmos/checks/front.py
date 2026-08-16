@@ -234,7 +234,10 @@ class _SockClient:
 
 
 def _strip(ev: dict) -> dict:
-    return {k: v for k, v in ev.items() if k not in ("seq", "ts")}
+    stamped = {
+        "seq", "ts", "mono_ns", "payload_bytes", "payload_sha256"
+    }
+    return {k: v for k, v in ev.items() if k not in stamped}
 
 
 def _check_socket() -> None:
@@ -247,10 +250,28 @@ def _check_socket() -> None:
     import tempfile
     import time
 
-    def read_log(path: Path) -> list[dict]:
-        # The bridge may be appending while this check reads. A trailing
-        # fragment is not a durable JSONL record until its newline lands.
-        return [json.loads(line) for line in path.read_bytes().split(b"\n")[:-1] if line]
+    def read_log(path: Path, session_id: str) -> list[dict]:
+        import sqlite3
+
+        with sqlite3.connect(path) as db:
+            db.row_factory = sqlite3.Row
+            rows = db.execute(
+                "SELECT seq, ts_ms, mono_ns, payload_json,"
+                " payload_bytes, payload_sha256"
+                " FROM events WHERE session_id = ? ORDER BY seq",
+                (session_id,),
+            ).fetchall()
+        out = []
+        for row in rows:
+            event = json.loads(row["payload_json"])
+            event.update({
+                "seq": row["seq"], "ts": row["ts_ms"],
+                "mono_ns": row["mono_ns"],
+                "payload_bytes": row["payload_bytes"],
+                "payload_sha256": row["payload_sha256"],
+            })
+            out.append(event)
+        return out
 
     root = Path(__file__).resolve().parents[2]
     # Tripwire for the cwd= on the Popen below: the check must not leave a
@@ -309,7 +330,8 @@ def _check_socket() -> None:
             assert header["ev"] == "session", header
             assert header["session_id"] and header["cwd"] == str(cwd.resolve()), header
             assert isinstance(header["ts"], int), header
-            log_file = cwd / ".desmos" / "events" / f"{header['session_id']}.jsonl"
+            session_id = header["session_id"]
+            log_file = cwd / ".desmos" / "harness.sqlite3"
             assert log_file.is_file(), log_file
             replayed = [b.line() for _ in range(1 + len(a_events))]
             seqs = [e["seq"] for e in replayed]
@@ -382,7 +404,7 @@ def _check_socket() -> None:
             # b, snapshot included; drain it or the flood wait stops early)
             a.until(lambda e: e.get("ev") == "snapshot")
             before_flood = max(
-                event.get("seq") or 0 for event in read_log(log_file)
+                event.get("seq") or 0 for event in read_log(log_file, session_id)
             )
             a.send({"op": "step", "text": "flood test"})
             # The live queue is deliberately bounded, so a 6,000-event burst
@@ -391,7 +413,7 @@ def _check_socket() -> None:
             # snapshot instead of requiring the live queue to be unbounded.
             deadline = time.monotonic() + 90
             while time.monotonic() < deadline:
-                logged_now = read_log(log_file)
+                logged_now = read_log(log_file, session_id)
                 if any(
                     event.get("seq", 0) > before_flood and event.get("ev") == "snapshot"
                     for event in logged_now
@@ -400,15 +422,18 @@ def _check_socket() -> None:
                 time.sleep(0.05)
             else:
                 raise AssertionError("flood step never reached its logged snapshot")
-            stamped_total = sum(e.get("seq") is not None for e in read_log(log_file))
+            stamped_total = len(read_log(log_file, session_id))
             assert stamped_total > 4096, (
                 f"flood produced only {stamped_total} events; the attach "
                 f"ceiling under test starts at the 4096 queue bound"
             )
             fresh = _SockClient(sock_path)
             fresh.send({"op": "attach", "since": 0})
-            assert fresh.line()["ev"] == "session"
-            seqs2 = [fresh.line()["seq"] for _ in range(stamped_total)]
+            first = fresh.line()
+            assert first["ev"] == "session" and first["seq"] == 1
+            seqs2 = [first["seq"]] + [
+                fresh.line()["seq"] for _ in range(stamped_total - 1)
+            ]
             assert seqs2 == list(range(1, stamped_total + 1)), (
                 f"long attach lost events: {len(seqs2)} lines, first gap at "
                 f"{next((i for i, s in enumerate(seqs2, 1) if s != i), None)}"
@@ -416,9 +441,9 @@ def _check_socket() -> None:
             fresh.close()
 
             # the log holds everything, stamped, interventions included
-            logged = read_log(log_file)
+            logged = read_log(log_file, session_id)
             assert logged[0]["ev"] == "session"
-            log_seqs = [e["seq"] for e in logged[1:]]
+            log_seqs = [e["seq"] for e in logged]
             assert log_seqs == list(range(1, len(log_seqs) + 1)), "log seq has gaps"
             assert any(e.get("ev") == "intervention" and e.get("action") == "kill_run" for e in logged)
         finally:
