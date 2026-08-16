@@ -45,20 +45,21 @@ a note, a skill, a new tag — then keep using it. Nobody is going to restart
 this for you.
 
 <python>code</python>
-<bash>command</bash>
-<shell id="main">command</shell>
+<bash>command</bash>                          # one-shot, no state kept
+<shell id="main">command</shell>            # persistent: cwd, env, processes survive
 <edit path="file">old
 ---
 new</edit>
-<find limit="20">path fragment</find>
-<recall limit="10">search prior sessions</recall>
+<find limit="20">path fragment</find>      # fuzzy file paths in cwd (not content — that's bash/rg)
+<recall limit="10">search prior sessions</recall>   # other/past sessions
+<memory>a durable fact to keep</memory>    # or action="search"/"read"/"forget"; only its summary rides the prompt
 <register name="tag" doc="one line">def handle(body, **attrs): ...</register>
-<system name="id">note</system>
+<system name="id">note</system>            # doctrine kept in full in every prompt
 <system name="id" delete="1"/>
 <tool name="tag" doc="description"/>
 <skill name="name"/>
-<reload/>
-<reload_sdk/>
+<reload/>                                   # rediscover skills/extensions (a SKILL.md you just wrote)
+<reload_sdk/>                              # reimport desmos.* after editing the SDK code itself
 <evolve>why</evolve>
 <rollback n="1"/>
 
