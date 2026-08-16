@@ -38,7 +38,7 @@ Progressive disclosure is load-bearing. The catalog is an index. The body
 of a skill enters context only when chosen. If every grown thing is dumped
 into the system prompt, the creature drowns in its own organs.
 
-## The inverted version
+## What the loop actually is
 
 The kernel is the organism. `complete()` is a gland. Growth is files plus
 a live catalog, not a fatter `messages[]`.

@@ -30,7 +30,7 @@ If you catch yourself writing that sentence, delete the code. Do not commit it.
 
 ## This repo
 
-desmos is an inverted harness. The kernel owns the loop. `complete()` is a gland. XML tags are syscalls. Data lives in kernel variables; the model peeks by name. Growth is files plus a live catalog, not a fatter `messages[]`.
+desmos is a self-improving harness. The kernel owns the loop. `complete()` is a gland. XML syscalls are the capability surface, and that surface is writable state: notes, tags, skills and the SDK itself can be rewritten from inside a turn and are live on the next dispatch, bounded by `evolve`/`rollback`. Data lives in kernel variables; the model peeks by name. Growth is files plus a live catalog, not a fatter `messages[]`.
 
 - Frozen ABI: `desmos/const.py` (`ABI`, `FROZEN`). Do not casually rewrite the brainstem.
 - Live catalog + `# runtime`: `desmos/catalog.py`. System prompt is ABI + catalog. It must explain how the system actually works (panes, wire calls, markdown, cache, reload, ACP). A path dump is not an explanation.

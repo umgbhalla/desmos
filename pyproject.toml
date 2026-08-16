@@ -1,7 +1,7 @@
 [project]
 name = "desmos"
 version = "0.1.1b1"
-description = "Inverted coding harness: data in the kernel, user calls step(prompt)"
+description = "A coding agent that rebuilds its own harness: writable syscalls, live reload, reversible generations"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = []

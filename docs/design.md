@@ -2,10 +2,13 @@
 
 How desmos is put together, and which parts are allowed to change.
 
-## The inversion
+## What the design is for
 
-A normal coding agent owns the conversation and calls tools. desmos inverts it.
-You own a Python kernel; the agent is a function you call from inside it.
+desmos exists so the agent can improve the harness it runs inside, and so that
+improvement stays reversible. Two choices carry that weight.
+
+**The kernel holds the data.** You own a Python kernel; the agent is a function
+you call from inside it.
 
 ```python
 doc = open("paper.txt").read()      # your data, your process
@@ -15,12 +18,15 @@ step("what's in doc? don't dump it")
 The model never receives `doc`. It receives an *index* of the kernel — names and
 shapes — and a way to run code against them. Everything it wants, it fetches.
 That single choice explains most of the rest of the design: the context window
-holds decisions and results, not payloads.
+holds decisions and results, not payloads — which is what makes it affordable
+for the agent to read its own source, its own trajectory, and a whole repo.
 
-The second choice: capability is discovered, not compiled in. Seven canonical
-XML families are advertised through one external syscall tool. Legacy names
-remain accepted but hidden; every custom tool, note, skill and description can
-still be written by the agent into state that outlives the process.
+**Capability is discovered, not compiled in.** Seven canonical XML families are
+advertised through one external syscall tool. Legacy names remain accepted but
+hidden; every custom tool, note, skill and description can be written by the
+agent into state that outlives the process, and takes effect on the next
+dispatch. `evolve` and `rollback` bound that: grown state is snapshotted as a
+numbered generation, and a generation can be restored.
 
 ## The turn
 

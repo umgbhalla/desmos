@@ -2,23 +2,65 @@
 
 # desmos
 
-**A coding agent that owns its harness.**
+**A coding agent that rebuilds its own harness, and has to prove every change.**
 
 [![release](https://github.com/umgbhalla/desmos/actions/workflows/release.yml/badge.svg)](https://github.com/umgbhalla/desmos/actions/workflows/release.yml)
 [![license](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![python](https://img.shields.io/badge/python-3.11%2B-blue.svg)](pyproject.toml)
 [![dependencies](https://img.shields.io/badge/runtime%20deps-0-brightgreen.svg)](pyproject.toml)
 
-[Design](docs/design.md) · [Tags](docs/tags.md) · [Self-growth](docs/self-growth.md) · [Subagents](docs/subagents.md) · [Contributing](CONTRIBUTING.md)
+[Design](docs/design.md) · [Tags](docs/tags.md) · [Self-growth](docs/self-growth.md) · [Constitution](docs/constitution.md) · [Subagents](docs/subagents.md) · [Contributing](CONTRIBUTING.md)
 
 </div>
 
 ---
 
-## The inversion
+## Recursive self-improvement
 
-Most agents own the conversation and call your code. desmos flips it. **You own
-a Python kernel; the agent is a function you call from inside it.**
+Most coding agents are frozen at the moment they ship. Their tools are compiled
+in, and whatever they work out during a session dies with the transcript.
+
+desmos treats the agent's own capability surface as writable state. Inside a
+turn it can write doctrine, install a syscall, author a skill, or edit the SDK
+that is running it — and that change is live on the *next* dispatch, in the same
+process, with the heap and the transcript intact.
+
+Self-modification is only worth having if it is survivable, so the loop is
+closed at both ends:
+
+| stage | mechanism |
+|---|---|
+| **change** | notes, tags, skills, extensions and `desmos/*.py` are all writable from inside a turn |
+| **live** | `harness op=reload` / `op=reload-sdk` rebind the catalog and handlers — no restart, no lost state |
+| **prove** | the new thing is used once against real work, and the evidence decides |
+| **keep or drop** | anything that did not earn its line in the catalog is deleted |
+| **snapshot** | `op=evolve` writes generation N+1; `op=rollback` restores notes, grown tools and prior turns |
+
+```mermaid
+flowchart LR
+    W[real work] --> N{miss worth<br/>fixing?}
+    N -- no --> W
+    N -- yes --> C[smallest durable<br/>change]
+    C --> R[reload: live on the<br/>next dispatch]
+    R --> P{proven against<br/>real work?}
+    P -- no --> D[delete it]
+    D --> W
+    P -- yes --> S[evolve:<br/>generation N+1]
+    S --> W
+    S -.->|rollback n| C
+```
+
+The ceiling is deliberate. A generation is a snapshot a human can read and
+revert, the base prompt is not self-writable, and no part of the loop turns
+without someone asking for a turn. What compounds here is the harness, not the
+model — swap the model tomorrow and the notes, skills and tags it left behind
+are still there.
+
+## Why the kernel holds the data
+
+An agent cannot improve on what it cannot afford to look at: its own source, its
+own trajectory, a whole repository. desmos does not paste any of it. **You own a
+Python kernel; the agent is a function you call from inside it.**
 
 ```python
 doc = open("paper.txt").read()
@@ -31,11 +73,9 @@ and shapes — and a way to run code against them. It fetches what it needs. The
 context window ends up holding decisions and results instead of payloads, and
 sequential `step` calls share one transcript.
 
-The second half of the idea: **capability is discovered, not compiled in.**
-One external syscall tool advertises seven capability families. Earlier tag
-names remain accepted as hidden compatibility aliases, while custom tools,
-descriptions, notes and skills can still be written by the agent into durable
-runtime state. The next `complete()` sees the change. No restart.
+The same property is what lets capability be discovered instead of compiled in.
+One external syscall tool advertises seven families, and the catalog behind them
+is state the agent writes; the next `complete()` sees the change.
 
 ## Runtime architecture
 
@@ -150,35 +190,36 @@ python -m desmos check            # self-check, no API key needed
 python -m desmos tui              # the full interface (needs cargo)
 python -m desmos tui --demo       # same layout, offline, no key
 python -m desmos console          # IPython with step() and world bound
-python -m desmos run "add a --json flag to inverted.py --check"
+python -m desmos run "add a --json flag to desmos check, with a test"
 ```
 
 The harness itself is stdlib-only — `pyproject.toml` says `dependencies = []`.
 The `kernel` extra is just IPython. Only the TUI needs Rust.
 
-## The frozen tags
+## The seven families
 
-Text the model writes is speech. An XML tag is a syscall.
+Text the model writes is speech. An XML tag is a syscall. There is one external
+tool and it advertises seven capability families; every call names an `op`.
 
-| tag | what it does |
-|---|---|
-| `python` | exec in the persistent kernel; names stay |
-| `bash` | one-shot subprocess in cwd, no state kept |
-| `shell` | named persistent pty: cwd, env, venv and running processes survive |
-| `edit` | replace exactly one occurrence (`old` / `---` / `new`) |
-| `register` | install a new tag, live on the next dispatch |
-| `system` | write or delete a note — doctrine, in every prompt |
-| `tool` | rewrite a tool's catalog description |
-| `skill` | load a full `SKILL.md` on demand |
-| `reload` | rediscover skills and extensions now |
-| `reload_sdk` | reimport `desmos.*` and rebind `step` without restarting |
-| `evolve` | snapshot grown state as the next generation |
-| `rollback` | restore generation `n` |
-| `memory` | durable cross-session memory, kept out of the prompt |
+| family | ops | what it reaches |
+|---|---|---|
+| `exec` | `python` `bash` `shell` | the persistent kernel, a hermetic one-shot, a named PTY that keeps cwd, env and running processes |
+| `workspace` | `find` `read` `edit` `see` `commit` | fff search, bounded reads, single-occurrence edits, screenshots, git |
+| `knowledge` | `memory` `recall` `system` `todo` | durable facts, prior-session history, always-present doctrine, work items |
+| `harness` | `register` `describe` `skill` `reload` `reload-sdk` `evolve` `rollback` | the self-extension lifecycle |
+| `observe` | `usage` `trajectory` `retrace` `error` `symbol` `threads` | bounded telemetry and self-diagnosis |
+| `agents` | `spawn` `fanout` `resume` `lineage` `status` `result` `judgment` `wait` | child worlds under contract |
+| `session` | `compact` `status` `switch` `peers` `inbox` `post` | conversation, model and peer-session lifecycle |
 
-Every tag in a reply runs, in order; all results come back together as
-user-role `result` blocks on the same transcript. Any tag takes `end="TOKEN"`
-so a body can contain tag text safely.
+`harness` is the family that closes the improvement loop: `register` installs a
+tag that is live on the very next dispatch, `skill` loads a procedure only when
+it is wanted, `evolve` snapshots grown state as a numbered generation, and
+`rollback` takes it back.
+
+Every call in a reply runs, in written order, and all results come back together
+as user-role result blocks on the same transcript. Any call takes `end="TOKEN"`
+so a body can safely contain tag text. Legacy single-purpose tag names stay
+accepted so old transcripts still replay.
 
 **Full reference with attributes and result shapes: [docs/tags.md](docs/tags.md).**
 
@@ -221,7 +262,10 @@ pair is what makes self-modification survivable.
 **Architecture, dispatch order, persistence and the invariants:
 [docs/design.md](docs/design.md).**
 
-## Evolution loop
+## The growth ladder
+
+The loop above in full: five durable forms, ordered by how much they can
+break, and the two exits — delete it, or snapshot it as a generation.
 
 ```mermaid
 flowchart TD
@@ -333,21 +377,23 @@ invalidate the cached prefix.
 `ctrl+p` in the TUI saves provider/model/effort to `~/.desmos/settings.json`
 (`DESMOS_SETTINGS` moves it); that file outranks whatever the last session
 persisted, and a machine without one opens the picker rather than guessing.
-`DESMOS_MODEL` picks the model for `desmos run` and `inverted.py`;
+`DESMOS_MODEL` picks the model for headless runs;
 `DESMOS_THINKING` is the effort floor (`low`).
 
 ## Headless
 
 ```bash
 python -m desmos run "task"
-python inverted.py "task"          # back-compat entry, same defaults
-python inverted.py --check
+python -m desmos check
 ```
 
-Both take the same `--max-tokens`, `--max-turns`, `--max-total-tokens`. Traces
+It takes `--max-tokens`, `--max-turns`, `--max-total-tokens`. Traces
 land under `runs/`. State lands in `.desmos/harness.sqlite3` (gitignored). The
 chat is append-only inside a session, only its tail is carried across a restart,
 and `reset()` clears it outright.
+
+`inverted.py` at the repo root is a back-compat alias for `desmos run`, kept so
+older scripts keep working; it is not the entry point to learn.
 
 ## Skills and extensions
 
@@ -423,6 +469,8 @@ Vulnerabilities: [SECURITY.md](SECURITY.md) — never a public issue.
 | [design.md](docs/design.md) | architecture, turn loop, dispatch, persistence, invariants |
 | [tags.md](docs/tags.md) | every tag, attributes, result shapes |
 | [self-growth.md](docs/self-growth.md) | how the agent extends itself |
+| [constitution.md](docs/constitution.md) | the invariants self-improvement is not allowed to break |
+| [identity.md](docs/identity.md) | what state survives which reset |
 | [extensibility.md](docs/extensibility.md) | writing an extension |
 | [subagents.md](docs/subagents.md) | contracts, fan-out, judgment |
 | [comet-frontend.md](docs/comet-frontend.md) | the optional desktop frontend |

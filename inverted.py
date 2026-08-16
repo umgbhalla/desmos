@@ -23,7 +23,7 @@ __all__ = [
 
 
 def main() -> int:
-    p = argparse.ArgumentParser(description="Inverted coding harness")
+    p = argparse.ArgumentParser(description="desmos coding harness (back-compat entry for `desmos run`)")
     p.add_argument("task", nargs="?", default="", help="coding task")
     p.add_argument("--model", default=DEFAULT_MODEL)
     # Same defaults as `desmos run`. This entry used to cap turns at 32 and
