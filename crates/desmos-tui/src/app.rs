@@ -419,6 +419,9 @@ pub(crate) struct App {
     /// Slash completion for the composer. Recomputed on every keystroke that
     /// changes the line, so it never has to be dismissed explicitly.
     pub(crate) slash: slash::Slash,
+    /// A paste is data, not a local command. While set, leading slash text is
+    /// sent as prose and completion stays closed until a normal key edits it.
+    pub(crate) slash_paste_guard: bool,
     /// Theme active before the completion list began previewing. `None` means
     /// there is no preview transaction to roll back.
     pub(crate) theme_preview_origin: Option<ThemeKind>,
@@ -494,6 +497,8 @@ pub(crate) struct App {
     pub(crate) queue_area: Rect,
     pub(crate) input_area: Rect,
     pub(crate) input_inner: Rect,
+    /// First wrapped prompt row visible in the bounded composer viewport.
+    pub(crate) input_scroll: u16,
     pub(crate) mouse: Option<(u16, u16)>,
     pub(crate) last_click: Option<(Instant, usize, u8)>, // time, entry, pane: 0 story 1 calls 2 in 3 out
     pub(crate) last_chip_click: Option<(Instant, u64)>,
@@ -524,6 +529,7 @@ impl App {
             model_pending: None,
             background: Vec::new(),
             slash: slash::Slash::default(),
+            slash_paste_guard: false,
             theme_preview_origin: None,
             generation: String::new(),
             running: false,
@@ -566,6 +572,7 @@ impl App {
             queue_area: Rect::default(),
             input_area: Rect::default(),
             input_inner: Rect::default(),
+            input_scroll: 0,
             mouse: None,
             last_click: None,
             last_chip_click: None,

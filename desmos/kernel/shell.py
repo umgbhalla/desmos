@@ -121,6 +121,13 @@ class Shell:
         env["PS2"] = ""
         # No colours, no cursor tricks, no paste brackets to strip back out.
         env["TERM"] = "dumb"
+        # A PTY makes tools believe a human can answer a pager. There is no
+        # second input loop while a monitor owns the terminal, so `git diff`
+        # launching `less` waits forever and looks exactly like a broken
+        # monitor. Agent shells always stream output; explicit interactive
+        # programs can still be invoked by name.
+        for key in ("PAGER", "GIT_PAGER", "SYSTEMD_PAGER", "MANPAGER"):
+            env[key] = "cat"
         env.pop("PROMPT_COMMAND", None)
         self.proc = subprocess.Popen(
             argv,
@@ -339,14 +346,25 @@ class Shell:
         return f"{body}\n{note}".strip()
 
     def interrupt(self) -> str:
-        """Ctrl-C, for a call that is stuck and a next call that should not be."""
+        """Ctrl-C the foreground job, leaving the persistent shell alive."""
         if not self.alive():
             return "shell exited"
         try:
-            os.killpg(os.getpgid(self.proc.pid), signal.SIGINT)
+            # Bash gives each foreground job its own process group. Signalling
+            # the shell's group misses `less`, cargo, and every other real job;
+            # the tty's foreground pgrp is the authoritative target.
+            pgid = os.tcgetpgrp(self.master)
+            if pgid <= 0:
+                pgid = os.getpgid(self.proc.pid)
+            os.killpg(pgid, signal.SIGINT)
         except OSError as exc:
             return f"interrupt failed: {exc}"
-        return (head_tail(self._drain(0.5)).strip() or "interrupted")
+        # Once monitoring begins it is the sole PTY reader. Competing here can
+        # steal the completion marker and turn a successful interrupt into a
+        # permanently pending task.
+        if self.monitoring:
+            return "interrupt sent; the shell monitor will report completion"
+        return head_tail(self._drain(0.5)).strip() or "interrupted"
 
     def alive(self) -> bool:
         return self.proc.poll() is None

@@ -87,7 +87,7 @@ use crossterm::terminal::{
 use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
 use unicode_width::UnicodeWidthStr;
 use ratatui::prelude::CrosstermBackend;
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::{Frame, Terminal};
@@ -1039,7 +1039,11 @@ fn sync_theme_preview(app: &mut App) {
 }
 
 fn update_slash(app: &mut App) {
-    app.slash.update(&app.prompt.to_send(), &app.picker);
+    if app.slash_paste_guard {
+        app.slash.close();
+    } else {
+        app.slash.update(&app.prompt.to_send(), &app.picker);
+    }
     sync_theme_preview(app);
 }
 
@@ -1439,11 +1443,13 @@ fn submit_prompt(mut bridge: Option<&mut Bridge>, app: &mut App) -> io::Result<b
         return Ok(false);
     }
     app.prompt.clear();
+    let slash_allowed = !app.slash_paste_guard;
+    app.slash_paste_guard = false;
     let slot = app.queue_edit.take();
-    if line == "/quit" || line == "/exit" {
+    if slash_allowed && (line == "/quit" || line == "/exit") {
         return Ok(true);
     }
-    if is_local_slash(&line) {
+    if slash_allowed && is_local_slash(&line) {
         // No story row. A local command never reaches the model -- it is not
         // in world.messages and no turn runs -- so pushing a UserPrompt block
         // put a turn in the transcript that never happened. It was the only
@@ -3129,6 +3135,17 @@ fn draw_queue(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(Paragraph::new(app.queue.lines(inner.width, focused)), inner);
 }
 
+fn less_saturated(color: Color) -> Color {
+    let Color::Rgb(r, g, b) = color else {
+        return color;
+    };
+    // Preserve the selected hue while pulling 40% of its chroma toward its
+    // luminance. At rest it reads as the same state colour, not generic gray.
+    let gray = ((r as u16 * 30 + g as u16 * 59 + b as u16 * 11) / 100) as u8;
+    let mix = |channel: u8| ((channel as u16 * 3 + gray as u16 * 2) / 5) as u8;
+    Color::Rgb(mix(r), mix(g), mix(b))
+}
+
 /// The run tree over the Activity column: one row per subagent run, nested by
 /// the kernel's own parent/depth, fed purely from events. A list pane in the
 /// queue's shape — the rows come from `tree::row_text`, not a second renderer.
@@ -3178,12 +3195,17 @@ fn draw_tree_pane(f: &mut Frame, area: Rect, app: &mut App) {
         .take(inner.height as usize)
         .map(|(i, id)| {
             let text = tree::row_text(&app.children[id]);
-            let mut line = Line::from(Span::styled(
-                text,
-                Style::default().fg(theme.text_primary),
-            ));
-            if focused && i == app.tree_sel {
-                let band = Style::default().bg(theme.bg_highlight);
+            let selected = focused && i == app.tree_sel;
+            let tone = if selected {
+                theme.accent_tool
+            } else {
+                less_saturated(theme.accent_tool)
+            };
+            let mut line = Line::from(Span::styled(text, Style::default().fg(tone)));
+            if selected {
+                let band = Style::default()
+                    .bg(theme.bg_highlight)
+                    .add_modifier(Modifier::BOLD);
                 for span in &mut line.spans {
                     span.style = span.style.patch(band);
                 }
@@ -3336,16 +3358,24 @@ fn draw_input(f: &mut Frame, area: Rect, app: &mut App) {
     let inner = block.inner(card);
     app.input_inner = inner;
     let lay = app.prompt.layout(prefix, inner.width);
+    // Past the growth cap this becomes a viewport over the wrapped prompt.
+    app.input_scroll = lay.cursor_row.saturating_sub(inner.height.saturating_sub(1));
     f.render_widget(block, card);
     if inner.width > 0 && inner.height > 0 {
         f.render_widget(
-            Paragraph::new(lay.lines.clone()).style(Style::default().fg(theme.text_primary)),
+            Paragraph::new(lay.lines.clone())
+                .scroll((app.input_scroll, 0))
+                .style(Style::default().fg(theme.text_primary)),
             inner,
         );
     }
     if focused && inner.width > 0 && inner.height > 0 {
         let x = inner.x + lay.cursor_col.min(inner.width.saturating_sub(1));
-        let y = inner.y + lay.cursor_row.min(inner.height.saturating_sub(1));
+        let y = inner.y
+            + lay
+                .cursor_row
+                .saturating_sub(app.input_scroll)
+                .min(inner.height.saturating_sub(1));
         f.buffer_mut()[(x, y)].modifier.insert(Modifier::REVERSED);
         f.set_cursor_position(Position { x, y });
     }
@@ -3588,8 +3618,16 @@ fn draw_file_picker(f: &mut Frame, app: &mut App) {
     f.render_widget(Paragraph::new(lines), inner);
 }
 
+fn slash_verdict(app: &App) -> slash::Verdict {
+    if app.slash_paste_guard {
+        slash::Verdict::NotACommand
+    } else {
+        slash::verdict(&app.prompt.to_send(), &app.picker)
+    }
+}
+
 fn slash_popup_area(input: Rect, app: &App) -> Option<Rect> {
-    let verdict = slash::verdict(&app.prompt.to_send(), &app.picker);
+    let verdict = slash_verdict(app);
     if !app.slash.open && matches!(verdict, slash::Verdict::NotACommand) {
         return None;
     }
@@ -3615,7 +3653,7 @@ fn slash_popup_area(input: Rect, app: &App) -> Option<Rect> {
 /// only by sending it and reading an error a step later.
 fn draw_slash(f: &mut Frame, input: Rect, app: &App) {
     let theme = Theme::current();
-    let verdict = slash::verdict(&app.prompt.to_send(), &app.picker);
+    let verdict = slash_verdict(app);
     if !app.slash.open && matches!(verdict, slash::Verdict::NotACommand) {
         return;
     }
@@ -6846,6 +6884,37 @@ mod tests {
     }
 
     #[test]
+    fn pasted_slashes_are_data_and_image_paths_never_open_commands() {
+        let mut pasted_command = App::new();
+        apply_paste(&mut pasted_command, "/reset", false);
+        assert!(pasted_command.slash_paste_guard);
+        assert!(!pasted_command.slash.open);
+        assert!(matches!(slash_verdict(&pasted_command), slash::Verdict::NotACommand));
+        handle_key(None, &mut pasted_command, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        assert_ne!(
+            pasted_command.status, "transcript cleared",
+            "a pasted /reset executed as a local command"
+        );
+
+        let mut typed_command = App::new();
+        for c in "/reset".chars() {
+            handle_key(None, &mut typed_command, press(KeyCode::Char(c))).unwrap();
+        }
+        handle_key(None, &mut typed_command, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(typed_command.status, "transcript cleared");
+
+        let png = png_file("paste-slash");
+        let mut image_path = App::new();
+        apply_paste(&mut image_path, png.to_str().unwrap(), false);
+        assert_eq!(image_path.prompt.images().len(), 1);
+        assert!(image_path.prompt.to_send().is_empty());
+        assert!(image_path.slash_paste_guard);
+        assert!(matches!(slash_verdict(&image_path), slash::Verdict::NotACommand));
+    }
+
+    #[test]
     fn paste_chip_enter_expands_instead_of_send() {
         let mut app = App::new();
         apply_paste(&mut app, "a\nb\nc\nd", false);
@@ -8193,6 +8262,36 @@ mod tests {
     }
 
     #[test]
+    fn long_composer_is_a_caret_following_internal_viewport() {
+        let mut app = App::new();
+        app.set_focus(Focus::Input);
+        let body = (0..30)
+            .map(|n| format!("line-{n:02}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        app.prompt.insert_str(&body);
+
+        let tail = paint(&mut app, 80, 24);
+        let tail_card = rows_of(&tail, app.input_area);
+        assert!(app.input_scroll > 0, "long prompt never entered viewport mode");
+        assert!(tail_card.contains("line-29"), "caret tail is not visible:\n{tail_card}");
+        assert!(!tail_card.contains("line-00"), "viewport did not scroll:\n{tail_card}");
+
+        for _ in 0..40 {
+            handle_key(None, &mut app, press(KeyCode::Up)).unwrap();
+        }
+        let head = paint(&mut app, 80, 24);
+        let head_card = rows_of(&head, app.input_area);
+        assert_eq!(app.input_scroll, 0, "Up did not scroll back to the first row");
+        assert!(head_card.contains("line-00"), "prompt head is not visible:\n{head_card}");
+        let backend = TestBackend::new(80, 24);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let pos = term.get_cursor_position().expect("composer cursor");
+        assert!(hit(app.input_inner, pos.x, pos.y), "caret escaped its viewport");
+    }
+
+    #[test]
     fn runtime_state_animates_the_composer_in_three_distinct_colors() {
         let mut inference = App::new();
         inference.running = true;
@@ -8246,6 +8345,42 @@ mod tests {
         assert_ne!(inference_color, queued_color);
         assert_ne!(queued_color, tool_color);
         assert_ne!(inference_color, tool_color);
+    }
+
+    #[test]
+    fn activity_stack_keeps_a_muted_tool_hue_off_selection() {
+        let _theme = theme_lock();
+        let mut app = App::new();
+        app.focus = Focus::Calls;
+        app.tree_open = true;
+        {
+            let first = app.ensure_child("first", "first task");
+            first.agent = "explore".into();
+            first.state = "running".into();
+        }
+        {
+            let second = app.ensure_child("second", "second task");
+            second.agent = "review".into();
+            second.state = "done".into();
+        }
+
+        let backend = TestBackend::new(70, 8);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| draw_tree_pane(f, Rect::new(0, 0, 70, 8), &mut app))
+            .unwrap();
+        let theme = Theme::current();
+        let buf = term.backend().buffer();
+        assert_eq!(buf[(1, 1)].fg, theme.accent_tool, "selected run lost its tool hue");
+        assert_eq!(
+            buf[(1, 2)].fg,
+            less_saturated(theme.accent_tool),
+            "resting run fell back to generic gray"
+        );
+        assert_eq!(
+            less_saturated(Color::Rgb(0, 180, 255)),
+            Color::Rgb(53, 161, 206),
+            "desaturation no longer preserves a recognizable source hue"
+        );
     }
 
     #[test]
@@ -8773,6 +8908,11 @@ mod tests {
     /// once it stops being drawn, or the picture outlives its cells.
     #[test]
     fn attached_image_places_then_clears() {
+        assert_eq!(
+            gfx::protocol_for_brand(xai_grok_pager::terminal::TerminalName::Ghostty, false),
+            gfx::GraphicsProtocol::Kitty,
+            "Ghostty must select the real Kitty graphics protocol",
+        );
         let _kitty = gfx::set_protocol_for_test(gfx::GraphicsProtocol::Kitty);
         let png = png_file("attach");
         let mut app = App::new();

@@ -288,6 +288,7 @@ pub(crate) fn handle_key(
             if app.focus != Focus::Input {
                 app.set_focus(Focus::Input);
             }
+            guard_paste_from_slash(app);
             app.prompt.insert_image(&path);
             app.notify("attached 1 image(s)");
             return Ok(false);
@@ -611,24 +612,54 @@ pub(crate) fn handle_key(
     }
 
     let width = app.input_inner.width.max(20);
-    match key.code {
+    let edited = match key.code {
         KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             app.prompt.move_line_home(width);
+            false
         }
         KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             app.prompt.move_line_end(width);
+            false
         }
-        KeyCode::Char(c) if is_text_key(&key) => app.prompt.insert_char(c),
-        KeyCode::Backspace => app.prompt.backspace(),
-        KeyCode::Delete => app.prompt.delete(),
-        KeyCode::Left => app.prompt.move_left(),
-        KeyCode::Right => app.prompt.move_right(),
-        KeyCode::Up => app.prompt.move_up(width),
-        KeyCode::Down => app.prompt.move_down(width),
-        KeyCode::Home => app.prompt.move_line_home(width),
-        KeyCode::End => app.prompt.move_line_end(width),
+        KeyCode::Char(c) if is_text_key(&key) => {
+            app.prompt.insert_char(c);
+            true
+        }
+        KeyCode::Backspace => {
+            app.prompt.backspace();
+            true
+        }
+        KeyCode::Delete => {
+            app.prompt.delete();
+            true
+        }
+        KeyCode::Left => {
+            app.prompt.move_left();
+            false
+        }
+        KeyCode::Right => {
+            app.prompt.move_right();
+            false
+        }
+        KeyCode::Up => {
+            app.prompt.move_up(width);
+            false
+        }
+        KeyCode::Down => {
+            app.prompt.move_down(width);
+            false
+        }
+        KeyCode::Home => {
+            app.prompt.move_line_home(width);
+            false
+        }
+        KeyCode::End => {
+            app.prompt.move_line_end(width);
+            false
+        }
         KeyCode::Enter if is_mod_enter(&key) => {
             app.prompt.insert_char('\n');
+            true
         }
         KeyCode::Enter => {
             if app.prompt.expand_at_cursor() {
@@ -639,7 +670,12 @@ pub(crate) fn handle_key(
             }
             return submit_prompt(bridge, app);
         }
-        _ => {}
+        _ => false,
+    };
+    // Editing a paste makes it intentional composer text again. Movement alone
+    // must not arm a pasted `/reset` as a local command.
+    if edited {
+        app.slash_paste_guard = false;
     }
     // One recompute after any edit, rather than a call at each of the dozen
     // sites that can change the line. A line that stopped being a command
@@ -788,7 +824,14 @@ pub(crate) fn flush_media(app: &mut App, out: &mut impl Write) -> io::Result<()>
     out.flush()
 }
 
+fn guard_paste_from_slash(app: &mut App) {
+    app.slash_paste_guard = true;
+    app.slash.close();
+    sync_theme_preview(app);
+}
+
 pub(crate) fn apply_paste(app: &mut App, text: &str, inline: bool) {
+    guard_paste_from_slash(app);
     if app.focus != Focus::Input {
         app.set_focus(Focus::Input);
     }
@@ -981,7 +1024,10 @@ pub(crate) fn handle_mouse(app: &mut App, m: MouseEvent) {
                 app.set_focus(Focus::Input);
                 if hit(app.input_inner, m.column, m.row) {
                     let col = m.column.saturating_sub(app.input_inner.x);
-                    let row = m.row.saturating_sub(app.input_inner.y);
+                    let row = m
+                        .row
+                        .saturating_sub(app.input_inner.y)
+                        .saturating_add(app.input_scroll);
                     let hit_chip = app.prompt.click(col, row, app.input_inner.width);
                     if let Some(id) = hit_chip {
                         let now = Instant::now();

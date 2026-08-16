@@ -872,6 +872,9 @@ def check() -> None:
             assert sh("export DZ=kept; echo ok").strip() == "ok"
             assert sh("echo $DZ").strip() == "kept", "and its environment"
             assert sh("python3 -c 'import sys;print(sys.stdin.isatty())'").strip() == "True"
+            assert sh("printf '%s:%s' \"$GIT_PAGER\" \"$PAGER\"").strip() == "cat:cat", (
+                "agent PTYs must disable pagers or a quiet `less` looks like a stuck monitor"
+            )
             failed = sh("ls /definitely-not-here")
             assert "[exit " in failed and "[exit 0]" not in failed, failed
             # A second session is a second machine as far as state goes.
@@ -892,6 +895,15 @@ def check() -> None:
             assert landed and "late-line" in landed[0].output, landed
             assert _pending.count(w_sh) == 0, "and it is delivered once"
             assert sh("echo reusable", id="slow").strip() == "reusable", "the shell outlives it"
+            # Interrupt targets the tty's foreground process group, not bash's
+            # own group, and the monitor remains the only PTY reader.
+            cancelled = sh("sleep 30", id="cancel")
+            assert "monitored" in cancelled, cancelled
+            sent = sh("", id="cancel", interrupt="1")
+            assert "interrupt sent" in sent, sent
+            landed = _pending.wait_next(w_sh, timeout=10)
+            assert landed and "exit" in landed[0].output, landed
+            assert sh("echo after-interrupt", id="cancel").strip() == "after-interrupt"
             # A multi-line block runs whole. It used to be written raw to the
             # tty, so a line queued behind a still-running one never reached
             # bash at all while the transcript reported the block as run.
