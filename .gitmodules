@@ -4,3 +4,6 @@
 [submodule "vendor/memex"]
 	path = vendor/memex
 	url = git@github.com:umgbhalla/memex-desmos.git
+[submodule "vendor/herdr"]
+	path = vendor/herdr
+	url = git@github.com:umgbhalla/herdr.git

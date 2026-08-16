@@ -46,6 +46,11 @@ vendor/fff/**/target/
 # vendored crate). The gitlink is tracked; the checkout's build output is not.
 !vendor/memex
 vendor/memex/target/
+# herdr: the agent runtime, vendored as a fork submodule (staged; no
+# desmos consumer wires it yet). Same shape as memex/comet — pinned repo,
+# build output ignored.
+!vendor/herdr
+vendor/herdr/target/
 # ~/.gitignore_global carries a bare `build/`, which matches
 # vendor/grok-build/crates/build/ -- the home of xai-proto-build, a workspace
 # member and a path dep of our root Cargo.toml. Committing the tree and then
