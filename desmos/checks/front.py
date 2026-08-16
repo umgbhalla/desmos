@@ -510,11 +510,11 @@ def _check_socket() -> None:
             fresh = _SockClient(sock_path)
             fresh.send({"op": "attach", "since": 0})
             first = fresh.line()
-            assert first["ev"] == "session" and first["seq"] == 1
-            seqs2 = [first["seq"]] + [
+            assert first["ev"] == "session" and "seq" not in first
+            seqs2 = [
                 fresh.line()["seq"] for _ in range(stamped_total - 1)
             ]
-            assert seqs2 == list(range(1, stamped_total + 1)), (
+            assert seqs2 == list(range(2, stamped_total + 1)), (
                 f"long attach lost events: {len(seqs2)} lines, first gap at "
                 f"{next((i for i, s in enumerate(seqs2, 1) if s != i), None)}"
             )

@@ -131,17 +131,21 @@ def check() -> None:
         # <agents> is a grown tool a persist=False child never loads, so the
         # budgeted world must carry the real handler itself or its own prompt
         # teaches a syscall that answers unknown-tag.
-        orc_status = dispatch(orc1, Block("agents", "wait", {}))
+        orc_status = dispatch(orc1, Block("agents", "", {"op": "status"}))
         assert "unknown tag" not in orc_status, orc_status
         probe = cwd / "orc-probe.txt"
-        for tag, body in (
-            ("bash", f"echo pwn > {probe}"),
-            ("shell", f"echo pwn > {probe}"),
-            ("python", f"open({str(probe)!r}, 'w').write('pwn')"),
-            ("edit", "a\n---\nb"),
-        ):
-            out = dispatch(orc1, Block(tag, body, {"path": str(probe)} if tag == "edit" else {}))
-            assert "outside this agent's scope" in out, (tag, out)
+        probes = (
+            ("exec", "bash", f"echo pwn > {probe}", {}),
+            ("exec", "shell", f"echo pwn > {probe}", {}),
+            ("exec", "python", f"open({str(probe)!r}, 'w').write('pwn')", {}),
+            ("workspace", "edit", "a\n---\nb", {"path": str(probe)}),
+        )
+        for family, op, body, attrs in probes:
+            out = dispatch(orc1, Block(family, body, {"op": op, **attrs}))
+            assert (
+                "outside this agent's scope" in out
+                or "is unavailable in this world" in out
+            ), (family, op, out)
         assert not probe.exists(), "an orchestrator wrote to disk"
 
         import os

@@ -876,7 +876,7 @@ def check() -> None:
             "status": "completed",
             "call_id": "call_1",
             "name": "syscall",
-            "input": "<python>OPENAI_SYSCALL_EVAL = 40 + 2\nprint(OPENAI_SYSCALL_EVAL)</python>",
+            "input": '<exec op="python">OPENAI_SYSCALL_EVAL = 40 + 2\nprint(OPENAI_SYSCALL_EVAL)</exec>',
         }
         call_resp = {
             "role": "assistant",
@@ -887,7 +887,7 @@ def check() -> None:
         }
         kept_call = _ac(call_resp)
         assert text_of(call_resp) == "", "typed syscall input is not assistant speech"
-        assert kept_call[0]["input"].endswith("</python>")
+        assert kept_call[0]["input"].endswith("</" + "exec>")
         replay = _oai.to_input(
             [
                 {"role": "assistant", "content": kept_call},
@@ -897,7 +897,7 @@ def check() -> None:
                         {
                             "type": "custom_tool_call_output",
                             "call_id": "call_1",
-                            "output": '<result tag="python">42</result>',
+                            "output": '<result tag="exec">42</result>',
                         }
                     ],
                 },
@@ -908,7 +908,7 @@ def check() -> None:
             {
                 "type": "custom_tool_call_output",
                 "call_id": "call_1",
-                "output": '<result tag="python">42</result>',
+                "output": '<result tag="exec">42</result>',
             },
         ], replay
         tools = _oai.payload_for("gpt-5.6-sol", "system", [], 100)["tools"]

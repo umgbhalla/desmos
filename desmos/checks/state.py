@@ -11,6 +11,10 @@ from desmos.catalog import system_prompt
 from desmos.types import Block
 
 
+def _memory(body: str, attrs: dict | None = None) -> Block:
+    return Block("knowledge", body, {"op": "memory", **(attrs or {})})
+
+
 def check() -> None:
     import tempfile
 
@@ -32,7 +36,6 @@ def check() -> None:
         (memory_dir / "MEMORY.md").write_text(legacy, encoding="utf-8")
         memory_world = new_world(memory_dir, state_path=memory_dir / "harness.sqlite3")
         memory_prompt = system_prompt(memory_world)
-        assert memory_world.tools["memory"].frozen
         assert "Umang prefers actual tools before narration" in memory_prompt
         assert "x" * 500 not in memory_prompt
         assert (memory_dir / "memories" / "legacy_MEMORY.md").read_text(encoding="utf-8") == legacy
@@ -41,48 +44,44 @@ def check() -> None:
 
         remembered = dispatch(
             memory_world,
-            Block(
-                "memory",
+            _memory(
                 "Umang's name is Umang.",
                 {"id": "user.umang.identity", "scope": "user", "kind": "identity"},
             ),
         )
         updated = dispatch(
             memory_world,
-            Block(
-                "memory",
+            _memory(
                 "Umang's name is Umang.",
                 {"id": "user.umang.identity", "scope": "user", "kind": "identity"},
             ),
         )
-        search_result = dispatch(memory_world, Block("memory", "search Umang identity", {}))
+        search_result = dispatch(memory_world, _memory( "search Umang identity", {}))
         # Writing the same id twice updates the record instead of adding a
         # second one -- searching would otherwise return both and the model
         # would read two versions of the same fact.
         assert search_result.count("user.umang.identity") == 1, search_result
-        read_result = dispatch(memory_world, Block("memory", "read user.umang.identity", {}))
+        read_result = dispatch(memory_world, _memory( "read user.umang.identity", {}))
         assert '"scope": "user"' in read_result
-        dispatch(memory_world, Block("memory", "verify user.umang.identity", {}))
+        dispatch(memory_world, _memory( "verify user.umang.identity", {}))
 
         secret_result = dispatch(
             memory_world,
-            Block(
-                "memory",
+            _memory(
                 "api_key=abcdefghijk123456789",
                 {"id": "repo.secret-test", "scope": "repo", "kind": "test"},
             ),
         )
-        secret_read = dispatch(memory_world, Block("memory", "read repo.secret-test", {}))
+        secret_read = dispatch(memory_world, _memory( "read repo.secret-test", {}))
         assert "[REDACTED_SECRET]" in secret_read
         assert "abcdefghijk123456789" not in secret_read
 
         memory_world2 = new_world(memory_dir, state_path=memory_dir / "harness.sqlite3")
-        assert memory_world2.tools["memory"].frozen
         assert "Umang's name is Umang" in system_prompt(memory_world2)
-        dispatch(memory_world2, Block("memory", "forget user.umang.identity", {}))
-        gone = dispatch(memory_world2, Block("memory", "search user.umang.identity", {}))
+        dispatch(memory_world2, _memory( "forget user.umang.identity", {}))
+        gone = dispatch(memory_world2, _memory( "search user.umang.identity", {}))
         assert "user.umang.identity" not in gone, gone
-        dispatch(memory_world2, Block("memory", "consolidate", {}))
+        dispatch(memory_world2, _memory( "consolidate", {}))
 
         ping = cwd / ".desmos" / "skills" / "ping"
         ping.mkdir(parents=True)
@@ -92,7 +91,7 @@ def check() -> None:
         )
         (ping / "skill.py").write_text("def handle(body, **a):\n    return 'pong:' + body\n", encoding="utf-8")
         world = new_world(cwd, state_path=cwd / "harness.sqlite3")
-        assert dispatch(world, Block("skill", "", {"name": "ping"})).endswith("body\n")
+        assert dispatch(world, Block("harness", "", {"op": "skill", "name": "ping"})).endswith("body\n")
         assert dispatch(world, Block("ping", "hi", {})) == "pong:hi"
 
         grown = cwd / ".desmos" / "skills" / "later"
@@ -102,17 +101,17 @@ def check() -> None:
             encoding="utf-8",
         )
         assert not any(s.name == "later" for s in world.skills)
-        dispatch(world, Block("reload", "", {}))
+        dispatch(world, Block("harness", "", {"op": "reload"}))
         assert any(s.name == "later" for s in world.skills)
-        assert dispatch(world, Block("skill", "", {"name": "later"})).endswith("ok\n")
+        assert dispatch(world, Block("harness", "", {"op": "skill", "name": "later"})).endswith("ok\n")
 
         out = dispatch(
             world,
-            Block("register", "def handle(body, **a):\n    return body.upper()\n", {"name": "echo", "doc": "uppercase"}),
+            Block("harness", "def handle(body, **a):\n    return body.upper()\n", {"op": "register", "name": "echo", "doc": "uppercase"}),
         )
         assert dispatch(world, Block("echo", "hi", {})) == "HI"
 
-        dispatch(world, Block("system", "prefer tests", {"name": "style"}))
+        dispatch(world, Block("knowledge", "prefer tests", {"op": "system", "name": "style"}))
         assert "prefer tests" in system_prompt(world)
 
         world2 = new_world(cwd, state_path=cwd / "harness.sqlite3")
@@ -314,7 +313,7 @@ def check() -> None:
 
         evolve(w3, "after ping")
         assert (gen_dir(w3) / "0001.json").is_file()
-        dispatch(w3, Block("system", "usage line", {}))
+        dispatch(w3, Block("knowledge", "usage line", {"op": "system"}))
         assert w3.notes["note"] == "usage line"
         rollback(w3, 1)
         assert "note" not in w3.notes

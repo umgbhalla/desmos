@@ -219,11 +219,19 @@ def _replay(wire: "_Client", since: int) -> None:
             last = target
             continue
         for event in rows:
+            last = int(event["seq"])
+            if event.get("ev") == "timing":
+                continue
+            wire_event = dict(event)
+            wire_event.pop("payload_bytes", None)
+            wire_event.pop("payload_sha256", None)
+            if wire_event.get("ev") == "session":
+                wire_event.pop("seq", None)
+                wire_event.pop("mono_ns", None)
             wire.push_wait(
-                (json.dumps(event, default=str) + "\n").encode("utf-8"),
+                (json.dumps(wire_event, default=str) + "\n").encode("utf-8"),
                 _REPLAY_STALL,
             )
-            last = int(event["seq"])
 
 
 def _intervene(op: str, msg: dict[str, Any]) -> None:

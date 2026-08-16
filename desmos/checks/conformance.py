@@ -149,9 +149,10 @@ def _sql_log(cwd: Path, session_id: str) -> str:
             "seq": row["seq"],
             "ts": row["ts_ms"],
             "mono_ns": row["mono_ns"],
-            "payload_bytes": row["payload_bytes"],
-            "payload_sha256": row["payload_sha256"],
         })
+        if event.get("ev") == "session":
+            event.pop("seq", None)
+            event.pop("mono_ns", None)
         lines.append(json.dumps(event, separators=(",", ":")))
     return "\n".join(lines) + ("\n" if lines else "")
 
