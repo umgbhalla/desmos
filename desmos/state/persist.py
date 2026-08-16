@@ -289,6 +289,141 @@ def _move_sqlite_files(path: Path, label: str) -> list[Path]:
     return moved
 
 
+#: One line per quarantine, beside the database it describes. A replaced
+#: database cannot account for its own replacement -- that is the entire
+#: failure -- so the account lives outside it. This workspace quarantined 98
+#: databases inside one 32-minute window and nothing recorded that it had.
+QUARANTINE_LOG = "quarantine.jsonl"
+
+#: Reported once per process per database. A second `load()` in the same run
+#: is not new information.
+_QUARANTINE_REPORTED: set[str] = set()
+
+
+def quarantine_log_path(path: Path) -> Path:
+    return path.parent / QUARANTINE_LOG
+
+
+def _inventory(dead: Path) -> dict[str, Any]:
+    """Best-effort census of a database that just failed to open."""
+    try:
+        conn = sqlite3.connect(f"file:{dead}?mode=ro", uri=True, timeout=2.0)
+    except sqlite3.Error as exc:
+        return {"readable": False, "error": str(exc)[:200]}
+    out: dict[str, Any] = {}
+    try:
+        for table in ("sessions", "messages", "events", "calls"):
+            try:
+                out[table] = int(
+                    conn.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
+                )
+            except sqlite3.DatabaseError:
+                out[table] = None
+        try:
+            row = conn.execute(
+                "SELECT min(started_at), max(last_seen_at) FROM sessions"
+            ).fetchone()
+            out["earliest"], out["latest"] = (row[0], row[1]) if row else (None, None)
+        except sqlite3.DatabaseError:
+            out["earliest"] = out["latest"] = None
+    finally:
+        conn.close()
+    out["readable"] = any(isinstance(v, int) for v in out.values())
+    return out
+
+
+def _record_quarantine(
+    path: Path, exc: BaseException, moved: list[Path]
+) -> dict[str, Any]:
+    """Append the account of one replaced database. Never raises."""
+    entry: dict[str, Any] = {
+        "at": datetime.now(timezone.utc).isoformat(),
+        "reason": f"{type(exc).__name__}: {exc}"[:300],
+        "moved": [str(p) for p in moved],
+        "bytes": 0,
+        "inventory": None,
+    }
+    try:
+        entry["bytes"] = sum(p.stat().st_size for p in moved if p.exists())
+        if moved:
+            entry["inventory"] = _inventory(moved[0])
+        log = quarantine_log_path(path)
+        log.parent.mkdir(parents=True, exist_ok=True)
+        with log.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(entry, separators=(",", ":")) + "\n")
+    except Exception:
+        # An unwritable manifest must not turn a recovered database into a
+        # crash. The caller still warns.
+        pass
+    return entry
+
+
+def quarantines(path: Path) -> list[dict[str, Any]]:
+    """Every recorded quarantine for this database, oldest first."""
+    log = quarantine_log_path(path)
+    if not log.is_file():
+        return []
+    out: list[dict[str, Any]] = []
+    for line in log.read_text(encoding="utf-8", errors="replace").splitlines():
+        if not line.strip():
+            continue
+        try:
+            item = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(item, dict):
+            out.append(item)
+    return out
+
+
+def quarantine_summary(path: Path) -> str:
+    """What wake says. Empty when nothing was ever replaced."""
+    entries = quarantines(path)
+    if not entries:
+        return ""
+    last = entries[-1]
+    inv = last.get("inventory")
+    held = ""
+    if isinstance(inv, dict) and inv.get("readable"):
+        held = (
+            f", holding {inv.get('sessions')} sessions"
+            f" / {inv.get('messages')} messages"
+            f" spanning {inv.get('earliest')} to {inv.get('latest')}"
+        )
+    total = sum(int(e.get("bytes") or 0) for e in entries)
+    return (
+        f"history quarantined, not absent: {len(entries)} database(s) replaced,"
+        f" {total // 1024} KiB still on disk; most recent {last.get('at')}"
+        f" -- {last.get('reason')}{held}"
+    )
+
+
+def _report_quarantines(world: World, path: Path) -> None:
+    """Say it on the route ordinary notices take, once per process.
+
+    A RuntimeWarning is not loud. Ninety-eight of them were raised in this
+    workspace and no one saw one. A notice event reaches the story pane and the
+    history index, so a later recall for "quarantined" finds it as well.
+    """
+    key = str(path)
+    if key in _QUARANTINE_REPORTED:
+        return
+    _QUARANTINE_REPORTED.add(key)
+    summary = quarantine_summary(path)
+    if not summary:
+        return
+    try:
+        record_event(
+            world,
+            {"ev": "notice", "text": summary},
+            ts_ms=int(time.time() * 1000),
+            mono_ns=time.monotonic_ns(),
+        )
+    except Exception:
+        pass
+    warnings.warn(summary, RuntimeWarning, stacklevel=2)
+
+
 def _connect(path: Path) -> sqlite3.Connection:
     conn = sqlite3.connect(path, timeout=5.0)
     conn.row_factory = sqlite3.Row
@@ -480,9 +615,11 @@ def _open(path: Path) -> sqlite3.Connection:
         if conn is not None:
             conn.close()
         moved = _move_sqlite_files(path, "corrupt")
+        _record_quarantine(path, exc, moved)
         warnings.warn(
             f"backed up corrupt harness database ({exc}); fresh state will be created"
-            + (f" at {moved[0]}" if moved else ""),
+            + (f" at {moved[0]}" if moved else "")
+            + f"; accounted in {quarantine_log_path(path)}",
             RuntimeWarning,
             stacklevel=2,
         )
@@ -1486,7 +1623,8 @@ def _read_data(
 def load(world: World) -> None:
     if not world.persist:
         return
-    conn = _open(state_file(world))
+    path = state_file(world)
+    conn = _open(path)
     try:
         conn.execute("BEGIN IMMEDIATE")
         workspace = _workspace_id(conn, world)
@@ -1503,3 +1641,5 @@ def load(world: World) -> None:
         raise
     finally:
         conn.close()
+    # After the write lock is released: record_event opens its own connection.
+    _report_quarantines(world, path)

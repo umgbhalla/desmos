@@ -339,6 +339,7 @@ def check() -> None:
         _check_call_ledger(cwd)
         _check_session_lineage(cwd)
         _check_session_channel(cwd)
+        _check_quarantine_manifest()
 
 
 #: The one fixture both languages price. `crates/desmos-tui/src/main.rs`
@@ -351,6 +352,73 @@ FIXTURE_USAGE = {
     "output_tokens": 50,
 }
 FIXTURE_COST_OPUS = 0.0023125
+
+
+def _check_quarantine_manifest() -> None:
+    """A replaced database must leave an account of itself, loudly.
+
+    Recovery renames the corrupt file and creates a fresh one. That is correct
+    -- refusing to start would be worse -- but until now the only trace was a
+    RuntimeWarning, and this workspace raised 98 of them in a 32-minute window
+    without anyone noticing that every session before it had stopped being
+    reachable. The manifest is the account; the notice is the volume.
+
+    Reverting either fix fails this: drop `_record_quarantine` and there is no
+    entry, drop `_report_quarantines` and wake says nothing.
+    """
+    import json
+    import tempfile
+    import warnings
+
+    from desmos.state import persist
+
+    root = Path(tempfile.mkdtemp())
+    world = new_world(root, persist=True)
+    world.messages.append({"role": "user", "content": "written before the corruption"})
+    persist.save(world)
+    path = persist.state_file(world)
+    assert path.is_file(), path
+
+    # How a killed writer leaves it: the header no longer says SQLite.
+    raw = bytearray(path.read_bytes())
+    raw[0:16] = b"not-a-database\x00\x00"
+    path.write_bytes(bytes(raw))
+
+    persist._QUARANTINE_REPORTED.discard(str(path))
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        persist._open(path).close()
+
+    entries = persist.quarantines(path)
+    assert len(entries) == 1, entries
+    entry = entries[0]
+    assert entry["bytes"] > 0, entry
+    assert entry["reason"], entry
+    assert entry["moved"], entry
+    assert "inventory" in entry, entry
+
+    summary = persist.quarantine_summary(path)
+    assert "not absent" in summary, summary
+    assert "1 database(s) replaced" in summary, summary
+
+    # Wake reports it on the ordinary notice route, not only as a warning a
+    # front never renders.
+    persist._QUARANTINE_REPORTED.discard(str(path))
+    fresh = new_world(root, persist=True)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        persist.load(fresh)
+    events = persist.read_events(fresh, limit=500)
+    assert any("quarantined" in json.dumps(ev, default=str) for ev in events), (
+        f"wake did not report the quarantine: {len(events)} events"
+    )
+
+    # Once per process: a second load is not new information.
+    before = len(persist.read_events(fresh, limit=500))
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        persist.load(fresh)
+    assert len(persist.read_events(fresh, limit=500)) == before, "quarantine notice repeated"
 
 
 def _check_prices() -> None:
