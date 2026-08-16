@@ -21,7 +21,25 @@ vendor/grok-build/**/target/
 # fff is committed too: desmos-tui and the fff-python extension both build
 # from this one tree (Phase 6). Its own workspace, reached via a path dep.
 !vendor/fff/
-vendor/fff/target/
+# Commit only the build subset (the four workspace crates, the python
+# bindings, and .cargo/config.toml — its macOS dynamic_lookup link args are
+# what let the abi3 extension link). The rest of the upstream clone (.github,
+# Formula, lua, docs) is noise; ignore it so a fresh clone builds from exactly
+# what is tracked.
+vendor/fff/*
+!vendor/fff/.cargo/
+!vendor/fff/Cargo.toml
+!vendor/fff/Cargo.lock
+!vendor/fff/LICENSE
+!vendor/fff/crates/
+vendor/fff/crates/*
+!vendor/fff/crates/fff-core/
+!vendor/fff/crates/fff-grep/
+!vendor/fff/crates/fff-query-parser/
+!vendor/fff/crates/fff-python/
+!vendor/fff/packages/
+vendor/fff/packages/*
+!vendor/fff/packages/fff-python/
 vendor/fff/**/target/
 # ~/.gitignore_global carries a bare `build/`, which matches
 # vendor/grok-build/crates/build/ -- the home of xai-proto-build, a workspace
