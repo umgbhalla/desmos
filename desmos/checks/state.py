@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from desmos.dispatch import dispatch
@@ -340,6 +341,7 @@ def check() -> None:
         _check_session_lineage(cwd)
         _check_session_channel(cwd)
         _check_quarantine_manifest()
+        _check_prune_manifest()
 
 
 #: The one fixture both languages price. `crates/desmos-tui/src/main.rs`
@@ -419,6 +421,80 @@ def _check_quarantine_manifest() -> None:
         warnings.simplefilter("ignore")
         persist.load(fresh)
     assert len(persist.read_events(fresh, limit=500)) == before, "quarantine notice repeated"
+
+
+def _check_prune_manifest() -> None:
+    """Bounding the database must not be a silent delete.
+
+    `_prune_sessions` keeps the newest SESSION_KEEP sessions and drops the
+    rest. Foreign keys cascade, so a dropped session takes its messages, prior
+    turns, events and calls with it -- and nothing recorded which conversations
+    were spent. This drives the real entry point: `save()` prunes, so the
+    manifest must appear without the test ever calling the pruner itself.
+
+    Revert the `_record_prune` call and the manifest is empty; revert the
+    `path=` argument at the call site and the census never runs.
+    """
+    import tempfile
+
+    from desmos.state import persist
+
+    root = Path(tempfile.mkdtemp())
+    world = new_world(root, persist=True)
+    world.messages.append({"role": "user", "content": "the surviving session"})
+    persist.save(world)
+    path = persist.state_file(world)
+    assert not persist.pruned(path), "nothing was pruned yet"
+
+    conn = persist._open(path)
+    try:
+        workspace = conn.execute("SELECT id FROM workspaces").fetchone()[0]
+        extra = persist.SESSION_KEEP + 6
+        with conn:
+            for i in range(extra):
+                sid = f"doomed-{i:04d}"
+                conn.execute(
+                    "INSERT INTO sessions(id, workspace_id, kind, started_at,"
+                    " last_seen_at, cache_key) VALUES (?, ?, 'attach', ?, ?, ?)",
+                    (sid, workspace, f"2020-01-01T00:00:{i:02d}",
+                     f"2020-01-01T00:00:{i:02d}", sid),
+                )
+                conn.execute(
+                    "INSERT INTO messages(session_id, seq, role, content_json)"
+                    " VALUES (?, 0, 'user', ?)",
+                    (sid, json.dumps(f"doomed conversation {i}")),
+                )
+    finally:
+        conn.close()
+
+    persist.save(world)
+
+    entries = persist.pruned(path)
+    # SESSION_KEEP + 6 fakes + this session = SESSION_KEEP + 7 rows.
+    expected = 7
+    assert len(entries) == expected, f"{len(entries)} pruned entries, want {expected}"
+    for entry in entries:
+        assert entry["session_id"].startswith("doomed-"), entry
+        assert entry["messages"] == 1, entry
+        assert entry["bytes"] > 0, entry
+        assert entry["at"], entry
+        assert "doomed conversation" in entry["opened_with"], entry
+
+    # The account describes something that really is gone.
+    conn = persist._open(path)
+    try:
+        gone = [e["session_id"] for e in entries]
+        marks = ",".join("?" * len(gone))
+        left = conn.execute(
+            f"SELECT count(*) FROM sessions WHERE id IN ({marks})", gone
+        ).fetchone()[0]
+        assert left == 0, f"{left} pruned sessions still present"
+        left = conn.execute(
+            f"SELECT count(*) FROM messages WHERE session_id IN ({marks})", gone
+        ).fetchone()[0]
+        assert left == 0, f"{left} messages survived their pruned session"
+    finally:
+        conn.close()
 
 
 def _check_prices() -> None:

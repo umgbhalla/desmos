@@ -1250,11 +1250,109 @@ def runs(world: World, limit: int = 20) -> list[dict[str, Any]]:
     return [dict(row) for row in reversed(rows)]
 
 
+#: One line per dropped session, beside the database that dropped it. Pruning
+#: is the second silent-loss path: foreign keys cascade, so removing a session
+#: row also removes its messages, prior turns, events and calls, and until now
+#: nothing recorded which conversations were spent to keep the file small. Same
+#: rule as a quarantine -- the account of a loss cannot live only inside the
+#: thing that lost it.
+PRUNE_LOG = "pruned.jsonl"
+
+
+def prune_log_path(path: Path) -> Path:
+    return path.parent / PRUNE_LOG
+
+
+def _prune_census(
+    conn: sqlite3.Connection, doomed: list[str]
+) -> list[dict[str, Any]]:
+    """Describe sessions about to be deleted, while they still exist."""
+    out: list[dict[str, Any]] = []
+    for sid in doomed:
+        entry: dict[str, Any] = {"session_id": sid}
+        try:
+            row = conn.execute(
+                "SELECT started_at, last_seen_at, model, title, kind"
+                " FROM sessions WHERE id = ?",
+                (sid,),
+            ).fetchone()
+            if row is not None:
+                entry.update(
+                    started_at=row[0],
+                    last_seen_at=row[1],
+                    model=row[2],
+                    title=row[3],
+                    kind=row[4],
+                )
+            counts = conn.execute(
+                "SELECT count(*), coalesce(sum(length(content_json)), 0)"
+                " FROM messages WHERE session_id = ?",
+                (sid,),
+            ).fetchone()
+            entry["messages"] = int(counts[0])
+            entry["bytes"] = int(counts[1])
+            for table in ("prior_turns", "events", "calls"):
+                entry[table] = int(
+                    conn.execute(
+                        f"SELECT count(*) FROM {table} WHERE session_id = ?", (sid,)
+                    ).fetchone()[0]
+                )
+            first = conn.execute(
+                "SELECT content_json FROM messages"
+                " WHERE session_id = ? AND role = 'user' ORDER BY seq LIMIT 1",
+                (sid,),
+            ).fetchone()
+            if first is not None:
+                entry["opened_with"] = _content_text(json.loads(first[0]))[:300]
+        except (sqlite3.DatabaseError, ValueError, TypeError) as exc:
+            entry["census_error"] = f"{type(exc).__name__}: {exc}"[:200]
+        out.append(entry)
+    return out
+
+
+def _record_prune(path: Path, entries: list[dict[str, Any]]) -> None:
+    """Append the account of one pruning pass. Never raises."""
+    if not entries:
+        return
+    try:
+        log = prune_log_path(path)
+        log.parent.mkdir(parents=True, exist_ok=True)
+        at = datetime.now(timezone.utc).isoformat()
+        with log.open("a", encoding="utf-8") as fh:
+            for entry in entries:
+                fh.write(
+                    json.dumps({"at": at, **entry}, separators=(",", ":")) + "\n"
+                )
+    except Exception:
+        # Bounding the database must not fail because its account cannot be
+        # written. The pruning itself already happened.
+        pass
+
+
+def pruned(path: Path) -> list[dict[str, Any]]:
+    """Every session this database dropped to stay bounded, oldest first."""
+    log = prune_log_path(path)
+    if not log.is_file():
+        return []
+    out: list[dict[str, Any]] = []
+    for line in log.read_text(encoding="utf-8", errors="replace").splitlines():
+        if not line.strip():
+            continue
+        try:
+            item = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(item, dict):
+            out.append(item)
+    return out
+
+
 def _prune_sessions(
     conn: sqlite3.Connection,
     workspace: str,
     current: str,
     keep: int = SESSION_KEEP,
+    path: Path | None = None,
 ) -> int:
     """Bound history without deleting a live peer or this attach."""
     rows = conn.execute(
@@ -1275,10 +1373,14 @@ def _prune_sessions(
         if str(row["id"]) != current and str(row["id"]) not in live
     ]
     if doomed:
+        # Census first: after the delete there is nothing left to describe.
+        census = _prune_census(conn, doomed) if path is not None else []
         conn.executemany(
             "DELETE FROM history_fts WHERE session_id = ?", [(sid,) for sid in doomed]
         )
         conn.executemany("DELETE FROM sessions WHERE id = ?", [(sid,) for sid in doomed])
+        if path is not None:
+            _record_prune(path, census)
     return len(doomed)
 
 
@@ -1467,7 +1569,7 @@ def save(world: World) -> None:
             assert workspace is not None
             session = _session_id(conn, world, workspace)
             assert session is not None
-            _prune_sessions(conn, workspace, session)
+            _prune_sessions(conn, workspace, session, path=state_file(world))
     finally:
         conn.close()
     try:
