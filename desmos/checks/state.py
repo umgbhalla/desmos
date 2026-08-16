@@ -345,6 +345,7 @@ def check() -> None:
         _check_prune_manifest()
         _check_salvage()
         _check_fold_keeps_transcript()
+        _check_session_asks()
 
 
 #: The one fixture both languages price. `crates/desmos-tui/src/main.rs`
@@ -498,6 +499,49 @@ def _check_prune_manifest() -> None:
         assert left == 0, f"{left} messages survived their pruned session"
     finally:
         conn.close()
+
+
+def _check_session_asks() -> None:
+    """Recover what a person asked from the stored record, by content.
+
+    Every row below is role 'user' and exactly one was written by a person.
+    Counting roles gets six; classifying by content-block type gets the one.
+    """
+    import tempfile
+
+    from desmos.state import persist
+
+    root = Path(tempfile.mkdtemp())
+    live = new_world(root, persist=True)
+    ask = "fold the record and tell me what broke"
+    live.messages.extend(
+        [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "tool_result", "tool_use_id": "x", "content": "output"}
+                ],
+            },
+            {"role": "assistant", "content": "working on it"},
+            {"role": "user", "content": f"ns:\n  diag: Diagnostics\n  w: World\n\n{ask}"},
+            {"role": "user", "content": "[background task finished] shell main"},
+            {"role": "user", "content": "# now\n[todo]\n1. [ ] something"},
+            {"role": "user", "content": "<compacted n=9>\nEarlier turns, folded."},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "an accidental caption"},
+                    {"type": "tool_result", "content": "z"},
+                ],
+            },
+        ]
+    )
+    live.session_message_start = 0
+    persist.save(live)
+
+    found = persist.session_asks(live)
+    assert [item["ask"] for item in found] == [ask], found
+    assert persist.last_task(live) == ask, persist.last_task(live)
 
 
 def _check_fold_keeps_transcript() -> None:

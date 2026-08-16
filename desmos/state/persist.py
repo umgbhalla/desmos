@@ -1422,6 +1422,85 @@ def _strip_opaque(value: Any) -> Any:
 LIVE_SESSION_PENALTY = 10.0
 
 
+_HARNESS_TURNS = (
+    "<compacted",
+    "<result",
+    "[background task",
+    "[stopped by the user",
+    "# now",
+)
+
+
+def _strip_preamble(text: str) -> str:
+    """Drop the namespace dump the harness prepends to a human turn."""
+    lines = text.splitlines()
+    if lines and lines[0].strip() == "ns:":
+        index = 1
+        while index < len(lines) and (
+            not lines[index].strip() or lines[index].startswith("  ")
+        ):
+            index += 1
+        lines = lines[index:]
+    ask = "\n".join(lines).strip()
+    return "" if ask.startswith(_HARNESS_TURNS) else ask
+
+
+def _human_ask(content_json: str) -> str:
+    """The text a person wrote, or empty for any other user-shaped row."""
+    try:
+        value = json.loads(content_json)
+    except ValueError:
+        return ""
+    blocks = [{"type": "text", "text": value}] if isinstance(value, str) else value
+    if not isinstance(blocks, list) or not blocks:
+        return ""
+    parts = []
+    for block in blocks:
+        # A tool result anywhere in the row means the harness spoke, not a
+        # person. One non-text block disqualifies the whole message.
+        if not isinstance(block, dict) or block.get("type") != "text":
+            return ""
+        parts.append(str(block.get("text", "")))
+    return _strip_preamble("\n".join(parts))
+
+
+def session_asks(
+    world: World, *, session: str | None = None, limit: int = 20
+) -> list[dict[str, Any]]:
+    """The human asks of one session, read back out of the stored record.
+
+    API role is not authorship. Most user-shaped rows are tool results, and a
+    genuine turn arrives behind a namespace dump. Counting `role == 'user'`
+    returned thirty-six rows here, of which three were written by a person and
+    two were asks. Classifying by content-block type returns those two.
+
+    Oldest first, so the last entry is the current task. Reading the store
+    rather than `world.messages` is the point: this survives a fold, a restart,
+    and a model switch, none of which the live list does.
+    """
+    conn = _open(state_file(world))
+    try:
+        rows = conn.execute(
+            "SELECT seq, content_json FROM messages"
+            " WHERE session_id = ? AND role = 'user' ORDER BY seq",
+            (session or run_id(),),
+        ).fetchall()
+    finally:
+        conn.close()
+    found = [
+        {"seq": int(seq), "ask": ask}
+        for seq, content in rows
+        if (ask := _human_ask(str(content)))
+    ]
+    return found[-limit:] if limit and limit > 0 else found
+
+
+def last_task(world: World, *, session: str | None = None) -> str:
+    """The most recent thing a person actually asked for."""
+    asks = session_asks(world, session=session, limit=1)
+    return str(asks[-1]["ask"]) if asks else ""
+
+
 def search_history(
     world: World, query: str, limit: int = 12
 ) -> list[dict[str, Any]]:
