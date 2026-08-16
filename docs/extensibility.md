@@ -22,6 +22,23 @@ harness Prime Agent is built on) and Prime's Python-backed skills.
 | Continual harness notes | `<system name>` + `.desmos/harness.json` |
 | Packages (npm/git) | not yet |
 
+## Persistent-kernel diagnostics
+
+Every world gets a collision-safe `diag` object in its Python namespace. It
+returns bounded plain data so inspecting a failure never retains traceback
+frames, locals, subprocesses, or arbitrary user values.
+
+- `diag.error(clear=False)` returns the last uncaught Python-block exception,
+  recorded automatically with type, message, and leaf-oriented frame metadata.
+- `diag.symbol(obj, source=False, max_chars=8192)` returns location, signature,
+  and optional clipped source metadata without resolving dotted names.
+- `diag.threads(pattern=None, limit=32, depth=12, max_chars=16384)` returns
+  thread state and bounded leaf-first file/function/line stacks, never locals.
+
+Installation uses `setdefault` semantics for user-owned names: if a caller
+already supplied a different `diag`, Desmos leaves it untouched. SDK reloads
+migrate Desmos' own diagnostic object and preserve its last error.
+
 ## Skill
 
 ```

@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from desmos.kernel.const import BASH_TIMEOUT, FROZEN, RESULT_CAP
+from desmos.kernel.diagnostics import record_exception
 from desmos.kernel.spill import spill
 from desmos.kernel.types import Tool, World
 
@@ -189,7 +190,8 @@ def run_python(
             cwd=world.cwd,
             keep="tail",
         )
-    except Exception:
+    except Exception as exc:
+        record_exception(world.ns, exc)
         return spill(
             (buf.getvalue() + traceback.format_exc()).strip(),
             RESULT_CAP,

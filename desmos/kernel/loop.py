@@ -10,6 +10,7 @@ from typing import Any, Callable
 from desmos.kernel.catalog import header, ns_names, system_prompt
 from desmos.kernel.const import FROZEN, MAX_TOKENS, PRIOR_KEEP
 from desmos.kernel.dispatch import dispatch
+from desmos.kernel.diagnostics import install_diagnostics
 from desmos.kernel.scan import clip, dropped_openers, scan, scan_spans, trailing_residue
 from desmos.kernel.spill import spill
 from desmos.kernel.types import Block, Tool, World
@@ -186,6 +187,7 @@ _BUILTIN_DOCS = (
 
 
 def seed_builtins(world: World) -> None:
+    install_diagnostics(world.ns)
     for name, doc in _BUILTIN_DOCS:
         existing = world.tools.get(name)
         if existing is None:

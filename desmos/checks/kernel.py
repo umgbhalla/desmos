@@ -225,6 +225,65 @@ def check() -> None:
         assert world.ns["x"] == 2
         assert dispatch(world, blocks[1]).strip() == "hi"
 
+        # `diag` is a real persistent-kernel primitive, not a helper exercised
+        # out of band. An uncaught Python call records bounded plain data, and a
+        # later call can query it without reconstructing inspect/traceback code.
+        import json as _json
+
+        failed = dispatch(
+            world,
+            Block(
+                "python",
+                "def diag_outer():\n    raise RuntimeError('structured boom')\ndiag_outer()",
+                {},
+            ),
+        )
+        assert "RuntimeError: structured boom" in failed, failed
+        diag = world.ns["diag"]
+        snap = diag.error()
+        encoded = _json.dumps(snap)
+        assert snap["type"] == "RuntimeError" and snap["message"] == "structured boom", snap
+        assert snap["frames"][-1]["function"] == "diag_outer", snap
+        assert "locals" not in encoded and len(encoded) <= 8192, encoded
+        try:
+            raise RuntimeError("x" * 10_000)
+        except RuntimeError as oversized:
+            from desmos.kernel.diagnostics import exception_snapshot
+
+            assert len(_json.dumps(exception_snapshot(oversized, max_chars=512))) <= 512
+        queried = dispatch(world, Block("python", "diag.error()['frames'][-1]['function']", {}))
+        assert queried == "'diag_outer'", queried
+
+        symbol = diag.symbol(diag.threads, source=True, max_chars=1200)
+        assert symbol["name"] == "threads" and symbol["file"].endswith("diagnostics.py"), symbol
+        assert isinstance(symbol["line"], int) and len(_json.dumps(symbol)) <= 1200, symbol
+        assert len(_json.dumps(diag.symbol(type(diag).threads, source=True, max_chars=512))) <= 512
+        assert dispatch(world, Block("python", "diag.symbol(diag.threads)['name']", {})) == "'threads'"
+
+        ready = _threading.Event()
+        release = _threading.Event()
+
+        def _diag_waiter() -> None:
+            ready.set()
+            release.wait()
+
+        waiter = _threading.Thread(target=_diag_waiter, name="diag-blocked", daemon=True)
+        waiter.start()
+        assert ready.wait(1)
+        thread_snap = diag.threads("diag-blocked", depth=8)
+        release.set()
+        waiter.join(1)
+        assert len(thread_snap) == 1 and thread_snap[0]["name"] == "diag-blocked", thread_snap
+        assert any(frame["function"] == "wait" for frame in thread_snap[0]["stack"]), thread_snap
+        assert "locals" not in _json.dumps(thread_snap), thread_snap
+        assert len(_json.dumps(diag.threads(max_chars=512))) <= 512
+
+        custom_diag = object()
+        collision = new_world(cwd, state_path=None, persist=False, ns={"diag": custom_diag})
+        assert collision.ns["diag"] is custom_diag, "kernel diagnostics clobbered user state"
+        collision_none = new_world(cwd, state_path=None, persist=False, ns={"diag": None})
+        assert collision_none.ns["diag"] is None, "kernel diagnostics replaced a user-owned None"
+
         out = dispatch(
             world,
             Block("register", "def handle(body, **a):\n    return body.upper()\n", {"name": "echo", "doc": "uppercase"}),
