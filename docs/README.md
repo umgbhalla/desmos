@@ -6,6 +6,7 @@
 | [tags.md](tags.md) | every tag, its attributes, and its result shape |
 | [self-growth.md](self-growth.md) | how the agent extends itself: tools, notes, skills, generations |
 | [constitution.md](constitution.md) | the invariants self-improvement is not allowed to break |
+| [seat-design.md](seat-design.md) | proposal: durable named seats and a conductor that holds one |
 | [identity.md](identity.md) | which state survives which reset |
 | [extensibility.md](extensibility.md) | writing an extension that registers tags or hooks dispatch |
 | [subagents.md](subagents.md) | child worlds, contracts, fan-out, judgment |

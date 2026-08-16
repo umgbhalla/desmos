@@ -254,6 +254,10 @@ DIR = Path(".desmos/subagents")
 #: ever deleted one. The ledger below is what survives pruning.
 RUNS_KEEP = 200
 LEDGER = DIR / "ledger.jsonl"
+# Transcripts live under the record directory, not beside the records: the
+# pruner globs *.json there, and a sidecar matching that glob would be
+# counted as a run and deleted as one.
+TRANSCRIPTS = DIR / "transcripts"
 #: `_persist` runs on every state transition and a finished run is persisted
 #: more than once (result, then judgment), so the ledger needs a once-per-run
 #: guard or the same dollars are counted twice.
@@ -300,7 +304,41 @@ def _prune_runs(keep: int | None = None) -> int:
             removed += 1
         except OSError:
             pass
+        # A transcript that outlives its record is unreachable, because
+        # resume reads the record first. Drop it with the record.
+        try:
+            (TRANSCRIPTS / path.name).unlink(missing_ok=True)
+        except OSError:
+            pass
     return removed
+
+
+def _write_json(path: Path, value: Any) -> None:
+    """Write whole, then replace, so a crash cannot leave a half record."""
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(value, indent=2, default=str))
+    tmp.replace(path)
+
+
+def _revive(run_id: str) -> tuple[str, list[dict[str, Any]]] | None:
+    """A finished run, read back from disk. None if there is no such run.
+
+    RUNS is process memory, so after a restart every completed child looks
+    absent. The record and its transcript outlived that process, and a run
+    that can still be read is still a run that can be continued.
+    """
+    try:
+        rec = json.loads((DIR / f"{run_id}.json").read_text())
+    except (OSError, ValueError):
+        return None
+    if not isinstance(rec, dict) or rec.get("state") != "done":
+        return None
+    agent = str((rec.get("cfg") or {}).get("agent") or "")
+    try:
+        messages = json.loads((TRANSCRIPTS / f"{run_id}.json").read_text())
+    except (OSError, ValueError):
+        messages = []
+    return agent, messages if isinstance(messages, list) else []
 
 
 def _persist(run: Run) -> None:
@@ -308,7 +346,14 @@ def _persist(run: Run) -> None:
         DIR.mkdir(parents=True, exist_ok=True)
         rec = {k: v for k, v in asdict(run).items() if k != "messages"}
         rec["cfg"] = asdict(run.cfg)
-        (DIR / f"{run.id}.json").write_text(json.dumps(rec, indent=2, default=str))
+        _write_json(DIR / f"{run.id}.json", rec)
+        if run.messages and run.state in ("done", "stopped", "failed"):
+            # The record is read by every status listing and stays a
+            # summary; the transcript is orders of magnitude larger. But
+            # without it a run that outlives its process can only be
+            # described, never continued.
+            TRANSCRIPTS.mkdir(parents=True, exist_ok=True)
+            _write_json(TRANSCRIPTS / f"{run.id}.json", run.messages)
         if run.state in ("done", "stopped", "failed") and run.id not in _LEDGERED:
             _LEDGERED.add(run.id)
             _append_ledger(run)
@@ -837,12 +882,24 @@ def spawn(
     )
     if resume:
         src = RUNS.get(resume)
-        if src is None or src.state != "done":
-            raise ValueError(f"cannot resume from {resume!r}: not a completed run")
-        if src.cfg.agent != cfg.agent:
-            raise ValueError(f"resume identity mismatch: {src.cfg.agent} != {cfg.agent}")
-        run.messages = list(src.messages)
-        run.source = src.id
+        if src is not None:
+            if src.state != "done":
+                raise ValueError(f"cannot resume from {resume!r}: not a completed run")
+            source_agent, source_messages = src.cfg.agent, list(src.messages)
+        else:
+            revived = _revive(resume)
+            if revived is None:
+                raise ValueError(f"cannot resume from {resume!r}: not a completed run")
+            source_agent, source_messages = revived
+            if not source_messages:
+                raise ValueError(
+                    f"cannot resume from {resume!r}: the run finished before its "
+                    "transcript was recorded"
+                )
+        if source_agent != cfg.agent:
+            raise ValueError(f"resume identity mismatch: {source_agent} != {cfg.agent}")
+        run.messages = source_messages
+        run.source = resume
         run.cfg.context = "resumed"
     _launch(run, parent, _register_pending)
     return run.id

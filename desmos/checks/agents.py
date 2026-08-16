@@ -480,6 +480,43 @@ def check() -> None:
             else:
                 raise AssertionError("resume crossed agent identity")
 
+            # --- a finished run outlives the process that ran it. RUNS is
+            # memory only; the record and its transcript are on disk. Popping
+            # the entry is what a restart looks like from inside, and resume
+            # must read the record rather than call the run absent. The sharp
+            # assertion is the identity error: without the disk path both
+            # agent names fail as "not a completed run", so only a record that
+            # was actually read can produce a mismatch.
+            assert (S.TRANSCRIPTS / f"{bid}.json").exists(), "no transcript recorded"
+            restarted = S.RUNS.pop(bid)
+            try:
+                agent_name, carried = S._revive(bid)
+                assert agent_name == "explore", agent_name
+                assert len(carried) == len(restarted.messages), (
+                    len(carried), len(restarted.messages)
+                )
+                assert any("compose an epic" in json.dumps(m) for m in carried), (
+                    "the transcript survived without its task"
+                )
+                try:
+                    S.spawn(
+                        "wrong seat after restart", agent="general",
+                        resume=bid, parent=big_root,
+                    )
+                except ValueError as exc:
+                    assert "identity mismatch" in str(exc), exc
+                else:
+                    raise AssertionError("restart resume crossed agent identity")
+                revived_id = S.spawn(
+                    "carry on after restart", agent="explore",
+                    model="claude-opus-5", resume=bid, parent=big_root,
+                )
+                S.wait(revived_id, timeout=20.0)
+                assert S.RUNS[revived_id].source == bid, S.RUNS[revived_id].source
+                assert S.RUNS[revived_id].cfg.context == "resumed"
+            finally:
+                S.RUNS[bid] = restarted
+
             # --- rerun (C3): a settled run respawns as a fresh id with the
             # same objective, wired to the same parent world. Unknown ids are
             # answered in prose, never raised.
