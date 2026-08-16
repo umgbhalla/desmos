@@ -1,172 +1,187 @@
-# Seat design
+# Seats: a conductor and the agents it conjures
 
-Status: **proposal**. Nothing in this document is built. It exists so it can be
-rejected cheaply.
+Status: design, not schema. Evidence base is thirteen read-only researchers
+over `vendor/exo` and this repo; raw reports with file:line citations are in
+`.desmos/out/seat-research.md` and `.desmos/out/seat-research-2.md`.
 
-It answers one question: what is the smallest set of changes that turns desmos
-subagents into a durable, named, user-gated team with a conductor at its head.
+This is the layer under `docs/constitution.md`. The constitution decided what
+may change and who decides; this decides what a durable working party *is*.
 
-Evidence is thirteen read-only research runs against `vendor/exo` and this
-repository; raw reports with file:line citations are in
-`.desmos/out/seat-research.md`.
+## 1. The shape being built
 
-## The gap in one paragraph
+A **conductor** holds a seat and almost no tools. It does not read files, run
+code, or edit. It delegates, consults durable memory, and talks to the user.
+It can conjure **members**: named agents that persist, accumulate their own
+memory and character, and are addressable later by name. Growing the active
+team is gated by the user; waking an existing member is not.
 
-Desmos can already do the hard parts. It prunes a child's tool table so the
-prompt cannot advertise capability the child does not have, and it blocks the
-call at dispatch even if the tool is reinstalled (`subagent.py:357-378`). It
-has a peer rail: one live session can wake another in the same workspace. Exo
-has neither — it hard-codes a tool list per executor and has no agent-to-agent
-messaging at all. What desmos does not have is **durability of a party**. A
-child gets a fresh world with `state_path=None, persist=False`
-(`subagent.py:341-354`), its transcript is deliberately excluded from the saved
-record (`subagent.py:306-311`), and when the process dies the child dies with
-it. Only the result survives. There is no one to come back to.
+Two claims in that paragraph were assumed to come from exo. Only one does.
 
-## Definitions
+## 2. What exo actually provides
 
-**Seat** — a durable named party with a charter, a memory scope, and a tool
-grant. Survives process restart. Survives a model change. Has lineage.
+Exo's agent record is three fields — a uuid7 id, a slug, and a
+caller-chosen name (`exoharness/src/types.rs:166-171`). No charter, no
+persona, no prompt, no model, no parent pointer. Exo has durable named
+agents; the name is a nameplate, not a self.
 
-**Session** — one live occupancy of a seat by a model. Ends. The seat does not.
+What is genuinely ahead of us:
 
-**Run** — one delegated unit of work inside a session.
+- **Durable agents.** `agents/<id>/record.json` plus an `agents/by-slug`
+  index, with per-agent directories for conversations, bindings, secrets and
+  artifacts. Re-addressable by id or slug; removed only by explicit delete
+  (`basic.rs:937-966`, `921-934`, `1433-1450`).
+- **Model pinned to the agent** at creation, overridable per conversation
+  (`cli/src/main.rs:440-465`, `1819-1827`).
+- **Conjuring works, in an unexpected way.** There is no shipped
+  create-agent tool. The built-ins are shell, inspect_tools, manage_tool,
+  install_agent_tool, uninstall_agent_tool
+  (`typescript/harness/built-in-tools.ts:26-31`). An agent writes a
+  TypeScript tool whose handler calls `exoharness.newAgent({slug, name})`
+  and installs it (`harness/index.ts:281-286`). The model authors its own
+  conjuring instrument.
 
-A subagent today is a run with no seat and no session. That is the whole defect.
+What exo does not have, at all:
 
-## Decision T2 — a seat survives a model change
+- **A gate.** `enable_agent_tool_creation` gates *tool authoring*, not agent
+  creation; there is no flag check on `newAgent`, which forwards straight to
+  Rust (`executor/src/typescript.rs:415-423`, `exoharness/src/server.rs:45-49`).
+- **A way to make a member work.** Authored tools can `listAgents()` and
+  `getAgent(id)` globally, with no ownership check, and can read another
+  agent's conversations — but no send, run, or delegate method exists on
+  Agent or Conversation (`harness/index.ts:244-279`). You can create a
+  colleague and read their mail. You cannot ask them to do anything.
+- **A roster, budget, approval, or evolving trust.** Cost is observational:
+  recorded per model call, totalled per conversation, attributed to no agent
+  (`cli/src/tui.rs:852-889`). The only per-agent budget is
+  `max_tool_round_trips` (`executor_types.rs:31-33`).
+- **Retention policy.** No summarization, no forgetting; only coarse prefix
+  delete of a whole conversation or agent (`basic.rs:1266-1303`).
 
-**Decided: yes.** The seat is the durable party; the model is a binding of one
-session; lineage is the append-only list of those bindings.
+Its containment model differs from ours structurally. A conversation is the
+durable log; session and turn are *tags on events*, not nested records
+(`types.rs:386-395`). The event is the smallest replayable unit. Fork copies
+events through a chosen point plus bindings and artifacts, assigns new ids,
+appends provenance, and leaves the source untouched (`basic.rs:2403-2474`).
 
-This is now evidence-backed rather than taste. Exo pins the model at agent
-creation and lets a conversation override it per launch, which is the same
-shape arrived at independently. It is also the only reading under which the
-stated goal — advanced, fast and cheap models as controlled agents — is
-expressible: you re-point a seat at a cheaper model without destroying who it
-is.
+## 3. What desmos already provides
 
-Consequence for the schema: `model` is an attribute of a session, not of a
-seat, and a change is an event in the seat's own history.
+- **Real per-agent capability enforcement**, in two layers exo has no
+  equivalent of: the child's tool table is pruned so the prompt cannot
+  advertise what it lacks, then dispatch scope blocks execution even if a
+  tool is reinstalled (`agents/subagent.py:320-338`, `357-378`).
+- **The peer rail.** One live session waking another in the same workspace,
+  one turn injected, final speech waking the sender back
+  (`state/persist.py:948-997`, `front/bridge.py:404-452`). This is the
+  member-to-member channel exo lacks entirely.
+- **The conductor role, already written.** `orchestrator` holds
+  agents, memory, system, skill, find — no exec, no edit, budget 1
+  (`subagent.py:43-48`, `60-61`). It is also half-broken: `memory` refuses a
+  non-persistent world, so the one role meant to accumulate judgment is the
+  one that cannot remember, and its runtime block advertises `workspace edit`
+  and `reload` that it does not hold. The prompt lies to it.
+- **Schema room.** `sessions.parent_id` is a nullable self-FK and `kind`
+  already permits `child`, though only attach and resume are ever written
+  (`state/persist.py:449-460`, `699-714`).
 
-## Three findings that constrain the build
+## 4. Definitions
 
-### 1. The conductor already exists, and is half-broken
+- **Seat** — the enduring party. Name, slug, charter, birth generation,
+  append-only model lineage, memory, standing. Does not exist yet.
+- **Session** — one incarnation of a seat: a transcript, a model binding, a
+  cost, a start and an end.
+- **Run** — one dispatched unit of model work.
+- **Conductor** — the seat that holds the roster and no execution tools.
+- **Member** — a seat conjured by the conductor.
 
-The `orchestrator` role holds close to the minimum already: `agents`, `memory`,
-`system`, `skill`, `find` — no exec, no edit, budget 1. Two defects:
+Sessions are days. Seats are people. A model is something a seat wears.
 
-- `memory` refuses a non-persistent world. The one role whose entire purpose is
-  to accumulate judgment across time is the one role that cannot remember
-  anything.
-- It inherits a runtime block advertising `workspace edit` and `reload`, which
-  it does not hold. The prompt lies to it.
+## 5. What the research settles
 
-The true minimum is smaller than the current role: `agents` to delegate, and
-`recall` or `memory` to consult. Speech needs no syscall. Note that delegation
-self-destructs at budget zero — `agents` is removed when the budget runs out,
-which is why `orchestrator` defaults to 1.
+**T2 — a seat survives a model change: yes.** Exo pins the model at agent
+creation and lets a conversation override it. The durable party and the
+model binding are already separate there. A seat therefore owns an
+append-only lineage of model bindings, and switching model starts a new
+binding rather than a new party.
 
-### 2. Turning on child persistence against the parent database is unsafe
+**The conductor must not persist its children's worlds.** This reverses my
+earlier build step. Setting `state_path` on a child does nothing while
+`persist=False`, and turning persistence on is actively unsafe: every World
+reads the process-global `DESMOS_SESSION_ID`, so children would reuse the
+root session row, and concurrent saves overwrite the root transcript, merge
+calls and events, and delete-then-rewrite workspace-wide notes and tools
+(`state/persist.py:28-32`, `675-690`, `758-839`). Durability comes from the
+run record, not from handing a child a database handle.
 
-The tempting one-line fix — give the child a `state_path` — does nothing while
-`persist=False`, and is actively destructive if both are set. Every World reads
-the process-global `DESMOS_SESSION_ID` (`persist.py:28-32,675-690`), so children
-would reuse the *root* session rather than create their own rows. Concurrent
-saves then overwrite the same transcript and FTS rows, merge calls and events,
-and delete-then-rewrite workspace-wide notes and tools (`persist.py:771-839`).
-WAL and `BEGIN IMMEDIATE` prevent corruption; they do not prevent one session
-semantically erasing another. A separate database avoids the collision but
-produces an unlinked attach, not a child.
+**Memory should not move wholesale into SQL.** This also reverses an earlier
+step. The losses are real: line-oriented inspection, salvage from malformed
+lines, file-copy portability, and recovery independent of the database file
+(`state/memory.py:74-91`). This session is the argument — a corrupt harness
+database was survived precisely because a separate file-shaped record
+existed. Keep JSONL as the record of truth, add a seat field to each record,
+and index into the existing FTS table for ranked search, which today is a
+linear unranked substring scan (`memory.py:301-326`) against BM25 for
+history (`persist.py:1504-1544`). Git-diffability is not a dependency:
+`.desmos/` is ignored.
 
-This is the same class of bug as the fold that erased this session's own
-transcript. It should not be re-introduced deliberately.
+**The minimum conductor toolset is smaller than the orchestrator role.**
+Delegation plus durable consultation: agents, and recall or memory. Speech
+needs no syscall. Note that delegation self-destructs at budget zero,
+because the agents tag is removed when the budget is spent
+(`subagent.py:358-361`).
 
-**The smallest durable change is therefore not to persist the child World at
-all.** Include the child's messages in the per-run JSON record that already
-exists, and on `spawn(resume=id)` read and validate that record from disk when
-it is absent from memory. Final state already copies the messages
-(`subagent.py:616-619`); they are simply dropped before writing.
+**Exo's best idea belongs to the conductor.** The RLM executor treats
+context as data: a flattened conversation is loaded into a persistent
+sandboxed JavaScript workspace, the root model emits repl_execute or
+subquery actions, recursive submodels run with tools disabled, and the run
+ends when JS sets a Final value (`executor/src/rlm.rs:70-98`, `309-348`,
+`687-746`). The REPL deliberately has no filesystem or network. The
+principle transfers directly: a party that owns a large record should query
+slices of it rather than page all of it into a prompt. Our version of that
+is delegation — which is what a toolless conductor is forced into anyway.
 
-### 3. Memory cannot be keyed to a seat today
+## 6. What it does not settle
 
-Notes and grown tools are workspace-keyed in SQL and could take a seat foreign
-key tomorrow. Memory records are a JSONL file keyed by a content hash
-(`memory.py:69-71`) — no foreign key is possible without moving them into the
-database.
+- **T1, retention.** Neither system has a policy. Exo can only delete whole
+  conversations; we fold. Still the user's call, and it still blocks the
+  salvage.
+- **Standing.** Whether a member's scope can widen with demonstrated work,
+  or is fixed at conjuring. Exo has static sandbox scopes only.
+- **Cross-repo seats.** Everything here is workspace-local. A seat that
+  follows a person across checkouts is unspecified.
+- **Attribution under concurrent writers.** Already open as T5/T7.
 
-Moving them buys a second thing worth having on its own: memory search today is
-a substring scan over every active record, sorted by scope, kind and ID rather
-than by relevance (`memory.py:301-326`), while history search is already FTS5
-with BM25 ranking (`persist.py:1504-1544`). The move is reversible — rows export
-back to canonical JSONL — but no migration exists.
+## 7. Build order
 
-## What the schema needs
+Each step is independently shippable, and each names the check that proves
+it and the mutation that proves the check.
 
-`sessions.parent_id` is already a nullable foreign key and `kind` already
-permits `'child'` (`persist.py:449-460`). Nothing inserts one: the only kinds
-ever written are `attach` and `resume` (`persist.py:699-714`). The anchor is
-built and unused.
+1. **Run records carry their transcript.** *Shipped in 65a787d.* Include
+   messages in the per-run
+   JSON and hydrate on resume from disk when the run is absent from memory
+   (`subagent.py:306-315`, `838-846`). Check: finish a child holding a
+   unique marker, restart the process, resume its id, assert the marker
+   survived and no root harness row changed. Mutation: drop messages from
+   the saved record — today's behaviour — and the check must fail.
+2. **Seats table.** `seats(id, workspace_id, slug, name, charter, born_gen,
+   status)` plus `sessions.seat_id`. No behaviour change yet; a seat is
+   created for the existing session so nothing is orphaned.
+3. **Model lineage.** Append-only bindings per seat, written on switch.
+   Settles T2 in the schema rather than in prose.
+4. **Named conjuring with a gate.** Resolving an existing seat is free;
+   minting a new one requires user approval. This is the deliberate
+   divergence from exo, whose `newAgent` is ungated. Model tier is gated the same
+   way: re-pointing a seat at a cheaper model is free, escalating it to an
+   expensive one is not.
+5. **Seat-scoped memory.** A seat field on each JSONL record and an FTS
+   index for ranked retrieval. No storage migration.
+6. **Members address each other over the existing peer rail.** Do not build
+   a second channel; exo's absence of one is a gap, not a design.
 
-Additions, in dependency order:
+## 8. Rejected
 
-| change | why |
-|---|---|
-| `seats` table | the durable party: id, name, charter, tool grant, parent seat, created, retired |
-| `sessions.seat_id` | binds an occupancy to a seat; `model` on the session already carries the binding |
-| child messages in the run record | a finished child becomes resumable after a restart |
-| memory rows in SQL | lets a seat own its memory, and replaces substring scan with BM25 |
-| named spawn | resolve an existing seat, or ask the user to create one |
-
-## Gating
-
-Exo is no help here: its cost accounting is observational only, with no
-budgets, no approval gates and no trust system. This is ours to invent.
-
-Proposed, and open to correction:
-
-- Creating a **new named seat** requires the user's explicit yes. Every time.
-- **Re-pointing an existing seat at a cheaper model** does not.
-- **Escalating a seat to an expensive model** does.
-- A seat may never write another seat's memory, and no child may write the root
-  harness. `persist=False` is today's hard boundary and stays the boundary.
-
-## Build order
-
-Smallest first, each independently useful, each with a check that fails if the
-wiring is absent rather than only if the function is wrong:
-
-1. `seats` table and `sessions.seat_id`. Nothing uses them yet.
-2. Persist child messages in the run record; make `spawn(resume=id)` survive a
-   process restart. Test: finish a child carrying a unique marker, restart the
-   process, resume by id, assert the marker is present and root harness rows are
-   unchanged. Mutation: drop `messages` from the saved record — the test must
-   fail.
-3. Move memory into SQL, keyed by seat, exporting back to JSONL to prove
-   reversibility.
-4. Named spawn: resolving an existing seat is free, creating one asks.
-5. Reuse the peer rail for seat-to-seat traffic rather than inventing a second
-   channel.
-
-## What was deliberately not copied from exo
-
-Exo's durable unit is an `Event`; sessions and turns are labels attached to
-events rather than nested durable records. Desmos models sessions, prior turns
-and messages separately. Adopting the event log would be a rewrite of
-persistence for no gain, and the two shapes do not compose.
-
-Exo's RLM executor — context loaded into a sandboxed JS workspace, explored and
-recursively sub-queried by the root model — is a genuinely different idea and
-is not part of this proposal. It is close to what the desmos kernel already
-does with `ns`, and the comparison deserves its own document.
-
-## Still open
-
-These block nothing in step 1 but must be settled before step 3:
-
-- **T1 retention** — what is kept verbatim and what is summarized, and who
-  decides. Also blocks the salvage of 22 recoverable sessions.
-- **T3/T4** — what a seat may change without review.
-- **Evaluation** — what measures this harness improving itself. There is no
-  eval today, so "proven against real work" currently means one agent's
-  judgment and nothing more.
+- **Persisting child worlds.** Unsafe for the reasons in section 5.
+- **Moving memory to SQL.** Loses the independent recovery path that this
+  session depended on.
+- **A new inter-agent transport.** The peer rail exists.
+- **Copying exo's ungated creation.** The user asked for a gate, and the
+  absence of one is exo's weakest point, not its strength.
