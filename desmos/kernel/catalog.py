@@ -86,11 +86,18 @@ def volatile(world: World, delta: str = "") -> str:
     return VOLATILE_MARKER + "\n" + "\n".join(parts) if parts else ""
 
 
-def catalog(world: World) -> str:
-    from desmos.kernel.const import FROZEN
 
+def advertised_names(world: World) -> list[str]:
+    """Canonical families plus truly custom tools; never compatibility aliases."""
+    from desmos.kernel.const import CANONICAL, COMPAT_ALIASES
+
+    canonical = sorted(name for name in world.tools if name in CANONICAL)
+    custom = sorted(name for name in world.tools if name not in CANONICAL | COMPAT_ALIASES)
+    return [*canonical, *custom]
+
+def catalog(world: World) -> str:
     lines = ["# tools"]
-    for name in (*sorted(t for t in world.tools if t in FROZEN), *sorted(t for t in world.tools if t not in FROZEN)):
+    for name in advertised_names(world):
         tool = world.tools[name]
         flag = " frozen" if tool.frozen else ""
         lines.append(f"<{name}>{flag} {tool.doc}")
@@ -139,7 +146,7 @@ def runtime_block(world: World) -> str:
             "  repo-durable (.desmos/, beside harness_state): the harness db (transcript tail, notes, grown tools, generation), memories/records.jsonl, generations/, subagents/, pending/, events/, trajectory/ (self-pruning).",
             "  machine-global (~/.desmos/): settings.json (provider/model/effort — one file for every checkout), auth.json, user skills and extensions. rm -rf .desmos does not touch them.",
             "  in memory only: ns values, messages beyond the persisted tail, shells, pending monitors. reload_sdk keeps them; a process restart does not.",
-            "  <rollback n> restores notes/tools/prior from generations/n and nothing else — it never touches messages, files, or memory records.",
+            "  harness op=rollback restores notes/tools/prior only; it never touches messages, files, or memory records.",
             "  a fork (persist=False child) inherits none of the db and writes none back. What future turns need goes in a memory record, a note, or a file — never only in speech or ns.",
             f"sdk: {sdk}",
             f"  ABI: {sdk / 'const.py'}",
@@ -171,15 +178,15 @@ def runtime_block(world: World) -> str:
             "transcript: world.messages is append-only within a session — nothing already sent is rewritten or reordered. step() continues it. Syscall output arrives as user <result> blocks — not a restated task. Never write a result block in your own speech. Two explicit exceptions: what survives a process restart is the tail persist kept, not the whole chat; and reset() (the TUI reset op) drops the chat outright so a poisoned turn cannot train the next one.",
             "compaction: server-side (beta compact-2026-01-12, strategy compact_20260112) on adaptive models. Past the trigger the API folds earlier turns and returns a compaction block inside the assistant message; that block is replayed and replaces everything before it on the next POST. Nothing local is rewritten and the ABI/catalog cache blocks are untouched, so a fold never invalidates the cached prefix. A fold emits ev compacted and paints a FOLD card on the wire pane. Earlier turns you cannot see verbatim were folded, not lost — do not restate them.",
             "complete: Opus 5 is adaptive thinking + output_config.effort (default low). Older Claude 4 uses a token budget + interleaved thinking. Thinking/redacted blocks are replayed on the wire, not restated as speech. Live: POST in is emitted before the HTTP body; thinking and speech stream as the model writes (grok StreamingMarkdownRenderer / thinking_streaming). A syscall card opens when the tag starts; bash/python stdout streams into that Execute card; the user <result> is the finished output. The TUI paints those events as they arrive — a turn is not a single paint at the end.",
-            "reload: every turn rediscovers skills/extensions. After writing SKILL.md this turn, emit <reload/> then <skill name=\"…\"/>, or wait one turn.",
-            "reload_sdk: <reload_sdk/> reimports desmos.*, reseeds missing builtins, rebinds step. Does not wipe ns, notes, or messages. New ABI/loop apply on the next complete().",
-            "edit: <edit path=\"file\">old\\n---\\nnew</edit> — exactly one occurrence. Relative paths are cwd-relative. Or edit.run(path, old, new).",
+            "harness reload: op=reload rediscovers skills/extensions; op=skill loads one by name.",
+            "harness reload-sdk: reimports desmos.*, reseeds builtins, and rebinds step without wiping state.",
+            "workspace edit: op=edit, path=, and body old\\n---\\nnew replaces exactly one occurrence.",
             "python diagnostics: diag.error() returns the automatically recorded last uncaught exception; diag.symbol(obj, source=False) gives bounded location/signature/source metadata; diag.threads(pattern=None) gives bounded file/function/line stacks without locals.",
             "find: fff search over cwd. mode=path (default, fuzzy/typo-resistant paths + inline glob constraints), glob, grep, symbol (definitions first + usages), or multi (newline-separated patterns; optional constraints=). grep/symbol/multi accept match=plain|regex|fuzzy and context=N; limit=20. Your edits feed frecency. Absent build names scripts/build-fff-python.sh.",
-            "recall: <recall limit=\"10\">query</recall> — BM25 search over prior-session history through the external memex-desmos fork (shells one `memex search --json-array`, no daemon). Results are spill-capped user-role text, secret-scrubbed like every result; children are pinned to source=desmos (this system's own events, not the whole machine). mode=hybrid|semantic opts into embeddings at ONNX-init cost. Absent fork refuses and names scripts/memex-setup.sh; then bash/rg over .desmos/events/*.jsonl.",
-            "grow: write .desmos/skills/<name>/SKILL.md (optional handle/run). <system name> for doctrine. <tool> to rewrite a description. Then <evolve>why</evolve>.",
-            "unstick: read the error, fix attrs, retry. Unknown tag → register it first. Nameless <system> writes note \"note\".",
-            "rollback: <rollback n=\"1\"/>. Read the docs above before changing the harness.",
+            "knowledge recall: op=recall searches prior-session history; limit and mode are optional.",
+            "grow: write a SKILL.md, then use harness op=reload or op=skill; knowledge op=system stores doctrine.",
+            "unstick: read the error, fix attrs, retry; use harness op=register only for repeated operations.",
+            "rollback: harness op=rollback with n=1. Read the docs before changing the harness.",
         ]
     )
 

@@ -17,9 +17,10 @@ shapes — and a way to run code against them. Everything it wants, it fetches.
 That single choice explains most of the rest of the design: the context window
 holds decisions and results, not payloads.
 
-The second choice: capability is discovered, not compiled in. Thirteen frozen
-XML tags are the brainstem. Every other tool, note, skill and description is
-written by the agent, at runtime, into state that outlives the process.
+The second choice: capability is discovered, not compiled in. Seven canonical
+XML families are advertised through one external syscall tool. Legacy names
+remain accepted but hidden; every custom tool, note, skill and description can
+still be written by the agent into state that outlives the process.
 
 ## The turn
 
@@ -54,17 +55,18 @@ The point of the architecture is that almost nothing lives in the frozen layer.
 
 | layer | lives in | changed by | cost per turn |
 |---|---|---|---|
-| frozen ABI | `desmos/const.py` (`FROZEN`) | a commit, an ABI break | always in the prompt |
-| grown tools | `.desmos/harness.sqlite3` | `<register>` at runtime | one catalog line each |
-| notes | same | `<system>` | full text, every turn |
-| skills | `SKILL.md` files on disk | a file write, then `<reload/>` | name + description only |
-| extensions | `.desmos/extensions/*.py` | a file write, then `<reload/>` | whatever they register |
-| memory | `.desmos/MEMORY.md` + index | `<memory>` | a short routing summary |
+| canonical ABI | `desmos/kernel/const.py` (`CANONICAL`) | a commit | seven lines in the prompt |
+| accepted aliases | same (`COMPAT_ALIASES`) | compatibility-only | hidden |
+| grown tools | `.desmos/harness.sqlite3` | harness `op=register` | one catalog line each |
+| notes | same | knowledge `op=system` | full text, every turn |
+| skills | `SKILL.md` files on disk | a file write, then harness `op=reload` | name + description only |
+| extensions | `.desmos/extensions/*.py` | a file write, then harness `op=reload` | whatever they register |
+| memory | `.desmos/MEMORY.md` + index | knowledge `op=memory` | a short routing summary |
 
-Grown tools and notes are per-machine state, not repo content. A clone of this
-repo has the thirteen frozen tags and nothing else; the drawer of `<grep>`,
-`<read>`, `<todo>` and friends in a live session was written by the agent that
-needed them.
+Grown tools and notes are per-machine state, not repo content. A fresh clone
+advertises the same seven families. Legacy names and old grown operations can
+still execute for transcript and generation compatibility but do not consume
+catalog lines.
 
 The price of a tool is one catalog line in **every** request from then on. That
 is the whole cost model, and it is why "write a skill" (name + description only,
@@ -266,8 +268,8 @@ and routes cannot leak by construction.
 
 Things that must stay true. Most bugs worth the name were one of these breaking.
 
-1. `FROZEN` does not grow or change. Every persisted generation on every machine
-   was written against it.
+1. Canonical family names and operation meanings do not change. Accepted legacy
+   aliases may grow for compatibility, but never reappear in the advertised catalog.
 2. The harness imports stdlib only. `dependencies = []`.
 3. Dispatch returns a string for every input, including hostile ones.
 4. A syscall body ends at its first closer; `end=` is the only escape.

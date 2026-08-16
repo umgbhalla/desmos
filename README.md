@@ -32,9 +32,10 @@ context window ends up holding decisions and results instead of payloads, and
 sequential `step` calls share one transcript.
 
 The second half of the idea: **capability is discovered, not compiled in.**
-Thirteen frozen XML tags are the brainstem. Every other tool, description, note
-and skill is written by the agent, at runtime, into state that survives the
-process. The next `complete()` sees the change. No restart.
+One external syscall tool advertises seven capability families. Earlier tag
+names remain accepted as hidden compatibility aliases, while custom tools,
+descriptions, notes and skills can still be written by the agent into durable
+runtime state. The next `complete()` sees the change. No restart.
 
 ## Quickstart
 

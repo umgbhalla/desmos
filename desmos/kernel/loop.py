@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
-from desmos.kernel.catalog import header, ns_names, system_prompt
+from desmos.kernel.catalog import advertised_names, header, ns_names, system_prompt
 from desmos.kernel.const import FROZEN, MAX_TOKENS, PRIOR_KEEP
 from desmos.kernel.dispatch import dispatch
 from desmos.kernel.diagnostics import install_diagnostics
@@ -183,6 +183,13 @@ _BUILTIN_DOCS = (
         "memory",
         "structured durable memory: body remembers; actions show/search/read/forget/verify/consolidate",
     ),
+    ("exec", "op=python|bash|shell — computation and persistent process sessions"),
+    ("workspace", "op=find|read|edit|see|commit — repository search, files, media, and version control"),
+    ("knowledge", "op=memory|recall|system|todo — durable facts, history, doctrine, and work state"),
+    ("harness", "op=register|describe|skill|reload|reload-sdk|evolve|rollback — self-extension lifecycle"),
+    ("observe", "op=usage|trajectory|retrace|error|symbol|threads — bounded diagnostics and telemetry"),
+    ("agents", "op=spawn|fanout|status|result|structured-result|judgment|wait — child orchestration"),
+    ("session", "op=compact|status|switch — conversation and model lifecycle"),
 )
 
 
@@ -1272,7 +1279,7 @@ def run(args: Any) -> int:
     summary = {
         "task": args.task,
         "ns": ns_names(world),
-        "tools": {n: t.doc for n, t in world.tools.items()},
+        "tools": {name: world.tools[name].doc for name in advertised_names(world)},
         "notes": world.notes,
         "turns": len(world.log),
         "usage": [e.get("usage") for e in world.log],

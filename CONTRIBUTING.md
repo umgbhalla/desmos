@@ -10,10 +10,11 @@ changing anything under `desmos/`.
 - **The harness is stdlib-only.** `pyproject.toml` has `dependencies = []` and it
   stays that way. IPython lives behind the optional `kernel` extra; anything else
   belongs in a skill or an extension, not in `desmos/`.
-- **The frozen tag set is an ABI.** `FROZEN` in `desmos/const.py` is what every
-  prompt promises. Adding, renaming or repurposing one of those tags breaks every
-  persisted generation on every machine. New capability goes in as a grown tool,
-  a skill, or an extension.
+- **Canonical names are the advertised ABI.** `CANONICAL` defines the seven
+  capability families promised to new prompts; `COMPAT_ALIASES` keeps old
+  transcripts executable without advertising their names. Do not repurpose a
+  canonical operation or remove an accepted alias. New repeated capability
+  belongs under an existing family, or in a grown tool, skill, or extension.
 - **Never commit key material.** CI greps the whole tree, `vendor/` included, for
   key-shaped strings. `.env.example` shows the shape; real keys live in the
   environment or `~/.desmos/auth.json`.

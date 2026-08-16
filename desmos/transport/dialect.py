@@ -69,9 +69,9 @@ def growth() -> str:
     """When to build a tool, not just how.
 
     The prompt already said "grow what you need as you go" and then only ever
-    explained mechanics -- where a SKILL.md lives, what attrs <register>
+    explained mechanics -- where a SKILL.md lives, what attrs harness op=register
     takes. Exhortation plus a manual is not a decision procedure: it never
-    said at what point in a task the answer stops being another <python> and
+    said at what point in a task the answer stops being another exec op=python and
     starts being a tag. So the model wrote the same block three times and
     called that working.
 
@@ -81,11 +81,11 @@ def growth() -> str:
         [
             "# building your own tools",
             "The frozen tags are not your toolset. They are what a toolset gets built from:"
-            " <register> installs a tag that is live on the very next dispatch and survives into"
+            " harness op=register installs a tag that is live on the very next dispatch and survives into"
             " later sessions, a skill is a file the catalog lists by name and loads only when"
             " asked for, a note is doctrine that rides in every prompt from then on.",
             "Build one when the work says so. The signals are concrete: you have written close to"
-            " the same <python> a third time; the task has many units differing only by an"
+            " the same exec op=python a third time; the task has many units differing only by an"
             " argument -- forty files, twenty endpoints, every row of a table; or you worked"
             " something out that was not obvious and a later turn would have to work it out"
             " again from nothing.",
@@ -163,16 +163,16 @@ def capabilities() -> str:
             "extensions: a .py under .desmos/extensions gets api.tool(name, doc, handler) to add a"
             " tag and api.hook(\"before_dispatch\", fn) to inspect or veto one -- returning a string"
             " from that hook replaces the syscall result and the call never runs.",
-            "<edit> also accepts old_str= and new_str= as attributes when the body form is awkward.",
-            "state: <python> calls share one kernel -- a name bound in one is there in the next,"
-            " this turn and later turns. Prefer <shell id=\"main\"> for command work: its cwd,"
+            "workspace op=edit also accepts old_str= and new_str= as attributes when the body form is awkward.",
+            "state: exec op=python calls share one kernel -- a name bound in one is there in the next,"
+            " this turn and later turns. Prefer exec op=shell with id=main for command work: its cwd,"
             " environment, interactive process, and unfinished build survive across calls."
             " There are no read windows to choose and nothing to poll: a command that outlives"
             " the first look is taken over by a monitor that owns the terminal, and the step is"
             " resumed with its output when it actually finishes. A result saying it is monitored"
             " means the work is still going -- go do something else, or interrupt it. A program"
-            " that asks a question comes back saying so; answer it with another <shell> on the"
-            " same id. Use <bash> only for a quick hermetic one-shot where a fresh subprocess is"
+            " that asks a question comes back saying so; answer it with another exec op=shell on the"
+            " same id. Use exec op=bash only for a quick hermetic one-shot where a fresh subprocess is"
             " the point.",
             "a failing call does not stop the ones after it. Every tag in the turn runs, and you get"
             " every result. If a later call only makes sense when an earlier one succeeded, put it"
@@ -182,7 +182,7 @@ def capabilities() -> str:
             "a body ends at the first closing tag, so a body that contains its own closer is"
             " cut there and the rest leaks out as speech -- which is what makes editing this"
             " codebase hazardous, since its sources are full of literal tag text. Declare an"
-            " end token instead: <python end=\"X\"> runs to </python:X> and any bare"
+            " end token instead: an end-token exec call runs to its tokenized closer and any bare"
             " </python> inside it is ordinary text. It works on every tag, the token is any word,"
             " and the attribute never reaches the handler. Use it for edits to harness code,"
             " for tests that quote calls, and any time you would otherwise build a closing tag"
@@ -190,7 +190,7 @@ def capabilities() -> str:
             "results arrive after your whole message, never mid-sentence. So do not write prose"
             " that predicts what a call will return, and do not branch in this reply on a value"
             " this reply is still computing. Read the results next turn.",
-            "switching model or effort mid-session: switch(\"claude-opus-5\") from <python>, or"
+            "switching model or effort mid-session: switch(\"claude-opus-5\") from exec op=python, or"
             " switch(\"gpt-5.6-sol\", \"high\"). It validates the choice, checks this machine has a"
             " credential for that provider, saves it, and returns a line describing what changed."
             " The new model drives the next turn -- not the rest of this reply, which is already"

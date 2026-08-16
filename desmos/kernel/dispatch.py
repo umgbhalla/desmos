@@ -6,7 +6,7 @@ import weakref
 from inspect import signature
 from typing import Any, Callable, Iterable
 
-from desmos.kernel.const import FROZEN
+from desmos.kernel.const import CANONICAL, FROZEN
 from desmos.kernel.edit import apply_edit, apply_edit_line, parse_edit_body  # noqa: F401  (apply_edit: facade re-export)
 from desmos.kernel.exec import register_tag, run_bash, run_python
 from desmos.kernel.const import RESULT_CAP
@@ -131,6 +131,19 @@ def _dispatch(
     should_stop: Callable[[], bool] | None = None,
     meta: dict[str, Any] | None = None,
 ) -> str:
+    canonical_direct = None
+    if block.tag in CANONICAL:
+        from desmos.kernel.canonical import normalize, policy_target
+
+        normalized = normalize(world, block)
+        if isinstance(normalized, str):
+            return normalized
+        if normalized.tag in CANONICAL:
+            canonical_direct = normalized
+            block = Block(policy_target(normalized), normalized.body, normalized.attrs)
+        else:
+            block = normalized
+
     # Before the hooks and before the frozen chain: a denied tag must not reach
     # third-party code and must not run. Refuse in prose, never raise -- a raise
     # here kills the child's turn instead of teaching it what it may call.
@@ -139,7 +152,7 @@ def _dispatch(
     # the unknown-tag answer below, which is where "speak when done" lives.
     scope = scope_of(world)
     if scope is not None and block.tag not in scope:
-        if block.tag in FROZEN or block.tag in world.tools:
+        if canonical_direct is not None or block.tag in FROZEN or block.tag in world.tools:
             return (
                 f"<{block.tag}> is outside this agent's scope. "
                 f"Allowed: {', '.join(sorted(scope)) or 'none'}."
@@ -165,6 +178,10 @@ def _dispatch(
             )
         except Exception:
             return traceback.format_exc()
+    if canonical_direct is not None:
+        from desmos.kernel.canonical import direct
+
+        return direct(world, canonical_direct)
     if block.tag == "python":
         return run_python(block.body, world, on_chunk=on_chunk)
     if block.tag == "bash":
@@ -247,7 +264,9 @@ def _dispatch(
         return handle_memory(world, block.body, block.attrs)
     tool = world.tools.get(block.tag)
     if tool is None or tool.handler is None:
-        known = ", ".join(sorted(world.tools) or sorted(FROZEN))
+        from desmos.kernel.catalog import advertised_names
+
+        known = ", ".join(advertised_names(world)) or "none"
         return f"unknown tag <{block.tag}> — not a syscall. Known: {known}. Speak without XML when done."
     try:
         return spill(

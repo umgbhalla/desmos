@@ -54,6 +54,10 @@ ALLOWED_FN_EDGES = {
     ("desmos.kernel.dispatch", "desmos.state.generations"),
     ("desmos.kernel.dispatch", "desmos.state.memory"),
     ("desmos.kernel.dispatch", "desmos.state.persist"),
+    ("desmos.kernel.canonical", "desmos.agents.subagent"),
+    ("desmos.kernel.canonical", "desmos.state.compact"),
+    ("desmos.kernel.canonical", "desmos.state.persist"),
+    ("desmos.kernel.canonical", "desmos.transport.complete"),
     ("desmos.kernel.exec", "desmos.state.persist"),
     ("desmos.kernel.loop", "desmos.agents.pending"),  # resume seam
     ("desmos.kernel.loop", "desmos.state.persist"),  # per-call usage ledger

@@ -1,279 +1,119 @@
-# Tag reference
+# Syscall reference
 
-Text a model writes is speech. An XML tag is a syscall. This page lists every
-tag the harness ships with, what it accepts, and what comes back.
+Models have one external tool, `syscall`. Its input contains one or more XML
+calls. Desmos advertises seven canonical capability families; each requires an
+`op` attribute.
 
-## The medium
+## Wire rules
 
-- **Results are user-role messages.** Each call comes back as a
-  `<result tag="..."&gt;...</result>` block on the same transcript. There is no
-  separate tool channel.
-- **Every tag in a reply runs**, in written order, and all results arrive
-  together in the next message. A failing call does not stop the ones after it.
-  A call that needs an earlier result belongs in the next turn.
-- **A body ends at its first closing tag.** If the body must contain tag text,
-  declare an end token: any tag accepts `end="TOKEN"`, and the body then runs to
-  `&lt;/tag:TOKEN&gt;`. This is not optional when editing this codebase — its
-  sources are full of literal tag text.
-- **An unclosed tag is dropped in silence.** No result, no error; the turn looks
-  like nothing was called.
-- **Results are capped** at 6000 characters. Anything longer is written whole to
-  `.desmos/out/NNNN-tag.txt` and the result opens with a pointer to that file.
-  Nothing is discarded; it just is not spent on context.
-- **Nothing raises.** A denied tag, an unknown tag, a handler that throws — all
-  come back as readable text.
+- Text is speech; XML calls are syscalls.
+- Calls in one response execute in order and return together next turn.
+- A failure does not stop later independent calls.
+- Results over the inline cap spill under `.desmos/out/`.
+- A body containing tag syntax must use `end="TOKEN"`.
+- Unknown families and operations fail without raising into the agent loop.
 
-## Frozen tags
+## Canonical families
 
-Thirteen tags are the ABI (`FROZEN` in `desmos/const.py`). They are present in
-every session on every machine and never change.
+### exec
 
-### python
+`op=python|bash|shell`
 
-Executes in the persistent kernel. Names bound in one call are there in the
-next, this turn and in later turns. stdout streams into the call's card as it is
-produced.
+- `python` executes in the persistent in-process namespace.
+- `bash` is a fresh hermetic command with a bounded timeout.
+- `shell` is a named persistent PTY; `id`, `interrupt`, and `close` retain their
+  established meanings. Long commands are monitored and resume the loop when
+  they finish.
 
 ```
-<python>x = load(); print(len(x))</python>
+<exec op="python">value = 40 + 2</exec>
+<exec op="shell" id="main">cargo test</exec>
 ```
 
-Prints go to the result; the value of the last expression does not. Peek at
-shapes, not contents — dumping the heap into chat is what this harness exists to
-avoid.
+### workspace
 
-### bash
+`op=find|read|edit|see|commit`
 
-A one-shot subprocess in the world's cwd. No state survives it: not the cwd, not
-an export, not a background job. Timeout is 60s.
-
-```
-<bash>git status --short</bash>
-```
-
-Use it for a quick hermetic command where a fresh process is the point.
-
-### shell
-
-The preferred way to run commands. A named persistent pty whose cwd,
-environment, virtualenv, interactive process and unfinished build survive across
-calls.
-
-| attribute | meaning |
-|---|---|
-| `id` | session name, default `main`. Different ids are different terminals. |
-| `interrupt` | `1` sends an interrupt to whatever is running on that session. |
-| `close` | `1` ends the session and frees the pty. |
+- `find` exposes fff path, glob, grep, symbol, and multi-pattern modes.
+- `read` accepts `path`, `lines`, or `head` and returns numbered bounded text.
+- `edit` uses the exact old/new body separated by a line containing `---`.
+- `see` attaches paths or captures the screen.
+- `commit` takes the commit message in the body; `add`, `only`, and `amend`
+  preserve the safe message-file behavior.
 
 ```
-<shell id="build">cargo test -p desmos-tui</shell>
-```
-
-There is no polling and no read window to choose. A command that outlives the
-first look is taken over by a monitor that owns the terminal, and the step is
-resumed with its output when the command actually finishes — a result that says
-it is monitored means the work is still running. A program that asks a question
-comes back saying so; answer it with another call on the same id.
-
-Shells are process-lifetime only. They are deliberately not persisted: a pty
-cannot be restored from JSON, and pretending otherwise would hand back a session
-whose `cd` silently did not survive.
-
-### find
-
-A long-lived, watched `fff` index over the world's cwd. The default `path` mode
-does typo-resistant fuzzy filename search, ranks by git state and frecency, and
-accepts inline constraints such as `*.rs`, `src/`, and `!tests/`. Successful
-edits automatically feed its frecency ranking.
-
-| attribute | meaning |
-|---|---|
-| `mode` | `path` (default), `glob`, `grep`, `symbol`, or `multi` |
-| `limit` | maximum returned paths or matching lines, default 20 |
-| `match` | content matcher: `plain` (default), `regex`, or `fuzzy` |
-| `context` | lines before and after each content match, clamped to 0–20 |
-| `constraints` | file constraints for `multi`; its body is one pattern per line |
-
-`grep` uses SIMD content search and marks classified definitions. `symbol` puts
-definitions before usages. `multi` performs one Aho–Corasick search for several
-identifiers rather than making sequential calls. Content queries can prepend
-the same constraints inline, for example `*.py Widget`. The index supports
-watcher updates, smart case, git-aware ranking, query history, and frecency;
-pagination and scan lifecycle are managed internally rather than exposed as
-agent-facing knobs.
-
-The Python extension is built by `scripts/build-fff-python.sh`. If absent,
-`find` refuses explicitly instead of silently falling back to a second
-implementation.
-
-### edit
-
-Replace exactly one occurrence in a file. Fails loudly if the old text is absent
-or appears more than once — that assertion is the whole point, because a stale
-read then aborts instead of clobbering a file someone else moved.
-
-```
-<edit path="desmos/const.py">BASH_TIMEOUT = 60
+<workspace op="find" mode="symbol">seed_builtins</workspace>
+<workspace op="read" path="README.md" head="40"/>
+<workspace op="edit" path="file.py">old
 ---
-BASH_TIMEOUT = 90</edit>
+new</workspace>
 ```
 
-The body is `old`, a line containing only `---`, then `new`. When that shape is
-awkward — the body itself contains a `---` line — pass `old_str=` and `new_str=`
-as attributes instead. Paths are relative to the world's cwd.
+### knowledge
 
-### register
+`op=memory|recall|system|todo`
 
-Installs a new tag, live on the very next dispatch, persisted into state and
-present in later sessions.
+- `memory` manages curated cross-session facts.
+- `recall` searches prior Desmos events.
+- `system` writes or deletes always-present doctrine.
+- `todo` appends, completes, removes, and lists persistent work items.
 
-```
-<register name="wc" doc="line count of a path">
-def handle(body, **attrs):
-    return str(len(open(body.strip()).read().splitlines()))
-</register>
-```
+### harness
 
-The body defines `handle(body, **attrs)`. `name` must be an identifier and must
-not be a frozen tag. The source is stored, so the tool is rebuilt on load.
+`op=register|describe|skill|reload|reload-sdk|evolve|rollback`
 
-Register a tag when the same call has been written a third time, or when a task
-has many units differing only by an argument. Do not register one for something
-that happens once: the price is a catalog line in every request, forever.
+This family owns self-extension and grown-state lifecycle. Register installs an
+operation, describe changes its catalog line, skill loads detailed procedure
+text, reload refreshes resources, reload-sdk reimports Desmos Python modules,
+and evolve/rollback snapshot or restore grown state.
 
-### system
+### observe
 
-Writes or deletes a note. Notes are doctrine — they ride verbatim in every
-prompt from then on, so they are the most expensive kind of memory and should
-hold only what must shape every turn.
+`op=usage|trajectory|retrace|error|symbol|threads`
 
-```
-<system name="verify-dont-read">A dump is not verification.</system>
-<system name="verify-dont-read" delete="1"/>
-```
+Read-only diagnostics and telemetry. Error, symbol, and threads are bounded
+views backed by the persistent kernel's `diag` object and never return locals.
 
-### tool
+### agents
 
-Rewrites a tool's one-line catalog description without touching its handler.
+`op=spawn|fanout|status|result|structured-result|judgment|wait`
 
-```
-<tool name="wc" doc="count lines, words, bytes of a path"/>
-```
+Spawn accepts the task body and optional agent/model/thinking attributes.
+Fanout separates task bodies with a line containing `---`. Result operations
+take an id in the body or `id`; wait accepts whitespace- or comma-separated ids.
 
-### skill
+### session
 
-Loads a full `SKILL.md` into the transcript. The catalog carries only names and
-descriptions; the body is fetched on demand, which is why a skill is the cheap
-place to put a long procedure.
+`op=compact|status|switch`
 
-```
-<skill name="subagent-brief"/>
-```
+Compaction accepts `keep` and `floor`. Status reports model, effort/generation,
+and transcript size. Switch takes the model in the body or `model`, with
+optional `effort`; it applies from the next turn.
 
-### reload
+## Compatibility aliases
 
-Rediscovers skills and extensions now, instead of at the next turn boundary.
-Emit it after writing a `SKILL.md` if you want to load that skill in the same
-turn.
+Earlier transcripts and persisted generations may contain the former names.
+They remain accepted by dispatch but are deliberately omitted from the tool
+catalog and ABI prompt. Canonical calls normalize before scope checks and
+extension hooks, so existing policies continue to see the underlying operation
+such as `bash`, `edit`, or `memory`.
 
-### reload_sdk
+The accepted aliases are:
 
-Reimports `desmos.*`, reseeds missing builtins and rebinds `step` without
-restarting the process. `ns`, notes and the transcript survive. The new ABI and
-loop apply on the next `complete()` — not to the reply being written.
+- execution: `python`, `bash`, `shell`
+- workspace: `find`, `grep`, `read`, `edit`, `see`, `commit`
+- knowledge: `memory`, `recall`, `system`, `todo`
+- harness: `register`, `tool`, `skill`, `reload`, `reload_sdk`, `evolve`,
+  `rollback`
+- observation/session: `usage`, `traj`, `trajectory_retrace`, `compact`
+- retired utility: `sleeper`
 
-Required after editing anything under `desmos/`: without it the live kernel
-keeps running the module it imported.
+Compatibility does not imply advertisement. New prompts and documentation use
+only the seven families.
 
-### evolve
+## Extensibility
 
-Snapshots the grown state — tools, notes, descriptions — as the next numbered
-generation under `.desmos/generations/`. The body is the reason, and it is worth
-writing properly; it is what a future rollback reads.
-
-```
-<evolve>added the shell monitor and retired the polling guidance</evolve>
-```
-
-### rollback
-
-Restores generation `n` counting back from now.
-
-```
-<rollback n="1"/>
-```
-
-### memory
-
-Durable memory across sessions, kept out of the prompt except for a short
-routing summary. The action comes from the `action` attribute, or from the first
-word of the body.
-
-| body | effect |
-|---|---|
-| `fact` | remember (default action) |
-| `show` | print the index |
-| `search PAT` | search (`grep` is an alias) |
-| `read ID` | read one record |
-| `forget ID` | drop one record |
-| `verify ID` | re-check a record against reality |
-| `consolidate` | fold the store |
-
-Attributes: `action`, `id`, `scope` (default `repo`), `kind`, `confidence`,
-`source`, plus `max` and `mode` for search.
-
-## Grown tags
-
-Everything else a live session shows is not in this repo. It was registered at
-runtime by the agent and lives in `.desmos/harness.sqlite3` on that machine.
-A fresh clone starts with the thirteen frozen tags and grows its own.
-
-A mature session typically carries some of: `read`, `grep`, `commit`, `todo`,
-`usage`, `traj`, `compact`, `see`, `sleeper`. None of them are guaranteed, and
-the catalog in the system prompt is always the authoritative list — a tag not
-named there does not exist in that session.
-
-## Extension tags
-
-An extension is a Python file under `.desmos/extensions/` or
-`~/.desmos/extensions/` with a `load(api)` function. It can register tags and
-hook dispatch:
-
-```python
-def load(api):
-    api.tool("hello", "say hello", lambda body, **a: "hello " + body.strip())
-    api.hook("before_dispatch", veto)
-
-def veto(world, block):
-    if block.tag == "bash" and "rm -rf /" in block.body:
-        return "refused"   # a string replaces the result; the call never runs
-```
-
-The hook runs before the handler and can veto any call. See
-[extensibility.md](extensibility.md).
-
-## Subagents
-
-`spawn`, `fanout`, `spawn_many`, `wait`, `gather`, `status`, `result`,
-`structured_result` and `judgment` are Python functions on `desmos.subagent`,
-usually reached through an `agents` tag a session has grown. A child is an
-isolated `World` with its own transcript, a scoped tag set, and no ability to
-write parent state. Depth is capped at 1.
-
-Under a contract, `result(id)` is the child's story about its own work and
-`judgment(id)` is the harness's verdict on that story. Read the verdict.
-Details in [subagents.md](subagents.md).
-
-## Choosing where a capability goes
-
-| lifetime | put it in |
-|---|---|
-| this one call | nothing — just write the call |
-| an operation you will run again | a grown tag (register) |
-| a procedure with real detail | a skill (SKILL.md, loaded on demand) |
-| doctrine that must shape every turn | a note (system) |
-| behaviour for every session on this machine | an extension |
-
-The deciding question is not effort. It is how many turns pay for it: a note and
-a tag cost tokens on every request from now on, a skill costs one catalog line
-until someone asks for it.
+Custom registered and extension tools remain visible alongside the canonical
+families unless their name is a compatibility alias. A skill is still loaded
+on demand; its metadata appears in the skills catalog rather than becoming
+another syscall family.

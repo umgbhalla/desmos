@@ -14,7 +14,7 @@
 ## Checklist
 
 - [ ] No new runtime dependency in `desmos/` — the harness stays stdlib-only.
-- [ ] `FROZEN` in `desmos/const.py` is unchanged, or the PR explains why the ABI break is worth it.
+- [ ] `CANONICAL` operation meanings are unchanged; any new compatibility alias remains hidden from advertisement.
 - [ ] No key material, transcript, or `.desmos/` state in the diff.
 - [ ] `vendor/` untouched, or the change is called out explicitly.
 - [ ] Docs updated when behaviour changed: `README.md`, `docs/`, `AGENTS.md`.

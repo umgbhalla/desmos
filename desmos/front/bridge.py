@@ -13,7 +13,7 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-from desmos.kernel.catalog import ns_names
+from desmos.kernel.catalog import advertised_names, ns_names
 from desmos.kernel.loop import new_world, reload, reload_sdk, reset_transcript, run_turns
 
 
@@ -43,7 +43,7 @@ def _snapshot(world: Any) -> dict[str, Any]:
         "generation": world.generation,
         "cwd": str(world.cwd),
         "ns": ns_names(world),
-        "tools": sorted(world.tools),
+        "tools": advertised_names(world),
     }
 
 

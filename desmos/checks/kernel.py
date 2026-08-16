@@ -78,13 +78,13 @@ def check() -> None:
         # so the name is derived from the module that writes it.
         from desmos.spill import SPILL_DIR as _spill_dir
         assert _spill_dir in caps, "the prompt does not say where a spilled result lands"
-        assert 'Prefer <shell id="main">' in caps
+        assert "Prefer exec op=shell with id=main" in caps
         # The model must never be asked to size a read window; that was prompt
         # noise describing transport, and it taught polling.
         assert "no read windows to choose and nothing to poll" in caps
-        _state_line = next(l for l in caps.split("\n") if l.startswith("state: <python>"))
+        _state_line = next(l for l in caps.split("\n") if l.startswith("state: exec op=python"))
         assert "timeout" not in _state_line, _state_line
-        assert "Use <bash> only for a quick hermetic one-shot" in caps
+        assert "Use exec op=bash only for a quick hermetic one-shot" in caps
         for _name in _sa.AGENTS:
             assert _name in caps, _name
         # fanout's default agent is not spawn's. The prompt says so because a
@@ -224,6 +224,44 @@ def check() -> None:
         assert dispatch(world, blocks[0]) == "ok"
         assert world.ns["x"] == 2
         assert dispatch(world, blocks[1]).strip() == "hi"
+
+        # The advertised surface is seven capability families. Compatibility
+        # aliases still execute, but they do not compete in the tool catalog.
+        canonical_file = cwd / "canonical.txt"
+        canonical_file.write_text("one\ntwo\nthree")
+        canonical = new_world(cwd, state_path=None, persist=False)
+        prompt = system_prompt(canonical)
+        tool_block = prompt.split("# tools\n", 1)[1].split("# runtime", 1)[0]
+        marker = chr(60)
+        canonical_names = {"exec", "workspace", "knowledge", "harness", "observe", "agents", "session"}
+        shown = {
+            line.split(">", 1)[0][1:]
+            for line in tool_block.splitlines()
+            if line.startswith(marker) and line[1:2] != "/" and line.split(">", 1)[0][1:] in canonical_names
+        }
+        assert shown == canonical_names, shown
+        for alias in ("python", "bash", "shell", "edit", "find", "memory", "read", "grep", "sleeper"):
+            assert marker + alias + ">" not in tool_block, alias
+
+        assert dispatch(canonical, Block("exec", "20 + 22", {"op": "python"})) == "42"
+        assert dispatch(canonical, Block("python", "20 + 22", {})) == "42"
+        read_back = dispatch(
+            canonical,
+            Block("workspace", "", {"op": "read", "path": "canonical.txt", "lines": "2-3"}),
+        )
+        assert "two" in read_back and "three" in read_back, read_back
+        todo_back = dispatch(canonical, Block("knowledge", "+ canonical proof", {"op": "todo"}))
+        assert "canonical proof" in todo_back, todo_back
+        assert "calls" in dispatch(canonical, Block("observe", "", {"op": "usage"}))
+        assert '"generation":' in dispatch(canonical, Block("session", "", {"op": "status"}))
+        assert "unknown op" in dispatch(canonical, Block("exec", "", {"op": "wrong"}))
+
+        observed_tags: list[str] = []
+        canonical.hooks["before_dispatch"] = [
+            lambda _world, normalized: observed_tags.append(normalized.tag)
+        ]
+        dispatch(canonical, Block("exec", "printf canonical", {"op": "bash"}))
+        assert observed_tags == ["bash"], observed_tags
 
         # `diag` is a real persistent-kernel primitive, not a helper exercised
         # out of band. An uncaught Python call records bounded plain data, and a
