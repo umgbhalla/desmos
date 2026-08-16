@@ -71,7 +71,15 @@ def _pinned(names: tuple[str, ...]) -> int:
             _json.dumps({"provider": "anthropic", "model": PINNED_MODEL, "effort": "low"}),
             encoding="utf-8",
         )
-        env = {"DESMOS_SETTINGS": str(pin), "DESMOS_MODEL": PINNED_MODEL}
+        # The fake responses below are written in the prose dialect: an
+        # assistant message whose text is a tag. That is the flag-off path now,
+        # and it is still supported, so pin it here and let
+        # desmos.anthropic_check drive the tool path with the flag on.
+        env = {
+            "DESMOS_SETTINGS": str(pin),
+            "DESMOS_MODEL": PINNED_MODEL,
+            "DESMOS_TOOL_SYSCALLS": "0",
+        }
         old_env = {k: _os.environ.get(k) for k in env}
         # DEFAULT_MODEL is read from the environment at import, which already
         # happened, so the constant has to be pinned as well as the variable.

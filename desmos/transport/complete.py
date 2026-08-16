@@ -337,7 +337,7 @@ def cached_payload(
     thinking: str | None = "low",
 ) -> dict[str, Any]:
     """Pi/Anthropic: cache ABI, cache catalog, cache last *user* only. Replay thinking."""
-    from desmos.dialect import tool_syscalls
+    from desmos.transport.dialect import tool_syscalls
     from desmos.skills import filter_skill_dialects
 
     cache = {"type": "ephemeral"}

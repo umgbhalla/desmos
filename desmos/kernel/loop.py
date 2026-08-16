@@ -753,7 +753,7 @@ def _run_turns(
     # A bad path is a note in that same message, never an exception: losing the
     # whole step because one screenshot moved is not a trade worth making.
     if images:
-        from desmos import vision
+        from desmos.kernel import vision
 
         try:
             note = vision.attach(world, *images)

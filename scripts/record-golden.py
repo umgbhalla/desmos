@@ -39,6 +39,11 @@ for _key in [k for k in os.environ if k.startswith("DESMOS_")]:
 _HOME = tempfile.mkdtemp(prefix="desmos-golden-home-")
 os.environ["HOME"] = _HOME
 os.environ["DESMOS_SETTINGS"] = str(Path(_HOME) / "settings.json")
+# The canned responses speak the prose dialect (XML in speech). With typed
+# syscall tools on, the loop rightly refuses that as "XML as speech" -- the
+# tool-channel wire has its own check (checks/anthropic_check.py). Pin off,
+# same as the check runner does.
+os.environ["DESMOS_TOOL_SYSCALLS"] = "0"
 # The commit scenario runs real git. Pin it off the machine's config (system
 # gitconfig, XDG paths) so hooks, signing, or a renamed default branch cannot
 # reshape the recorded output.
