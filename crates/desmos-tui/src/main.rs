@@ -469,6 +469,40 @@ impl Bridge {
         Ok(Self { child, stdin, rx })
     }
 
+    /// A bridge whose child echoes whatever it is sent, so a test can read
+    /// back the ops the TUI emitted. `cat` round-trips one JSON object per
+    /// line, which is exactly the wire format.
+    #[cfg(test)]
+    fn loopback() -> io::Result<Self> {
+        let mut child = Command::new("cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "loopback stdin"))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "loopback stdout"))?;
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                if line.trim().is_empty() {
+                    continue;
+                }
+                let v = serde_json::from_str(&line)
+                    .unwrap_or_else(|e| json!({"ev":"error","text": e.to_string()}));
+                if tx.send(v).is_err() {
+                    break;
+                }
+            }
+        });
+        Ok(Self { child, stdin, rx })
+    }
+
     fn send(&mut self, msg: &Value) -> io::Result<()> {
         writeln!(self.stdin, "{msg}")?;
         self.stdin.flush()
@@ -3882,6 +3916,16 @@ fn submit_prompt(mut bridge: Option<&mut Bridge>, app: &mut App) -> io::Result<b
                 app.queue.len()
             }
         };
+        // Tell the loop something was typed. A queued follow-up outranks
+        // background work, but run_turns can only see it through the bridge's
+        // inbox -- the queue lives here, not there. With nothing sent,
+        // pending.wait_next blocked until every task landed, so any turn that
+        // left a shell monitor running parked the composer in "queued" and the
+        // follow-up never fired. The op itself does nothing; being in the
+        // inbox is the whole signal.
+        if let Some(b) = bridge.as_mut() {
+            b.send(&json!({"op": "typed"}))?;
+        }
         app.notify(format!("queued #{pos}"));
         return Ok(false);
     }
@@ -5724,6 +5768,45 @@ fn draw_files(f: &mut Frame, area: Rect, app: &mut App) {
     f.render_widget(Paragraph::new(lines), inner);
 }
 
+/// Where the cache sits in its window, as (fill, segments) for the bar.
+///
+/// The countdown is what a glance needs: the fill is the time still on the
+/// clock and the colour says which stage of the window that is. Blue while
+/// nothing is cached and nothing is counting down, green while the entry is
+/// fresh, yellow once it is past halfway, amber in the last fifth -- the
+/// stretch where the next call is the one that pays to write it again. A
+/// provider that declares no TTL has no window to stage, so it keeps the
+/// read-against-write proportion, which is the only honest thing its bar can
+/// say.
+fn cache_stage(meter: &CacheMeter, theme: &Theme) -> (f64, Vec<(u64, ratatui::style::Color)>) {
+    if !meter.ephemeral {
+        let rw = meter.read + meter.write;
+        return (
+            if rw == 0 { 0.0 } else { 1.0 },
+            vec![
+                (meter.read, theme.accent_success),
+                (meter.write, theme.accent_tool),
+            ],
+        );
+    }
+    match meter.left() {
+        // Never written, or already expired. Both are cold, and a cold window
+        // is not running out of anything -- so it reads as a full calm track
+        // rather than an empty one, which would look like a cache about to die.
+        None => (1.0, vec![(1, theme.accent_system)]),
+        Some(l) => {
+            let colour = if l > 0.5 {
+                theme.accent_success
+            } else if l > 0.2 {
+                theme.warning
+            } else {
+                theme.path
+            };
+            (f64::from(l), vec![(1, colour)])
+        }
+    }
+}
+
 fn draw_meta(
     f: &mut Frame,
     area: Rect,
@@ -5819,20 +5902,14 @@ fn draw_meta(
             theme.text_primary,
         )
     };
-    let rw = meter.read + meter.write;
-    // Read against write on the last call: a write-heavy bar is the call that
-    // paid to fill the cache rather than riding it. The track is always full --
-    // this is a proportion, not a level.
+    let (cache_fill, cache_segments) = cache_stage(meter, &theme);
     let cache_row = || {
         meter_row(
             inner.width,
             "cache",
             &cache_value,
-            &[
-                (meter.read, theme.accent_success),
-                (meter.write, theme.accent_tool),
-            ],
-            if rw == 0 { 0.0 } else { 1.0 },
+            &cache_segments,
+            cache_fill,
             theme.bg_highlight,
             theme.bg_base,
             theme.text_primary,
@@ -8792,6 +8869,101 @@ mod tests {
         }
     }
 
+
+    /// The cache bar is a countdown, staged by colour. Cold is blue and does
+    /// not look like an emergency; the window turns yellow at halfway and
+    /// amber in the last fifth, which is the warning worth having.
+    #[test]
+    fn cache_bar_stages_by_time_left_in_the_window() {
+        let theme = Theme::current();
+        let mut m = CacheMeter::default();
+        m.ephemeral = true;
+        m.ttl = Duration::from_secs(300);
+
+        let colour = |m: &CacheMeter| cache_stage(m, &theme).1[0].1;
+        assert_eq!(colour(&m), theme.accent_system, "cold must be blue");
+
+        m.read = 900;
+        m.write = 100;
+        for (elapsed, want, stage) in [
+            (10u64, theme.accent_success, "fresh"),
+            (200, theme.warning, "past halfway"),
+            (280, theme.path, "nearly gone"),
+        ] {
+            m.at = Some(Instant::now() - Duration::from_secs(elapsed));
+            let (fill, seg) = cache_stage(&m, &theme);
+            assert_eq!(seg[0].1, want, "{stage}");
+            assert!(fill > 0.0 && fill <= 1.0, "{stage} fill {fill}");
+        }
+
+        // Expired is cold again, not "almost gone" forever.
+        m.at = Some(Instant::now() - Duration::from_secs(400));
+        assert_eq!(colour(&m), theme.accent_system, "expired must read as cold");
+
+        // A provider with no declared window keeps the read/write proportion.
+        m.ephemeral = false;
+        let (fill, seg) = cache_stage(&m, &theme);
+        assert_eq!(fill, 1.0);
+        assert_eq!(seg.len(), 2, "read and write must stay separate spans");
+    }
+
+    /// And the stage must reach the pane. Drives the real frame and reads the
+    /// cache row's cells back, so a staged colour nothing paints fails here.
+    #[test]
+    fn the_meta_cache_row_paints_its_stage() {
+        let mut app = App::new();
+        app.cache.ephemeral = true;
+        app.cache.ttl = Duration::from_secs(300);
+        app.cache.read = 900;
+        app.cache.write = 100;
+        app.cache.window = 200_000;
+        app.cache.at = Some(Instant::now() - Duration::from_secs(200));
+
+        let backend = TestBackend::new(120, 44);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let buf = term.backend().buffer();
+        let want = Theme::current().warning;
+
+        let mut seen = false;
+        for y in 0..buf.area.height {
+            let row: String = (0..buf.area.width)
+                .map(|x| buf[(x, y)].symbol().to_string())
+                .collect();
+            if !row.contains("cache") {
+                continue;
+            }
+            seen = (0..buf.area.width).any(|x| buf[(x, y)].bg == want);
+            if seen {
+                break;
+            }
+        }
+        assert!(seen, "the cache row never painted the past-halfway stage");
+    }
+
+    /// A follow-up typed while a step runs must reach the bridge, not just the
+    /// local queue. `run_turns` parks on `pending.wait_next` while background
+    /// tasks are outstanding and only releases when its inbox is non-empty, so
+    /// a queue-only push left the composer stuck in "queued" until every
+    /// monitor landed. Drives the real key path and reads the wire back.
+    #[test]
+    fn queued_followup_pokes_the_bridge() {
+        let mut app = App::new();
+        let mut bridge = match Bridge::loopback() {
+            Ok(b) => b,
+            Err(_) => return, // no `cat` on this box; nothing to assert
+        };
+        app.running = true;
+        app.prompt.insert_str("and then push it");
+        submit_prompt(Some(&mut bridge), &mut app).unwrap();
+
+        assert_eq!(app.queue.len(), 1, "follow-up did not queue");
+        let sent = bridge
+            .rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("nothing reached the bridge -- the loop cannot see the queue");
+        assert_eq!(sent["op"], "typed", "wrong op on the wire: {sent}");
+    }
 
     /// User prompts go through the real story renderer with stronger weight.
     /// A terminal has fixed-size cells, so bold is the native larger-type

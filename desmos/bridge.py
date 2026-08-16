@@ -216,6 +216,13 @@ def serve(cwd: Path) -> int:
                 level = str(msg.get("level") or "low").strip()
                 world.thinking = level
                 _emit(_snapshot(world))
+            elif op == "typed":
+                # The TUI queued a follow-up. Nothing to do here: run_turns
+                # polls `has_input`, which is `not inbox.empty()`, so landing
+                # in the queue at all is what releases a step parked on
+                # background work. Draining it here is the no-op that keeps it
+                # from being reported as an unknown op.
+                pass
             else:
                 _emit({"ev": "error", "text": f"unknown op {op!r}"})
         except Exception as exc:  # noqa: BLE001 — keep the TUI alive
