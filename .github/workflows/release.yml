@@ -62,8 +62,8 @@ jobs:
       - name: Test TUI and markdown
         if: matrix.target == 'x86_64-unknown-linux-gnu'
         run: |
-          env -u NO_COLOR COLORTERM=truecolor TERM=xterm-256color cargo test --locked -p desmos-tui
-          cargo test --locked -p xai-grok-markdown -p xai-grok-markdown-core
+          env -u NO_COLOR COLORTERM=truecolor TERM=xterm-256color cargo test --locked --release -p desmos-tui
+          cargo test --locked --release -p xai-grok-markdown -p xai-grok-markdown-core
       - name: Package and upload TUI
         env:
           GH_TOKEN: ${{ github.token }}
