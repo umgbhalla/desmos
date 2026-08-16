@@ -23,7 +23,7 @@ from desmos.kernel.types import Tool, World
 _UMASK = os.umask(0)
 os.umask(_UMASK)
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 4
 SESSION_ID = "default"
 #: One attach of the process. `sessions` is a singleton keyed to the cwd --
 #: it is the durable world, not a sitting -- so nothing named the thing a
@@ -259,6 +259,16 @@ def state_file(world: World) -> Path:
     return world.cwd / ".desmos" / DB_FILENAME
 
 
+def open_db(path: Path) -> sqlite3.Connection:
+    """A migrated connection for callers outside this module.
+
+    `_open` is the only correct way in: it creates the parent, runs the
+    migration, and recovers a corrupt file instead of raising. Anything that
+    reaches for `sqlite3.connect` directly gets an unmigrated database.
+    """
+    return _open(path)
+
+
 def _legacy_file(world: World) -> Path:
     if world.state_path:
         return world.state_path
@@ -351,6 +361,8 @@ def _migrate(conn: sqlite3.Connection) -> None:
             cost_usd REAL NOT NULL DEFAULT 0,
             PRIMARY KEY (session_id, run_id, seq)
         );
+        DROP TABLE IF EXISTS seat;
+        DROP TABLE IF EXISTS seat_events;
         CREATE INDEX IF NOT EXISTS idx_messages_session_seq
             ON messages(session_id, seq);
         CREATE INDEX IF NOT EXISTS idx_calls_run

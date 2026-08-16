@@ -30,7 +30,7 @@ DIRECT_TARGETS = {
 
 DIRECT_OPS = {
     "workspace": ("read", "see", "commit"),
-    "knowledge": ("todo",),
+    "knowledge": ("todo", "plan"),
     "observe": ("usage", "trajectory", "error", "symbol", "threads"),
     "agents": ("spawn", "fanout", "status", "result", "structured-result", "judgment", "wait"),
     "session": ("compact", "status", "switch"),
@@ -177,6 +177,9 @@ def _commit(world, body, attrs):
 
 
 def _knowledge(world, op, body, attrs):
+    if op == "plan":
+        from desmos.state.plan import handle_plan
+        return handle_plan(world, body, **attrs)
     existing = _legacy(world, "todo", body, attrs)
     if existing is not None:
         return existing
