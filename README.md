@@ -109,16 +109,21 @@ Linux and macOS are supported; these early releases are marked beta.
 ```mermaid
 sequenceDiagram
     participant Dev as annotated tag v0.0.1
-    participant GH as release.yml
-    participant Matrix as macOS + Linux builders
+    participant GH as GitHub release gate
+    participant IX as persistent ix Linux builder
+    participant Native as macOS + Linux ARM runners
     participant Release as GitHub beta release
     participant Install as install.sh
     participant Host as isolated venv + ~/.local/bin
 
     Dev->>GH: git push origin v0.0.1
-    GH->>Matrix: build and test desmos-tui
-    Matrix-->>GH: target tarballs + SHA-256 files
-    GH->>GH: check Python + build wheel
+    GH->>IX: start desmos-ci-linux with capped IX_TOKEN
+    IX->>IX: reuse Cargo target + checkout exact tag SHA
+    IX->>IX: Python checks + Linux tests + wheel + x64 TUI
+    IX-->>GH: checksummed wheel + Linux x64 tarball
+    GH->>Native: build macOS x64/ARM64 + Linux ARM64
+    Native-->>GH: target tarballs + SHA-256 files
+    GH->>IX: remove worktree + stop idle VM
     GH->>Release: publish verified-tag assets
     Install->>Release: resolve latest beta or exact tag
     Release-->>Install: wheel + platform tarball + checksums
@@ -126,6 +131,12 @@ sequenceDiagram
     Install->>Host: install wheel, binary, desmos command
     Host-->>Install: desmos tui
 ```
+
+GitHub Actions is the public trigger and publisher. Linux x64 validation runs
+inside the stopped-when-idle `desmos-ci-linux` ix VM, so its Cargo target and
+toolchains survive between tags; the repository secret is a VM-only ix key
+with a `$2` spend cap. Native runners remain for Apple binaries and Linux
+ARM64, where a Linux x64 Cargo build is not an equivalent artifact.
 
 For development from a checkout:
 

@@ -30,8 +30,6 @@ jobs:
             target: aarch64-apple-darwin
           - runner: macos-15-intel
             target: x86_64-apple-darwin
-          - runner: ubuntu-24.04
-            target: x86_64-unknown-linux-gnu
           - runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
     runs-on: ${{ matrix.runner }}
@@ -59,11 +57,6 @@ jobs:
           fi
       - name: Build TUI
         run: cargo build --locked -p desmos-tui --release --target "${{ matrix.target }}"
-      - name: Test TUI and markdown
-        if: matrix.target == 'x86_64-unknown-linux-gnu'
-        run: |
-          env -u NO_COLOR COLORTERM=truecolor TERM=xterm-256color cargo test --locked --release -p desmos-tui
-          cargo test --locked --release -p xai-grok-markdown -p xai-grok-markdown-core
       - name: Package and upload TUI
         env:
           GH_TOKEN: ${{ github.token }}
@@ -76,62 +69,72 @@ jobs:
           shasum -a 256 "desmos-tui-$TARGET.tar.gz" > "desmos-tui-$TARGET.tar.gz.sha256"
           gh release upload "$GITHUB_REF_NAME" desmos-tui-* --clobber --repo "$GITHUB_REPOSITORY"
 
-  python:
+  ix-linux:
     needs: prepare
     runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    concurrency:
+      group: desmos-ix-linux
+      cancel-in-progress: false
     steps:
-      - name: Fetch tagged source
+      - name: Install ix
         run: |
-          git init .
-          git remote add origin "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY.git"
-          git fetch --depth=1 origin "$GITHUB_SHA"
-          git checkout --detach FETCH_HEAD
-      - name: Check and build wheel
+          curl -fsSL https://ix.dev -o "$RUNNER_TEMP/install-ix.sh"
+          sh "$RUNNER_TEMP/install-ix.sh"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: Build and test on ix
+        env:
+          IX_TOKEN: ${{ secrets.IX_TOKEN }}
         run: |
-          version=$(python3 -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')
-          test "$GITHUB_REF_NAME" = "v$version"
-          python3 -m desmos check
-          python3 -m unittest discover -s tests -q
-          python3 inverted.py --check
-          python3 -m pip wheel --no-deps . -w dist
-          cd dist
-          shasum -a 256 desmos-*.whl > "desmos-$version-py3-none-any.whl.sha256"
-      - name: Check documentation links
-        run: |
-          python3 - <<'PY'
-          import pathlib
-          import re
+          vm=desmos-ci-linux
+          state=/srv/desmos-ci
+          work=$state/work
+          export PATH="$HOME/.local/bin:$PATH"
 
-          bad = []
-          root = pathlib.Path(".")
-          for md in [*root.glob("*.md"), *root.glob("docs/*.md"), *root.glob(".github/**/*.md")]:
-              for text, link in re.findall(r"\[([^\]]*)\]\(([^)]+)\)", md.read_text()):
-                  if link.startswith(("http://", "https://", "#", "mailto:")):
-                      continue
-                  target = (md.parent / link.split("#")[0]).resolve()
-                  if not target.exists():
-                      bad.append(f"{md}: [{text}]({link})")
-          if bad:
-              raise SystemExit("\n".join(bad))
-          PY
-      - name: Check for secrets
+          ix start "$vm" >/dev/null 2>&1 || ix new default --name "$vm" --no-shell
+          cleanup() {
+            ix shell "$vm" --noninteractive -- sh -lc \
+              "git --git-dir='$state/repo.git' worktree remove --force '$work' >/dev/null 2>&1 || true" || true
+            ix stop "$vm" || true
+          }
+          trap cleanup EXIT
+
+          ix shell "$vm" --noninteractive -- sh -lc \
+            'command -v rustup >/dev/null && command -v protoc >/dev/null && command -v rg >/dev/null || nix profile install nixpkgs#rustup nixpkgs#protobuf nixpkgs#ripgrep'
+          ix shell "$vm" --noninteractive -- env \
+            DESMOS_REPOSITORY="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY.git" \
+            DESMOS_SHA="$GITHUB_SHA" DESMOS_TAG="$GITHUB_REF_NAME" \
+            DESMOS_WORK="$work" DESMOS_STATE="$state" \
+            sh -lc '
+              mkdir -p "$DESMOS_STATE"
+              if [ ! -d "$DESMOS_STATE/repo.git" ]; then
+                git clone --bare "$DESMOS_REPOSITORY" "$DESMOS_STATE/repo.git"
+              fi
+              git --git-dir="$DESMOS_STATE/repo.git" fetch --force origin "$DESMOS_SHA"
+              git --git-dir="$DESMOS_STATE/repo.git" worktree prune
+              git --git-dir="$DESMOS_STATE/repo.git" worktree add --detach "$DESMOS_WORK" FETCH_HEAD
+              cd "$DESMOS_WORK"
+              scripts/ci-release-linux.sh "$DESMOS_TAG" "$DESMOS_STATE"
+            '
+          ix shell "$vm" --noninteractive -- tar -C "$work/dist" -czf - \
+            "desmos-tui-x86_64-unknown-linux-gnu.tar.gz" \
+            "desmos-tui-x86_64-unknown-linux-gnu.tar.gz.sha256" \
+            "desmos-${GITHUB_REF_NAME#v}-py3-none-any.whl" \
+            "desmos-${GITHUB_REF_NAME#v}-py3-none-any.whl.sha256" \
+            > "$RUNNER_TEMP/ix-release.tar.gz"
+          mkdir dist
+          tar -C dist -xzf "$RUNNER_TEMP/ix-release.tar.gz"
+      - name: Verify ix artifacts
         run: |
-          rc=0
-          git grep -InE --untracked \
-            'sk-ant-[A-Za-z0-9_-]{16,}|sk-proj-[A-Za-z0-9_-]{16,}|(ANTHROPIC|OPENAI|XAI)_API_KEY=[A-Za-z0-9_-]{16,}|(access|refresh|id)_token"?[[:space:]:=]+"?eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{16,}' \
-            -- . || rc=$?
-          case "$rc" in
-            0) echo "possible secret in tree" >&2; exit 1 ;;
-            1) echo "no key material found" ;;
-            *) echo "git grep failed (rc=$rc)" >&2; exit 1 ;;
-          esac
-      - name: Upload wheel
+          cd dist
+          sha256sum -c *.sha256
+      - name: Upload ix artifacts
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh release upload "$GITHUB_REF_NAME" dist/* --clobber --repo "$GITHUB_REPOSITORY"
 
   publish:
-    needs: [tui, python]
+    needs: [tui, ix-linux]
     runs-on: ubuntu-24.04
     steps:
       - name: Publish beta release
