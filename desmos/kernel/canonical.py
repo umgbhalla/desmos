@@ -33,7 +33,7 @@ DIRECT_OPS = {
     "knowledge": ("todo", "plan"),
     "observe": ("usage", "trajectory", "error", "symbol", "threads"),
     "agents": ("spawn", "fanout", "status", "result", "structured-result", "judgment", "wait"),
-    "session": ("compact", "status", "switch", "peers", "read", "post"),
+    "session": ("compact", "status", "switch", "peers", "inbox", "read", "post", "dismiss"),
 }
 
 
@@ -285,17 +285,32 @@ def _session(world, op, body, attrs):
             "model": world.model, "thinking": world.thinking,
             "generation": world.generation, "messages": len(world.messages),
         })
-    if op in {"peers", "read", "post"}:
+    if op in {"peers", "inbox", "read", "post", "dismiss"}:
         from desmos.state import persist
         if op == "peers":
             return json.dumps(persist.peers(world), default=str)
         channel = attrs.get("channel", "conflicts")
-        if op == "read":
+        if op == "inbox":
             return json.dumps(
-                persist.channel_read(
-                    world, channel=channel,
-                    since=int(attrs.get("since", 0)),
-                    limit=int(attrs.get("limit", 50)),
+                persist.channel_inbox(
+                    world, channel=channel, limit=int(attrs.get("limit", 20))
+                ),
+                default=str,
+            )
+        if op == "read":
+            messages = persist.channel_read(
+                world, channel=channel,
+                since=int(attrs.get("since", 0)),
+                limit=int(attrs.get("limit", 50)),
+            )
+            mark = str(attrs.get("mark", "true")).lower() not in {"0", "false", "no", "off"}
+            if mark and messages:
+                persist.channel_dismiss(world, channel=channel, through=messages[-1]["id"])
+            return json.dumps(messages, default=str)
+        if op == "dismiss":
+            return json.dumps(
+                persist.channel_dismiss(
+                    world, channel=channel, through=int(attrs.get("through", 0))
                 ),
                 default=str,
             )

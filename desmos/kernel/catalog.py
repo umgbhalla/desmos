@@ -76,6 +76,14 @@ VOLATILE_VIEW = {"todo": todo_digest}
 def volatile(world: World, delta: str = "") -> str:
     """Per-turn mutable state, deliberately outside the cached prefix."""
     parts = []
+    try:
+        from desmos.state.persist import channel_notice
+
+        notice = channel_notice(world)
+    except Exception:  # noqa: BLE001 -- notification failure cannot block a turn
+        notice = ""
+    if notice:
+        parts.append("[channel]\n" + notice)
     for key in VOLATILE_NOTES:
         raw = world.notes.get(key) or ""
         view = VOLATILE_VIEW.get(key, str)(raw)

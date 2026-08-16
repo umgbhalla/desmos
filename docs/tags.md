@@ -84,17 +84,20 @@ take an id in the body or `id`; wait accepts whitespace- or comma-separated ids.
 
 ### session
 
-`op=compact|status|switch|peers|read|post`
+`op=compact|status|switch|peers|inbox|read|post|dismiss`
 
 Compaction accepts `keep` and `floor`. Status reports model, effort/generation,
 and transcript size. Switch takes the model in the body or `model`, with
 optional `effort`; it applies from the next turn.
 
 Peers lists live processes in the current checkout; each process holds an OS
-lease, so crashed or exited peers are pruned without a heartbeat timeout. Read
-returns ordered messages from the `conflicts` channel by default and accepts
-`channel`, `since`, and `limit`. Post appends the body and accepts `channel`
-and `author`. All channel data stays in the checkout's harness database.
+lease, so crashed or exited peers are pruned without a heartbeat timeout.
+Inbox reports unread messages from other runs without advancing the cursor.
+Read returns ordered messages from the `conflicts` channel by default, accepts
+`channel`, `since`, and `limit`, and marks returned messages read unless
+`mark=false`. Post appends the body and accepts `channel` and `author`; dismiss
+advances the unread cursor without replying. All channel data stays in the
+checkout's harness database.
 
 ## Compatibility aliases
 
