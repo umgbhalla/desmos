@@ -99,7 +99,8 @@ def set_tool_doc(world: World, name: str, doc: str) -> str:
     from desmos.state.persist import save
 
     if name not in world.tools:
-        return f"unknown tool {name!r}"
+        known = ", ".join(sorted(world.tools)) or "none"
+        return f"unknown tool {name!r}. Existing: {known}. <tool> rewrites a doc; <register> installs a new tag."
     if not doc.strip():
         return "tool failed: doc required"
     world.tools[name].doc = doc.strip()
@@ -216,7 +217,8 @@ def _dispatch(
         name = (block.attrs.get("name") or block.body).strip()
         skill = next((s for s in world.skills if s.name == name), None)
         if skill is None:
-            return f"unknown skill {name!r}"
+            known = ", ".join(sorted(s.name for s in world.skills)) or "none"
+            return f"unknown skill {name!r}. Available: {known}. Write .desmos/skills/<name>/SKILL.md then <reload/> to add one."
         return load_skill_body(skill, world.model)
     if block.tag == "reload":
         from desmos.kernel.loop import reload

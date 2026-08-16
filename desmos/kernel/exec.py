@@ -372,6 +372,11 @@ def register_tag(world: World, body: str, name: str, doc: str) -> str:
         return f"register failed: {name} is frozen"
     try:
         fn = callable_from_source(world, body, name)
+    except ValueError as exc:
+        # These are hand-written fix instructions ("name it X or handle"),
+        # not crashes. Returning the traceback framed a bad-handler mistake as
+        # an internal error on the core self-growth path.
+        return f"register failed: {exc}"
     except Exception:
         return traceback.format_exc()
     world.tools[name] = Tool(name=name, doc=doc or f"user tag <{name}>", source=body, handler=fn)

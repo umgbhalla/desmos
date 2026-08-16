@@ -24,6 +24,8 @@ catalog never said out loud. Both families need it; neither infers it.
 """
 
 import os
+
+from desmos.kernel.const import RESULT_CLIP
 from typing import Any
 
 
@@ -115,7 +117,7 @@ def capabilities() -> str:
             "batching: several tags in one turn all run, in the order you wrote them, and every"
             " result comes back in the same reply. Batch independent calls instead of spending a"
             " turn each. A call that needs an earlier result waits for the next turn.",
-            "results are capped at 6000 chars per call, but nothing is thrown away: over the cap"
+            f"results are capped at {RESULT_CLIP} chars per call, but nothing is thrown away: over the cap"
             " the whole output is written to .desmos/out/NNNN-<tag>.txt and the result opens with"
             " a pointer line naming that file. Read the part you need out of it -- grep, sed,"
             " head, a line range -- instead of paging it back into the transcript. Filtering in"

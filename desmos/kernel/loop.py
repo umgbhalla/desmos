@@ -24,11 +24,11 @@ def format_results(results: list[tuple[Block, str]]) -> str:
     return "\n\n".join(chunks)
 
 
-#: How much of a syscall's output reaches the model. dispatch clips a handler
-#: at scan.RESULT_CAP first; this is the tighter cap that actually bounds the
-#: transcript, and it is the number the prompt quotes -- check.py ties the two
-#: together so the prompt cannot drift off it.
-RESULT_CLIP = 6000
+#: How much of a syscall's output reaches the model. Re-exported from const so
+#: the dialect prompt and the loop quote one number: over scan.RESULT_CAP a
+#: result spills to a file, and this tighter cap then bounds the inline text
+#: that re-enters the transcript.
+from desmos.kernel.const import RESULT_CLIP  # noqa: E402,F401
 
 
 def format_result_message(results: list[tuple[Block, str]], cwd: Path | None = None) -> str:

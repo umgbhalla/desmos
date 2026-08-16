@@ -22,6 +22,9 @@ FROZEN = frozenset(
     }
 )
 RESULT_CAP = 8000
+#: The tighter cap that bounds what a result puts back into the transcript;
+#: over RESULT_CAP spills to a file, then the inline text is clipped to this.
+RESULT_CLIP = 6000
 MAX_TOKENS = int(os.environ.get("DESMOS_MAX_TOKENS") or 128000)
 BASH_TIMEOUT = 60
 PRIOR_KEEP = 8
