@@ -247,6 +247,11 @@ def _check_socket() -> None:
     import tempfile
     import time
 
+    def read_log(path: Path) -> list[dict]:
+        # The bridge may be appending while this check reads. A trailing
+        # fragment is not a durable JSONL record until its newline lands.
+        return [json.loads(line) for line in path.read_bytes().split(b"\n")[:-1] if line]
+
     root = Path(__file__).resolve().parents[2]
     # Tripwire for the cwd= on the Popen below: the check must not leave a
     # byte in the runner's own .desmos.
@@ -377,8 +382,7 @@ def _check_socket() -> None:
             # b, snapshot included; drain it or the flood wait stops early)
             a.until(lambda e: e.get("ev") == "snapshot")
             before_flood = max(
-                json.loads(line).get("seq") or 0
-                for line in log_file.read_text(encoding="utf-8").splitlines()
+                event.get("seq") or 0 for event in read_log(log_file)
             )
             a.send({"op": "step", "text": "flood test"})
             # The live queue is deliberately bounded, so a 6,000-event burst
@@ -387,10 +391,7 @@ def _check_socket() -> None:
             # snapshot instead of requiring the live queue to be unbounded.
             deadline = time.monotonic() + 90
             while time.monotonic() < deadline:
-                logged_now = [
-                    json.loads(line)
-                    for line in log_file.read_text(encoding="utf-8").splitlines()
-                ]
+                logged_now = read_log(log_file)
                 if any(
                     event.get("seq", 0) > before_flood and event.get("ev") == "snapshot"
                     for event in logged_now
@@ -399,10 +400,7 @@ def _check_socket() -> None:
                 time.sleep(0.05)
             else:
                 raise AssertionError("flood step never reached its logged snapshot")
-            stamped_total = sum(
-                1 for l in log_file.read_text(encoding="utf-8").splitlines()
-                if json.loads(l).get("seq") is not None
-            )
+            stamped_total = sum(e.get("seq") is not None for e in read_log(log_file))
             assert stamped_total > 4096, (
                 f"flood produced only {stamped_total} events; the attach "
                 f"ceiling under test starts at the 4096 queue bound"
@@ -418,7 +416,7 @@ def _check_socket() -> None:
             fresh.close()
 
             # the log holds everything, stamped, interventions included
-            logged = [json.loads(l) for l in log_file.read_text(encoding="utf-8").splitlines()]
+            logged = read_log(log_file)
             assert logged[0]["ev"] == "session"
             log_seqs = [e["seq"] for e in logged[1:]]
             assert log_seqs == list(range(1, len(log_seqs) + 1)), "log seq has gaps"
