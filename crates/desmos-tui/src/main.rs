@@ -3833,10 +3833,10 @@ fn wire_complete(
 /// (failed edit, start phase, non-edit tags) the card carries no hunks and
 /// therefore claims no line, honestly.
 fn wire_syscall(tag: &str, body: &str, attrs: &Value, result: &str, line: Option<u64>) -> RenderBlock {
-    match tag {
-        "python" | "bash" => {
+    match exec_tag(tag, attrs) {
+        Some(exec) => {
             let cmd = if body.trim().is_empty() {
-                syscall_label(tag, attrs)
+                syscall_label(exec, if tag == "exec" { &Value::Null } else { attrs })
             } else {
                 body.to_string()
             };
@@ -3844,14 +3844,14 @@ fn wire_syscall(tag: &str, body: &str, attrs: &Value, result: &str, line: Option
             // there — a bare `<bash>` is not a preview of anything.
             let preview = card_summary(&cmd);
             let desc = if preview.is_empty() {
-                tag.to_string()
+                exec.to_string()
             } else {
-                format!("{tag}  {preview}")
+                format!("{exec}  {preview}")
             };
             let mut block = ExecuteToolCallBlock::new(cmd)
                 .with_description(desc)
                 .with_output(result);
-            if looks_failed(tag, result) {
+            if looks_failed(exec, result) {
                 block = block.with_error(
                     result
                         .lines()
@@ -3862,7 +3862,7 @@ fn wire_syscall(tag: &str, body: &str, attrs: &Value, result: &str, line: Option
             }
             RenderBlock::ToolCall(ToolCallBlock::Execute(block))
         }
-        "edit" => {
+        None if tag == "edit" => {
             let path = attrs
                 .get("path")
                 .and_then(Value::as_str)
@@ -3887,7 +3887,7 @@ fn wire_syscall(tag: &str, body: &str, attrs: &Value, result: &str, line: Option
             }
             RenderBlock::ToolCall(ToolCallBlock::Edit(block))
         }
-        _ => {
+        None => {
             let summary = card_summary(&{
                 let attrs_s = attr_summary(attrs);
                 if !body.trim().is_empty() {
@@ -4017,7 +4017,7 @@ fn looks_failed(tag: &str, result: &str) -> bool {
         || t.starts_with("SyntaxError")
         || t.starts_with("NameError")
         || t.starts_with("TypeError")
-        || (tag == "bash" && t.starts_with("exit "))
+        || (matches!(tag, "bash" | "shell") && t.starts_with("exit "))
 }
 
 fn format_usage_line(usage: &Value, thoughts: u64, redacted: u64) -> String {
@@ -5665,6 +5665,42 @@ mod tests {
         assert!(text.contains("hi"), "output not visible:\n{text}");
     }
 
+
+    #[test]
+    fn canonical_and_legacy_exec_events_make_equivalent_execute_cards() {
+        for (legacy, failure) in [
+            ("python", "Traceback (most recent call last): boom"),
+            ("bash", "exit 1"),
+            ("shell", "exit 1"),
+        ] {
+            for body in ["echo audited", ""] {
+                let card = |tag, attrs| {
+                    let ev = json!({
+                        "ev": "result",
+                        "phase": "done",
+                        "tag": tag,
+                        "attrs": attrs,
+                        "body": body,
+                        "text": failure,
+                    });
+                    let RenderBlock::ToolCall(ToolCallBlock::Execute(block)) = result_block(&ev)
+                    else {
+                        panic!("{tag}/{legacy} did not produce an execute card");
+                    };
+                    block
+                };
+                let legacy_card = card(legacy, json!({}));
+                let canonical_card = card("exec", json!({"op": legacy}));
+                assert_eq!(canonical_card.command, legacy_card.command);
+                assert_eq!(canonical_card.description, legacy_card.description);
+                assert_eq!(canonical_card.output, legacy_card.output);
+                assert_eq!(canonical_card.error, legacy_card.error);
+                if body.is_empty() {
+                    assert_eq!(canonical_card.command, format!("<{legacy}/>"));
+                }
+            }
+        }
+    }
 
     /// Row colouring is NOT verified. The hunks carry the right Delete/Insert
     /// tags (see edit_tag_becomes_a_real_diff_block), and grok picks per-row
@@ -7613,8 +7649,14 @@ mod tests {
     #[test]
     fn a_folded_row_waits_for_the_read_that_saw_its_last_call() {
         let mut app = App::new();
-        app.sess.stream.run.call("bash", None);
-        app.sess.stream.run.call("bash", None);
+        app.sess
+            .stream
+            .run
+            .call("bash", call_target("bash", &json!({})));
+        app.sess
+            .stream
+            .run
+            .call("bash", call_target("bash", &json!({})));
         // No read has landed at all, so the pane's generation is 0.
         assert_eq!(app.git.snap_gen(), 0);
         app.sess.stream.run.fresh_gen = 7;
@@ -7626,8 +7668,14 @@ mod tests {
             "settled on a snapshot that predates the call it is reporting"
         );
         // A run whose calls forced no read is owed nothing and closes at once.
-        app.sess.stream.run.call("read", None);
-        app.sess.stream.run.call("read", None);
+        app.sess
+            .stream
+            .run
+            .call("read", call_target("read", &json!({})));
+        app.sess
+            .stream
+            .run
+            .call("read", call_target("read", &json!({})));
         app.sess.stream.run.fold(&mut app.sess.story);
         app.sess.stream.run.settle(&mut app.sess.story, &app.git);
         assert!(app.sess.stream.run.settled.is_none());

@@ -10,41 +10,76 @@ use xai_grok_pager::scrollback::{EntryId, RenderBlock, ScrollbackState};
 
 use crate::side;
 
+/// The legacy execution tag represented by an event.
+///
+/// Canonical events keep their `exec` kernel tag; only the TUI interpretation
+/// is normalized here.
+pub(crate) fn exec_tag<'a>(tag: &'a str, attrs: &'a Value) -> Option<&'a str> {
+    match tag {
+        "python" | "bash" | "shell" => Some(tag),
+        "exec" => attrs
+            .get("op")
+            .and_then(Value::as_str)
+            .filter(|op| matches!(*op, "python" | "bash" | "shell")),
+        _ => None,
+    }
+}
+
 /// What a call was aimed at, when that is structural rather than payload.
 ///
 /// A path from an attr is a target. For a shell command the *program* is the
 /// semantic part -- `cargo`, `git`, `grep` -- while its flags and arguments are
 /// the payload the calls pane already holds, so only the bare program name
 /// comes across, and only after stepping past a leading `cd`.
-pub(crate) fn call_target(tag: &str, ev: &Value) -> Option<String> {
-    if let Some(p) = ev
-        .get("attrs")
-        .and_then(|a| a.get("path"))
-        .and_then(Value::as_str)
-    {
-        return Some(
+pub(crate) struct CallTarget {
+    tag: String,
+    target: Option<String>,
+}
+
+impl CallTarget {
+    fn new(tag: &str, target: Option<String>) -> Self {
+        Self {
+            tag: tag.to_string(),
+            target,
+        }
+    }
+
+    pub(crate) fn as_deref(&self) -> Option<&str> {
+        self.target.as_deref()
+    }
+}
+
+pub(crate) fn call_target(tag: &str, ev: &Value) -> CallTarget {
+    let empty = Value::Null;
+    let attrs = ev.get("attrs").unwrap_or(&empty);
+    let tag = exec_tag(tag, attrs).unwrap_or(tag);
+    if let Some(p) = attrs.get("path").and_then(Value::as_str) {
+        let target = Some(
             p.rsplit('/')
                 .next()
                 .filter(|s| !s.is_empty())
                 .unwrap_or(p)
                 .to_string(),
         );
+        return CallTarget::new(tag, target);
     }
-    if tag != "bash" {
-        return None;
+    if !matches!(tag, "bash" | "shell") {
+        return CallTarget::new(tag, None);
     }
-    let body = ev.get("body").and_then(Value::as_str)?;
-    for step in body.split("&&").flat_map(|s| s.split(';')) {
-        let Some(word) = step.split_whitespace().next() else {
-            continue;
-        };
-        if matches!(word, "cd" | "export" | "set" | "source" | "") || word.contains('=') {
-            continue;
+    let body = ev.get("body").and_then(Value::as_str);
+    let target = body.and_then(|body| {
+        for step in body.split("&&").flat_map(|s| s.split(';')) {
+            let Some(word) = step.split_whitespace().next() else {
+                continue;
+            };
+            if matches!(word, "cd" | "export" | "set" | "source" | "") || word.contains('=') {
+                continue;
+            }
+            return Some(word.rsplit('/').next().unwrap_or(word).to_string());
         }
-        let prog = word.rsplit('/').next().unwrap_or(word);
-        return Some(prog.to_string());
-    }
-    None
+        None
+    });
+    CallTarget::new(tag, target)
 }
 
 /// What the repo looks like at the seam, where prose starts.
@@ -140,10 +175,10 @@ impl WorkRun {
         self.tail = Some(format!("\u{00b7} committed {sha}"));
     }
 
-    pub(crate) fn call(&mut self, tag: &str, target: Option<String>) {
+    pub(crate) fn call(&mut self, _tag: &str, target: CallTarget) {
         self.segs.push(Seg::Call {
-            tag: tag.to_string(),
-            target,
+            tag: target.tag,
+            target: target.target,
         });
     }
 
@@ -418,6 +453,31 @@ mod tests {
         assert_eq!(human_secs(95_000), "1m35s");
     }
 
+    #[test]
+    fn canonical_exec_ops_use_their_legacy_work_tags() {
+        for op in ["python", "bash", "shell"] {
+            let attrs = json!({"op": op});
+            assert_eq!(exec_tag("exec", &attrs), Some(op));
+            assert_eq!(exec_tag(op, &json!({})), Some(op));
+
+            let ev = json!({"attrs": attrs});
+            let mut run = WorkRun::default();
+            run.call("exec", call_target("exec", &ev));
+            assert!(matches!(
+                run.segs.as_slice(),
+                [Seg::Call { tag, target: None }] if tag == op
+            ));
+        }
+        assert_eq!(exec_tag("exec", &json!({"op": "unknown"})), None);
+        let ev = json!({"attrs": {"op": "unknown"}});
+        let mut run = WorkRun::default();
+        run.call("exec", call_target("exec", &ev));
+        assert!(matches!(
+            run.segs.as_slice(),
+            [Seg::Call { tag, target: None }] if tag == "exec"
+        ));
+    }
+
     /// A shell command contributes its program and nothing else. This is the
     /// rule that keeps the row from becoming a second calls pane.
     #[test]
@@ -427,6 +487,17 @@ mod tests {
             "body": "cd /Users/zeus/hub/desmos && cargo test --workspace 2>&1 | grep FAIL",
         });
         assert_eq!(call_target("bash", &ev).as_deref(), Some("cargo"));
+        let canonical = json!({
+            "tag": "exec",
+            "attrs": {"op": "bash"},
+            "body": "cd /Users/zeus/hub/desmos && cargo test --workspace",
+        });
+        assert_eq!(call_target("exec", &canonical).as_deref(), Some("cargo"));
+        let legacy_shell = json!({"tag": "shell", "body": "/usr/bin/git status"});
+        assert_eq!(call_target("shell", &legacy_shell).as_deref(), Some("git"));
+        let canonical_shell =
+            json!({"tag": "exec", "attrs": {"op": "shell"}, "body": "/usr/bin/git status"});
+        assert_eq!(call_target("exec", &canonical_shell).as_deref(), Some("git"));
         let edit = json!({"tag": "edit", "attrs": {"path": "crates/desmos-tui/src/main.rs"}});
         assert_eq!(call_target("edit", &edit).as_deref(), Some("main.rs"));
     }
