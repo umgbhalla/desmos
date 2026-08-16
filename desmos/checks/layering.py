@@ -56,6 +56,7 @@ ALLOWED_FN_EDGES = {
     ("desmos.kernel.dispatch", "desmos.state.persist"),
     ("desmos.kernel.exec", "desmos.state.persist"),
     ("desmos.kernel.loop", "desmos.agents.pending"),  # resume seam
+    ("desmos.kernel.loop", "desmos.state.persist"),  # per-call usage ledger
     ("desmos.kernel.shell", "desmos.agents.pending"),  # monitor hand-off
     ("desmos.kernel.loop", "desmos.agents.subagent"),  # reload_sdk emitter/RUNS rebind
     ("desmos.kernel.loop", "desmos.skills"),

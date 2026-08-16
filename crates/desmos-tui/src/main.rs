@@ -391,14 +391,85 @@ fn model_window(model: &str) -> u64 {
     }
 }
 
+/// The rate card, shared with the kernel rather than copied from it. Two
+/// hardcoded price lists are two answers to "what did this session spend", and
+/// they had already drifted: this table said opus, `desmos/kernel/prices.py`
+/// said sonnet for every model. Compiled in, so a malformed table is a build
+/// failure and not a wrong invoice.
+const PRICE_TABLE_JSON: &str = include_str!("../../../desmos/kernel/prices.json");
+
+fn price_table() -> &'static Value {
+    static TABLE: std::sync::OnceLock<Value> = std::sync::OnceLock::new();
+    TABLE.get_or_init(|| {
+        serde_json::from_str(PRICE_TABLE_JSON).expect("desmos/kernel/prices.json is malformed")
+    })
+}
+
+/// A cache tier's multiplier over list input price.
+fn price_multiplier(key: &str) -> f64 {
+    price_table()
+        .get("multipliers")
+        .and_then(|m| m.get(key))
+        .and_then(Value::as_f64)
+        .unwrap_or(1.0)
+}
+
 fn model_price(model: &str) -> (f64, f64) {
-    match model {
-        m if m.starts_with("claude-fable") || m.starts_with("claude-mythos") => (10.0, 50.0),
-        m if m.starts_with("claude-opus") => (5.0, 25.0),
-        m if m.starts_with("claude-sonnet") => (3.0, 15.0),
-        m if m.starts_with("claude-haiku") => (1.0, 5.0),
-        m if m.starts_with("gpt-") => (1.25, 10.0),
-        _ => (5.0, 25.0),
+    let table = price_table();
+    let rate = |entry: &Value| {
+        (
+            entry.get("input").and_then(Value::as_f64).unwrap_or(0.0),
+            entry.get("output").and_then(Value::as_f64).unwrap_or(0.0),
+        )
+    };
+    if let Some(models) = table.get("models").and_then(Value::as_array) {
+        for entry in models {
+            match entry.get("prefix").and_then(Value::as_str) {
+                Some(prefix) if model.starts_with(prefix) => return rate(entry),
+                _ => {}
+            }
+        }
+    }
+    table.get("default").map(rate).unwrap_or((5.0, 25.0))
+}
+
+#[cfg(test)]
+mod price_table_tests {
+    use super::*;
+
+    /// The shared fixture. `desmos/checks/state.py` prices the same usage
+    /// through `desmos.kernel.prices` and asserts this same number, so a rate
+    /// edited on one side and not the other fails on the other side.
+    const FIXTURE_COST_OPUS: f64 = 0.0023125;
+
+    #[test]
+    fn table_drives_the_rates() {
+        assert_eq!(model_price("claude-opus-5"), (5.0, 25.0));
+        assert_eq!(model_price("gpt-5.6-sol"), (1.25, 10.0));
+        // Unknown models bill at the default, never free.
+        assert_eq!(model_price("mystery-9"), (5.0, 25.0));
+        assert_eq!(price_multiplier("cache_read"), 0.1);
+        assert_eq!(price_multiplier("cache_write_5m"), 1.25);
+    }
+
+    #[test]
+    fn bill_agrees_with_the_kernel_on_the_fixture() {
+        let mut meter = CacheMeter::default();
+        meter.bill(
+            &json!({
+                "input_tokens": 100,
+                "cache_read_input_tokens": 1000,
+                "cache_creation_input_tokens": 10,
+                "output_tokens": 50
+            }),
+            "claude-opus-5",
+        );
+        assert!(
+            (meter.spent - FIXTURE_COST_OPUS).abs() < 1e-9,
+            "rust billed {} for the shared fixture, kernel says {}",
+            meter.spent,
+            FIXTURE_COST_OPUS
+        );
     }
 }
 
@@ -525,13 +596,13 @@ impl CacheMeter {
         let (in_rate, out_rate) = model_price(model);
         let m = 1_000_000.0;
         let cost = (fresh as f64 * in_rate
-            + read as f64 * in_rate * 0.1
-            + write_5m as f64 * in_rate * 1.25
-            + hour as f64 * in_rate * 2.0
+            + read as f64 * in_rate * price_multiplier("cache_read")
+            + write_5m as f64 * in_rate * price_multiplier("cache_write_5m")
+            + hour as f64 * in_rate * price_multiplier("cache_write_1h")
             + out as f64 * out_rate)
             / m;
         // Uncached, those read tokens would have been fresh input.
-        let saved = read as f64 * in_rate * 0.9 / m;
+        let saved = read as f64 * in_rate * (1.0 - price_multiplier("cache_read")) / m;
 
         self.calls += 1;
         if read > 0 {

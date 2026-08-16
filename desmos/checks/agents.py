@@ -577,4 +577,5 @@ def check() -> None:
 
         subagent_check.self_check()
         subagent_check.parallel_tool_check()
+        subagent_check.ledger_check()
         pending_check.self_check()

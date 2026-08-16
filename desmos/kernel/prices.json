@@ -1,0 +1,46 @@
+{
+  "version": 1,
+  "unit": "USD per million tokens",
+  "note": "One table, two readers: desmos/kernel/prices.py and crates/desmos-tui/src/main.rs (include_str! at build time). Cached input is priced as input * the matching multiplier, which is how both wires bill it.",
+  "multipliers": {
+    "cache_read": 0.1,
+    "cache_write_5m": 1.25,
+    "cache_write_1h": 2.0
+  },
+  "models": [
+    {
+      "prefix": "claude-fable",
+      "input": 10.0,
+      "output": 50.0
+    },
+    {
+      "prefix": "claude-mythos",
+      "input": 10.0,
+      "output": 50.0
+    },
+    {
+      "prefix": "claude-opus",
+      "input": 5.0,
+      "output": 25.0
+    },
+    {
+      "prefix": "claude-sonnet",
+      "input": 3.0,
+      "output": 15.0
+    },
+    {
+      "prefix": "claude-haiku",
+      "input": 1.0,
+      "output": 5.0
+    },
+    {
+      "prefix": "gpt-",
+      "input": 1.25,
+      "output": 10.0
+    }
+  ],
+  "default": {
+    "input": 5.0,
+    "output": 25.0
+  }
+}

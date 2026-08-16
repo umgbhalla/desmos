@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
+from desmos.kernel import prices
 from desmos.kernel.const import FROZEN, PRIOR_KEEP
 from desmos.kernel.exec import callable_from_source
 from desmos.kernel.types import Tool, World
@@ -22,8 +23,15 @@ from desmos.kernel.types import Tool, World
 _UMASK = os.umask(0)
 os.umask(_UMASK)
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 SESSION_ID = "default"
+#: One attach of the process. `sessions` is a singleton keyed to the cwd --
+#: it is the durable world, not a sitting -- so nothing named the thing a
+#: person means by "this session", and per-call usage lived only in
+#: `world.log`, in memory, gone on restart. The id goes in the environment
+#: rather than a module global so `reload_sdk` (which re-imports this module)
+#: keeps the same run, and a fresh process gets a fresh one.
+RUN_ID_ENV = "DESMOS_RUN_ID"
 DB_FILENAME = "harness.sqlite3"
 LEGACY_FILENAME = "harness.json"
 KEEP_MESSAGES = 80
@@ -330,8 +338,23 @@ def _migrate(conn: sqlite3.Connection) -> None:
             frozen INTEGER NOT NULL CHECK (frozen IN (0, 1)),
             PRIMARY KEY (session_id, name)
         );
+        CREATE TABLE IF NOT EXISTS calls (
+            session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+            run_id TEXT NOT NULL,
+            seq INTEGER NOT NULL,
+            ts TEXT NOT NULL,
+            model TEXT NOT NULL,
+            input_tokens INTEGER NOT NULL DEFAULT 0,
+            cache_read_input_tokens INTEGER NOT NULL DEFAULT 0,
+            cache_creation_input_tokens INTEGER NOT NULL DEFAULT 0,
+            output_tokens INTEGER NOT NULL DEFAULT 0,
+            cost_usd REAL NOT NULL DEFAULT 0,
+            PRIMARY KEY (session_id, run_id, seq)
+        );
         CREATE INDEX IF NOT EXISTS idx_messages_session_seq
             ON messages(session_id, seq);
+        CREATE INDEX IF NOT EXISTS idx_calls_run
+            ON calls(session_id, run_id, seq);
         """
     )
     versions = [int(row[0]) for row in conn.execute("SELECT version FROM schema_migrations")]
@@ -507,6 +530,113 @@ def _append_registry(cwd: Path) -> None:
     if old == kept:  # nothing changed; do not churn the file every save
         return
     atomic_write(reg, text)
+
+
+def run_id() -> str:
+    """The id of this attach of the process. Stable across `reload_sdk`."""
+    existing = os.environ.get(RUN_ID_ENV)
+    if existing:
+        return existing
+    fresh = f"{int(datetime.now(timezone.utc).timestamp())}-{os.getpid()}"
+    os.environ[RUN_ID_ENV] = fresh
+    return fresh
+
+
+def record_call(world: World, entry: dict[str, Any]) -> None:
+    """Append one model round-trip to the durable ledger.
+
+    Called from the loop the moment a response lands, not from `save`: a run
+    that is killed mid-turn still spent the money, and the whole point of the
+    table is that the number survives the process. Never raises -- a billing
+    row is not worth losing a turn over.
+    """
+    if not world.persist or not entry:
+        return
+    usage = entry.get("usage") or {}
+    if not any(usage.get(key) for key in prices.USAGE_KEYS):
+        return
+    model = str(world.model or "")
+    run = run_id()
+    try:
+        conn = _open(state_file(world))
+    except Exception:  # noqa: BLE001
+        return
+    try:
+        with conn:
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO sessions(
+                    id, cwd, generation, gen_reason, thinking, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    SESSION_ID,
+                    str(world.cwd),
+                    int(world.generation),
+                    str(world.gen_reason),
+                    str(world.thinking),
+                    datetime.now(timezone.utc).isoformat(),
+                ),
+            )
+            row = conn.execute(
+                "SELECT COALESCE(MAX(seq), 0) FROM calls WHERE session_id = ? AND run_id = ?",
+                (SESSION_ID, run),
+            ).fetchone()
+            conn.execute(
+                """
+                INSERT INTO calls(
+                    session_id, run_id, seq, ts, model,
+                    input_tokens, cache_read_input_tokens,
+                    cache_creation_input_tokens, output_tokens, cost_usd)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    SESSION_ID,
+                    run,
+                    int(row[0]) + 1,
+                    str(entry.get("ts") or datetime.now(timezone.utc).isoformat()),
+                    model,
+                    int(usage.get("input_tokens") or 0),
+                    int(usage.get("cache_read_input_tokens") or 0),
+                    int(usage.get("cache_creation_input_tokens") or 0),
+                    int(usage.get("output_tokens") or 0),
+                    float(prices.cost(usage, model)),
+                ),
+            )
+    except Exception:  # noqa: BLE001
+        pass
+    finally:
+        conn.close()
+
+
+def runs(world: World, limit: int = 20) -> list[dict[str, Any]]:
+    """Per-run rollups, newest last: what each attach of the process spent."""
+    if not world.persist:
+        return []
+    try:
+        conn = _open(state_file(world))
+    except Exception:  # noqa: BLE001
+        return []
+    try:
+        rows = conn.execute(
+            """
+            SELECT run_id, COUNT(*) AS calls, MIN(ts) AS started, MAX(ts) AS ended,
+                   SUM(input_tokens) AS fresh,
+                   SUM(cache_read_input_tokens) AS read,
+                   SUM(cache_creation_input_tokens) AS write,
+                   SUM(output_tokens) AS out,
+                   SUM(cost_usd) AS cost,
+                   GROUP_CONCAT(DISTINCT model) AS models
+            FROM calls WHERE session_id = ?
+            GROUP BY run_id ORDER BY started DESC LIMIT ?
+            """,
+            (SESSION_ID, int(limit)),
+        ).fetchall()
+    except Exception:  # noqa: BLE001
+        return []
+    finally:
+        conn.close()
+    return [dict(row) for row in reversed(rows)]
 
 
 def save(world: World) -> None:

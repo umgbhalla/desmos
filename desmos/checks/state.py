@@ -342,3 +342,80 @@ def check() -> None:
         assert w3.notes["note"] == "usage line"
         rollback(w3, 1)
         assert "note" not in w3.notes
+
+        _check_prices()
+        _check_call_ledger(cwd)
+
+
+#: The one fixture both languages price. `crates/desmos-tui/src/main.rs`
+#: (mod price_table_tests) bills the same usage through CacheMeter and asserts
+#: this same constant, so a rate changed on one side fails on the other.
+FIXTURE_USAGE = {
+    "input_tokens": 100,
+    "cache_read_input_tokens": 1000,
+    "cache_creation_input_tokens": 10,
+    "output_tokens": 50,
+}
+FIXTURE_COST_OPUS = 0.0023125
+
+
+def _check_prices() -> None:
+    from desmos.kernel import prices
+
+    assert prices.rates("claude-opus-5") == (5.0, 25.0)
+    assert prices.rates("gpt-5.6-sol") == (1.25, 10.0)
+    # An unpriced model bills at the default. A silent zero reads as free.
+    assert prices.rates("mystery-9") == prices.rates("claude-opus-5")
+    got = prices.cost(FIXTURE_USAGE, "claude-opus-5")
+    assert abs(got - FIXTURE_COST_OPUS) < 1e-12, got
+    # Sonnet is the rate the old usage tag hardcoded for every model; the gap
+    # between these two is exactly the error that motivated the shared table.
+    assert prices.cost(FIXTURE_USAGE, "claude-sonnet-4-6") < got
+    # The 1h cache tier is a premium over the 5m one, not the same write.
+    hour = dict(FIXTURE_USAGE, cache_creation={"ephemeral_1h_input_tokens": 10})
+    assert prices.cost(hour, "claude-opus-5") > got
+
+    # The TUI must read this file, not a copy of it. A literal rate table in
+    # main.rs is the drift this check exists to catch.
+    main_rs = Path(__file__).resolve().parents[2] / "crates" / "desmos-tui" / "src" / "main.rs"
+    if main_rs.is_file():
+        text = main_rs.read_text()
+        assert "include_str!(\"../../../desmos/kernel/prices.json\")" in text, (
+            "the TUI stopped reading desmos/kernel/prices.json"
+        )
+        assert 'm if m.starts_with("claude-opus")' not in text, (
+            "main.rs grew a second hardcoded price table"
+        )
+
+
+def _check_call_ledger(cwd: Path) -> None:
+    """Per-call usage is durable, keyed by a run id, and priced on the way in."""
+    from desmos.state import persist
+
+    world = new_world(cwd, state_path=cwd / "ledger.sqlite3")
+    world.model = "claude-opus-5"
+    assert persist.runs(world) == []
+
+    persist.record_call(world, {"ts": "2026-01-01T00:00:00+00:00", "usage": FIXTURE_USAGE})
+    persist.record_call(world, {"ts": "2026-01-01T00:01:00+00:00", "usage": FIXTURE_USAGE})
+    # A call that reported nothing is not a call. Rows here are money.
+    persist.record_call(world, {"ts": "2026-01-01T00:02:00+00:00", "usage": {}})
+
+    rows = persist.runs(world)
+    assert len(rows) == 1, rows
+    row = rows[0]
+    assert row["calls"] == 2, row
+    assert row["run_id"] == persist.run_id()
+    assert row["models"] == "claude-opus-5"
+    assert abs(row["cost"] - 2 * FIXTURE_COST_OPUS) < 1e-12, row
+
+    # The point of the table: it outlives the process that wrote it.
+    reopened = new_world(cwd, state_path=cwd / "ledger.sqlite3")
+    assert persist.runs(reopened)[0]["calls"] == 2
+
+    # A child world (persist off) spends against its own transcript and must
+    # never write rows into the parent's ledger.
+    child = new_world(cwd, state_path=None)
+    child.model = "gpt-5.6-luna"
+    persist.record_call(child, {"usage": FIXTURE_USAGE})
+    assert persist.runs(world)[0]["calls"] == 2

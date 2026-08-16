@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 import desmos.agents.subagent as subagents
+from desmos.kernel import prices
 from desmos.loop import new_world
 from desmos.subagent_contracts import TaskContract
 
@@ -335,3 +336,70 @@ if __name__ == "__main__":
     self_check()
     parallel_tool_check()
     print("subagent contract check ok")
+
+
+def ledger_check() -> None:
+    """A run remembers its model and its dollars, and the directory stays bounded.
+
+    Both halves are wiring, not arithmetic. `cfg.model` is None for every child
+    that inherits the parent's model -- 184 of the 289 records on disk -- so the
+    model has to be resolved where the child world is built, and the assertion
+    here is on the persisted record, not on the resolver. The ledger has to be
+    written by `_persist` itself: pruning deletes the run files, so anything
+    that only `_append_ledger` knows how to write is lost with them.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        parent = new_world(root, state_path=None, persist=False, ns={})
+        parent.model = "claude-opus-5"
+
+        def complete(_model: str, _system: str, _messages: list[dict[str, Any]], _max: int) -> dict[str, Any]:
+            return response("done, arithmetic checked", usage=4)
+
+        parent.complete_fn = complete
+        old_dir, old_parent = subagents.DIR, subagents.PARENT
+        old_ledger, old_keep = subagents.LEDGER, subagents.RUNS_KEEP
+        subagents.DIR = root / "runs"
+        subagents.LEDGER = subagents.DIR / "ledger.jsonl"
+        subagents.RUNS_KEEP = 3
+        subagents.RUNS.clear()
+        subagents._LEDGERED.clear()
+        subagents.bind(parent)
+        try:
+            rid = subagents.spawn("Say what two plus two is.", agent="explore", parent=parent)
+            subagents.wait(rid, timeout=5, poll=0.01)
+            run = subagents.RUNS[rid]
+
+            # The effective model, on the record, priced with it. Roles carry
+            # their own model today; the 184 unpriceable records on disk are
+            # from before they did, and the field is what stops it recurring.
+            child_model = run.cfg.model or parent.model
+            assert run.model == child_model, (run.model, child_model)
+            record = json.loads((subagents.DIR / f"{rid}.json").read_text())
+            assert record["model"] == child_model, record["model"]
+            assert record["cost_usd"] > 0, record["cost_usd"]
+            expected = prices.cost(run.usage, child_model)
+            assert abs(record["cost_usd"] - round(expected, 6)) < 1e-9, (record, expected)
+
+            # One line per run, however many times the record is rewritten.
+            subagents._persist(run)
+            subagents._persist(run)
+            lines = subagents.LEDGER.read_text().splitlines()
+            assert len(lines) == 1, lines
+            row = json.loads(lines[0])
+            assert row["id"] == rid and row["model"] == child_model
+            assert row["cost_usd"] == record["cost_usd"]
+
+            # Pruning bounds the directory and never touches the ledger.
+            for n in range(6):
+                (subagents.DIR / f"filler{n}.json").write_text("{}")
+            removed = subagents._prune_runs()
+            kept = list(subagents.DIR.glob("*.json"))
+            assert removed == 4, removed
+            assert len(kept) == subagents.RUNS_KEEP, kept
+            assert subagents.LEDGER.is_file() and subagents.LEDGER.read_text().count(rid) == 1
+        finally:
+            subagents.DIR, subagents.PARENT = old_dir, old_parent
+            subagents.LEDGER, subagents.RUNS_KEEP = old_ledger, old_keep
+            subagents.RUNS.clear()
+            subagents._LEDGERED.clear()

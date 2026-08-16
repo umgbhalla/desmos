@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any
 
 from desmos.agents.subagent_contracts import Judgment, RunResult, TaskContract, judge, parse_run_result
+from desmos.kernel import prices
 
 # --- bundle -----------------------------------------------------------------
 
@@ -175,6 +176,13 @@ class Run:
     error: str = ""
     turns: int = 0
     usage: dict[str, int] = field(default_factory=dict)
+    #: The model the child actually ran on, and what its usage priced out at.
+    #: `cfg.model` is None whenever the child inherits the parent's model --
+    #: which was 184 of 289 runs on disk, every one of them unpriceable after
+    #: the fact. Resolve it once, at world creation, and keep the number with
+    #: the run that spent it.
+    model: str = ""
+    cost_usd: float = 0.0
     started: float = 0.0
     ended: float = 0.0
     retries: int = 0
@@ -208,6 +216,8 @@ class Run:
             "steers": self.steers,
             "guidance_reminders": self.guidance_reminders,
             "observed_tools": list(self.observed_tools),
+            "model": self.model,
+            "cost_usd": self.cost_usd,
             "usage": dict(self.usage),
             "out": (self.result or self.error)[:120],
         }
@@ -251,12 +261,70 @@ _LOCK = threading.Lock()
 DIR = Path(".desmos/subagents")
 
 
+#: How many finished run records to keep on disk. The directory had 289 files
+#: and no policy: nothing read the old ones, nothing summed them, and nothing
+#: ever deleted one. The ledger below is what survives pruning.
+RUNS_KEEP = 200
+LEDGER = DIR / "ledger.jsonl"
+#: `_persist` runs on every state transition and a finished run is persisted
+#: more than once (result, then judgment), so the ledger needs a once-per-run
+#: guard or the same dollars are counted twice.
+_LEDGERED: set[str] = set()
+
+
+def _append_ledger(run: Run) -> None:
+    """One line per finished run: the part worth keeping after the file goes.
+
+    Pruning a run record must not lose what it cost. This is append-only and
+    tiny -- id, agent, model, turns, tokens, dollars -- so a year of children
+    still summarises in one pass.
+    """
+    row = {
+        "id": run.id,
+        "ts": run.ended or run.started or time.time(),
+        "agent": run.cfg.agent,
+        "model": run.model,
+        "state": run.state,
+        "turns": run.turns,
+        "secs": run.secs,
+        "usage": dict(run.usage),
+        "cost_usd": run.cost_usd,
+    }
+    with LEDGER.open("a") as handle:
+        handle.write(json.dumps(row, default=str) + "\n")
+
+
+def _prune_runs(keep: int | None = None) -> int:
+    """Drop the oldest finished run files. Returns how many were removed.
+
+    `keep` is read at call time, not bound as a default: a default argument
+    freezes RUNS_KEEP at import and no test (or setting) can move it after.
+    """
+    keep = RUNS_KEEP if keep is None else keep
+    files = sorted(DIR.glob("*.json"), key=lambda f: f.stat().st_mtime)
+    excess = len(files) - keep
+    if excess <= 0:
+        return 0
+    removed = 0
+    for path in files[:excess]:
+        try:
+            path.unlink()
+            removed += 1
+        except OSError:
+            pass
+    return removed
+
+
 def _persist(run: Run) -> None:
     try:
         DIR.mkdir(parents=True, exist_ok=True)
         rec = {k: v for k, v in asdict(run).items() if k != "messages"}
         rec["cfg"] = asdict(run.cfg)
         (DIR / f"{run.id}.json").write_text(json.dumps(rec, indent=2, default=str))
+        if run.state in ("done", "stopped", "failed") and run.id not in _LEDGERED:
+            _LEDGERED.add(run.id)
+            _append_ledger(run)
+            _prune_runs()
     except OSError:
         pass
 
@@ -462,6 +530,10 @@ def _execute(run: Run, parent: Any) -> None:
         # `parent` world it is handed, so a nested spawn lands in the tree with
         # the spawning run as parent and its depth + 1.
         w.subagent_run = run.id
+        # Resolve the inherited model here, where it is known. cfg.model is
+        # None for every child that takes the parent's model, and a run record
+        # with no model cannot be priced afterwards.
+        run.model = str(w.model or "")
         if run.cfg.context == "resumed" and run.messages:
             w.messages = list(run.messages)
 
@@ -553,6 +625,7 @@ def _execute(run: Run, parent: Any) -> None:
                 if isinstance(value, int):
                     total[key] = total.get(key, 0) + value
         run.usage = total
+        run.cost_usd = round(prices.cost(total, run.model), 6)
 
         if run.killed:
             run.state = "stopped"

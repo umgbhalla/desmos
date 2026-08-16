@@ -331,6 +331,13 @@ def turn(
             "response": redact_wire(resp),
         }
     )
+    # Durable the moment it lands. world.log is memory: a restart, a crash or a
+    # kill loses every token this run spent, and the only other record on disk
+    # is the request side in the trajectory files. Late import: state sits above
+    # kernel, and this is a frozen load-order seam in checks/layering.py.
+    from desmos.state import persist as _persist
+
+    _persist.record_call(world, world.log[-1])
     if len(world.log) > 1:
         # Only the newest entry's wire bodies are ever read -- by the complete
         # event three lines below, and by nothing else in the process. Keeping
