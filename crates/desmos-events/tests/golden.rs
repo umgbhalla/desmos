@@ -62,6 +62,14 @@ fn bogus_field_on_a_real_line_is_rejected() {
 
 /// A new `ev` kind the vocabulary does not list is an error, not a shrug.
 #[test]
+fn channel_notification_has_a_closed_wire_shape() {
+    let line = r#"{"ev":"channel","channel":"conflicts","author":"worker-b","preview":"persist.py conflict","unread":2,"message_id":9}"#;
+    assert!(parse(line).is_ok(), "channel event rejected");
+    let missing = r#"{"ev":"channel","channel":"conflicts","author":"worker-b","preview":"persist.py conflict","unread":2}"#;
+    assert!(parse(missing).is_err(), "channel event without cursor accepted");
+}
+
+#[test]
 fn unknown_ev_kind_is_rejected() {
     for line in [
         r#"{"ev": "telemetry", "text": "new kind"}"#,

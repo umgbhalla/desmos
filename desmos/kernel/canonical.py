@@ -32,8 +32,11 @@ DIRECT_OPS = {
     "workspace": ("read", "see", "commit"),
     "knowledge": ("todo", "plan"),
     "observe": ("usage", "trajectory", "error", "symbol", "threads"),
-    "agents": ("spawn", "fanout", "status", "result", "structured-result", "judgment", "wait"),
-    "session": ("compact", "status", "switch", "peers", "read", "post"),
+    "agents": (
+        "spawn", "fanout", "resume", "lineage",
+        "status", "result", "structured-result", "judgment", "wait",
+    ),
+    "session": ("compact", "status", "switch", "peers", "inbox", "read", "post", "dismiss"),
 }
 
 
@@ -242,8 +245,30 @@ def _observe(world, op, body, attrs):
     return json.dumps(value, ensure_ascii=False)
 
 
+#: Contract scope, written as tag attributes with comma-separated values.
+#: Without these the tag could only produce a legacy prose contract -- so the
+#: one rule that makes delegation honest (name the paths, the checks and the
+#: evidence *before* you spawn) was unwritable in the interface that spawns most
+#: children. 136 of 205 recorded runs were unstructured for exactly that reason.
+_SCOPE = ("paths", "write", "checks", "tools", "depends", "evidence")
+
+
+def _simple(attrs):
+    scope = {}
+    for key in _SCOPE:
+        items = tuple(part.strip() for part in attrs.pop(key, "").split(",") if part.strip())
+        if items:
+            scope[key] = items
+    return scope or None
+
+
 def _agents(op, body, attrs):
     from desmos.agents import subagent as agents
+    if op == "lineage":
+        rid = body.strip() or attrs.get("id", "")
+        if not rid:
+            return "agents lineage: missing id"
+        return json.dumps(agents.lineage(rid))
     if op == "status":
         return json.dumps(agents.status(), default=str)
     if op in {"result", "structured-result", "judgment"}:
@@ -257,15 +282,30 @@ def _agents(op, body, attrs):
         if not ids:
             return "agents wait: missing ids"
         return json.dumps(agents.wait(*ids, timeout=float(attrs.get("timeout", 600))), default=str)
+    simple = _simple(attrs)
+    for key in ("budget", "guidance_every_turns"):
+        if key in attrs:
+            attrs[key] = int(attrs[key])
     if op == "fanout":
         tasks = [part.strip() for part in body.split("\n---\n") if part.strip()]
         if not tasks:
             return "agents fanout: missing tasks"
-        return json.dumps(agents.fanout(tasks, agent=attrs.pop("agent", "explore"), **attrs))
-    for key in ("budget", "guidance_every_turns"):
-        if key in attrs:
-            attrs[key] = int(attrs[key])
-    return agents.spawn(body, agent=attrs.pop("agent", "general"), **attrs)
+        return json.dumps(
+            agents.fanout(tasks, agent=attrs.pop("agent", "explore"), simple=simple, **attrs)
+        )
+    if op == "resume":
+        src = attrs.pop("from", "") or attrs.pop("id", "")
+        if not src:
+            return "agents resume: missing from=<run id>"
+        if not body.strip():
+            return "agents resume: missing the next task"
+        # Identity does not travel, so the source's agent is the default rather
+        # than "general": a resume that has to restate the seat it already sits
+        # in is a resume that mostly raises.
+        run = agents.RUNS.get(src)
+        agent = attrs.pop("agent", "") or (run.cfg.agent if run is not None else "general")
+        return agents.spawn(body, agent=agent, resume=src, simple=simple, **attrs)
+    return agents.spawn(body, agent=attrs.pop("agent", "general"), simple=simple, **attrs)
 
 
 def _session(world, op, body, attrs):
@@ -285,17 +325,32 @@ def _session(world, op, body, attrs):
             "model": world.model, "thinking": world.thinking,
             "generation": world.generation, "messages": len(world.messages),
         })
-    if op in {"peers", "read", "post"}:
+    if op in {"peers", "inbox", "read", "post", "dismiss"}:
         from desmos.state import persist
         if op == "peers":
             return json.dumps(persist.peers(world), default=str)
         channel = attrs.get("channel", "conflicts")
-        if op == "read":
+        if op == "inbox":
             return json.dumps(
-                persist.channel_read(
-                    world, channel=channel,
-                    since=int(attrs.get("since", 0)),
-                    limit=int(attrs.get("limit", 50)),
+                persist.channel_inbox(
+                    world, channel=channel, limit=int(attrs.get("limit", 20))
+                ),
+                default=str,
+            )
+        if op == "read":
+            messages = persist.channel_read(
+                world, channel=channel,
+                since=int(attrs.get("since", 0)),
+                limit=int(attrs.get("limit", 50)),
+            )
+            mark = str(attrs.get("mark", "true")).lower() not in {"0", "false", "no", "off"}
+            if mark and messages:
+                persist.channel_dismiss(world, channel=channel, through=messages[-1]["id"])
+            return json.dumps(messages, default=str)
+        if op == "dismiss":
+            return json.dumps(
+                persist.channel_dismiss(
+                    world, channel=channel, through=int(attrs.get("through", 0))
                 ),
                 default=str,
             )

@@ -245,6 +245,7 @@ def _check_socket() -> None:
     double-drive serialization, dead-client survival, kill mid-step."""
     import json
     import os
+    import sqlite3
     import subprocess
     import sys
     import tempfile
@@ -316,6 +317,37 @@ def _check_socket() -> None:
             # --- client A drives a step; the events fan out to its socket ---
             a = _SockClient(sock_path)
             a_events: list[dict] = []
+            a.send({"op": "snapshot"})
+            a.until(lambda e: e.get("ev") == "snapshot", seen=a_events)
+            with sqlite3.connect(cwd / ".desmos" / "harness.sqlite3") as db:
+                owner = db.execute(
+                    "SELECT workspace_id, id FROM sessions ORDER BY started_at DESC LIMIT 1"
+                ).fetchone()
+                assert owner is not None
+                db.execute(
+                    """
+                    INSERT INTO channel_messages(
+                        workspace_id, session_id, channel, run_id,
+                        author, body, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        owner[0], owner[1], "conflicts", "peer-check",
+                        "worker-b", "persist.py conflict", "2026-01-01",
+                    ),
+                )
+            channel = a.until(
+                lambda e: e.get("ev") == "channel", seen=a_events
+            )
+            assert channel == {
+                "ev": "channel",
+                "channel": "conflicts",
+                "author": "worker-b",
+                "preview": "persist.py conflict",
+                "unread": 1,
+                "message_id": 1,
+            }, channel
+
             a.send({"op": "step", "text": "ping"})
             a.until(lambda e: e.get("ev") == "snapshot", seen=a_events)
             assert any(e.get("ev") == "done" for e in a_events), a_events

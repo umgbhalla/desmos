@@ -404,6 +404,12 @@ CREATE TABLE IF NOT EXISTS channel_messages (
     body TEXT NOT NULL,
     created_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS channel_cursors (
+    run_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    channel TEXT NOT NULL,
+    last_seen INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (run_id, channel)
+);
 CREATE INDEX IF NOT EXISTS idx_messages_session
     ON messages(session_id, seq);
 CREATE INDEX IF NOT EXISTS idx_calls_session
@@ -906,6 +912,107 @@ def channel_read(
         return [dict(row) for row in rows]
     finally:
         db.close()
+
+
+def channel_inbox(
+    world: World, channel: str = "conflicts", limit: int = 20
+) -> dict[str, Any]:
+    """Unread messages from other runs, without advancing the durable cursor."""
+    if not world.persist:
+        return {"channel": channel, "unread": 0, "last_seen": 0, "messages": []}
+    announce(world)
+    db = _open(state_file(world))
+    run = run_id()
+    name = channel or "conflicts"
+    try:
+        workspace = _workspace_id(db, world, create=False)
+        if workspace is None:
+            return {"channel": name, "unread": 0, "last_seen": 0, "messages": []}
+        cursor = db.execute(
+            "SELECT last_seen FROM channel_cursors WHERE run_id = ? AND channel = ?",
+            (run, name),
+        ).fetchone()
+        last_seen = int(cursor[0]) if cursor is not None else 0
+        unread = int(
+            db.execute(
+                """
+                SELECT COUNT(*) FROM channel_messages
+                WHERE workspace_id = ? AND channel = ? AND id > ?
+                  AND run_id != ?
+                """,
+                (workspace, name, last_seen, run),
+            ).fetchone()[0]
+        )
+        rows = db.execute(
+            """
+            SELECT id, channel, run_id, author, body, created_at
+            FROM channel_messages
+            WHERE workspace_id = ? AND channel = ? AND id > ?
+              AND run_id != ?
+            ORDER BY id LIMIT ?
+            """,
+            (
+                workspace, name, last_seen, run,
+                max(1, min(int(limit), 200)),
+            ),
+        ).fetchall()
+        return {
+            "channel": name, "unread": unread, "last_seen": last_seen,
+            "messages": [dict(row) for row in rows],
+        }
+    finally:
+        db.close()
+
+
+def channel_dismiss(
+    world: World, channel: str = "conflicts", through: int = 0
+) -> dict[str, Any]:
+    """Advance this run's unread cursor, defaulting to the newest message."""
+    if not world.persist:
+        return {"channel": channel, "last_seen": 0}
+    announce(world)
+    db = _open(state_file(world))
+    run = run_id()
+    name = channel or "conflicts"
+    try:
+        workspace = _workspace_id(db, world, create=False)
+        if workspace is None:
+            return {"channel": name, "last_seen": 0}
+        if int(through) <= 0:
+            through = int(
+                db.execute(
+                    "SELECT COALESCE(MAX(id), 0) FROM channel_messages"
+                    " WHERE workspace_id = ? AND channel = ?",
+                    (workspace, name),
+                ).fetchone()[0]
+            )
+        with db:
+            db.execute(
+                """
+                INSERT INTO channel_cursors(run_id, channel, last_seen)
+                VALUES (?, ?, ?)
+                ON CONFLICT(run_id, channel) DO UPDATE SET
+                    last_seen=MAX(channel_cursors.last_seen, excluded.last_seen)
+                """,
+                (run, name, int(through)),
+            )
+        return {"channel": name, "last_seen": int(through)}
+    finally:
+        db.close()
+
+
+def channel_notice(world: World, channel: str = "conflicts") -> str:
+    inbox = channel_inbox(world, channel=channel, limit=1)
+    if not inbox["unread"]:
+        return ""
+    message = inbox["messages"][0]
+    preview = " ".join(str(message["body"]).split())
+    if len(preview) > 120:
+        preview = preview[:119].rstrip() + "…"
+    return (
+        f"IRC #{inbox['channel']}: {inbox['unread']} unread from "
+        f"{message['author']}: {preview}. Use session inbox/read/post/dismiss."
+    )
 
 
 def record_call(world: World, entry: dict[str, Any]) -> None:

@@ -525,18 +525,59 @@ def _check_session_channel(cwd: Path) -> None:
             )
         )
         assert posted["channel"] == "conflicts" and posted["id"] > 0, posted
-        messages = json.loads(
-            dispatch(world, Block("session", "", {"op": "read", "since": "0"}))
-        )
-        assert [row["body"] for row in messages] == [
-            "I am editing persist.py; please avoid it."
-        ], messages
         assert json.loads(
+            dispatch(world, Block("session", "", {"op": "inbox"}))
+        )["unread"] == 0, "a run must not notify itself"
+
+        with sqlite3.connect(path) as db:
+            db.execute(
+                """
+                INSERT INTO channel_messages(
+                    workspace_id, session_id, channel, run_id,
+                    author, body, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    workspace, peer_id, "conflicts", peer_id,
+                    "worker-b", "I also need persist.py.", "2026-01-02",
+                ),
+            )
+        inbox = json.loads(dispatch(world, Block("session", "", {"op": "inbox"})))
+        assert inbox["unread"] == 1 and inbox["messages"][0]["author"] == "worker-b", inbox
+        from desmos.kernel.catalog import volatile
+        assert "IRC #conflicts: 1 unread from worker-b" in volatile(world)
+
+        messages = json.loads(
             dispatch(
                 world,
                 Block("session", "", {"op": "read", "since": str(posted["id"])}),
             )
-        ) == []
+        )
+        assert [row["body"] for row in messages] == ["I also need persist.py."], messages
+        assert json.loads(
+            dispatch(world, Block("session", "", {"op": "inbox"}))
+        )["unread"] == 0, "read must advance the unread cursor"
+
+        with sqlite3.connect(path) as db:
+            db.execute(
+                """
+                INSERT INTO channel_messages(
+                    workspace_id, session_id, channel, run_id,
+                    author, body, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    workspace, peer_id, "conflicts", peer_id,
+                    "worker-b", "Resolved.", "2026-01-03",
+                ),
+            )
+        assert json.loads(
+            dispatch(world, Block("session", "", {"op": "inbox"}))
+        )["unread"] == 1
+        dispatch(world, Block("session", "", {"op": "dismiss"}))
+        assert json.loads(
+            dispatch(world, Block("session", "", {"op": "inbox"}))
+        )["unread"] == 0
     finally:
         fcntl.flock(peer_lease.fileno(), fcntl.LOCK_UN)
         peer_lease.close()

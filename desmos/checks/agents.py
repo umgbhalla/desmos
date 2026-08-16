@@ -190,6 +190,46 @@ def check() -> None:
         )
         S.set_emitter(None)
 
+        import json as _json
+
+        # --- the tag can write a contract. Without scope attributes the
+        # <agents> surface could only produce a legacy prose run, so the rule
+        # that makes delegation honest -- name the paths, the checks and the
+        # evidence before spawning -- was unwritable in the interface that
+        # spawns most children.
+        tag_rid = dispatch(parent_sp, Block("agents", "read the module", {
+            "op": "spawn", "agent": "explore", "model": "claude-opus-5",
+            "paths": "a.py, b.py", "checks": "suite passes", "evidence": "file, test",
+        })).strip()
+        assert tag_rid in S.RUNS, tag_rid
+        tag_run = S.RUNS[tag_rid]
+        assert tag_run.structured is True, "scope attributes did not build a contract"
+        assert tag_run.contract.allowed_paths == ("a.py", "b.py"), tag_run.contract.allowed_paths
+        assert tag_run.contract.acceptance_checks == ("suite passes",), tag_run.contract.acceptance_checks
+        assert tag_run.contract.required_evidence == ("file", "test"), tag_run.contract.required_evidence
+        S.wait(tag_rid, timeout=15.0)
+
+        bare_rid = dispatch(parent_sp, Block("agents", "just look", {
+            "op": "spawn", "agent": "explore", "model": "claude-opus-5",
+        })).strip()
+        assert S.RUNS[bare_rid].structured is False, "a scopeless tag spawn invented a contract"
+        S.wait(bare_rid, timeout=15.0)
+
+        # resume through the tag inherits the source's seat by default -- a
+        # resume that has to restate the seat it already sits in mostly raises.
+        res = dispatch(parent_sp, Block("agents", "carry on", {
+            "op": "resume", "from": tag_rid, "model": "claude-opus-5",
+        })).strip()
+        assert res in S.RUNS, res
+        assert S.RUNS[res].source == tag_rid, S.RUNS[res].source
+        assert S.RUNS[res].cfg.agent == "explore", S.RUNS[res].cfg.agent
+        S.wait(res, timeout=15.0)
+        chain = _json.loads(dispatch(parent_sp, Block("agents", res, {"op": "lineage"})))
+        assert chain == [tag_rid, res], chain
+        assert dispatch(parent_sp, Block("agents", "x", {"op": "resume"})).endswith(
+            "missing from=<run id>"
+        ), "a resume with no source must answer, not raise"
+
         # --- the tree on the wire: a spawn inside a spawn records parent/depth,
         # and the depth budget rides the run. Three levels through the real pool
         # with scripted complete_fns, on the UNCOOPERATIVE path: no level hands
