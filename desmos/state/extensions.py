@@ -11,12 +11,21 @@ class ExtAPI:
     def __init__(self) -> None:
         self.hooks: dict[str, list[Callable[..., Any]]] = {}
         self.tools: list[tuple[str, str, Callable[..., Any]]] = []
+        # A file that raises on import used to disappear without a word, which
+        # looks exactly like a hook that registered and never fired.
+        self.errors: list[str] = []
 
     def on(self, event: str, fn: Callable[..., Any]) -> None:
         self.hooks.setdefault(event, []).append(fn)
 
     def register_tool(self, name: str, doc: str, handler: Callable[..., Any]) -> None:
         self.tools.append((name, doc, handler))
+
+    # The ABI has always advertised api.hook and api.tool. Neither existed, so
+    # an extension written against the prompt failed on its first line. Both
+    # spellings are the interface now; the pi-shaped ones stay primary.
+    hook = on
+    tool = register_tool
 
 
 def extension_roots(cwd: Path) -> list[Path]:
@@ -49,14 +58,9 @@ def load_extensions(cwd: Path) -> ExtAPI:
     for root in extension_roots(cwd):
         if not root.is_dir():
             continue
-        for path in sorted(root.glob("*.py")):
+        for path in sorted(root.glob("*.py")) + sorted(root.glob("*/index.py")):
             try:
                 _load_file(path, api)
-            except Exception:
-                continue
-        for path in sorted(root.glob("*/index.py")):
-            try:
-                _load_file(path, api)
-            except Exception:
-                continue
+            except Exception as exc:
+                api.errors.append(f"{path}: {type(exc).__name__}: {exc}")
     return api

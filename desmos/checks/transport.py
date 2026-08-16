@@ -547,6 +547,36 @@ def check() -> None:
         assert any(e.get("ev") == "compacted" for e in fold_evs), [e.get("ev") for e in fold_evs]
         assert compaction_block(w_fold.messages[-1]["content"]) == fold, w_fold.messages[-1]
 
+        # A fold destroys exactly what the next model cannot read back, so a
+        # session gets a hook there to copy what it needs somewhere that
+        # survives. Drive the real turn: a test that calls the hook itself
+        # passes just as happily against a loop that never registered one.
+        seen: list[dict] = []
+
+        def _boom(_world, _info):
+            raise RuntimeError("hook blew up")
+
+        w_hook = new_world(cwd, state_path=cwd / "harness-hook.json", ns={})
+        w_hook.complete_fn = w_fold.complete_fn
+        w_hook.hooks["compacted"] = [lambda _w, info: seen.append(info), _boom]
+        _run(w_hook, "long run", quiet=True)
+        assert len(seen) == 1 and seen[0]["text"] == "folded 40 turns", seen
+        assert seen[0]["kept"] > 0 and "n" in seen[0], seen
+        # A hook that raises must not take the run with it: the fold already
+        # happened, and dying on the way out loses strictly more than it saved.
+        assert "hook blew up" in (w_hook.log[-1].get("hook_error") or ""), w_hook.log[-1]
+
+        # api.hook and api.tool are the two names the ABI advertises to every
+        # extension author. Both were missing; an extension written against
+        # the prompt died on its first line, silently.
+        from desmos.state.extensions import ExtAPI
+
+        probe = ExtAPI()
+        probe.hook("compacted", _boom)
+        probe.tool("probe_tool", "doc", _boom)
+        assert probe.hooks["compacted"] == [_boom], probe.hooks
+        assert probe.tools[0][0] == "probe_tool", probe.tools
+
         # Overload is routine and used to kill a whole multi-turn step.
         from desmos.transport.complete import RETRY_CAP, RETRY_STATUS, _retry_after
 

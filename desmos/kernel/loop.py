@@ -240,7 +240,17 @@ def seed_builtins(world: World) -> None:
             existing.frozen = True
 
 
-def install_resources(world: World) -> None:
+def _ext_hook(fn: Callable[..., Any]) -> Callable[..., Any]:
+    """Mark a hook as owned by the extension loader, so a reload can retire it."""
+
+    def call(*args: Any, **kwargs: Any) -> Any:
+        return fn(*args, **kwargs)
+
+    call._desmos_ext = True  # type: ignore[attr-defined]
+    return call
+
+
+def install_resources(world: World) -> Any:
     from desmos.state.extensions import load_extensions
     from desmos.skills import bind_python_skill, discover_skills
 
@@ -254,15 +264,28 @@ def install_resources(world: World) -> None:
                 handler=fn,
             )
     api = load_extensions(world.cwd)
-    world.hooks = api.hooks
+    # A session registers a hook by appending straight to world.hooks from the
+    # kernel. Replacing the dict wholesale deleted every one of those, and
+    # run_turns calls this at the top of each run -- so a session-level hook was
+    # erased before it could fire even once, which is indistinguishable from a
+    # hook point that was never wired. Retire only what this loader installed.
+    for name, fns in list(world.hooks.items()):
+        world.hooks[name] = [fn for fn in fns if not getattr(fn, "_desmos_ext", False)]
+    for name, fns in api.hooks.items():
+        world.hooks.setdefault(name, []).extend(_ext_hook(fn) for fn in fns)
     for name, doc, handler in api.tools:
         if name not in FROZEN:
             world.tools[name] = Tool(name=name, doc=doc, handler=handler)
+    return api
 
 
 def reload(world: World) -> str:
-    install_resources(world)
-    return f"reloaded {len(world.skills)} skills, {len(world.tools)} tools"
+    api = install_resources(world)
+    msg = f"reloaded {len(world.skills)} skills, {len(world.tools)} tools"
+    errors = getattr(api, "errors", None)
+    if errors:
+        msg += "\nextensions that failed to load:\n" + "\n".join("  " + e for e in errors)
+    return msg
 
 
 def turn(
@@ -420,11 +443,32 @@ def turn(
         # The block's summary field is the server's, not ours. Read whichever
         # string it carries rather than asserting a shape; the trajectory log
         # has the exact wire block if this ever needs pinning down.
+        # "id" is a string and it is not a summary. Reading whichever field
+        # comes first meant the fold card and every compacted hook received
+        # the block id -- a stable-looking value that is never wrong enough
+        # to notice and never once carried what the server actually wrote.
         summary = next(
-            (v for k, v in fold.items() if k != "type" and isinstance(v, str) and v.strip()),
+            (
+                v
+                for k, v in fold.items()
+                if k not in ("type", "id") and isinstance(v, str) and v.strip()
+            ),
             "",
         )
         fire({"ev": "compacted", "n": n, "kept": len(messages), "text": summary})
+        # A fold is the one moment the harness destroys state it cannot get
+        # back, and the model that wakes up after it cannot read what was
+        # folded. Hooks run here so a session can copy what only the transcript
+        # knew into somewhere that survives by construction -- a note rides in
+        # every later request. A hook that raises must not take the turn with
+        # it: the fold already happened, and losing the run on the way out
+        # would destroy strictly more than the fold did.
+        for hook in world.hooks.get("compacted", []):
+            try:
+                hook(world, {"n": n, "kept": len(messages), "text": summary})
+            except Exception:
+                if world.log:
+                    world.log[-1]["hook_error"] = traceback.format_exc()
     # What the model wrote after its last closing tag. Never rewritten -- the
     # stored message must stay byte-exact for the cached prefix -- but recorded,
     # so a degenerate suffix is visible the first time instead of the fiftieth.
