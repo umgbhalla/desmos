@@ -25,8 +25,8 @@ rustup toolchain install stable --profile minimal --target "$target"
 rustup default stable
 cargo build --locked --release --target "$target" -p desmos-tui
 env -u NO_COLOR COLORTERM=truecolor TERM=xterm-256color \
-  cargo test --locked --release -p desmos-tui
-cargo test --locked --release -p xai-grok-markdown -p xai-grok-markdown-core
+  cargo test --locked --release --target "$target" -p desmos-tui
+cargo test --locked --release --target "$target" -p xai-grok-markdown -p xai-grok-markdown-core
 
 python3 - <<'PY'
 import pathlib
