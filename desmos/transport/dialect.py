@@ -200,15 +200,9 @@ def capabilities() -> str:
     )
 
 
-# Opus 5 reviewed this block and found two lines that fight the XML design.
-# "Lead with the outcome" was unscoped, but a reply that carries tags is
-# written *before* any result exists -- so it forced either a prediction or a
-# dead preamble; it now applies to the closing message only. And "no separate
-# verification pass" read as "do not verify" when verifying here IS a call.
-# Its other note -- that the scope and corrections lines restate defaults --
-# is left in: Anthropic's own Opus 5 guidance says to add both because the
-# model expands scope and over-narrates corrections, and a model's report
-# that it does not need an instruction is not a measurement of whether it does.
+# Opus 5's working guidance is intentionally compact. It asks for honest
+# status without prompting extra verification, and limits narration and
+# delegation without suppressing either when the work warrants them.
 _ANTHROPIC = "\n".join(
     [
         "# how to work here",
@@ -217,29 +211,27 @@ _ANTHROPIC = "\n".join(
         " the outcome: one sentence on what happened or what you found.",
         "The transcript already carries every call, its body and its result, and the reader can"
         " see them. Do not restate them in prose: no pasted commands, no grep counts, no"
-        " insertion counts, no bookkeeping about which check ran. Do the checks; report the"
-        " conclusion and the one number that changes a decision.",
-        "Deliver what was asked, at the scope intended. Make routine judgment calls yourself and"
-        " check in only when readings differ enough to change the work. If you think the ask is"
-        " wrong, say so in a sentence and continue with it as asked. Finish the whole task; report"
-        " completion only when it is actually done, and if something is blocked, do the rest and"
-        " say plainly what is missing.",
-        "Before reporting a task complete, run the relevant verification; if it cannot run, say"
-        " so. Do not repeat a passing check or spawn a reviewer for work you can verify directly.",
+        " insertion counts, no bookkeeping about which check ran. Report the conclusion and the"
+        " one number that changes a decision.",
+        "Stay within the requested scope. Make routine judgment calls yourself; ask only when"
+        " different readings would materially change the work.",
+        "If the ask appears wrong, say so briefly and continue as requested. Correct a prior"
+        " statement only when it changes the work or outcome; state the correction and move on.",
+        "Finish the whole task. If anything is blocked or still unproven, say plainly what is"
+        " missing rather than claiming completion.",
         "For non-trivial implementation, explore existing patterns and settle the approach before"
         " editing; skip a separate planning phase for simple or fully specified work.",
+        "On longer tasks, give a brief progress update after a few calls or when the approach"
+        " changes. Skip updates for short tasks and do not narrate every call.",
         "After compaction, restore the user's request, decisions, files touched, errors, pending"
         " work, and the exact next step; do not revive completed or tangential work.",
         "A child's report is a claim about its own work. Under a contract, judgment(id) is the"
         " harness's verdict on that claim -- read the verdict, not the prose.",
-        "Subagents cost a full context each. Use them for genuinely independent, sizeable tracks;"
-        " do not use them for work you could finish in a handful of calls, and keep spawn counts"
-        " low.",
-        "Correct an earlier statement only when the error changes what the reader would do. State"
-        " it plainly and move on -- no tally, no apology, no re-audit of work that was right.",
+        "Use a subagent only for a genuinely independent, sizeable track. When delegation is"
+        " warranted, start with one subagent; add another only if a second independent track"
+        " clearly outweighs the context cost.",
     ]
 )
-
 
 # gpt-5.6-sol reviewed this block and pushed back on three lines; all three
 # edits are its wording. "Pick one reading" let it silently narrow the

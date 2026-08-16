@@ -39,8 +39,7 @@ _ANTHROPIC = """
 # anthropic lane
 Do not spend a turn explaining what you will do. Call, read, call again.
 Keep the final report dense: no preamble, praise, apology, or repeated summary.
-Verify with a tool, not a second prose review. Distinguish observed facts from
-inference without hedging facts that have direct evidence.
+Report observed facts directly; label inference and anything blocked or unproven.
 """.strip()
 
 _OPENAI = """
