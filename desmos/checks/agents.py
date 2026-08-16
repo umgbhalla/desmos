@@ -382,10 +382,29 @@ def check() -> None:
             assert landed, "settle notice never landed"
             notice = landed[0].output
             assert len(notice) <= 400, len(notice)
-            assert notice.startswith(f"[{bid} done depth=0] compose an epic — unjudged: B"), notice
+            assert notice.startswith(f"[{bid} done depth=0] compose an epic — accepted: B"), notice
             assert S.RUNS[bid].result == big, "the run record lost the raw result"
             rec_big = json.loads((S.DIR / f"{bid}.json").read_text(encoding="utf-8"))
             assert len(rec_big["result"]) == 50_000, len(rec_big["result"])
+
+            # --- a prose run is judged too. Tool use is the one thing the
+            # parent observes for itself, so a toolless report comes back
+            # rejected instead of riding upward as an unjudged success.
+            def mute_complete(_model, _system, _messages, _max_tokens):
+                return {"content": [{"type": "text", "text": "I thought about it."}], "usage": {}}
+
+            mute_root = new_world(cwd, state_path=None, persist=False)
+            mute_root.complete_fn = mute_complete
+            mid = S.spawn("think about it", agent="explore", model="claude-opus-5", parent=mute_root)
+            S.wait(mid, timeout=15.0)
+            verdict = S.judgment(mid)
+            assert verdict is not None, "a prose run came back unjudged"
+            assert not verdict.accepted, verdict
+            assert "no tool use observed" in verdict.reasons, verdict.reasons
+            assert S.RUNS[mid].stage == "rejected", S.RUNS[mid].stage
+            mute_notice = S.child_notice(S.RUNS[mid])
+            assert "— rejected:" in mute_notice, mute_notice
+            assert "REJECTED." in mute_notice, mute_notice
 
             # --- rerun (C3): a settled run respawns as a fresh id with the
             # same objective, wired to the same parent world. Unknown ids are

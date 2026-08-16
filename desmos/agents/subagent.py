@@ -637,17 +637,36 @@ def _execute(run: Run, parent: Any) -> None:
             run.stage = "failed"
             run.progress = run.error
         else:
-            run.stage = "judging" if run.structured else "completed"
-            run.progress = "validating declared evidence" if run.structured else "child finished"
-        if run.structured and run.contract is not None:
-            run.run_result = parse_run_result(
-                run.result,
-                terminal_state=run.state,
-                stop_reason=run.stop_reason,
-                usage=run.usage,
-                duration=run.secs,
-                retries=run.retries,
+            run.stage = "judging"
+            run.progress = (
+                "validating declared evidence" if run.structured else "checking the report"
             )
+        if run.contract is not None:
+            if run.structured:
+                run.run_result = parse_run_result(
+                    run.result,
+                    terminal_state=run.state,
+                    stop_reason=run.stop_reason,
+                    usage=run.usage,
+                    duration=run.secs,
+                    retries=run.retries,
+                )
+            else:
+                # A prose run is judgeable too, on evidence the parent already
+                # holds: it finished cleanly, it said something, and it used a
+                # tool. There is no JSON to parse, so nothing is required of
+                # the child -- but the verdict stops being None. 136 of 205
+                # recorded runs carried no verdict at all, which made the cheap
+                # path one that could never fail and so never warn.
+                run.run_result = RunResult(
+                    terminal_state=run.state,
+                    stop_reason=run.stop_reason,
+                    summary=" ".join((run.result or "").split())[:2000],
+                    usage=dict(run.usage),
+                    duration=run.secs,
+                    retries=run.retries,
+                    raw=run.result,
+                )
             run.judgment = judge(
                 run.contract,
                 run.run_result,
@@ -657,7 +676,7 @@ def _execute(run: Run, parent: Any) -> None:
                 run.stop_reason = "invalid_result"
             run.stage = "accepted" if run.judgment.accepted else "rejected"
             run.progress = (
-                "all acceptance checks have evidence"
+                ("all acceptance checks have evidence" if run.structured else "report accepted")
                 if run.judgment.accepted
                 else "; ".join(run.judgment.reasons[:3])
             )
