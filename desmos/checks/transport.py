@@ -146,21 +146,31 @@ def check() -> None:
         from desmos.catalog import system_prompt as _sysprompt
 
         vol = new_world(cwd, state_path=cwd / "volatile.json")
-        vol.notes["todo"] = "[ ] one"
+        vol.notes["todo"] = "[ ] alpha\n[ ] beta"
         history = [{"role": "user", "content": "go"}]
         before = cached_payload("claude-opus-5", _sysprompt(vol), history, 8192, thinking="low")
-        vol.notes["todo"] = "[x] one"
+        vol.notes["todo"] = "[x] alpha\n[ ] beta"
         after = cached_payload("claude-opus-5", _sysprompt(vol), history, 8192, thinking="low")
         assert before["system"] == after["system"], "a todo tick rewrote the cached system blocks"
-        assert not any("[ ] one" in b["text"] for b in before["system"]), (
+        assert not any("[ ] beta" in b["text"] for b in before["system"]), (
             "the todo body is still inside the cached prefix"
         )
         last = after["messages"][-1]["content"]
         assert "cache_control" not in last[-1], last[-1]
-        assert "[x] one" in last[-1]["text"], last[-1]
-        assert "[ ] one" in before["messages"][-1]["content"][-1]["text"]
+        # Done rows are dropped and the survivors keep their real numbers: the
+        # tail is re-sent uncached every turn, so it pays for itself each time.
+        tail = last[-1]["text"]
+        assert "2. [ ] beta" in tail and "alpha" not in tail and "(1 done)" in tail, tail
+        assert "1. [ ] alpha" in before["messages"][-1]["content"][-1]["text"]
         marks = [i for i, b in enumerate(last) if "cache_control" in b]
         assert marks == [len(last) - 2], marks
+
+        # Nothing open, nothing sent.
+        vol.notes["todo"] = "[x] alpha\n[x] beta"
+        empty = cached_payload("claude-opus-5", _sysprompt(vol), history, 8192, thinking="low")
+        assert empty["messages"][-1]["content"][-1].get("cache_control"), (
+            "a fully ticked todo still appended a block"
+        )
 
         # An inbound cache_control on a user block is dropped and re-derived,
         # or a replayed transcript accumulates one breakpoint per turn and

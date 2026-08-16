@@ -60,9 +60,27 @@ VOLATILE_NOTES = ("todo",)
 VOLATILE_MARKER = "# now"
 
 
+def todo_digest(text: str) -> str:
+    """Open items only, keeping their real numbers. Done work is not context."""
+    rows = [r for r in text.splitlines() if r.strip()]
+    live = [f"{i}. {r}" for i, r in enumerate(rows, 1) if not r.lstrip().startswith("[x]")]
+    if not live:
+        return ""
+    done = len(rows) - len(live)
+    return "\n".join(live) + (f"\n({done} done)" if done else "")
+
+
+VOLATILE_VIEW = {"todo": todo_digest}
+
+
 def volatile(world: World) -> str:
     """Per-turn mutable state, deliberately outside the cached prefix."""
-    parts = [f"[{k}]\n{world.notes[k]}" for k in VOLATILE_NOTES if world.notes.get(k)]
+    parts = []
+    for key in VOLATILE_NOTES:
+        raw = world.notes.get(key) or ""
+        view = VOLATILE_VIEW.get(key, str)(raw)
+        if view.strip():
+            parts.append(f"[{key}]\n{view}")
     return VOLATILE_MARKER + "\n" + "\n".join(parts) if parts else ""
 
 
