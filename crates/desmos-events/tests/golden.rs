@@ -35,7 +35,7 @@ fn every_golden_line_parses() {
             lines += 1;
         }
     }
-    assert_eq!(fixtures, 11, "expected the 11 recorded scenarios");
+    assert_eq!(fixtures, 12, "expected the 12 recorded scenarios");
     assert!(lines > 0, "golden fixtures were empty");
 }
 
@@ -66,10 +66,82 @@ fn unknown_ev_kind_is_rejected() {
     for line in [
         r#"{"ev": "telemetry", "text": "new kind"}"#,
         r#"{"ev": "child", "id": "abcd1234", "kind": "telemetry", "text": "nested"}"#,
-        r#"{"ev": "subagent", "phase": "stopped", "id": "abcd1234"}"#, // no producer emits it
+        // session is the log FILE's header, never a wire event.
+        r#"{"ev": "session", "session_id": "abc", "cwd": "/x", "ts": 1}"#,
     ] {
         assert!(parse(line).is_err(), "accepted unknown kind: {line}");
     }
+}
+
+/// The terminal `stopped` phase (a kill_run intervention's settle) carries the
+/// same payload as done/failed and parses; a bare stopped without the terminal
+/// fields still does not.
+#[test]
+fn stopped_phase_is_the_terminal_payload() {
+    let text = std::fs::read_to_string(golden_dir().join("spawn.jsonl")).unwrap();
+    let done_line = text
+        .lines()
+        .find(|l| l.contains(r#""ev": "subagent""#) && l.contains(r#""stop_reason""#))
+        .expect("spawn.jsonl carries a terminal subagent line");
+    let mut obj: serde_json::Map<String, serde_json::Value> =
+        serde_json::from_str(done_line).unwrap();
+    obj.insert("phase".into(), "stopped".into());
+    let stopped = serde_json::to_string(&obj).unwrap();
+    assert!(parse(&stopped).is_ok(), "terminal stopped rejected: {stopped}");
+    let bare = r#"{"ev": "subagent", "phase": "stopped", "id": "abcd1234"}"#;
+    assert!(parse(bare).is_err(), "bare stopped accepted: {bare}");
+}
+
+/// Track 4.3: `generation` is required on `started` — the same recorded line
+/// without it is producer drift and must fail.
+#[test]
+fn started_requires_generation() {
+    let text = std::fs::read_to_string(golden_dir().join("spawn.jsonl")).unwrap();
+    let mut checked = 0;
+    for line in text.lines().filter(|l| l.contains(r#""phase": "started""#)) {
+        assert!(parse(line).is_ok(), "fixture line must parse clean: {line}");
+        let mut obj: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(line).unwrap();
+        assert!(
+            obj.remove("generation").is_some(),
+            "recorded started line stopped carrying generation: {line}"
+        );
+        let doctored = serde_json::to_string(&obj).unwrap();
+        assert!(parse(&doctored).is_err(), "started without generation accepted");
+        checked += 1;
+    }
+    assert!(checked > 0, "spawn.jsonl carried no started lines");
+}
+
+/// The two forms stay on their own sides of the seam: a stamped line parses
+/// only through the log form, a wire line refuses stamps, and the log form
+/// refuses an unstamped event line.
+#[test]
+fn log_form_owns_the_stamps() {
+    use desmos_events::{parse_log_line, LogLine};
+    let text = std::fs::read_to_string(golden_dir().join("plain.jsonl")).unwrap();
+    let wire_line = text.lines().next().unwrap();
+    // A wire event never carries seq/ts.
+    let mut obj: serde_json::Map<String, serde_json::Value> =
+        serde_json::from_str(wire_line).unwrap();
+    obj.insert("seq".into(), 1.into());
+    obj.insert("ts".into(), 1755300000000i64.into());
+    let stamped = serde_json::to_string(&obj).unwrap();
+    assert!(parse(&stamped).is_err(), "wire enum accepted seq/ts: {stamped}");
+    // The log form strips the stamps and parses the same strict Event.
+    match parse_log_line(&stamped) {
+        Ok(LogLine::Stamped { seq: 1, ts, .. }) => assert!(ts > 0),
+        other => panic!("stamped line did not parse as Stamped: {other:?}"),
+    }
+    // An unstamped event line is not a legal log line.
+    assert!(parse_log_line(wire_line).is_err(), "log form accepted a stampless line");
+    // The header parses only through the log form.
+    let header = r#"{"ev": "session", "session_id": "abc", "cwd": "/tmp/x", "ts": 1}"#;
+    assert!(matches!(parse_log_line(header), Ok(LogLine::Session { .. })));
+    // Strictness survives the strip: a bogus field under the stamps still fails.
+    obj.insert("bogus_field".into(), serde_json::Value::Bool(true));
+    let doctored = serde_json::to_string(&obj).unwrap();
+    assert!(parse_log_line(&doctored).is_err(), "log form lost deny_unknown_fields");
 }
 
 /// Phase 3 tree fields are required, not optional: every recorded `subagent`

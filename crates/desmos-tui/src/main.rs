@@ -43,6 +43,7 @@ mod session;
 mod side;
 mod slash;
 mod stream;
+mod tree;
 mod wire;
 mod work;
 
@@ -103,7 +104,7 @@ use xai_grok_pager::clipboard::SystemClipboard;
 use xai_grok_pager::scrollback::render::InlineMediaPlacement;
 use xai_grok_pager::terminal::image as gfx;
 use xai_grok_pager::scrollback::{
-    DisplayMode, EntryId, RenderBlock, ScratchBuffer, ScrollbackEntry, ScrollbackPane,
+    EntryId, RenderBlock, ScratchBuffer, ScrollbackEntry, ScrollbackPane,
     ScrollbackState,
     text_selection::{
         ActiveTextDrag, PendingTextDrag, PersistentTextSelection,
@@ -2074,7 +2075,13 @@ fn draw(f: &mut Frame, app: &mut App) {
         Some((cur, total)) => format!("Activity  #{cur}/{total}  {chip}"),
         None => format!("Activity  {chip}"),
     };
-    app.calls_chip = title_chip_rect(app.call_area, &calls_title, chip);
+    app.calls_chip = if app.tree_open {
+        // The tree replaces the Activity pane, chip included: a click where
+        // the chip was must not flip a setting on a pane that is not there.
+        None
+    } else {
+        title_chip_rect(app.call_area, &calls_title, chip)
+    };
     if let (Some(id), true) = (viewing.as_deref(), child_ok) {
         let child = app.children.get_mut(id).expect("checked");
         let title = format!("Session {id}");
@@ -2091,19 +2098,21 @@ fn draw(f: &mut Frame, app: &mut App) {
             &child.sess.story_text,
             &mut app.media.frame,
         );
-        draw_scrollback(
-            f,
-            panes[1],
-            &mut child.sess.calls,
-            &mut child.sess.calls_scratch,
-            &mut child.sess.calls_sel,
-            &calls_title,
-            theme.accent_tool,
-            app.focus == Focus::Calls,
-            app.mouse,
-            &child.sess.calls_text,
-            &mut app.media.frame,
-        );
+        if !app.tree_open {
+            draw_scrollback(
+                f,
+                panes[1],
+                &mut child.sess.calls,
+                &mut child.sess.calls_scratch,
+                &mut child.sess.calls_sel,
+                &calls_title,
+                theme.accent_tool,
+                app.focus == Focus::Calls,
+                app.mouse,
+                &child.sess.calls_text,
+                &mut app.media.frame,
+            );
+        }
     } else {
         draw_scrollback(
             f,
@@ -2118,19 +2127,25 @@ fn draw(f: &mut Frame, app: &mut App) {
             &app.sess.story_text,
             &mut app.media.frame,
         );
-        draw_scrollback(
-            f,
-            panes[1],
-            &mut app.sess.calls,
-            &mut app.sess.calls_scratch,
-            &mut app.sess.calls_sel,
-            &calls_title,
-            theme.accent_tool,
-            app.focus == Focus::Calls,
-            app.mouse,
-            &app.sess.calls_text,
-            &mut app.media.frame,
-        );
+        if !app.tree_open {
+            draw_scrollback(
+                f,
+                panes[1],
+                &mut app.sess.calls,
+                &mut app.sess.calls_scratch,
+                &mut app.sess.calls_sel,
+                &calls_title,
+                theme.accent_tool,
+                app.focus == Focus::Calls,
+                app.mouse,
+                &app.sess.calls_text,
+                &mut app.media.frame,
+            );
+        }
+    }
+    // `t` on the Activity pane: the run tree takes the column until Esc/t.
+    if app.tree_open {
+        draw_tree_pane(f, panes[1], app);
     }
     let n = app.post_n;
     let in_title = if n == 0 {
@@ -3003,6 +3018,79 @@ fn draw_queue(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(Paragraph::new(app.queue.lines(inner.width, focused)), inner);
 }
 
+/// The run tree over the Activity column: one row per subagent run, nested by
+/// the kernel's own parent/depth, fed purely from events. A list pane in the
+/// queue's shape — the rows come from `tree::row_text`, not a second renderer.
+fn draw_tree_pane(f: &mut Frame, area: Rect, app: &mut App) {
+    if area.height < 3 || area.width == 0 {
+        return;
+    }
+    let theme = Theme::current();
+    let focused = app.focus == Focus::Calls;
+    let border = if focused {
+        theme.accent_tool
+    } else {
+        theme.bg_base
+    };
+    let ids = tree::order(&app.children);
+    app.tree_sel = app.tree_sel.min(ids.len().saturating_sub(1));
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(border))
+        .title(Span::styled(
+            format!(" Runs  {} ", ids.len()),
+            Style::default()
+                .fg(theme.accent_tool)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .style(Style::default().bg(theme.bg_base).fg(theme.text_primary));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+    if ids.is_empty() {
+        f.render_widget(
+            Paragraph::new(Span::styled(
+                "no runs this session",
+                Style::default().fg(theme.text_secondary),
+            )),
+            inner,
+        );
+        return;
+    }
+    let w = inner.width as usize;
+    let lines: Vec<Line> = ids
+        .iter()
+        .enumerate()
+        .skip(app.tree_skip())
+        .take(inner.height as usize)
+        .map(|(i, id)| {
+            let text = tree::row_text(&app.children[id]);
+            let mut line = Line::from(Span::styled(
+                text,
+                Style::default().fg(theme.text_primary),
+            ));
+            if focused && i == app.tree_sel {
+                let band = Style::default().bg(theme.bg_highlight);
+                for span in &mut line.spans {
+                    span.style = span.style.patch(band);
+                }
+                let used: usize = line
+                    .spans
+                    .iter()
+                    .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
+                    .sum();
+                if w > used {
+                    line.spans.push(Span::styled(" ".repeat(w - used), band));
+                }
+            }
+            line
+        })
+        .collect();
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
 /// What to call the focused pane in the legend title.
 fn focus_name(focus: Focus) -> &'static str {
     match focus {
@@ -3179,6 +3267,10 @@ fn pane_keys(focus: Focus) -> (&'static str, &'static [(&'static str, &'static s
                 ("ctrl-f", "zoom, without moving the fold"),
                 ("[ ]", "previous / next POST group (Activity)"),
                 ("p", "show / hide the POST rows (Activity)"),
+                (
+                    "t",
+                    "run tree (Activity): enter opens, x kill, r rerun, t/esc back",
+                ),
                 ("r", "raw text of the selected block"),
                 ("pgup pgdn", "scroll a page"),
                 ("i", "back to the composer"),
@@ -8532,6 +8624,7 @@ mod tests {
             &p,
             &json!({}),
             &format!("attached 1 image(s): {p} [1KB]"),
+            None,
         );
         let mut app = App::new();
         app.call_push(card);

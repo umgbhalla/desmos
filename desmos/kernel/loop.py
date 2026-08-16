@@ -746,6 +746,14 @@ def _run_turns(
             return f"[stopped: {hit[0]} after turn {n}]"
         return f"[stopped by the user after turn {n}]"
 
+    # The prompt event: the user's message text at injection time, never
+    # re-derived from POST bodies (the wire body carries the header and the
+    # cache dressing; this carries what the human actually said). n is this
+    # step's ordinal within the session, counted on the world because
+    # run_turns is the only injector. Emitted immediately before the message
+    # is appended, so the event log's order is the transcript's order.
+    world.prompt_ordinal = getattr(world, "prompt_ordinal", 0) + 1
+    emit({"ev": "prompt", "text": prompt, "n": world.prompt_ordinal})
     world.messages.append({"role": "user", "content": header(world) + "\n\n" + prompt})
     # Images the composer attached to this prompt. vision.attach appends its
     # blocks to the most recent user message, which is the one just pushed, so
@@ -855,6 +863,13 @@ def _run_turns(
                 if landed:
                     text = pending.notice(landed)
                     world.messages.append({"role": "user", "content": text})
+                    # Durable before delivered: commit saves the transcript
+                    # that now carries the notice, THEN renames the handoff
+                    # files into delivered/. A kill anywhere in this stretch
+                    # -- or in the complete() turn that follows -- either
+                    # leaves the file in pending/ for replay to deliver, or
+                    # leaves it deduped by the notice id already saved.
+                    pending.commit(world, landed)
                     emit({"ev": "resumed", "n": n, "text": text})
                     continue
             _commit_step(world, prompt, speech)
@@ -895,6 +910,15 @@ def new_world(
 
         load(world)
         ensure_gen1(world)
+        # Notices a previous process settled but never durably delivered:
+        # replay() appends each one the loaded transcript does not already
+        # carry (deduped by the notice id in the file stem), saves, and only
+        # then renames the files into delivered/ -- so a kill at any edge,
+        # here or in a previous process, yields the notice exactly once.
+        # Same fn-level pending seam the resume path uses.
+        from desmos.agents import pending
+
+        pending.replay(world)
     return world
 
 
@@ -1055,11 +1079,85 @@ def _reload_order() -> list[str]:
     return order
 
 
+#: The reload tier, run in a fresh interpreter against the on-disk tree BEFORE
+#: importlib.reload touches the live process. A subprocess on purpose, twice
+#: over: it imports the NEW files (the very code a reload would install, not
+#: the modules this process already holds), and its source lives in this
+#: constant, so an edit that broke the tree cannot also have broken the gate
+#: that judges it. Layering: py_compile of every module (compileall), the
+#: import-direction check, and the scan round-trip repros the loop depends on.
+#: Measured 2026-08-16 (M-series laptop): ~0.1s warm, ~1s with cold pyc --
+#: well under the 5s ceiling; the 13s kernel group has no business here.
+_RELOAD_TIER = """\
+import compileall
+from pathlib import Path
+import desmos
+
+pkg = Path(desmos.__file__).resolve().parent
+if not compileall.compile_dir(str(pkg), quiet=1, force=False):
+    raise SystemExit("py_compile failed for the modules named above")
+
+from desmos.checks.layering import self_check
+self_check()
+
+# Scan round-trip repros: what the dispatch loop actually relies on. These
+# fail on broken semantics that still compile (e.g. a scan that returns []).
+from desmos.kernel.scan import scan, scan_spans
+
+blocks = scan('<python>x = 1</python>\\n<bash a="b">echo hi</bash>')
+assert [b.tag for b in blocks] == ["python", "bash"], blocks
+assert blocks[1].attrs == {"a": "b"} and blocks[1].body == "echo hi", blocks
+assert [b.tag for b in scan('<reload/>\\n<skill name="ping"/>')] == ["reload", "skill"], "self-closing tags"
+spans = scan_spans("say\\n<bash>ls</bash>\\ndone")
+assert len(spans) == 1 and spans[0][0].tag == "bash", spans
+assert spans[0][1] < spans[0][2] <= len("say\\n<bash>ls</bash>\\ndone"), spans
+opaque = scan('<python end="K">print("</python>")</python:K>')
+assert [b.tag for b in opaque] == ["python"] and "</python>" in opaque[0].body, opaque
+"""
+
+
+def _reload_gate() -> str | None:
+    """Run the reload tier; None when the tree is fit to import, else why not."""
+    import os
+    import subprocess
+    import sys
+
+    root = Path(__file__).resolve().parents[2]
+    env = dict(os.environ)
+    env["PYTHONPATH"] = str(root) + (
+        os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else ""
+    )
+    try:
+        ran = subprocess.run(
+            [sys.executable, "-c", _RELOAD_TIER],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            env=env,
+            cwd=str(root),
+        )
+    except subprocess.TimeoutExpired:
+        return "the reload tier timed out after 30s"
+    if ran.returncode == 0:
+        return None
+    detail = ((ran.stderr or "") + (ran.stdout or "")).strip()
+    return detail[-2000:] or f"the reload tier exited {ran.returncode} with no output"
+
+
 def reload_sdk(world: World | None = None) -> str:
     """Reimport desmos.* then rebind. Safe from the kernel or <reload_sdk/> after editing the SDK."""
     import importlib
     import sys
 
+    # Gate BEFORE the reload loop, never inside it: a tier failure must leave
+    # every old module live, and a partial reload is worse than either state.
+    failure = _reload_gate()
+    if failure is not None:
+        return (
+            "reload_sdk refused: the reload tier failed, so nothing was "
+            "reimported and the old modules remain live. Fix the tree and "
+            "call it again.\n" + failure
+        )
     importlib.invalidate_caches()
     old_subagent = sys.modules.get("desmos.agents.subagent")
     old_subagent_emit = getattr(old_subagent, "_EMIT", None)

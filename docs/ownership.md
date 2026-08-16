@@ -42,12 +42,16 @@ will arrive as; the first four are the moves ordered by upgrade-paths.md.
 
 ## Part 2 — event vocabulary
 
-Wire = one NDJSON object per line, `_emit` (`front/bridge.py:64`). Every event from
+Wire = one NDJSON object per line, `_emit` (`front/bridge.py`). Every event from
 the loop and subagents funnels through the bridge's `on_event=_emit`
-(`front/bridge.py:139`) or `S.set_emitter(_emit)` (`front/bridge.py:83`). Consumer is
-`handle_event` (`main.rs:2581`) unless said otherwise; `front/acp.py:305 _emit_event`
-is the second consumer and reads only `thinking`, `speech`, `turn`, `error`,
-`result`.
+or `S.set_emitter(_emit)`, which under one lock writes stdout, fans out to
+every attached socket client, and appends the seq/ts-stamped copy to the
+event log (see "Durable bridge surfaces"). The wire itself never carries
+`seq`/`ts`. Consumer is `handle_event` (`main.rs:2581`) unless said
+otherwise; `front/acp.py:305 _emit_event` is the second consumer and reads
+only `thinking`, `speech`, `turn`, `error`, `result`. The typed mirror is
+`crates/desmos-events` (`Event` for the wire, `LogLine` for the stamped
+file/replay form), enforced by `desmos/checks/conformance.py`.
 
 Field types: `str`, `int`, `f64`, `bool`, `obj`, `[str]`, `?` = sometimes
 absent.
@@ -120,6 +124,28 @@ The `kind` deltas feeding this (`thinking_delta`/`thinking`/`text_delta`) are
 produced by transport/complete.py:396-413 and transport/openai.py:392-418 and consumed by
 `kernel/loop.py:163-186 on_delta`; they are transport-internal, not wire events.
 
+### `prompt` — kernel/loop.py `_run_turns` (contract C1)
+Emitted once per step, immediately before the user message is appended to the
+transcript — the user's message text at injection time, never re-derived from
+POST bodies (those carry the header and cache dressing). Every path emits it,
+so a child's copy rides the `child` envelope as `kind:"prompt"`.
+
+| field | type | produced | consumed |
+|---|---|---|---|
+| `text` | str | the `prompt` argument, verbatim | **no UI** (main.rs falls to `_ => {}`); typed in desmos-events; the event-log file is the intended reader (replay, and the Phase 6.5 memex precondition) |
+| `n` | int | `world.prompt_ordinal`, counted per `run_turns` call on that world, starts at 1 | same |
+
+### `intervention` — front/bridge.py `_intervene` (contract C3)
+One per `kill_run`/`rerun` op arriving on any transport (stdio reader or a
+socket client), answered inline on the reader thread — never queued behind
+the step it interrupts. Its prose twin rides the existing `notice` kind.
+
+| field | type | produced | consumed |
+|---|---|---|---|
+| `action` | `"kill_run"\|"rerun"` | the op name | typed in desmos-events; **no TUI reader** (the tree row's confirmation is the terminal `subagent` phase `stopped`, not this event) |
+| `id` | str | the op's `id`, verbatim | same |
+| `result` | str | `S.kill_subtree(id)` / `S.rerun(id)` — an unknown id is a refusal string here, never an `error` event | same, plus the human via the `notice` twin |
+
 ### `post` — kernel/loop.py:152-160
 | field | type | produced | consumed |
 |---|---|---|---|
@@ -182,9 +208,12 @@ Consumed by **no UI**: main.rs falls to `_ => {}` (main.rs:2767), acp ignores.
 Only pending_check.py:58-59 asserts it exists.
 
 ### `resumed` — kernel/loop.py:577
-`n` int, `text` str (`agents/pending.py:126 notice`). Consumed by **no UI**; only
-pending_check.py:65-67. A step that parks on background work and wakes up
-paints nothing in the TUI for either transition.
+`n` int, `text` str (`agents/pending.py notice`; for a settled subagent the
+notice body is the C5 brief — `agents/subagent.py child_notice`, `[<id>
+<state> depth=<d>] <objective:80> — <verdict>: <summary:200>`, ≤400 chars,
+the raw result staying in `.desmos/subagents/<id>.json` and the trajectory).
+Consumed by **no UI**; only pending_check.py. A step that parks on background
+work and wakes up paints nothing in the TUI for either transition.
 
 ### `guidance` — kernel/loop.py:585
 `n` int, `text` str (the reminder injected by `on_continue`). Consumed by
@@ -197,54 +226,62 @@ Three shapes, keyed by `phase`. Consumer: main.rs:2624 → `handle_subagent`
 Every phase carries the Phase 3 tree fields, fixed at spawn time from the
 spawning run (`Run.parent`/`Run.depth`, agents/subagent.py): `parent` is the
 spawner's run id — null when the root world spawned it — and `depth` is
-spawner depth + 1 (root spawns are 0). `_persist(run)` writes both, so
-late-attach reconstruction has the tree. Consumer: events.rs `set_tree` →
-`ChildSess.parent`/`ChildSess.depth` (stored for the Phase 4 tree view 3.2;
-nothing renders them yet).
+spawner depth + 1 (root spawns are 0). `_persist(run)` writes both (plus
+`budget`, `generation`, `killed`), so late-attach reconstruction has the
+tree. Consumer: events.rs `set_tree` → `ChildSess.parent`/`ChildSess.depth`,
+rendered by the Track 3.2 tree view (tree.rs `order`/`row_text`, toggled with
+`t`).
 
-`phase:"started"` — agents/subagent.py `spawn()`:
+`phase:"started"` — agents/subagent.py `spawn()`/`rerun()` via `_launch`:
 | field | type | consumed |
 |---|---|---|
 | `id` | str (8-hex) | main.rs:2397 |
 | `parent` | str\|null | events.rs `set_tree` → `ChildSess.parent` |
 | `depth` | int | events.rs `set_tree` → `ChildSess.depth` |
-| `agent` | str | main.rs:2404 |
+| `agent` | str | main.rs:2404; events.rs → `ChildSess.agent` (tree row) |
 | `persona` | str | main.rs:2405-2409 |
 | `task` | str | main.rs:2403 (→ `task_title`) |
 | `structured` | bool | **nobody** (dead) |
 | `model` | str | main.rs:2410-2414 |
+| `generation` | int | Track 4.3 lineage: the parent world's generation at spawn (rerun records the generation at rerun time). Typed in desmos-events; **no TUI reader yet** |
 
 `phase:"progress"` — agents/subagent.py (`publish_progress`):
 | field | type | consumed |
 |---|---|---|
 | `id` | str | main.rs:2397 |
-| `parent` | str\|null | **nobody on this phase** (set_tree reads started + child envelopes; required by the enum) |
+| `parent` | str\|null | events.rs `set_tree` (every phase feeds the tree row now) |
 | `depth` | int | same |
 | `task` | str | **nobody on this phase** (dead) |
-| `stage` | str | main.rs:2422 |
+| `stage` | str | main.rs:2422; events.rs `set_run_facts` → tree row |
 | `progress` | str | main.rs:2365-2372 (`subagent_status`) |
-| `turns` | int | **nobody** (dead) |
-| `usage` | obj | **nobody** (dead) |
+| `turns` | int | events.rs `set_run_facts` → tree row `tN` |
+| `usage` | obj | events.rs `set_run_facts` (input/output_tokens) → tree row |
 
-`phase:` terminal — agents/subagent.py:531-547; `phase` is `run.state`, which is only
-ever `"done"` or `"failed"` (agents/subagent.py:487, 491, 524). The Rust arm also
-matches `"stopped"` (main.rs:2438) — **no producer emits it**; it is a
-speculative branch until Track 3 interventions exist.
+`phase:` terminal — agents/subagent.py `_execute`'s `finally`; `phase` is
+`run.state`: `"done"`, `"failed"`, or `"stopped"` — the last produced when a
+`kill_run` intervention cancels the run (contract C3: `kill_subtree` flags the
+run, its own loop reads the flag via `should_stop`, and a queued run settles
+as "killed before start"), always with stage `stopped`, stop_reason `killed`,
+accepted null. The Rust arm at main.rs:2438 finally has its producer.
 | field | type | consumed |
 |---|---|---|
 | `id` | str | main.rs:2397 |
-| `parent` | str\|null | **nobody on this phase** (same as progress) |
+| `parent` | str\|null | events.rs `set_tree` |
 | `depth` | int | same |
 | `task` | str | **nobody on this phase** (dead) |
-| `stage` | str | main.rs:2382-2390 (verdict fallback) |
+| `stage` | str | main.rs:2382-2390 (verdict fallback); events.rs `set_run_facts` |
 | `progress` | str | main.rs:2365-2372 |
 | `stop_reason` | str | main.rs:2382-2390 |
-| `accepted` | bool\|null | main.rs:2379 |
+| `accepted` | bool\|null | main.rs:2379; events.rs → `ChildSess.accepted` (tree verdict) |
 | `secs` | f64 | main.rs:2439 |
-| `turns` | int | **nobody** (dead) |
-| `usage` | obj | **nobody** (dead; the parent bills from `child` complete events instead, main.rs:2503) |
+| `turns` | int | events.rs `set_run_facts` → tree row |
+| `usage` | obj | events.rs `set_run_facts` → tree row (the parent still bills from `child` complete events, main.rs:2503) |
 | `result` | str (clipped :800) | **nobody** (dead) |
 | `error` | str\|null | main.rs:2441-2445, 2483-2487 |
+
+The terminal event is also the TUI's confirmation for any intervention it
+sent: events.rs clears `ChildSess.op_sent` (the "sent (unconfirmed)" marker)
+on done/failed/stopped, never on the `intervention` event itself.
 
 ### `child` — agents/subagent.py (`child_event`)
 `{ev:"child", id: run.id, parent: run.parent, depth: run.depth, kind:
@@ -253,9 +290,11 @@ re-enveloped, stamped with the Phase 3 tree fields on every kind. Consumer:
 main.rs:2625 → `handle_child` (events.rs), which stores `parent`/`depth` on
 the `ChildSess` via `set_tree` (a late attach that never saw `started` still
 learns the tree), handles `kind` ∈ `thinking`, `speech`, `post`, `complete`,
-`result`, `turn` and **drops** `error`, `done`, `stopped`, `compacted`,
-`pending`, `resumed`, `guidance` (`_ => {}`) — a child's error text reaches
-the human only via the terminal `subagent` event's `error` field.
+`result`, `turn` and **drops** `prompt` (C1 at child level: the injected task
+text, present since the loop emits it on every path), `error`, `done`,
+`stopped`, `compacted`, `pending`, `resumed`, `guidance` (`_ => {}`) — a
+child's error text reaches the human only via the terminal `subagent` event's
+`error` field.
 
 ### Transport-internal delta channel (not `ev` events)
 `complete()`/OpenAI stream callbacks use `kind`, consumed only by
@@ -286,7 +325,24 @@ is narrated by kernel/loop.py (`pending`/`resumed` above).
 | `picker` | — | front/bridge.py:185-188 | check.py:2045 only (no TUI sender) |
 | `login` | `method` str (default `"auto"`) | front/bridge.py:189-208 | main.rs:2839 |
 | `thinking` | `level` str (default `"low"`) | front/bridge.py:209-212 | main.rs:3587 |
-| anything else | — | front/bridge.py:214 → `error` event | — |
+| `kill_run` | `id` str | front/bridge.py `_intervene` — reader thread, inline, never queued behind the step it interrupts; answers with `intervention` + `notice` | tree.rs `kill_op` (`x` on a tree row); checks |
+| `rerun` | `id` str | front/bridge.py `_intervene` (same path; `S.rerun` respawns the contract as a fresh id) | tree.rs `rerun_op` (`r` on a tree row); checks |
+| `attach` | `since` int (seq, exclusive; ≤0 replays from the header) | front/bridge.py `_serve_client` — **socket clients only**; replays the stamped log under the wire lock, then joins the live fan-out gapless | checks/front.py, checks/conformance.py (no TUI sender yet) |
+| anything else | — | front/bridge.py → `error` event | — |
+
+Both transports accept the same ops and feed one inbox queue (the queue is
+the serialization); `stop`, `kill_run`, and `rerun` are handled on the reader
+threads themselves. A socket client's `quit` detaches that client only —
+ending the bridge is the stdio owner's alone.
+
+## Durable bridge surfaces (files, not wire events)
+
+| surface | writer | reader |
+|---|---|---|
+| `<cwd>/.desmos/events/<session_id>.jsonl` — the sequenced event log (contract C2): line 1 `{"ev":"session","session_id","cwd","ts"}`, then every wire event PLUS `{"seq","ts"}` stamped by front/bridge.py `_log` under the wire lock (producers never stamp; the wire stays seq-less). Append-only, no rotation. | front/bridge.py `_open_log`/`_log` | attach replay (front/bridge.py `_replay`); typed as `LogLine` in desmos-events (`--log` mode of the validate bin); the Phase 6.5 memex source |
+| `<cwd>/.desmos/bridge.sock` — the unix-socket transport (Track 3.1), born 0600, stdlib only. A live owner is probed before takeover; unbindable → one startup `notice` and stdio continues alone. Unlinked on exit. | front/bridge.py `_bind_socket` | any local client (`_serve_client` per connection) |
+| `<cwd>/.desmos/pending/<task>-<uuid>.json` — Track 1.1 durable handoff: a settled background task's whole notice, written before `done` is visible, renamed into `pending/delivered/` in the same step that appends it to the transcript (the rename is the commit point), replayed exactly once by `pending.replay` at load. Root persistent world only — a child's tasks stay in memory by contract. | agents/pending.py `submit`/`_deliver_file` | agents/pending.py `replay` (kernel/loop.py `new_world` load path) |
+| `<cwd>/.desmos/subagents/<id>.json` — the run record: brief fields plus `parent`, `depth`, `budget`, `generation`, `killed`, and the raw `result` (what the C5 brief compressed). | agents/subagent.py `_persist` | late-attach reconstruction; checks |
 
 ## Dead fields and dead events (findings, not formatting)
 
@@ -299,18 +355,22 @@ Produced and consumed by no UI (checks noted where they are the only reader):
 - `result.delta` (delta phase) — kernel/loop.py:321; `phase` already decides.
 - `turn.n` — kernel/loop.py:509; status-only consumers, subagent recounts from `w.log`.
 - `error.n` — kernel/loop.py:361, 530; only `text` is read.
-- `subagent` started.`structured`; progress/terminal `task`, `turns`, `usage`;
-  terminal `result` — agents/subagent.py:377-388, 531-547; handle_subagent never
-  reads them (check.py:1729 reads phases only).
-- `subagent` terminal phase `"stopped"` — matched at main.rs:2438, emitted by
-  nobody (run.state is only `done`/`failed`).
+- `subagent` started.`structured`; progress/terminal `task`; terminal
+  `result` — agents/subagent.py; handle_subagent never reads them. (`turns`,
+  `usage`, and terminal `stopped` came alive with the Track 3.2 tree view and
+  C3 kills — see the `subagent` section; `generation` is typed but has no TUI
+  reader yet.)
+- `prompt` (kernel/loop.py `_run_turns`) — no UI consumer; the event-log
+  file and its replay are the intended readers.
+- `intervention` (front/bridge.py `_intervene`) — no TUI reader; the `notice`
+  twin carries the prose, the terminal `subagent` event carries confirmation.
 - `pending` (kernel/loop.py:572), `resumed` (kernel/loop.py:577) — no UI/ACP consumer; only
   pending_check.py:58-67. `guidance` (kernel/loop.py:585) — no consumer at all.
 - `retry` transport deltas (transport/complete.py:594/683, transport/openai.py:659) — dropped by
   `kernel/loop.py on_delta`; retry waits are invisible.
-- `child` envelope kinds `error`/`done`/`stopped`/`compacted` — produced
-  (every child event is forwarded, agents/subagent.py:423-424), dropped by
-  handle_child (main.rs:2568).
+- `child` envelope kinds `prompt`/`error`/`done`/`stopped`/`compacted` —
+  produced (every child event is forwarded, agents/subagent.py:423-424),
+  dropped by handle_child (main.rs:2568).
 - op `snapshot` — accepted (front/bridge.py:144), sent by nobody.
 
 The Phase 5.3 enum must still parse every produced field

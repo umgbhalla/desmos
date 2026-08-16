@@ -12,6 +12,7 @@ __all__ = [
     "Callable",
     "Task",
     "clear",
+    "commit",
     "count",
     "dataclass",
     "field",

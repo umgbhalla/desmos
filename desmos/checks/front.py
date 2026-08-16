@@ -93,6 +93,305 @@ def _check_vendor_patch() -> None:
 
 
 
+# The stubbed gland for the socket checks: the REAL bridge subprocess and the
+# REAL loop, with canned responses -- the record-golden pattern, one code path,
+# never a second engine. Content-addressed so call counts cannot skew it: the
+# child under the kill test loops forever until killed, everything else is one
+# plain turn.
+_BOOT = '''
+import json
+import sys
+from pathlib import Path
+
+import desmos.front.bridge as B
+
+
+def scripted(model, system, messages, max_tokens):
+    blob = json.dumps(messages, default=str)
+
+    def say(t):
+        return {
+            "content": [{"type": "text", "text": t}],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 1, "output_tokens": 1},
+        }
+
+    if "flood test" in blob:
+        # Runs after earlier steps, so "<result" is already in the transcript.
+        # The sentinel is printed FIRST because the oversized result is
+        # spilled keeping the head -- a tail marker never reaches the blob.
+        if "FLOODED" not in blob:
+            body = 'print("FLOODED")\\nfor i in range(6000):\\n    print(i)'
+            return say("flooding\\n<python>\\n" + body + "\\n</python>")
+        return say("flood finished")
+    if "kill test" in blob:
+        if "<result" not in blob:
+            body = "\\n".join([
+                "from desmos.subagent import spawn, wait",
+                'rid = spawn("loop forever", agent="explore", model="claude-opus-5")',
+                "wait(rid, timeout=60)",
+                'print("child settled")',
+            ])
+            return say("spawning\\n<python>\\n" + body + "\\n</python>")
+        return say("kill test finished")
+    if "loop forever" in blob:
+        return say("looping\\n<bash>sleep 0.3</bash>")
+    return say("pong")
+
+
+_real = B.new_world
+
+
+def stubbed(cwd, **kw):
+    w = _real(cwd, **kw)
+    w.model = "claude-opus-5"
+    w.thinking = "low"
+    w.complete_fn = scripted
+    return w
+
+
+B.new_world = stubbed
+raise SystemExit(B.serve(Path(sys.argv[1]).resolve()))
+'''
+
+
+class _SockClient:
+    """One unix-socket bridge client. Reads are bounded (30s) so a bridge that
+    stalls fails the check instead of hanging it."""
+
+    def __init__(self, path: Path) -> None:
+        import socket
+
+        self.sock = socket.socket(socket.AF_UNIX)
+        self.sock.settimeout(30)
+        self.sock.connect(str(path))
+        self.rd = self.sock.makefile("r", encoding="utf-8")
+
+    def send(self, obj: dict) -> None:
+        import json
+
+        self.sock.sendall((json.dumps(obj) + "\n").encode("utf-8"))
+
+    def line(self) -> dict:
+        import json
+
+        raw = self.rd.readline()
+        assert raw, "bridge closed the socket early"
+        return json.loads(raw)
+
+    def until(self, pred, seen: list | None = None, limit: int = 5000) -> dict:
+        for _ in range(limit):
+            ev = self.line()
+            if seen is not None:
+                seen.append(ev)
+            if pred(ev):
+                return ev
+        raise AssertionError(f"event never arrived in {limit} lines")
+
+    def close_hard(self) -> None:
+        """RST, not FIN: the dead-client case the fan-out must survive."""
+        import socket
+        import struct
+
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+        self.sock.close()
+
+    def close(self) -> None:
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+
+
+def _strip(ev: dict) -> dict:
+    return {k: v for k, v in ev.items() if k not in ("seq", "ts")}
+
+
+def _check_socket() -> None:
+    """Track 3.1/3.3: unix-socket fan-out, late attach off the event log,
+    double-drive serialization, dead-client survival, kill mid-step."""
+    import json
+    import os
+    import subprocess
+    import sys
+    import tempfile
+
+    root = Path(__file__).resolve().parents[2]
+    # Tripwire for the cwd= on the Popen below: the check must not leave a
+    # byte in the runner's own .desmos.
+    runner_dir = Path.cwd() / ".desmos" / "subagents"
+    runner_before = set(runner_dir.glob("*")) if runner_dir.is_dir() else set()
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        cwd = tmp / "w"
+        cwd.mkdir()
+        boot = tmp / "boot.py"
+        boot.write_text(_BOOT, encoding="utf-8")
+        env = dict(os.environ)
+        env["DESMOS_SETTINGS"] = str(tmp / "settings.json")
+        env["PYTHONPATH"] = str(root)
+        env["DESMOS_TOOL_SYSCALLS"] = "0"
+        proc = subprocess.Popen(
+            [sys.executable, str(boot), str(cwd)],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            # The real entrypoint chdirs to the workspace; without this the
+            # kill-test child's process-cwd-relative .desmos/subagents record
+            # lands in whatever repo the check runner happens to sit in.
+            text=True, env=env, cwd=str(cwd),
+        )
+        a = b = None
+        try:
+            ready = json.loads(proc.stdout.readline())
+            assert ready["ev"] == "ready", ready
+            # The stdio wire keeps streaming every event; left unread it fills
+            # the pipe and blocks _emit, stalling the sockets under test.
+            import threading
+
+            threading.Thread(
+                target=lambda: [None for _ in proc.stdout], daemon=True
+            ).start()
+
+            sock_path = cwd / ".desmos" / "bridge.sock"
+            assert sock_path.exists(), "bridge bound no socket"
+            mode = sock_path.stat().st_mode & 0o777
+            assert mode == 0o600, f"bridge.sock is {oct(mode)}, not 0600"
+
+            # --- client A drives a step; the events fan out to its socket ---
+            a = _SockClient(sock_path)
+            a_events: list[dict] = []
+            a.send({"op": "step", "text": "ping"})
+            a.until(lambda e: e.get("ev") == "snapshot", seen=a_events)
+            assert any(e.get("ev") == "done" for e in a_events), a_events
+            assert all("seq" not in e for e in a_events), (
+                "live wire events are stamped; seq/ts belong to the log file only"
+            )
+
+            # --- late attach: client B replays the log from seq 0 ---
+            b = _SockClient(sock_path)
+            b.send({"op": "attach", "since": 0})
+            header = b.line()
+            assert header["ev"] == "session", header
+            assert header["session_id"] and header["cwd"] == str(cwd.resolve()), header
+            assert isinstance(header["ts"], int), header
+            log_file = cwd / ".desmos" / "events" / f"{header['session_id']}.jsonl"
+            assert log_file.is_file(), log_file
+            replayed = [b.line() for _ in range(1 + len(a_events))]
+            seqs = [e["seq"] for e in replayed]
+            assert seqs == sorted(seqs) and len(set(seqs)) == len(seqs), seqs
+            assert all(isinstance(e["ts"], int) for e in replayed), replayed[0]
+            assert _strip(replayed[0])["ev"] == "ready"
+            assert [_strip(e) for e in replayed[1:]] == a_events, (
+                "replay does not match what client A saw live"
+            )
+
+            # --- double-drive: both clients step; the queue serializes ---
+            a.send({"op": "step", "text": "ping"})
+            b.send({"op": "step", "text": "ping"})
+            both: list[dict] = []
+            b.until(
+                lambda e: sum(x.get("ev") == "snapshot" for x in both) == 2,
+                seen=both,
+            )
+            assert not any(e.get("ev") == "error" for e in both), both
+            prompts = [i for i, e in enumerate(both) if e.get("ev") == "prompt"]
+            dones = [i for i, e in enumerate(both) if e.get("ev") == "done"]
+            assert len(prompts) == 2 and len(dones) == 2, (prompts, dones)
+            assert prompts[1] > dones[0], (
+                "second step started before the first finished: the inbox "
+                "queue no longer serializes the world"
+            )
+            # drain A to keep its buffer empty for the later steps
+            a_drain: list[dict] = []
+            a.until(lambda e: sum(x.get("ev") == "snapshot" for x in a_drain) == 2, seen=a_drain)
+
+            # --- a dead client must not stall the step ---
+            dead = _SockClient(sock_path)
+            dead.send({"op": "attach", "since": 0})
+            dead.line()  # one line proves it was attached and receiving
+            dead.close_hard()
+            a.send({"op": "step", "text": "ping"})
+            a_after: list[dict] = []
+            a.until(lambda e: e.get("ev") == "snapshot", seen=a_after)
+            assert any(e.get("ev") == "done" for e in a_after), a_after
+
+            # --- kill mid-step from client B settles the run ---
+            a.send({"op": "step", "text": "kill test"})
+            started = b.until(
+                lambda e: e.get("ev") == "subagent" and e.get("phase") == "started"
+            )
+            rid = started["id"]
+            b.send({"op": "kill_run", "id": rid})
+            kill_events: list[dict] = []
+            b.until(lambda e: e.get("ev") == "done", seen=kill_events)
+            hits = [e for e in kill_events if e.get("ev") == "intervention"]
+            assert hits and hits[0]["action"] == "kill_run" and hits[0]["id"] == rid, kill_events[:5]
+            assert isinstance(hits[0]["result"], str) and hits[0]["result"], hits[0]
+            assert any(
+                e.get("ev") == "subagent" and e.get("phase") == "stopped" and e.get("id") == rid
+                for e in kill_events
+            ), "the killed run never settled as stopped"
+            assert any(e.get("ev") == "notice" for e in kill_events), kill_events[-5:]
+
+            # --- rerun routing: unknown id answers in prose, never raises ---
+            b.send({"op": "rerun", "id": "zzzzzzzz"})
+            answer = b.until(
+                lambda e: e.get("ev") == "intervention" and e.get("action") == "rerun"
+            )
+            assert answer["id"] == "zzzzzzzz" and "zzzzzzzz" in answer["result"], answer
+
+            # --- attach past the queue bound: replay is backpressured, so a
+            # session longer than the 4096-line client queue still replays
+            # whole and gapless instead of overflowing and dropping the client
+            # (a's queue still holds the kill-test fan-out that was read via
+            # b, snapshot included; drain it or the flood wait stops early)
+            a.until(lambda e: e.get("ev") == "snapshot")
+            a.send({"op": "step", "text": "flood test"})
+            flood: list[dict] = []
+            a.until(lambda e: e.get("ev") == "snapshot", seen=flood, limit=50000)
+            stamped_total = sum(
+                1 for l in log_file.read_text(encoding="utf-8").splitlines()
+                if json.loads(l).get("seq") is not None
+            )
+            assert stamped_total > 4096, (
+                f"flood produced only {stamped_total} events; the attach "
+                f"ceiling under test starts at the 4096 queue bound"
+            )
+            fresh = _SockClient(sock_path)
+            fresh.send({"op": "attach", "since": 0})
+            assert fresh.line()["ev"] == "session"
+            seqs2 = [fresh.line()["seq"] for _ in range(stamped_total)]
+            assert seqs2 == list(range(1, stamped_total + 1)), (
+                f"long attach lost events: {len(seqs2)} lines, first gap at "
+                f"{next((i for i, s in enumerate(seqs2, 1) if s != i), None)}"
+            )
+            fresh.close()
+
+            # the log holds everything, stamped, interventions included
+            logged = [json.loads(l) for l in log_file.read_text(encoding="utf-8").splitlines()]
+            assert logged[0]["ev"] == "session"
+            log_seqs = [e["seq"] for e in logged[1:]]
+            assert log_seqs == list(range(1, len(log_seqs) + 1)), "log seq has gaps"
+            assert any(e.get("ev") == "intervention" and e.get("action") == "kill_run" for e in logged)
+        finally:
+            for c in (a, b):
+                if c is not None:
+                    c.close()
+            try:
+                proc.stdin.write(json.dumps({"op": "quit"}) + "\n")
+                proc.stdin.flush()
+                proc.wait(timeout=30)
+            except (OSError, subprocess.TimeoutExpired):
+                proc.kill()
+                proc.wait(timeout=10)
+        # unlinked on exit: a stale path would make the next bridge probe it
+        assert not sock_path.exists(), "bridge.sock survived bridge exit"
+    runner_after = set(runner_dir.glob("*")) if runner_dir.is_dir() else set()
+    assert runner_after <= runner_before, (
+        f"the check leaked run records into the runner's cwd: "
+        f"{sorted(p.name for p in runner_after - runner_before)}"
+    )
+
+
 def check() -> None:
     import tempfile
 
@@ -354,3 +653,4 @@ def check() -> None:
         # pager compiles either way and just runs grok's agent instead of ours.
         _check_path_deps_tracked()
         _check_vendor_patch()
+    _check_socket()

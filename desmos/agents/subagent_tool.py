@@ -115,6 +115,8 @@ def handle(body: str, **_attrs: str) -> str:
                 raise ValueError(f"bad launch override {word!r}; expected key=value")
             over[key] = value
         rid = S.spawn(task.strip(), agent=agent, **over)
+        if rid.startswith("spawn refused"):
+            return rid
         return f"spawned {rid} ({agent})"
     if text.startswith("wait"):
         return _watch(text.split()[1:])

@@ -12,6 +12,11 @@
 //! Optionality follows the doc's per-phase field sets: `result` and
 //! `subagent` are keyed on `phase`, the `child` envelope on its nested
 //! `kind`, each shape carrying only the fields its emit site writes.
+//!
+//! Two entry points: [`Event`] is the WIRE (stdout / socket live stream),
+//! which never carries `seq`/`ts`; [`parse_log_line`] is the event-log FILE
+//! and attach-replay form (contract C2), where the bridge-side writer stamps
+//! every event with both and prefixes the file with one `session` header.
 
 use serde::Deserialize;
 use std::collections::BTreeMap;
@@ -44,6 +49,14 @@ pub enum Origin {
 pub enum Billing {
     Plan,
     Usage,
+}
+
+/// `intervention.action` — contract C3 names exactly these two ops.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InterventionAction {
+    KillRun,
+    Rerun,
 }
 
 /// One `providers[]` entry — transport/settings.py `picker()` builds every field.
@@ -114,7 +127,10 @@ pub enum ResultEvent {
 }
 
 /// `subagent` — agents/subagent.py emits started / progress / terminal, where the
-/// terminal phase is `run.state`: only ever `done` or `failed`.
+/// terminal phase is `run.state`: `done`, `failed`, or — when a kill_run
+/// intervention cancels the run (including before it ever started) —
+/// `stopped`, carrying the same terminal payload with stage `stopped`,
+/// stop_reason `killed`, and accepted null.
 ///
 /// Phase 3 tree fields, on every phase: `parent` is the spawning run's id
 /// (null when the root world spawned this run) and `depth` is the spawner's
@@ -132,6 +148,9 @@ pub enum SubagentEvent {
         task: String,
         structured: bool, // dead but produced
         model: String,
+        /// Track 4.3 lineage: the parent world's generation at spawn time
+        /// (a rerun records the generation at rerun time).
+        generation: i64,
     },
     Progress {
         id: String,
@@ -146,9 +165,11 @@ pub enum SubagentEvent {
     },
     Done(SubagentTerminal),
     Failed(SubagentTerminal),
+    Stopped(SubagentTerminal),
 }
 
-/// The terminal payload, identical for `done` and `failed` (agents/subagent.py:533).
+/// The terminal payload, identical for `done`, `failed`, and `stopped`
+/// (agents/subagent.py emits `run.state` with one field set).
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SubagentTerminal {
@@ -176,6 +197,16 @@ pub struct SubagentTerminal {
 #[derive(Debug, Deserialize)]
 #[serde(tag = "kind", rename_all = "lowercase", deny_unknown_fields)]
 pub enum ChildEvent {
+    /// C1 at child level: the task text injected into the child's transcript,
+    /// emitted by the child's own `_run_turns` at injection time.
+    Prompt {
+        id: String,
+        #[serde(deserialize_with = "required_nullable")]
+        parent: Option<String>,
+        depth: u64,
+        text: String,
+        n: i64,
+    },
     Turn {
         id: String,
         #[serde(deserialize_with = "required_nullable")]
@@ -368,7 +399,24 @@ pub enum Event {
     Notice {
         text: String,
     },
+    /// `intervention` — front/bridge.py `_intervene`: one per kill_run/rerun
+    /// op arriving on any transport (stdio or socket); its prose twin rides
+    /// the `notice` kind. `result` is subagent.py's answer — an unknown id is
+    /// a refusal string here, never an error event.
+    Intervention {
+        action: InterventionAction,
+        id: String,
+        result: String,
+    },
     // --- loop kinds ---
+    /// C1: the user's message text at injection time (kernel/loop.py
+    /// `_run_turns`, immediately before the message is appended), never
+    /// re-derived from POST bodies. `n` is the step ordinal within the
+    /// session, starting at 1.
+    Prompt {
+        text: String,
+        n: i64,
+    },
     Turn {
         n: i64,
     },
@@ -429,4 +477,61 @@ pub enum Event {
     },
     Subagent(SubagentEvent),
     Child(ChildEvent),
+}
+
+/// One line of the event-log file `.desmos/events/<session_id>.jsonl` or of
+/// an attach replay (contract C2). The bridge-side writer stamps every wire
+/// event with a monotonic `seq` and an int-ms `ts`; the file's first line is
+/// the unstamped session header. The wire enum above stays seq-less — a
+/// `seq`/`ts` on a live wire event is producer drift and must fail there.
+#[derive(Debug)]
+pub enum LogLine {
+    Session {
+        session_id: String,
+        cwd: String,
+        ts: i64,
+    },
+    Stamped {
+        seq: i64,
+        ts: i64,
+        event: Event,
+    },
+}
+
+/// Parse one event-log line. Not serde-derived on purpose: `deny_unknown_fields`
+/// is silently dropped under `#[serde(flatten)]`, so the stamps are stripped by
+/// hand and the remainder goes through the same strict [`Event`] parser as the
+/// wire.
+pub fn parse_log_line(line: &str) -> Result<LogLine, String> {
+    let mut obj: serde_json::Map<String, serde_json::Value> =
+        serde_json::from_str(line).map_err(|e| e.to_string())?;
+    if obj.get("ev").and_then(serde_json::Value::as_str) == Some("session") {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Session {
+            #[allow(dead_code)]
+            ev: String,
+            session_id: String,
+            cwd: String,
+            ts: i64,
+        }
+        let s: Session =
+            serde_json::from_value(serde_json::Value::Object(obj)).map_err(|e| e.to_string())?;
+        return Ok(LogLine::Session {
+            session_id: s.session_id,
+            cwd: s.cwd,
+            ts: s.ts,
+        });
+    }
+    let seq = obj
+        .remove("seq")
+        .and_then(|v| v.as_i64())
+        .ok_or("log line missing int seq")?;
+    let ts = obj
+        .remove("ts")
+        .and_then(|v| v.as_i64())
+        .ok_or("log line missing int ts")?;
+    let event: Event =
+        serde_json::from_value(serde_json::Value::Object(obj)).map_err(|e| e.to_string())?;
+    Ok(LogLine::Stamped { seq, ts, event })
 }

@@ -69,6 +69,14 @@ def _scope(cfg: Any, contract: TaskContract | None) -> str:
     ]
     if cfg.capability == "read":
         lines.append("Read-only: investigate freely and change nothing.")
+    if cfg.capability == "orchestrator":
+        lines.append(
+            "Orchestrator: you have no bash, python, edit, or shell — you cannot "
+            "read files or run commands yourself. To look around, fork an explore "
+            "child through the agents syscall and read its report; fork worker "
+            "children for changes. Your job is decomposition, judgment, and the "
+            "integrated final answer."
+        )
     if contract is None:
         lines.append("Return a cited prose report.")
         return "\n".join(lines)
@@ -92,8 +100,16 @@ def child_system_prompt(
     world: Any,
     cfg: Any,
     contract: TaskContract | None,
+    budget: int = 0,
 ) -> str:
     lane = _OPENAI if family(getattr(world, "model", "") or "") == "openai" else _ANTHROPIC
+    shared = _SHARED
+    if budget > 0:
+        shared = shared.replace(
+            "You cannot spawn children or ask the parent questions.",
+            f"You may fork children of your own (remaining depth budget: {budget}); "
+            "you cannot ask the parent questions.",
+        )
     persona = (
         f"# persona\n{cfg.persona_instructions}\n\n"
         if getattr(cfg, "persona_instructions", None)
@@ -107,7 +123,7 @@ def child_system_prompt(
     )
     return "\n\n".join(
         [
-            _SHARED,
+            shared,
             _tool_lines(world),
             _scope(cfg, contract),
             persona + lane,

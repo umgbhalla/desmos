@@ -217,6 +217,123 @@ def check() -> None:
         )
         assert reloaded_stop.messages[0]["role"] == "user", reloaded_stop.messages[0]
 
+        # Orphan-call repair at load (Track 1.2). turn() appends the assistant
+        # call before dispatch runs, so a kill mid-syscall saves a transcript
+        # whose last call has no output. The typed shape is a hard 400 when
+        # replayed; load must pair every dangling call with an interrupted
+        # result -- in the transcript itself, so the wire never has to invent
+        # an answer per POST and the model reads what happened.
+        from desmos.state.persist import INTERRUPTED_CALL
+        from desmos.transport.complete import UNANSWERED_CALL, cached_payload
+
+        orphan_path = cwd / "orphan.sqlite3"
+        orphan_world = new_world(cwd, state_path=orphan_path)
+        orphan_world.messages = [
+            {"role": "user", "content": "run it"},
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "text", "text": "first"},
+                    {"type": "tool_use", "id": "toolu_ok", "name": "syscall",
+                     "input": {"input": "<bash>true</bash>"}},
+                ],
+            },
+            {
+                "role": "user",
+                "content": [{"type": "tool_result", "tool_use_id": "toolu_ok", "content": "fine"}],
+            },
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "text", "text": "now the slow one"},
+                    {"type": "tool_use", "id": "toolu_dangling", "name": "syscall",
+                     "input": {"input": "<bash>sleep 999</bash>"}},
+                ],
+            },
+            {"role": "user", "content": "a later prompt the crash never answered"},
+        ]
+        _save_world(orphan_world)
+        healed = new_world(cwd, state_path=orphan_path)
+        # An answered call is left alone; the dangling one gains a user
+        # message immediately after it (providers demand adjacency), and the
+        # message that followed the crash is still there behind the repair.
+        assert len(healed.messages) == 6, healed.messages
+        assert healed.messages[2]["content"][0]["content"] == "fine", healed.messages[2]
+        repair_msg = healed.messages[4]
+        assert repair_msg["role"] == "user", healed.messages
+        (repair_block,) = repair_msg["content"]
+        assert repair_block["type"] == "tool_result", repair_block
+        assert repair_block["tool_use_id"] == "toolu_dangling", repair_block
+        assert "interrupted" in repair_block["content"], repair_block
+        assert healed.messages[5]["content"] == "a later prompt the crash never answered"
+        # transport's own pairing accepts the loaded history as-is: the
+        # payload carries the load-time repair, not the per-POST
+        # UNANSWERED_CALL patch it falls back to for a dangling call.
+        # Structural, not a substring scan of json.dumps -- ensure_ascii
+        # escaped UNANSWERED_CALL's em dash, so `not in flat` could never
+        # fail, repair reverted or not.
+        payload = cached_payload("claude-opus-5", "abi\n\ncatalog", healed.messages, 512)
+        wire_calls: list[str] = []
+        wire_answers: dict[str, object] = {}
+        for wire_msg in payload["messages"]:
+            for wire_block in wire_msg["content"]:
+                if wire_block.get("type") == "tool_use":
+                    wire_calls.append(str(wire_block["id"]))
+                elif wire_block.get("type") == "tool_result":
+                    wire_answers[str(wire_block["tool_use_id"])] = wire_block.get("content")
+        assert set(wire_calls) == {"toolu_ok", "toolu_dangling"}, wire_calls
+        assert set(wire_calls) <= set(wire_answers), (wire_calls, sorted(wire_answers))
+        assert wire_answers["toolu_dangling"] == INTERRUPTED_CALL, wire_answers
+        assert UNANSWERED_CALL not in wire_answers.values(), (
+            "the wire had to patch a dangling call load should have repaired"
+        )
+
+        # Same repair for the Responses shape (custom_tool_call, keyed by
+        # call_id): the one that 400s on that wire.
+        openai_path = cwd / "orphan-openai.sqlite3"
+        openai_world = new_world(cwd, state_path=openai_path)
+        openai_world.messages = [
+            {"role": "user", "content": "run it"},
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "custom_tool_call", "call_id": "call_9", "name": "syscall",
+                     "input": "<bash>sleep 999</bash>"},
+                ],
+            },
+        ]
+        _save_world(openai_world)
+        healed_oa = new_world(cwd, state_path=openai_path)
+        assert len(healed_oa.messages) == 3, healed_oa.messages
+        (oa_block,) = healed_oa.messages[2]["content"]
+        assert oa_block["type"] == "custom_tool_call_output", oa_block
+        assert oa_block["call_id"] == "call_9" and "interrupted" in oa_block["output"], oa_block
+
+        # Prose dialect: a transcript that ends on speech that scans to a
+        # syscall got no <result> back. The synthesized block is user-role --
+        # the only place a result block may appear. Speech with no tags is a
+        # finished step and must not grow one.
+        prose_path = cwd / "orphan-prose.sqlite3"
+        prose_world = new_world(cwd, state_path=prose_path)
+        prose_world.messages = [
+            {"role": "user", "content": "run it"},
+            {"role": "assistant", "content": "on it\n<bash>echo hi</bash>"},
+        ]
+        _save_world(prose_world)
+        healed_prose = new_world(cwd, state_path=prose_path)
+        assert len(healed_prose.messages) == 3, healed_prose.messages
+        assert healed_prose.messages[2]["role"] == "user"
+        assert '<result tag="bash">' in healed_prose.messages[2]["content"]
+        assert "interrupted" in healed_prose.messages[2]["content"]
+        prose_world2 = new_world(cwd, state_path=cwd / "orphan-prose-done.sqlite3")
+        prose_world2.messages = [
+            {"role": "user", "content": "run it"},
+            {"role": "assistant", "content": "all done, nothing left to run"},
+        ]
+        _save_world(prose_world2)
+        finished = new_world(cwd, state_path=cwd / "orphan-prose-done.sqlite3")
+        assert len(finished.messages) == 2, finished.messages
+
         w3 = new_world(cwd, state_path=cwd / "harness2.json", ns={"doc": "hello world"})
 
         evolve(w3, "after ping")

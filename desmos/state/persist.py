@@ -114,6 +114,109 @@ def turn_aligned(
     return messages[start:]
 
 
+#: What the model reads in place of the output a killed process never
+#: produced. Same register as transport's UNANSWERED_CALL, but written into
+#: the transcript itself at load, so the interruption is durable and the
+#: wire never has to invent an answer per POST.
+INTERRUPTED_CALL = (
+    "[interrupted — the process ended before this syscall returned a result; "
+    "nothing is known about whether it ran]"
+)
+
+
+def _call_ids(content: Any) -> list[tuple[str, str]]:
+    """(wire type, id) of each syscall call block in assistant content."""
+    out: list[tuple[str, str]] = []
+    if isinstance(content, list):
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") == "tool_use" and block.get("id"):
+                out.append(("tool_use", str(block["id"])))
+            elif block.get("type") == "custom_tool_call" and block.get("call_id"):
+                out.append(("custom_tool_call", str(block["call_id"])))
+    return out
+
+
+def _answered_ids(content: Any) -> set[str]:
+    ids: set[str] = set()
+    if isinstance(content, list):
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") == "tool_result" and block.get("tool_use_id"):
+                ids.add(str(block["tool_use_id"]))
+            elif block.get("type") == "custom_tool_call_output" and block.get("call_id"):
+                ids.add(str(block["call_id"]))
+    return ids
+
+
+def repair_orphan_calls(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Synthesize the failed result a killed process never appended.
+
+    A transcript saved mid-turn carries an assistant call with no output --
+    deliberate: turn() makes the assistant message durable before dispatch
+    runs. Replayed as-is, the typed shape is a hard 400 (a tool_use nothing
+    answered), so every dangling call gets an interrupted result paired here,
+    in the load path -- never rebuilt from events, and never rewritten later:
+    the repaired transcript is the byte-stable prefix from now on.
+
+    The prose dialect cannot 400, so only its cheap case is repaired: a
+    transcript that ENDS on an assistant message whose speech scans to
+    syscalls got no <result> back. Load runs before anything is appended, so
+    "last message" is exactly "dispatch never answered". The synthesized
+    block is user-role, the only place a result block may ever appear.
+    """
+    from desmos.kernel.scan import scan
+
+    repaired: list[dict[str, Any]] = []
+    for i, msg in enumerate(messages):
+        repaired.append(msg)
+        if msg.get("role") != "assistant":
+            continue
+        calls = _call_ids(msg.get("content"))
+        if calls:
+            nxt = messages[i + 1] if i + 1 < len(messages) else {}
+            answered = _answered_ids(nxt.get("content")) if nxt.get("role") == "user" else set()
+            blocks: list[dict[str, Any]] = []
+            for kind, call_id in calls:
+                if call_id in answered:
+                    continue
+                if kind == "tool_use":
+                    blocks.append(
+                        {"type": "tool_result", "tool_use_id": call_id, "content": INTERRUPTED_CALL}
+                    )
+                else:
+                    blocks.append(
+                        {"type": "custom_tool_call_output", "call_id": call_id, "output": INTERRUPTED_CALL}
+                    )
+            if blocks:
+                repaired.append({"role": "user", "content": blocks})
+        elif i == len(messages) - 1:
+            content = msg.get("content")
+            if isinstance(content, str):
+                text = content
+            elif isinstance(content, list):
+                text = "\n".join(
+                    block.get("text") or ""
+                    for block in content
+                    if isinstance(block, dict) and block.get("type") == "text"
+                )
+            else:
+                text = ""
+            tags = scan(text) if text else []
+            if tags:
+                repaired.append(
+                    {
+                        "role": "user",
+                        "content": "\n\n".join(
+                            f'<result tag="{b.tag}">{INTERRUPTED_CALL}</result>' for b in tags
+                        ),
+                    }
+                )
+    return repaired
+
+
 def _broken_handler(name: str, detail: str) -> Callable[..., str]:
     def handler(*_a: Any, **_k: Any) -> str:
         return f"<{name}> failed to load from stored source:\n{detail}"
@@ -412,15 +515,19 @@ def _apply_data(world: World, data: dict[str, Any]) -> None:
     raw_msgs = data.get("messages")
     if isinstance(raw_msgs, list):
         # Align after the role filter, not before: a dropped junk row shifts
-        # every boundary test that ran ahead of it.
-        world.messages = turn_aligned(
-            [
-                {"role": item["role"], "content": item["content"]}
-                for item in raw_msgs
-                if isinstance(item, dict)
-                and item.get("role") in {"user", "assistant"}
-                and isinstance(item.get("content"), (str, list))
-            ]
+        # every boundary test that ran ahead of it. Repair after alignment,
+        # so the head alignment landed on cannot orphan a call the repair
+        # already answered.
+        world.messages = repair_orphan_calls(
+            turn_aligned(
+                [
+                    {"role": item["role"], "content": item["content"]}
+                    for item in raw_msgs
+                    if isinstance(item, dict)
+                    and item.get("role") in {"user", "assistant"}
+                    and isinstance(item.get("content"), (str, list))
+                ]
+            )
         )
 
 

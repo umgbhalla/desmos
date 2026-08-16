@@ -114,6 +114,30 @@ fn set_tree(child: &mut crate::ChildSess, ev: &Value) {
     }
 }
 
+/// The tree-row facts a `subagent` progress/terminal event carries: stage,
+/// turn count, token usage. Only what the event actually names is written.
+fn set_run_facts(child: &mut crate::ChildSess, ev: &Value) {
+    if let Some(s) = ev
+        .get("stage")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        child.stage = s.to_string();
+    }
+    if let Some(t) = ev.get("turns").and_then(Value::as_u64) {
+        child.turns = t;
+    }
+    if let Some(u) = ev.get("usage") {
+        if let Some(n) = u.get("input_tokens").and_then(Value::as_u64) {
+            child.tok_in = n;
+        }
+        if let Some(n) = u.get("output_tokens").and_then(Value::as_u64) {
+            child.tok_out = n;
+        }
+    }
+}
+
 pub(crate) fn handle_subagent(app: &mut App, ev: &Value) {
     let phase = ev.get("phase").and_then(Value::as_str).unwrap_or("");
     let id = ev.get("id").and_then(Value::as_str).unwrap_or("");
@@ -140,11 +164,18 @@ pub(crate) fn handle_subagent(app: &mut App, ev: &Value) {
             app.sess.story.set_last_running(true);
             let child = app.ensure_child(id, &title);
             child.parent_entry = Some(eid);
+            child.agent = agent.to_string();
+            child.state = "running".into();
             set_tree(child, ev);
         }
         "progress" => {
             let stage = ev.get("stage").and_then(Value::as_str);
             let label = subagent_status(ev, stage);
+            // Late attach still learns the tree row: every phase carries the
+            // coordinates, and progress carries stage/turns/usage.
+            let child = app.ensure_child(id, "");
+            set_tree(child, ev);
+            set_run_facts(child, ev);
             let eid = app.children.get(id).and_then(|c| c.parent_entry);
             if let Some(eid) = eid {
                 if let Some(entry) = app.sess.story.get_by_id_mut(eid) {
@@ -160,6 +191,15 @@ pub(crate) fn handle_subagent(app: &mut App, ev: &Value) {
         // Parent cancellation and runtime failure are terminal too; no terminal
         // child may leave a spinner behind on the parent story.
         "done" | "failed" | "stopped" => {
+            // The terminal event is the run's last word and the confirmation
+            // for any intervention this TUI sent: state, verdict, final
+            // stage/turns/usage land on the tree row, the sent-marker drops.
+            let child = app.ensure_child(id, "");
+            set_tree(child, ev);
+            set_run_facts(child, ev);
+            child.state = phase.to_string();
+            child.accepted = ev.get("accepted").and_then(Value::as_bool);
+            child.op_sent = None;
             let secs = ev.get("secs").and_then(Value::as_f64).unwrap_or(0.0);
             let elapsed = Duration::from_secs_f64(secs.max(0.0));
             let err = ev

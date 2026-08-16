@@ -956,6 +956,44 @@ def check() -> None:
         assert py.read_text() == "x = 1\n", "a file that would not compile was written anyway"
         assert py.read_text(encoding="utf-8") == "x = 1\n"
 
+        # docs/identity.md, driven: the in-memory row survives <reload_sdk/>
+        # (ns, notes, messages), and <rollback> restores notes without touching
+        # memory records or the transcript. Last before attach: reload_sdk
+        # reimports every desmos module, so nothing after this may hold state
+        # in one.
+        from desmos.loop import reload_sdk as _reload_sdk
+        from desmos.state.generations import rollback as _gen_rollback
+        from desmos.state.memory import memory_root as _mem_root, records_path as _rec_path, remember as _remember
+
+        id_dir = cwd / "idrow"
+        id_dir.mkdir()
+        w_id = new_world(id_dir, state_path=id_dir / "harness.sqlite3")
+        w_id.ns["keepsake"] = 42
+        w_id.messages.append({"role": "user", "content": "kept line"})
+        w_id.messages.append({"role": "assistant", "content": "kept reply"})
+        dispatch(w_id, Block("system", "identity doctrine", {"name": "identity-note"}))
+        _remember(w_id, "the sky is mauve")
+        rec_file = _rec_path(_mem_root(w_id))
+        rec_before = rec_file.read_bytes()
+        assert b"the sky is mauve" in rec_before
+
+        _reload_sdk(w_id)
+        assert w_id.ns.get("keepsake") == 42, "reload_sdk wiped ns"
+        assert w_id.notes.get("identity-note") == "identity doctrine", "reload_sdk wiped notes"
+        assert [m["content"] for m in w_id.messages] == ["kept line", "kept reply"], (
+            "reload_sdk rewrote the transcript"
+        )
+
+        # Generation 1 was snapshotted at world birth, before the note existed:
+        # rolling back must drop the note (proof rollback ran) and nothing else.
+        rolled = _gen_rollback(w_id, 1)
+        assert rolled == "rolled back to generation 1", rolled
+        assert "identity-note" not in w_id.notes, "rollback did not restore notes"
+        assert [m["content"] for m in w_id.messages] == ["kept line", "kept reply"], (
+            "rollback touched the transcript"
+        )
+        assert rec_file.read_bytes() == rec_before, "rollback rewrote memory records"
+
         try:
             from IPython.core.interactiveshell import InteractiveShell
         except ImportError:

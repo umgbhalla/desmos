@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextvars
 import traceback
 import weakref
 from inspect import signature
@@ -33,6 +34,18 @@ _SCOPES: dict[int, frozenset[str]] = globals().get("_SCOPES", {})
 # A child gets a narrow reference to its parent's todo handler, never the
 # parent World or persistence layer. Entries disappear with the child world.
 _CHILD_TODOS: dict[int, Callable[[str], Any]] = globals().get("_CHILD_TODOS", {})
+
+# The world whose syscall is executing right now, bound for the duration of
+# dispatch(). subagent.spawn() resolves its caller from this instead of
+# trusting a parent= kwarg: a budget gate keyed on an argument the caller
+# chooses is a gate the caller can walk around by passing nothing. A thread a
+# child detaches carries no binding (contextvars do not cross Thread on this
+# interpreter), so such a caller resolves to nothing and spawn refuses it.
+# globals().get for the same reason as _SCOPES: reload_sdk re-executes this
+# module, and a fresh ContextVar here would blind every child mid-turn.
+CALLER_WORLD: contextvars.ContextVar[Any] = globals().get("CALLER_WORLD") or contextvars.ContextVar(
+    "desmos_caller_world", default=None
+)
 
 
 def set_child_todo_handler(
@@ -95,6 +108,21 @@ def set_tool_doc(world: World, name: str, doc: str) -> str:
 
 
 def dispatch(
+    world: World,
+    block: Block,
+    *,
+    on_chunk: Callable[[str], None] | None = None,
+    should_stop: Callable[[], bool] | None = None,
+    meta: dict[str, Any] | None = None,
+) -> str:
+    token = CALLER_WORLD.set(world)
+    try:
+        return _dispatch(world, block, on_chunk=on_chunk, should_stop=should_stop, meta=meta)
+    finally:
+        CALLER_WORLD.reset(token)
+
+
+def _dispatch(
     world: World,
     block: Block,
     *,

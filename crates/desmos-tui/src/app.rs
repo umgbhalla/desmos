@@ -345,13 +345,26 @@ pub(crate) struct ChildSess {
     pub(crate) parent_entry: Option<EntryId>,
     /// Tree coordinates off the wire (every `subagent`/`child` event carries
     /// them, Phase 3): the spawning run's id — `None` when the root world
-    /// spawned this child — and its nesting depth (root spawns are 0). Stored
-    /// here so the Phase 4 tree view (upgrade-paths 3.2) has the tree; nothing
-    /// renders them yet.
-    #[allow(dead_code)]
+    /// spawned this child — and its nesting depth (root spawns are 0). The
+    /// tree view (`tree.rs`) nests rows by them.
     pub(crate) parent: Option<String>,
-    #[allow(dead_code)]
     pub(crate) depth: u64,
+    /// Arrival order, so siblings paint in spawn order. In-memory, monotonic:
+    /// children are never removed.
+    pub(crate) seq: u64,
+    /// The rest of the tree row, all off the `subagent` events: agent name
+    /// (started), stage/turns/usage (progress + terminal), the terminal phase
+    /// as `state` (`running` from started until then), the judge's verdict.
+    pub(crate) agent: String,
+    pub(crate) stage: String,
+    pub(crate) turns: u64,
+    pub(crate) tok_in: u64,
+    pub(crate) tok_out: u64,
+    pub(crate) state: String,
+    pub(crate) accepted: Option<bool>,
+    /// An intervention this TUI sent that the kernel has not answered yet.
+    /// The row says so; the terminal `subagent` event is the confirmation.
+    pub(crate) op_sent: Option<&'static str>,
 }
 
 /// Grok text selection for one scrollback (drag, persist, double-click word).
@@ -448,6 +461,11 @@ pub(crate) struct App {
     pub(crate) queue_edit: Option<usize>,
     pub(crate) drain_after: bool,
     pub(crate) children: HashMap<String, ChildSess>,
+    /// Tree-of-runs mode on the Activity column (`t` toggles it): one row per
+    /// subagent run, nested by the kernel's parent/depth. Selection is an
+    /// index into `tree::order`.
+    pub(crate) tree_open: bool,
+    pub(crate) tree_sel: usize,
     pub(crate) viewing: Option<String>,
     pub(crate) viewer: Option<BlockViewerPane>,
     pub(crate) viewer_src: ViewerSrc,
@@ -522,6 +540,8 @@ impl App {
             queue_edit: None,
             drain_after: false,
             children: HashMap::new(),
+            tree_open: false,
+            tree_sel: 0,
             viewing: None,
             viewer: None,
             viewer_src: ViewerSrc::Story,
@@ -589,6 +609,7 @@ impl App {
             if !task.is_empty() {
                 sess.story.push_block(RenderBlock::user_prompt(task));
             }
+            let seq = self.children.len() as u64;
             self.children.insert(
                 id.to_string(),
                 ChildSess {
@@ -596,6 +617,15 @@ impl App {
                     parent_entry: None,
                     parent: None,
                     depth: 0,
+                    seq,
+                    agent: String::new(),
+                    stage: String::new(),
+                    turns: 0,
+                    tok_in: 0,
+                    tok_out: 0,
+                    state: String::new(),
+                    accepted: None,
+                    op_sent: None,
                 },
             );
         }
@@ -760,6 +790,14 @@ impl App {
         s.calls.set_selected(Some(target));
         s.calls.scroll_to_entry_top(target);
         true
+    }
+
+    /// First tree row on screen: enough skipped that the selection stays
+    /// visible. Deterministic from state, so the draw pass and the mouse
+    /// hit-test compute the same number instead of sharing a cached one.
+    pub(crate) fn tree_skip(&self) -> usize {
+        let h = self.call_area.height.saturating_sub(2) as usize;
+        if h == 0 { 0 } else { self.tree_sel.saturating_sub(h - 1) }
     }
 
     pub(crate) fn focused_scroll(&mut self) -> &mut ScrollbackState {

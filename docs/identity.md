@@ -1,0 +1,70 @@
+# Identity: what desmos is made of
+
+The exo-style inventory. Every piece of state, where it lives, and what
+survives which reset. Every row is anchored to the code that writes it; a row
+without a writer is a contract row and says so. The 5-line summary lives in
+the runtime block (`desmos/kernel/catalog.py`); this file is the full table.
+
+Resets, from mildest to hardest:
+
+- `<reload_sdk/>` — reimports `desmos.*` (`kernel/loop.py reload_sdk`).
+- `<rollback n>` — restores notes/tools/prior from `generations/NNNN.json`
+  (`state/generations.py rollback` → `apply_snapshot`).
+- reset (TUI reset op) — `kernel/loop.py reset_transcript`: drops
+  `messages` and `prior`, then saves. Notes, tools, memory, generations stay.
+- process restart — everything in RAM dies; `state/persist.py load` rebuilds
+  from the db.
+- `rm -rf .desmos` — the repo-local store dies; `~/.desmos` does not.
+
+## The inventory
+
+Columns: survives `<reload_sdk/>` / process restart / `<rollback>` /
+`rm -rf .desmos` / checked-in.
+
+| state | lives in | writer | reload | restart | rollback | rm .desmos | git |
+|---|---|---|---|---|---|---|---|
+| code + prompts (ABI `kernel/const.py`, catalog `kernel/catalog.py`, docs/, packaged skills `desmos/skills/`) | git worktree | humans + the model via `<edit>` (`kernel/edit.py`) | yes — reload re-reads it | yes | yes | yes | **yes** |
+| harness db: transcript tail, prior turns, notes, grown tools, generation, thinking | `world.state_path` or `<cwd>/.desmos/harness.sqlite3` (`state/persist.py state_file`) | `state/persist.py save()`/`_save_data`, called from `_commit_step`, evolve, rollback, reset | yes | **tail only** — `turn_aligned` keeps the last `KEEP_MESSAGES=80` widened back to a user turn plus the newest compaction checkpoint; `prior` capped at `PRIOR_KEEP=8` | transcript yes; notes/tools/prior **replaced** from the snapshot (that is the point); generation never rewinds (`max(world.generation, n)`) | no | no |
+| memory records + derived handbook | `.desmos/memories/records.jsonl`, `MEMORY.md`, `memory_summary.md` beside the db (`state/memory.py memory_root`) | `state/memory.py _save` via `remember`/`forget`/`verify`/`consolidate` — atomic, secret-scrubbed (`_redact`); refuses on `persist=False` | yes | yes | **yes** — `apply_snapshot` touches notes/tools/prior only (driven in `checks/kernel.py`) | no | no |
+| generation snapshots (notes/tools/docs/prior — not messages, not memory) | `.desmos/generations/NNNN.json` | `state/generations.py write_generation` (persist-gated; `ensure_gen1` at world birth) | yes | yes | rollback reads them, never deletes; ids only go up | no | no |
+| trajectory (exact outgoing POST per `complete()`) | `.desmos/trajectory/*.json` (`DESMOS_TRAJECTORY`; **process**-cwd-relative) | `transport/complete.py log_payload` — unique name + `os.replace`; `prune_trajectory` strips payloads past the newest 12, deletes past 400 | yes | yes | yes | no | no |
+| pending handoff records (Track 1.1, landing this phase) | `.desmos/pending/` | contract: when a child settles, a notice file carrying the **whole notice text** is written; renamed to delivered in the same step that appends it to the transcript; replayed at load — a crash between settle and delivery cannot lose it | yes | yes — its purpose | yes | no | no |
+| event log (Track 1.3, landing this phase) | `.desmos/events/<session_id>.jsonl` | contract: line 1 `{"ev":"session","session_id","cwd","ts"}`; every later line = the wire event plus `seq` (monotonic) + `ts` stamped by the bridge-side writer, never producers — the wire itself carries neither; interventions appended as `{"ev":"intervention",...}`; append-only, no rotation | yes | yes — the replay substrate for late attach | yes | no | no |
+| subagent run records (raw child result; only the ≤400-char brief enters the parent transcript) | `.desmos/subagents/<id>.json` (**process**-cwd-relative `DIR`) | `agents/subagent.py _persist` at spawn and settle — Run minus messages, plus cfg | yes — `reload_sdk` also carries live `RUNS` + emitter across (`kernel/loop.py`) | file yes; live `RUNS` no | yes | no | no |
+| settings: provider / model / effort | `~/.desmos/settings.json` (`DESMOS_SETTINGS`) — **machine-global: one file for every checkout; a model switch in one repo switches all** | `transport/settings.py save` (atomic) | yes | yes | yes | **yes** | no |
+| auth | `~/.desmos/auth.json` (`DESMOS_AUTH`), borrowed `~/.codex/auth.json` (`CODEX_HOME`), `ANTHROPIC_API_KEY`/`OPENAI_API_KEY` env | `transport/auth.py write_auth_file` — 0600, atomic; a refresh rotates the refresh token, so writes go back to the file that was read | yes | yes | yes | **yes** | never — nor in logs, trajectory, or results |
+| skills | packaged `desmos/skills/`; shared `~/.agents/skills`; user `~/.desmos/skills`; project chain `<dir>/.agents/skills` + `<dir>/.desmos/skills` up to the git root (`skills/__init__.py skill_roots`, rediscovered every turn) | the model via `<edit>`/bash | yes | yes | yes | only the project `.desmos/skills` root dies | packaged root only |
+| extensions | `~/.desmos/extensions` + project chain `.desmos/extensions` (`state/extensions.py extension_roots`, loaded per turn) | the model via `<edit>`/bash | yes | yes | yes | project root dies; user root survives | no |
+| TUI pane layout | `.desmos/tui.json` | `crates/desmos-tui/src/app.rs` (~231) — pixels; the kernel never reads it | yes | yes | yes | no | no |
+| in-memory World: `ns` values, `messages` beyond the persisted tail, `shells` ptys, pending monitors (`agents/pending._BY_WORLD`), subagent `RUNS`, `transport/complete.LAST` | the process | the running kernel | **yes, by design** — `_RELOAD_SKIP` protects live-state modules and `reload_sdk` rebinds `RUNS`/emitter (driven in `checks/kernel.py`) | no | `ns`/`messages` untouched; notes/tools swapped | unaffected | no |
+
+Planned (Phase 6 — no writer on this branch; contract, not inventory):
+
+| state | lives in | planned writer |
+|---|---|---|
+| fff frecency LMDB | `.desmos/fff` | kernel `<edit>` dispatch choke point → `track_access` (6.3); TUI picker reads it one-way (6.4) |
+| session registry | `~/.desmos/registry` | `save()` appends `world.cwd`, deduped + atomic; children never write it (6.6) |
+
+## Operating rules that fall out
+
+- **What a fork inherits.** A child is `new_world(persist=False,
+  state_path=None)` (`agents/subagent.py _child_world`): it loads nothing
+  from the db, writes nothing back, cannot `remember()` ("memory disabled"),
+  cannot snapshot a generation. It does inherit code, settings, auth, and the
+  skills/extensions roots. Its only durable traces are its run record, its
+  trajectory files, its child-enveloped events, and the files it edits.
+- **Speech is not memory, and neither is `ns`.** The transcript is a tail
+  and `ns` dies with the process. If future-you needs it: a memory record
+  (survives everything but `rm -rf .desmos`), a note (survives restart, is
+  replaced by rollback), or a file/skill (survives everything, durable in git
+  once committed).
+- **Rollback is narrow.** It moves notes, grown tools, and prior turns —
+  nothing else. Do not expect it to undo an edit, a memory, or the
+  transcript; do not fear it eating them either.
+- **Machine-global blast radius.** `settings.json` and `auth.json` are
+  per-user, not per-repo. Any test or check pins `DESMOS_SETTINGS`,
+  `DESMOS_AUTH`, and a temp `.desmos` before touching them.
+- **Two process-cwd-relative writers.** `transport/complete.TRAJECTORY_DIR`
+  and `agents/subagent.DIR` resolve against the process cwd, not
+  `world.cwd`. The fronts chdir first (`front/cli.py`); an embedded
+  `attach()` world with a different cwd writes them beside the process.

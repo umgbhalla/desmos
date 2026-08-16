@@ -13,7 +13,7 @@ import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -29,12 +29,20 @@ PERSONAS: dict[str, str] = {
     "security": "Threat-model trust boundaries, seek concrete exploit paths, and separate likelihood from impact.",
     "planner": "Compare viable designs, expose constraints and irreversible choices, then give an ordered plan.",
     "debugger": "Reproduce first, minimize the failure, localize the first wrong state, and distinguish cause from symptom.",
+    "orchestrator": (
+        "Decompose the task, fork children for evidence and edits, judge their "
+        "reports, and integrate. Never guess at repository contents: you have no "
+        "read tools of your own, so spawn an explore child to look around first."
+    ),
 }
 
 # capability modes: which tags the child may use
 CAPS: dict[str, tuple[str, ...]] = {
     "read": ("python", "bash", "skill", "todo"),
     "edit": ("python", "bash", "edit", "skill", "reload", "todo"),
+    # No bash, python, edit, or shell: an orchestrator delegates. It looks at
+    # the world only through children it forks (until read-only probes land).
+    "orchestrator": ("agents", "memory", "system", "skill"),
     "full": (),  # empty tuple == inherit everything
 }
 
@@ -51,6 +59,8 @@ AGENTS: dict[str, dict[str, Any]] = {
     "security": {"persona": "security", "capability": "read", "model": "gpt-5.6-sol"},
     "planner": {"persona": "planner", "capability": "read", "model": "gpt-5.6-sol"},
     "sniffer": {"persona": "debugger", "capability": "read", "model": "gpt-5.6-luna"},
+    # budget 1 by default: an orchestrator that cannot fork is useless.
+    "orchestrator": {"persona": "orchestrator", "capability": "orchestrator", "model": "gpt-5.6-sol", "budget": 1},
 }
 
 ROLE_GUIDE: dict[str, str] = {
@@ -73,6 +83,9 @@ class EffectiveConfig:
     thinking: str | None = None
     cwd: str | None = None
     context: str = "new"  # new | resumed
+    # Requested depth budget for the spawned run: how many spawn levels may
+    # exist below it. None inherits (spawner's remaining budget - 1; 0 at root).
+    budget: int | None = None
     # Launch-time prompt controls. system_prompt replaces the generated child
     # prompt; system_append augments it. user_input replaces the rendered task,
     # while task_template transforms it with a required {task} placeholder.
@@ -103,6 +116,9 @@ def resolve(agent: str = "general", **over: Any) -> EffectiveConfig:
     guidance_every = d.get("guidance_every_turns", 8)
     if guidance_every is not None and int(guidance_every) < 0:
         raise ValueError("guidance_every_turns must be non-negative or None")
+    budget = d.get("budget")
+    if budget is not None and int(budget) < 0:
+        raise ValueError("budget must be non-negative or None")
     return EffectiveConfig(
         agent=agent,
         persona=persona,
@@ -112,6 +128,7 @@ def resolve(agent: str = "general", **over: Any) -> EffectiveConfig:
         thinking=d.get("thinking"),
         cwd=d.get("cwd"),
         context=d.get("context", "new"),
+        budget=(int(budget) if budget is not None else None),
         system_prompt=d.get("system_prompt"),
         system_append=d.get("system_append"),
         user_input=d.get("user_input"),
@@ -137,10 +154,18 @@ class Run:
     structured: bool = False
     # Tree coordinates, fixed at spawn time from the spawning run: `parent` is
     # that run's id (None when the root world spawned this run) and `depth` is
-    # spawner.depth + 1 (root spawns are 0). Recorded and emitted here; budget
-    # semantics stay on _DEPTH until Phase 4's 2.1.
+    # spawner.depth + 1 (root spawns are 0). `budget` is the remaining spawn
+    # depth below this run — data on the run, and spawn() discovers the run
+    # from the calling world dispatch() bound, so it holds for a bare spawn,
+    # the <agents> tag, and <python>; a detached thread resolves to nothing
+    # and is refused outright. At 0 the child world carries no <agents> scope
+    # and spawn() answers with a refusal string. `generation` is the parent
+    # world's generation at spawn.
     parent: str | None = None
     depth: int = 0
+    budget: int = 0
+    generation: int = 0
+    killed: bool = False
     state: str = "pending"  # pending | running | done | stopped | failed
     stage: str = "queued"
     progress: str = ""
@@ -169,6 +194,9 @@ class Run:
             "id": self.id,
             "agent": self.cfg.agent,
             "task": self.task[:160],
+            "parent": self.parent,
+            "depth": self.depth,
+            "budget": self.budget,
             "state": self.state,
             "stage": self.stage,
             "progress": self.progress[:160],
@@ -212,6 +240,11 @@ def _legacy_requires_tool(task: str) -> bool:
 
 
 RUNS: dict[str, Run] = {}
+# Parent world per run id, for rerun(): the world donates model/complete_fn/cwd
+# and receives the pending notice. Not on Run: asdict/_persist must stay JSON.
+# ponytail: lost on reload_sdk (loop.py copies RUNS only); rerun then falls
+# back to the bound PARENT world.
+_WORLDS: dict[str, Any] = {}
 _POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="subagent")
 _LOCK = threading.Lock()
 DIR = Path(".desmos/subagents")
@@ -225,9 +258,6 @@ def _persist(run: Run) -> None:
         (DIR / f"{run.id}.json").write_text(json.dumps(rec, indent=2, default=str))
     except OSError:
         pass
-
-
-_DEPTH = threading.local()
 
 
 def _scoped_tags(capability: str, contract: TaskContract | None) -> set[str] | None:
@@ -257,6 +287,7 @@ def _child_world(
     contract: TaskContract | None = None,
     *,
     todo_actor: str | None = None,
+    budget: int = 0,
 ):
     from desmos.kernel.loop import new_world, seed_builtins
 
@@ -267,6 +298,10 @@ def _child_world(
     w.model = cfg.model or parent.model
     w.thinking = cfg.thinking or parent.thinking
     allowed = _scoped_tags(cfg.capability, contract)
+    if budget <= 0 and allowed is not None:
+        # An exhausted budget removes the spawn surface itself, not just the
+        # spawn() answer: the tag is outside the frozen dispatch scope.
+        allowed.discard("agents")
     if allowed is not None:
         # The parent-todo bridge is a separate append-only capability. Typed
         # task contracts still receive it even when their ordinary tool list is
@@ -284,18 +319,31 @@ def _child_world(
             if name not in allowed:
                 del w.tools[name]
         set_scope(w, allowed)
-    # Not cleanup: <agents> is how a world reaches spawn(). It is a grown tool,
-    # not a frozen tag, so this pop only holds for the world as built --
-    # install_resources re-registers extension and skill tools from cwd at the
-    # top of every turn, and it is an extension that supplies <agents>.
-    # What holds afterwards is the scope for a scoped child ('agents' is in no
-    # CAPS entry) and, for an unscoped 'full' child, the depth cap: _DEPTH.n is
-    # 1 for the whole run_turns call in the child's worker thread, so an
-    # in-thread spawn() raises there. The cap is thread-local, so a child that
-    # starts its own thread or shells out to a new process is past it -- which
-    # is why the pop and the cap are both kept, and why anyone handing 'full'
-    # an explicit tag set must leave 'agents' out of it.
-    w.tools.pop("agents", None)
+    # <agents> is how a world reaches spawn(). In the root it is a grown tool,
+    # which a fresh persist=False child never loads -- so a capability that
+    # scopes 'agents' must also supply the tag here, or the child's prompt
+    # teaches a syscall that answers unknown-tag. Same handler the root's
+    # grown tool wraps; spawn() attributes the launch to this world's run via
+    # dispatch()'s caller binding, so budget and depth nest without the child
+    # cooperating. At budget 0 the tag is removed instead (install_resources
+    # may re-add one from an extension at the top of every turn; the scope
+    # above keeps refusing it). The budget itself is enforced in spawn() on
+    # every path — the tag, <python>, a detached thread.
+    if budget <= 0:
+        w.tools.pop("agents", None)
+    elif allowed is None or "agents" in allowed:
+        from desmos.agents import subagent_tool
+        from desmos.kernel.types import Tool
+
+        w.tools["agents"] = Tool(
+            name="agents",
+            doc=(
+                "subagents: body 'spawn <agent> [model=..] : task' forks a child; "
+                "'status', 'wait', 'result <id>'; or a JSON "
+                "spawn_many/spawn/wait/status/result command"
+            ),
+            handler=subagent_tool.handle,
+        )
     if cfg.persona_instructions:
         w.notes["persona"] = cfg.persona_instructions
     w.notes["subagent"] = (
@@ -309,7 +357,7 @@ def _child_world(
         )
     from desmos.agents.subagent_prompt import child_system_prompt
 
-    generated = child_system_prompt(w, cfg, contract)
+    generated = child_system_prompt(w, cfg, contract, budget=budget)
     w.system_override = cfg.system_prompt if cfg.system_prompt is not None else generated
     if cfg.system_append:
         w.system_override = w.system_override.rstrip() + "\n\n" + cfg.system_append.strip()
@@ -396,11 +444,18 @@ def _execute(run: Run, parent: Any) -> None:
         )
 
     try:
+        if run.killed:
+            run.state = "stopped"
+            run.stop_reason = "killed"
+            run.stage = "stopped"
+            run.progress = "killed before start"
+            return
         w = _child_world(
             run.cfg,
             parent,
             run.contract if run.structured else None,
             todo_actor=run.id,
+            budget=run.budget,
         )
         # The world remembers which run it executes. spawn() reads this off the
         # `parent` world it is handed, so a nested spawn lands in the tree with
@@ -454,17 +509,14 @@ def _execute(run: Run, parent: Any) -> None:
             publish_progress()
             return _guidance_prompt(run)
 
-        _DEPTH.n = 1
-        try:
-            out = run_turns(
-                w,
-                _user_prompt(run),
-                quiet=True,
-                on_event=child_event,
-                on_continue=guidance_after_turn,
-            )
-        finally:
-            _DEPTH.n = 0
+        out = run_turns(
+            w,
+            _user_prompt(run),
+            quiet=True,
+            on_event=child_event,
+            on_continue=guidance_after_turn,
+            should_stop=lambda: run.killed,
+        )
         if run.structured and run.contract is not None:
             require_tool = run.contract.require_tool_use
         elif run.cfg.require_tool_use is not None:
@@ -472,24 +524,21 @@ def _execute(run: Run, parent: Any) -> None:
         else:
             require_tool = _legacy_requires_tool(run.task)
         no_tool_failure = False
-        if require_tool and not run.observed_tools:
+        if require_tool and not run.observed_tools and not run.killed:
             run.steers += 1
             run.stage = "steering"
             run.progress = "no syscall observed; requiring action"
             publish_progress()
-            _DEPTH.n = 1
-            try:
-                out = run_turns(
-                    w,
-                    "You finished without using any tool. That result is unevidenced and will "
-                    "be rejected. Use one of your available syscalls now, inspect the task with "
-                    "a real call, read its result, and only then return the complete answer.",
-                    quiet=True,
-                    on_event=child_event,
-                    on_continue=guidance_after_turn,
-                )
-            finally:
-                _DEPTH.n = 0
+            out = run_turns(
+                w,
+                "You finished without using any tool. That result is unevidenced and will "
+                "be rejected. Use one of your available syscalls now, inspect the task with "
+                "a real call, read its result, and only then return the complete answer.",
+                quiet=True,
+                on_event=child_event,
+                on_continue=guidance_after_turn,
+                should_stop=lambda: run.killed,
+            )
             if not run.observed_tools:
                 no_tool_failure = True
 
@@ -504,6 +553,12 @@ def _execute(run: Run, parent: Any) -> None:
                     total[key] = total.get(key, 0) + value
         run.usage = total
 
+        if run.killed:
+            run.state = "stopped"
+            run.stop_reason = "killed"
+            run.stage = "stopped"
+            run.progress = "killed by intervention"
+            return
         if no_tool_failure:
             run.state = "failed"
             run.stop_reason = "no_tool_evidence"
@@ -593,6 +648,7 @@ def spawn(
     resume: str | None = None,
     model: str | None = None,
     thinking: str | None = None,
+    budget: int | None = None,
     system_prompt: str | None = None,
     system_append: str | None = None,
     user_input: str | None = None,
@@ -604,13 +660,41 @@ def spawn(
     _register_pending: bool = True,
     **over: Any,
 ) -> str:
-    """Start a child immediately after its typed dependencies are accepted."""
-    if getattr(_DEPTH, "n", 0) >= 1:
-        raise ValueError("subagent depth cap: children cannot spawn")
-    parent = parent or _parent()
+    """Start a child immediately after its typed dependencies are accepted.
+
+    Returns the run id — or, when the spawning run's depth budget is exhausted
+    (or it was killed, or the caller has no run context at all), a refusal
+    string. A refused spawn is a result the parent reads, never an exception.
+    """
+    # The spawning run is discovered from the CALLING world — the one bound by
+    # dispatch() around the executing syscall — never from the parent kwarg: a
+    # budget gate keyed on an argument the caller chooses is a gate a bare
+    # spawn() walks around. _execute tags each child world with the run it
+    # executes; a root world carries no tag, so a root spawn is never
+    # budget-refused. A caller that resolves to nothing (a detached thread
+    # outside any dispatched turn) cannot prove a budget, so it gets none.
+    caller = _caller_world()
+    if caller is _UNRESOLVED:
+        return (
+            "spawn refused: this call carries no run context (a detached thread "
+            "outside any dispatched turn), so its depth budget cannot be proven. "
+            "Spawn from your own turn instead."
+        )
+    spawner = RUNS.get(getattr(caller, "subagent_run", None) or "")
+    if spawner is not None and (spawner.killed or spawner.budget <= 0):
+        why = "the spawning run was killed" if spawner.killed else "depth budget exhausted"
+        return (
+            f"spawn refused: {why} (run {spawner.id} at depth {spawner.depth}, "
+            f"budget {spawner.budget}). Finish the task yourself and report."
+        )
+    # The kwarg's remaining job: donate model/complete_fn/cwd and receive the
+    # pending notice. It defaults to the calling world itself, so a child's
+    # spawn resumes the child's own loop, not the root's.
+    parent = parent if parent is not None else (caller if caller is not None else _parent())
     explicit = {
         "model": model,
         "thinking": thinking,
+        "budget": budget,
         "system_prompt": system_prompt,
         "system_append": system_append,
         "user_input": user_input,
@@ -641,10 +725,14 @@ def spawn(
     # Raises on a contract whose tool scope and capability do not overlap, here
     # rather than in the pool thread that would otherwise build the world.
     _scoped_tags(cfg.capability, contract if structured else None)
-    # The spawning run, read off the world this spawn was handed: _execute tags
-    # each child world with the run it executes. The root world carries no tag,
-    # so a root spawn records parent=None at depth 0.
-    spawner = RUNS.get(getattr(parent, "subagent_run", None) or "")
+    # Budget: inherited from the spawner, decremented one level; an explicit
+    # request can only narrow it (a child cannot mint budget). Root spawns get
+    # exactly what was asked for, default 0 (children that cannot fork).
+    if spawner is not None:
+        inherited = spawner.budget - 1
+        run_budget = min(cfg.budget, inherited) if cfg.budget is not None else inherited
+    else:
+        run_budget = cfg.budget if cfg.budget is not None else 0
     run = Run(
         id=uuid.uuid4().hex[:8],
         task=contract.objective,
@@ -653,6 +741,8 @@ def spawn(
         structured=structured,
         parent=spawner.id if spawner is not None else None,
         depth=spawner.depth + 1 if spawner is not None else 0,
+        budget=run_budget,
+        generation=int(getattr(parent, "generation", 0) or 0),
     )
     if resume:
         src = RUNS.get(resume)
@@ -662,8 +752,15 @@ def spawn(
             raise ValueError(f"resume identity mismatch: {src.cfg.agent} != {cfg.agent}")
         run.messages = list(src.messages)
         run.cfg.context = "resumed"
+    _launch(run, parent, _register_pending)
+    return run.id
+
+
+def _launch(run: Run, parent: Any, register_pending: bool) -> None:
+    """Register, announce, and submit a run. Shared by spawn() and rerun()."""
     with _LOCK:
         RUNS[run.id] = run
+    _WORLDS[run.id] = parent
     _emit(
         {
             "ev": "subagent",
@@ -671,31 +768,101 @@ def spawn(
             "id": run.id,
             "parent": run.parent,
             "depth": run.depth,
-            "agent": cfg.agent,
-            "persona": cfg.persona or "",
+            "agent": run.cfg.agent,
+            "persona": run.cfg.persona or "",
             "task": run.task,
-            "structured": structured,
-            "model": cfg.model or getattr(parent, "model", ""),
+            "structured": run.structured,
+            "model": run.cfg.model or getattr(parent, "model", ""),
+            "generation": run.generation,
         }
     )
     _POOL.submit(_execute, run, parent)
     # Nothing in the parent turn waits on this. The step ends normally and the
     # loop resumes it when the child settles, so a spawn costs no idle turn and
     # a queued follow-up is never stuck behind a sleeping call.
-    from desmos.agents import pending as _pending
+    if register_pending:
+        from desmos.agents import pending as _pending
 
-    def _settle() -> str:
-        while run.state in ("pending", "running"):
-            time.sleep(0.05)
-        brief = run.brief()
-        return (
-            f"{cfg.agent} {run.id}: {brief['state']}/{brief['stage']}"
-            f" after {brief['turns']} turns."
-            f' Read it with result("{run.id}") or judgment("{run.id}").'
-        )
+        _pending.register(parent, f"subagent {run.cfg.agent} {run.id}", lambda: _settle(run))
 
-    if _register_pending:
-        _pending.register(parent, f"subagent {cfg.agent} {run.id}", _settle)
+
+def _settle(run: Run) -> str:
+    while run.state in ("pending", "running"):
+        time.sleep(0.05)
+    return child_notice(run)
+
+
+def child_notice(run: Run) -> str:
+    """The parent's pending notice for a settled child (contract C5).
+
+    The compression lives here, never in the child: the raw result stays whole
+    on the run record, in .desmos/subagents/<id>.json, and in the trajectory.
+    """
+    if run.judgment is None:
+        verdict = "unjudged"
+    else:
+        verdict = "accepted" if run.judgment.accepted else "rejected"
+    summary = ""
+    if run.run_result is not None:
+        summary = run.run_result.summary
+    summary = summary or run.result or run.error or run.stop_reason
+    summary = " ".join(summary.split())[:200]
+    head = f"[{run.id} {run.state} depth={run.depth}] {run.task[:80]} — {verdict}: {summary}"
+    return head[:400]
+
+
+def kill_subtree(rid: str) -> str:
+    """Intervention (contract C3): cancel a run and every descendant.
+
+    Never raises; an unknown id is answered in prose. The kill is a flag each
+    run's own loop reads (run_turns should_stop), so a running child settles
+    as state=stopped / stop_reason=killed through the normal terminal path.
+    """
+    with _LOCK:
+        if rid not in RUNS:
+            return f"unknown run {rid}"
+        # Walk RUNS by parent, transitively.
+        # ponytail: O(tree * runs) scan; index children if RUNS ever gets big.
+        ids = [rid]
+        seen = {rid}
+        i = 0
+        while i < len(ids):
+            for r in RUNS.values():
+                if r.parent == ids[i] and r.id not in seen:
+                    seen.add(r.id)
+                    ids.append(r.id)
+            i += 1
+        live = [RUNS[x] for x in ids if RUNS[x].state in ("pending", "running")]
+        for r in live:
+            r.killed = True
+    if not live:
+        return f"kill {rid}: nothing running in a subtree of {len(ids)} run(s)"
+    return f"kill {rid}: stopping {len(live)} of {len(ids)} run(s): " + " ".join(r.id for r in live)
+
+
+def rerun(rid: str) -> str:
+    """Intervention (contract C3): respawn a settled run's contract as a fresh
+    run wired to the same parent world. Returns the new id or a refusal string;
+    never raises."""
+    with _LOCK:
+        src = RUNS.get(rid)
+    if src is None:
+        return f"unknown run {rid}"
+    if src.state in ("pending", "running"):
+        return f"run {rid} is still {src.state}; kill it before rerunning"
+    parent = _WORLDS.get(rid) or _parent()
+    run = Run(
+        id=uuid.uuid4().hex[:8],
+        task=src.task,
+        cfg=replace(src.cfg),
+        contract=src.contract,
+        structured=src.structured,
+        parent=src.parent,
+        depth=src.depth,
+        budget=src.budget,
+        generation=int(getattr(parent, "generation", 0) or 0),
+    )
+    _launch(run, parent, True)
     return run.id
 
 
@@ -735,6 +902,31 @@ def _parent() -> Any:
     # loaded and saved cwd/.desmos/harness.sqlite3 -- a child process writing
     # the real harness's state.
     return new_world(Path.cwd(), state_path=None, persist=False)
+
+
+#: spawn()'s answer for a caller that proves nothing: not a world, not None.
+_UNRESOLVED = globals().get("_UNRESOLVED") or object()
+
+
+def _caller_world() -> Any:
+    """The world whose turn is executing this call, or _UNRESOLVED.
+
+    Resolution the caller does not control: dispatch() binds the executing
+    world around every syscall, so <python> and <agents> in any world -- root
+    or child, on any thread -- resolve to that world. Without a binding, only
+    the main thread is trusted: child runs execute on pool threads and threads
+    they detach, never on the interpreter's main thread, so a main-thread call
+    is the embedding root (checks, programmatic use). Anything else is
+    _UNRESOLVED -- it cannot prove a budget, and spawn() refuses it.
+    """
+    from desmos.kernel.dispatch import CALLER_WORLD
+
+    world = CALLER_WORLD.get()
+    if world is not None:
+        return world
+    if threading.current_thread() is threading.main_thread():
+        return PARENT  # may be None: an unbound root; _parent() supplies one
+    return _UNRESOLVED
 
 
 def wait(*ids: str, timeout: float = 600.0, poll: float = 0.5) -> list[dict[str, Any]]:
@@ -814,7 +1006,12 @@ def spawn_many(specs: list[dict[str, Any]], *, parent: Any = None) -> list[str]:
         cfg = resolve(agent, **item)
         _scoped_tags(cfg.capability, contract if structured else None)
         prepared.append((normalized, agent, resume, item))
-    parent = parent or _parent()
+    if parent is None:
+        # Same default as spawn(): the calling world, so a child's batch
+        # resumes the child's own loop. Budget attribution never comes from
+        # this value -- spawn() re-resolves the caller itself.
+        caller = _caller_world()
+        parent = caller if caller is not None and caller is not _UNRESOLVED else _parent()
     ids = [
         spawn(
             task,
@@ -830,20 +1027,19 @@ def spawn_many(specs: list[dict[str, Any]], *, parent: Any = None) -> list[str]:
     # A batch is one parent decision. Child lifecycle events remain individual
     # for the TUI, but the model loop resumes once, after the complete batch is
     # available, rather than once per child with siblings still running.
+    # A refused spawn (depth budget) returns its refusal string in place of an
+    # id; only real runs are waited on.
+    live = [i for i in ids if i in RUNS]
+    if not live:
+        return ids
     from desmos.agents import pending as _pending
 
     def _settle_group() -> str:
-        while any(RUNS[i].state in ("pending", "running") for i in ids):
-            time.sleep(0.05)
-        rows = [
-            f"{RUNS[i].cfg.agent} {i}: {RUNS[i].state}/{RUNS[i].stage}"
-            f" after {RUNS[i].turns} turns"
-            for i in ids
-        ]
-        reads = ", ".join(f'result("{i}")' for i in ids)
+        rows = [_settle(RUNS[i]) for i in live]
+        reads = ", ".join(f'result("{i}")' for i in live)
         return "subagent group settled:\n" + "\n".join(rows) + f"\nRead: {reads}"
 
-    _pending.register(parent, "subagent group " + " ".join(ids), _settle_group)
+    _pending.register(parent, "subagent group " + " ".join(live), _settle_group)
     return ids
 
 

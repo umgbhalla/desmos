@@ -291,7 +291,17 @@ pub(crate) fn handle_key(
                 return Ok(false);
             }
             if app.viewing.take().is_some() {
-                app.focus = Focus::Story;
+                // Back where you came from: a child opened off the run tree
+                // returns to the tree, one opened off a story row to the story.
+                app.focus = if app.tree_open {
+                    Focus::Calls
+                } else {
+                    Focus::Story
+                };
+                return Ok(false);
+            }
+            if app.focus == Focus::Calls && app.tree_open {
+                app.tree_open = false;
                 return Ok(false);
             }
             if app.focus == Focus::Input {
@@ -474,6 +484,45 @@ pub(crate) fn handle_key(
         }
         return Ok(false);
     }
+    // The run tree owns the Activity keys while it is up (upgrade-paths 3.2 /
+    // 3.3): walk rows, open a child, intervene. `x`/`r` put the contract-C3 op
+    // on the bridge; the row says "sent (unconfirmed)" until the kernel's own
+    // terminal `subagent` event (kill) or a fresh `started` (rerun) answers.
+    if app.focus == Focus::Calls && app.tree_open {
+        let last = tree::order(&app.children).len().saturating_sub(1);
+        match key.code {
+            KeyCode::Char('j') | KeyCode::Down => app.tree_sel = (app.tree_sel + 1).min(last),
+            KeyCode::Char('k') | KeyCode::Up => app.tree_sel = app.tree_sel.saturating_sub(1),
+            KeyCode::Char('t') | KeyCode::Char('q') => app.tree_open = false,
+            KeyCode::Enter | KeyCode::Char('l') | KeyCode::Right => {
+                if let Some(id) = tree::order(&app.children).get(app.tree_sel).cloned() {
+                    app.ensure_child(&id, "");
+                    app.viewing = Some(id);
+                }
+            }
+            KeyCode::Char('x') | KeyCode::Char('r') => {
+                let kill = key.code == KeyCode::Char('x');
+                match bridge.as_deref_mut() {
+                    Some(b) => {
+                        if let Some(op) = tree::intervene(app, kill) {
+                            b.send(&op)?;
+                            app.notify(if kill {
+                                "kill_run sent — the run's terminal event confirms it"
+                            } else {
+                                "rerun sent — the new run appears as its own row"
+                            });
+                        }
+                    }
+                    // No bridge, no wire: nothing was sent, so nothing is
+                    // marked pending and the composer says why.
+                    None => app.notify("no bridge — intervention not sent"),
+                }
+            }
+            KeyCode::Char('i') => app.set_focus(Focus::Input),
+            _ => {}
+        }
+        return Ok(false);
+    }
     if app.focus != Focus::Input {
         match key.code {
             KeyCode::Char('j') | KeyCode::Down => app.focused_scroll().select_next(),
@@ -512,6 +561,11 @@ pub(crate) fn handle_key(
             }
             KeyCode::Char(']') if app.focus == Focus::Calls => {
                 app.select_call_group(true);
+            }
+            // The run tree (3.2): one row per subagent run, nested by the
+            // kernel's parent/depth, over this column until t/Esc.
+            KeyCode::Char('t') if app.focus == Focus::Calls => {
+                app.tree_open = true;
             }
             KeyCode::Char('r') => app.focused_scroll().toggle_raw_selected(),
             KeyCode::PageUp => app.focused_scroll().page_up(),
@@ -845,6 +899,13 @@ pub(crate) fn handle_mouse(app: &mut App, m: MouseEvent) {
             if on_slash && app.slash.open {
                 app.slash.move_sel(if up { -1 } else { 1 });
                 sync_theme_preview(app);
+            } else if on_calls && app.tree_open {
+                let last = tree::order(&app.children).len().saturating_sub(1);
+                app.tree_sel = if up {
+                    app.tree_sel.saturating_sub(3)
+                } else {
+                    (app.tree_sel + 3).min(last)
+                };
             } else if on_calls || on_story {
                 wheel_scroll(app.sess_mut().scroll(on_calls), up, 3);
             } else if on_post_in {
@@ -970,6 +1031,18 @@ pub(crate) fn handle_mouse(app: &mut App, m: MouseEvent) {
                                 app.last_click = Some((now, idx, 4));
                             }
                         }
+                    }
+                }
+                return;
+            }
+            if on_calls && app.tree_open {
+                // The tree replaced the scrollback, so its hit-test replaces
+                // the scrollback's: a click selects the row under it.
+                app.set_focus(Focus::Calls);
+                if let Some(row) = pane_row(app.call_area, m.row) {
+                    let idx = app.tree_skip() + row;
+                    if idx < tree::order(&app.children).len() {
+                        app.tree_sel = idx;
                     }
                 }
                 return;
