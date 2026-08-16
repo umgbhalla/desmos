@@ -90,6 +90,7 @@ class Shell:
         self.mark = ""
         self._lock = threading.RLock()
         self._generation = 0
+        self._interrupted_generation: int | None = None
         self.monitoring = False
         # False while a command is still running and reading stdin. Appending
         # the marker then does not reach bash at all -- the waiting program
@@ -115,7 +116,11 @@ class Shell:
             fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 50, 200, 0, 0))
         except (OSError, termios.error):
             pass
-        argv = [command] if command else ["/bin/bash", "--norc", "--noprofile"]
+        # interrupt() targets the tty's foreground process group. Bash only
+        # gives foreground jobs their own group with monitor mode enabled;
+        # without it Linux puts bash and the job in one group, so Ctrl-C also
+        # aborts the sourced completion marker and the monitor never settles.
+        argv = [command] if command else ["/bin/bash", "--norc", "--noprofile", "-m"]
         env = dict(os.environ)
         env["PS1"] = ""
         env["PS2"] = ""
@@ -247,6 +252,13 @@ class Shell:
             if not self.alive():
                 out.extend(self._drain(EARLY_EXIT_GRACE))
                 return bytes(out), "done"
+            if self._interrupted_generation == generation:
+                try:
+                    shell_pgid = os.getpgid(self.proc.pid)
+                    if os.tcgetpgrp(self.master) == shell_pgid:
+                        return bytes(out), "interrupted"
+                except OSError:
+                    pass
             now = time.monotonic()
             silent_since = silent_since or now
             if self._is_prompt(bytes(out)) and now - silent_since >= PROMPT_IDLE:
@@ -266,11 +278,15 @@ class Shell:
             if generation != self._generation:
                 return f"shell {name} monitor superseded"
             self.monitoring = False
-            self.at_prompt = state == "done" and self.alive()
+            self.at_prompt = state in ("done", "interrupted") and self.alive()
+            self._interrupted_generation = None
         if state == "prompt":
             return self._format(raw, waiting=True)
         if state == "replaced":
             return f"shell {name} monitor superseded"
+        if state == "interrupted":
+            body = head_tail(raw).strip()
+            return f"{body}\n[exit 130]".strip()
         return self._format(raw)
 
     def _start_monitor(
@@ -321,6 +337,7 @@ class Shell:
             else:
                 self._generation += 1
                 generation = self._generation
+                self._interrupted_generation = None
                 payload = self._command_payload(text)
                 self.at_prompt = False
                 try:
@@ -357,6 +374,7 @@ class Shell:
             if pgid <= 0:
                 pgid = os.getpgid(self.proc.pid)
             os.killpg(pgid, signal.SIGINT)
+            self._interrupted_generation = self._generation
         except OSError as exc:
             return f"interrupt failed: {exc}"
         # Once monitoring begins it is the sole PTY reader. Competing here can

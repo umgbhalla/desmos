@@ -1,0 +1,140 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  prepare:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Create draft beta release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 ||
+            gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
+              --verify-tag --generate-notes --draft --prerelease \
+              --title "$GITHUB_REF_NAME beta"
+
+  tui:
+    needs: prepare
+    strategy:
+      matrix:
+        include:
+          - runner: macos-15
+            target: aarch64-apple-darwin
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    steps:
+      - name: Fetch tagged source
+        run: |
+          git init .
+          git remote add origin "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY.git"
+          git fetch --depth=1 origin "$GITHUB_SHA"
+          git checkout --detach FETCH_HEAD
+      - name: Install build tools
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          rustup toolchain install stable --profile minimal --target "$TARGET"
+          rustup default stable
+          if ! command -v protoc >/dev/null; then
+            if [ "$RUNNER_OS" = macOS ]; then
+              brew install protobuf
+            else
+              sudo apt-get update
+              sudo apt-get install -y protobuf-compiler
+            fi
+          fi
+      - name: Build TUI
+        run: cargo build --locked -p desmos-tui --release --target "${{ matrix.target }}"
+      - name: Test TUI and markdown
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: |
+          env -u NO_COLOR COLORTERM=truecolor TERM=xterm-256color cargo test --locked -p desmos-tui
+          cargo test --locked -p xai-grok-markdown -p xai-grok-markdown-core
+      - name: Package and upload TUI
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          mkdir -p dist/package
+          cp "target/$TARGET/release/desmos-tui" dist/package/desmos-tui
+          tar -C dist/package -czf "dist/desmos-tui-$TARGET.tar.gz" desmos-tui
+          cd dist
+          shasum -a 256 "desmos-tui-$TARGET.tar.gz" > "desmos-tui-$TARGET.tar.gz.sha256"
+          gh release upload "$GITHUB_REF_NAME" desmos-tui-* --clobber --repo "$GITHUB_REPOSITORY"
+
+  python:
+    needs: prepare
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Fetch tagged source
+        run: |
+          git init .
+          git remote add origin "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY.git"
+          git fetch --depth=1 origin "$GITHUB_SHA"
+          git checkout --detach FETCH_HEAD
+      - name: Check and build wheel
+        run: |
+          version=$(python3 -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')
+          test "$GITHUB_REF_NAME" = "v$version"
+          python3 -m desmos check
+          python3 -m unittest discover -s tests -q
+          python3 inverted.py --check
+          python3 -m pip wheel --no-deps . -w dist
+          cd dist
+          shasum -a 256 desmos-*.whl > "desmos-$version-py3-none-any.whl.sha256"
+      - name: Check documentation links
+        run: |
+          python3 - <<'PY'
+          import pathlib
+          import re
+
+          bad = []
+          root = pathlib.Path(".")
+          for md in [*root.glob("*.md"), *root.glob("docs/*.md"), *root.glob(".github/**/*.md")]:
+              for text, link in re.findall(r"\[([^\]]*)\]\(([^)]+)\)", md.read_text()):
+                  if link.startswith(("http://", "https://", "#", "mailto:")):
+                      continue
+                  target = (md.parent / link.split("#")[0]).resolve()
+                  if not target.exists():
+                      bad.append(f"{md}: [{text}]({link})")
+          if bad:
+              raise SystemExit("\n".join(bad))
+          PY
+      - name: Check for secrets
+        run: |
+          rc=0
+          git grep -InE --untracked \
+            'sk-ant-[A-Za-z0-9_-]{16,}|sk-proj-[A-Za-z0-9_-]{16,}|(ANTHROPIC|OPENAI|XAI)_API_KEY=[A-Za-z0-9_-]{16,}|(access|refresh|id)_token"?[[:space:]:=]+"?eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{16,}' \
+            -- . || rc=$?
+          case "$rc" in
+            0) echo "possible secret in tree" >&2; exit 1 ;;
+            1) echo "no key material found" ;;
+            *) echo "git grep failed (rc=$rc)" >&2; exit 1 ;;
+          esac
+      - name: Upload wheel
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$GITHUB_REF_NAME" dist/* --clobber --repo "$GITHUB_REPOSITORY"
+
+  publish:
+    needs: [tui, python]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Publish beta release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft=false --prerelease --title "$GITHUB_REF_NAME beta"
