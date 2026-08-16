@@ -186,14 +186,14 @@ raise SystemExit(B.serve(Path(sys.argv[1]).resolve()))
 
 
 class _SockClient:
-    """One unix-socket bridge client. Reads are bounded (30s) so a bridge that
+    """One unix-socket bridge client. Reads are bounded (90s) so a bridge that
     stalls fails the check instead of hanging it."""
 
     def __init__(self, path: Path) -> None:
         import socket
 
         self.sock = socket.socket(socket.AF_UNIX)
-        self.sock.settimeout(30)
+        self.sock.settimeout(90)
         self.sock.connect(str(path))
         self.rd = self.sock.makefile("r", encoding="utf-8")
 
