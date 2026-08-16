@@ -35,12 +35,20 @@ BUDGETS = {
 }
 
 
-def split_system(system: str) -> tuple[str, str]:
+def split_system(system: str) -> tuple[str, str, str]:
+    """ABI, catalog, volatile tail -- the first two are cached, the third is not."""
+    from desmos.kernel.catalog import VOLATILE_MARKER
+
+    tail = ""
+    marker = "\n\n" + VOLATILE_MARKER
+    if marker in system:
+        i = system.rindex(marker)
+        system, tail = system[:i], system[i + 2 :]
     marker = "\n\n# tools"
     if marker in system:
         i = system.index(marker)
-        return system[:i], system[i + 2 :]
-    return system, ""
+        return system[:i], system[i + 2 :], tail
+    return system, "", tail
 
 
 def adaptive_model(model: str) -> bool:
@@ -341,7 +349,7 @@ def cached_payload(
     from desmos.skills import filter_skill_dialects
 
     cache = {"type": "ephemeral"}
-    abi, catalog_text = split_system(system)
+    abi, catalog_text, volatile_text = split_system(system)
     sys_blocks: list[dict[str, Any]] = [{"type": "text", "text": abi, "cache_control": cache}]
     if catalog_text.strip():
         sys_blocks.append({"type": "text", "text": catalog_text, "cache_control": cache})
@@ -417,6 +425,14 @@ def cached_payload(
         if m["role"] == "user" and m["content"]:
             m["content"][-1]["cache_control"] = dict(cache)
             break
+    # Volatile state rides *behind* the last breakpoint, so ticking a todo costs
+    # its own few hundred tokens instead of re-writing the entire cached prefix.
+    if volatile_text.strip():
+        block = {"type": "text", "text": volatile_text}
+        if msgs and msgs[-1]["role"] == "user":
+            msgs[-1]["content"].append(block)
+        else:
+            msgs.append({"role": "user", "content": [block]})
     payload: dict[str, Any] = {
         "model": model,
         "max_tokens": max_tokens,

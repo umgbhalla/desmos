@@ -52,6 +52,20 @@ def ns_index(world: World) -> str:
     return "\n".join(lines)
 
 
+# Notes that change many times inside one session. They live at the tail of the
+# prompt, after every cache breakpoint, because a byte changed anywhere in the
+# cached system blocks re-writes the whole prefix behind it -- measured at
+# ~$0.85 per todo tick at 130k tokens of context.
+VOLATILE_NOTES = ("todo",)
+VOLATILE_MARKER = "# now"
+
+
+def volatile(world: World) -> str:
+    """Per-turn mutable state, deliberately outside the cached prefix."""
+    parts = [f"[{k}]\n{world.notes[k]}" for k in VOLATILE_NOTES if world.notes.get(k)]
+    return VOLATILE_MARKER + "\n" + "\n".join(parts) if parts else ""
+
+
 def catalog(world: World) -> str:
     from desmos.kernel.const import FROZEN
 
@@ -60,9 +74,10 @@ def catalog(world: World) -> str:
         tool = world.tools[name]
         flag = " frozen" if tool.frozen else ""
         lines.append(f"<{name}>{flag} {tool.doc}")
-    if world.notes:
+    stable = [(k, v) for k, v in world.notes.items() if k not in VOLATILE_NOTES]
+    if stable:
         lines.append("# your notes")
-        for key, note in world.notes.items():
+        for key, note in stable:
             lines.append(f"[{key}]\n{note}")
     if world.skills:
         from desmos.skills import format_skills_for_prompt
@@ -154,7 +169,8 @@ def runtime_block(world: World) -> str:
 
 
 def system_prompt(world: World) -> str:
-    return ABI + "\n\n" + catalog(world)
+    tail = volatile(world)
+    return ABI + "\n\n" + catalog(world) + (("\n\n" + tail) if tail else "")
 
 
 def header(world: World) -> str:

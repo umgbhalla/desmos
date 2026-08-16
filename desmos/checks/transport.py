@@ -138,6 +138,30 @@ def check() -> None:
         ]
         assert marked == [("user", "second")], marked
 
+        # A todo tick must not move the cached prefix. Volatile notes ride
+        # behind every breakpoint, so mutating one rewrites a single trailing
+        # block instead of the whole 130k-token prefix in front of it -- the
+        # measured difference is ~$0.85 per tick late in a session.
+        from desmos.loop import new_world
+        from desmos.catalog import system_prompt as _sysprompt
+
+        vol = new_world(cwd, state_path=cwd / "volatile.json")
+        vol.notes["todo"] = "[ ] one"
+        history = [{"role": "user", "content": "go"}]
+        before = cached_payload("claude-opus-5", _sysprompt(vol), history, 8192, thinking="low")
+        vol.notes["todo"] = "[x] one"
+        after = cached_payload("claude-opus-5", _sysprompt(vol), history, 8192, thinking="low")
+        assert before["system"] == after["system"], "a todo tick rewrote the cached system blocks"
+        assert not any("[ ] one" in b["text"] for b in before["system"]), (
+            "the todo body is still inside the cached prefix"
+        )
+        last = after["messages"][-1]["content"]
+        assert "cache_control" not in last[-1], last[-1]
+        assert "[x] one" in last[-1]["text"], last[-1]
+        assert "[ ] one" in before["messages"][-1]["content"][-1]["text"]
+        marks = [i for i, b in enumerate(last) if "cache_control" in b]
+        assert marks == [len(last) - 2], marks
+
         # An inbound cache_control on a user block is dropped and re-derived,
         # or a replayed transcript accumulates one breakpoint per turn and
         # blows the four-block limit the API enforces.
