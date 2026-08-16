@@ -314,12 +314,24 @@ def payload_for(
     cache_key: str | None = None,
 ) -> dict[str, Any]:
     effort = effort_of(thinking)
+    from desmos.transport.complete import split_system
+
+    abi, catalog_text, volatile_text = split_system(system)
+    stable = abi + ("\n\n" + catalog_text if catalog_text else "")
+    items = to_input(messages, model)
+    # Same trade as the Anthropic lane: instructions sit ahead of every input
+    # item in the cached prefix, so volatile state goes behind them all instead
+    # of invalidating the prefix each time it changes.
+    if volatile_text.strip():
+        items = items + [
+            {"role": "user", "content": [{"type": "input_text", "text": volatile_text}]}
+        ]
     body: dict[str, Any] = {
         "model": model,
         # The system prompt is instructions, not the first input item. Put it in
         # input and it becomes a turn the model can compact away.
-        "instructions": system + CONTRACT,
-        "input": to_input(messages, model),
+        "instructions": stable + CONTRACT,
+        "input": items,
         "stream": True,
         "store": False,
         "include": ["reasoning.encrypted_content"],

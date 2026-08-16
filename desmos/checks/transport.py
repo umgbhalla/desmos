@@ -172,6 +172,42 @@ def check() -> None:
             "a fully ticked todo still appended a block"
         )
 
+        # A mid-run <register>, <tool>, <system> or <evolve> must not move the
+        # cached catalog block either. It is frozen at first use and the
+        # difference ships in the same trailing block the todo uses.
+        from desmos.types import Tool as _Tool
+        from desmos.complete import split_system as _split
+        from desmos.catalog import CATALOG_DELTA_LIMIT
+
+        first_cat = _split(_sysprompt(vol))[1]
+        vol.tools["zzz"] = _Tool(name="zzz", doc="do a thing")
+        vol.notes["style"] = "prefer tests"
+        grown = _sysprompt(vol)
+        assert _split(grown)[1] == first_cat, "a new tool rewrote the cached catalog block"
+        delta = _split(grown)[2]
+        assert "+<zzz> do a thing" in delta and "+prefer tests" in delta, delta
+        assert "prefer tests" in grown, "the new note never reached the prompt at all"
+        grown_payload = cached_payload("claude-opus-5", grown, history, 8192, thinking="low")
+        assert grown_payload["system"][1]["text"] == first_cat
+        grown_tail = grown_payload["messages"][-1]["content"][-1]
+        assert "<zzz>" in grown_tail["text"] and "cache_control" not in grown_tail, grown_tail
+
+        # Past the limit the frozen copy refreshes: one rewrite beats a delta
+        # nobody can reconstruct the catalog from.
+        vol.notes["big"] = "x" * (CATALOG_DELTA_LIMIT + 1)
+        refreshed = _sysprompt(vol)
+        assert _split(refreshed)[1] != first_cat, "the frozen catalog never refreshes"
+        assert _split(refreshed)[2] == "", _split(refreshed)[2]
+
+        # The OpenAI lane makes the same trade: instructions hold still and the
+        # volatile text becomes a trailing input item.
+        from desmos.openai import payload_for as _payload_for
+
+        vol.notes["todo"] = "[ ] alpha"
+        oai = _payload_for("gpt-5.6-sol", _sysprompt(vol), history, 8192, thinking="low")
+        assert "[ ] alpha" not in oai["instructions"], "volatile state rode in instructions"
+        assert "[ ] alpha" in oai["input"][-1]["content"][-1]["text"], oai["input"][-1]
+
         # An inbound cache_control on a user block is dropped and re-derived,
         # or a replayed transcript accumulates one breakpoint per turn and
         # blows the four-block limit the API enforces.

@@ -736,6 +736,20 @@ def _run_turns(
         if on_event is not None:
             on_event(ev)
 
+    # The pending set drives the meta pane's "will this resume itself?" row.
+    # Emit only on change: a count that repeats every turn is a stuck row, and
+    # the check pins the edges (n goes 1 then 0, never a run of 1s). Names, not
+    # just a count, so the reader knows whether it is a build or a wedged shell.
+    _pending_shown: list[list[str]] = [[]]
+
+    def emit_pending() -> None:
+        from desmos.agents import pending
+
+        labels = pending.labels(world)
+        if labels != _pending_shown[0]:
+            _pending_shown[0] = labels
+            emit({"ev": "pending", "n": len(labels), "tasks": labels})
+
     # A child gets a token ceiling from its contract's budget. The root loop
     # only ever had max_turns, so a run that burned its whole context in four
     # enormous turns was unbounded in the one unit that costs money. Count from
@@ -840,6 +854,9 @@ def _run_turns(
             world.messages.append(
                 {"role": "user", "content": result_content(results, assistant, world.cwd)}
             )
+        # A syscall in this batch may have handed work to a monitor. Say so now,
+        # while the turn is still running, rather than at the park.
+        emit_pending()
         # After the results, never before: the note explains what did not run,
         # and reads as nonsense ahead of the output of what did.
         if cut_note:
@@ -867,7 +884,7 @@ def _run_turns(
             from desmos.agents import pending
 
             if pending.count(world):
-                emit({"ev": "pending", "n": pending.count(world)})
+                emit_pending()
                 landed = pending.wait_next(world, stop=stopped, interrupt=has_input)
                 if landed:
                     text = pending.notice(landed)
@@ -879,8 +896,10 @@ def _run_turns(
                     # leaves the file in pending/ for replay to deliver, or
                     # leaves it deduped by the notice id already saved.
                     pending.commit(world, landed)
+                    emit_pending()
                     emit({"ev": "resumed", "n": n, "text": text})
                     continue
+            emit_pending()
             _commit_step(world, prompt, speech)
             return speech
         if on_continue is not None:

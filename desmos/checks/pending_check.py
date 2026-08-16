@@ -58,6 +58,14 @@ def self_check() -> None:
         kinds = [e.get("ev") for e in events]
         assert "pending" in kinds, kinds
         assert "resumed" in kinds, kinds
+        # Meta reads these to say whether anything will resume the session on
+        # its own. Named, and emitted on both edges: a count with no names is
+        # not actionable, and a set that only ever grows is a stuck row.
+        pend = [e for e in events if e.get("ev") == "pending"]
+        assert any(e["tasks"] and e["tasks"][0].startswith("sleep [") for e in pend), pend
+        assert pend[-1]["tasks"] == [] and pend[-1]["n"] == 0, pend[-1]
+        # One emit per change, not one per turn.
+        assert [e["n"] for e in pend] == [1, 0], pend
         # Turn 2 said nothing and called nothing: without the resume the step
         # would have ended there.
         assert not turns, "the loop never resumed after the background task"

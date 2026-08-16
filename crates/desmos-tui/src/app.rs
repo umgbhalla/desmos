@@ -412,6 +412,10 @@ pub(crate) struct App {
     /// header claim a model the harness was not using — for up to max_turns.
     /// Hold it here and let the bridge's snapshot be the thing that promotes it.
     pub(crate) model_pending: Option<(String, String)>,
+    /// Background work the kernel is still holding: a monitored shell, a
+    /// sleeper, any submitted task. Non-empty means the session will resume
+    /// itself when one lands, which is the one thing polling gets wrong.
+    pub(crate) background: Vec<String>,
     /// Slash completion for the composer. Recomputed on every keystroke that
     /// changes the line, so it never has to be dismissed explicitly.
     pub(crate) slash: slash::Slash,
@@ -518,6 +522,7 @@ impl App {
             model: String::new(),
             thinking: String::new(),
             model_pending: None,
+            background: Vec::new(),
             slash: slash::Slash::default(),
             theme_preview_origin: None,
             generation: String::new(),

@@ -121,6 +121,16 @@ def count(world: Any) -> int:
     return len(outstanding(world))
 
 
+def labels(world: Any) -> list[str]:
+    """Names of the work still outstanding, id included, for the meta pane.
+
+    A bare count is not actionable -- "1 pending" says nothing about whether
+    it is a 30s build or a wedged shell. `name [id]` is what the <shell>
+    monitor and the resume notice already print, so the pane reads the same.
+    """
+    return [f"{t.name} [{t.id}]" for t in outstanding(world)]
+
+
 def _deliver_file(task: Task) -> None:
     """Rename the handoff file into delivered/.
 

@@ -39,6 +39,11 @@ class World:
     skills: list[Any] = field(default_factory=list)
     hooks: dict[str, list[Callable[..., Any]]] = field(default_factory=dict)
     messages: list[dict[str, Any]] = field(default_factory=list)
+    # The catalog text as first sent this run. Frozen so a mid-run <register>,
+    # <tool>, <system> or <evolve> ships as a small delta at the tail instead of
+    # editing the cached system block and re-writing every token behind it.
+    # In memory only: a new process rebuilds it from the live objects.
+    catalog_frozen: str = ""
     generation: int = 1
     gen_reason: str = "gen-1"
     persist: bool = True

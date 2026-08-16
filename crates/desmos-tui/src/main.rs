@@ -1959,6 +1959,8 @@ struct MetaId {
     pending: Option<(String, String)>,
     theme: String,
     session: Option<String>,
+    /// Background tasks that will resume this session on their own.
+    background: Vec<String>,
 }
 
 fn meta_id(app: &App) -> MetaId {
@@ -1976,6 +1978,7 @@ fn meta_id(app: &App) -> MetaId {
         pending: app.model_pending.clone(),
         theme: Theme::current_kind().display_name().to_string(),
         session: app.viewing.clone(),
+        background: app.background.clone(),
     }
 }
 
@@ -3001,6 +3004,31 @@ fn draw_meta(
         ])
     };
 
+    // Background work the kernel is still holding. It earns a row because it
+    // changes what to do next: something is going to come back and resume the
+    // session, so waiting is correct and polling is not. Named, because "1
+    // task" does not say whether it is a build or a sleep.
+    let background_row = || {
+        let mut spans = vec![
+            Span::styled(
+                "\u{21bb} ",
+                Style::default().fg(theme.accent_tool),
+            ),
+            Span::styled(
+                format!("{}", id.background.len()),
+                Style::default()
+                    .fg(theme.accent_tool)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            label(" waiting  "),
+        ];
+        spans.push(Span::styled(
+            id.background.join(", "),
+            Style::default().fg(theme.text_secondary),
+        ));
+        Line::from(spans)
+    };
+
     // The theme, shown rather than named: the palette a block will actually be
     // painted in, in the order the panes use it.
     let theme_row = || {
@@ -3035,7 +3063,12 @@ fn draw_meta(
             cache_row(),
             money_row(),
             agent_row(),
-            if id.pending.is_some() {
+            // Last row, three claimants, in order of how fast the answer
+            // goes stale: work that will resume the session, then a switch
+            // that lands next turn, then the palette.
+            if !id.background.is_empty() {
+                background_row()
+            } else if id.pending.is_some() {
                 pending_row()
             } else {
                 theme_row()
@@ -8270,6 +8303,32 @@ mod tests {
 
     /// The painted rows a rect covers, joined — for asserting *where* a string
     /// landed rather than that it landed at all.
+    /// Background work is the one thing Meta must say out loud: while a monitor
+    /// holds a shell, waiting is correct and polling is not. Driven through the
+    /// real event handler, because a row nothing sets is a row nothing shows.
+    #[test]
+    fn meta_names_background_work_that_will_resume_the_session() {
+        let mut app = App::new();
+        let _ = paint(&mut app, 160, 48);
+        let idle = rows_of(&paint(&mut app, 160, 48), app.cache.area);
+        assert!(!idle.contains("waiting"), "idle Meta claims background work:\n{idle}");
+
+        handle_event(
+            &mut app,
+            json!({"ev": "pending", "n": 1, "tasks": ["shell main [t7-abc]"]}),
+        );
+        assert_eq!(app.background.len(), 1, "the pending event never reached App");
+        let busy = rows_of(&paint(&mut app, 160, 48), app.cache.area);
+        assert!(
+            busy.contains("1 waiting") && busy.contains("shell main"),
+            "Meta does not name the work holding the session:\n{busy}"
+        );
+
+        handle_event(&mut app, json!({"ev": "pending", "n": 0, "tasks": []}));
+        let cleared = rows_of(&paint(&mut app, 160, 48), app.cache.area);
+        assert!(!cleared.contains("waiting"), "the row outlived the task:\n{cleared}");
+    }
+
     fn rows_of(text: &str, area: Rect) -> String {
         text.lines()
             .skip(area.y as usize)

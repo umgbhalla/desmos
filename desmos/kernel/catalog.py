@@ -73,7 +73,7 @@ def todo_digest(text: str) -> str:
 VOLATILE_VIEW = {"todo": todo_digest}
 
 
-def volatile(world: World) -> str:
+def volatile(world: World, delta: str = "") -> str:
     """Per-turn mutable state, deliberately outside the cached prefix."""
     parts = []
     for key in VOLATILE_NOTES:
@@ -81,6 +81,8 @@ def volatile(world: World) -> str:
         view = VOLATILE_VIEW.get(key, str)(raw)
         if view.strip():
             parts.append(f"[{key}]\n{view}")
+    if delta.strip():
+        parts.append(CATALOG_DELTA_HEADER + "\n" + delta)
     return VOLATILE_MARKER + "\n" + "\n".join(parts) if parts else ""
 
 
@@ -186,9 +188,49 @@ def runtime_block(world: World) -> str:
     )
 
 
+# Past this much delta the frozen copy has drifted far enough that a reader
+# would be reconstructing the catalog by hand. Refresh and pay the one rewrite.
+CATALOG_DELTA_LIMIT = 4000
+CATALOG_DELTA_HEADER = "# catalog changed since the block above -- these lines win"
+
+
+def catalog_diff(frozen: str, live: str) -> str:
+    import difflib
+
+    rows = [
+        line
+        for line in difflib.unified_diff(
+            frozen.splitlines(), live.splitlines(), n=0, lineterm=""
+        )
+        if not line.startswith(("---", "+++", "@@"))
+    ]
+    return "\n".join(rows)
+
+
+def catalog_frozen(world: World) -> tuple[str, str]:
+    """The catalog as first sent this run, plus what changed since.
+
+    The cached prefix runs tools -> system -> messages, so one byte moved inside
+    the catalog block re-writes every message token behind it. Holding the block
+    still and shipping the difference at the tail costs a few hundred tokens
+    instead of the whole prefix.
+    """
+    live = catalog(world)
+    frozen = getattr(world, "catalog_frozen", "") or ""
+    if not frozen or frozen == live:
+        world.catalog_frozen = live
+        return live, ""
+    delta = catalog_diff(frozen, live)
+    if len(delta) > CATALOG_DELTA_LIMIT:
+        world.catalog_frozen = live
+        return live, ""
+    return frozen, delta
+
+
 def system_prompt(world: World) -> str:
-    tail = volatile(world)
-    return ABI + "\n\n" + catalog(world) + (("\n\n" + tail) if tail else "")
+    body, delta = catalog_frozen(world)
+    tail = volatile(world, delta)
+    return ABI + "\n\n" + body + (("\n\n" + tail) if tail else "")
 
 
 def header(world: World) -> str:

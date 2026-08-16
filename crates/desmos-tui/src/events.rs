@@ -517,6 +517,20 @@ pub(crate) fn handle_event(app: &mut App, ev: Value) {
             app.status = "running".into();
             app.sess.stream.finish(&mut app.sess.story, &mut app.sess.calls);
         }
+        // Outstanding background work, re-sent whenever the set changes. Meta
+        // is the only reader: this is state, not an event worth a card.
+        "pending" => {
+            app.background = ev
+                .get("tasks")
+                .and_then(Value::as_array)
+                .map(|a| {
+                    a.iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_owned)
+                        .collect()
+                })
+                .unwrap_or_default();
+        }
         "done" => {
             app.sess.stream.finish(&mut app.sess.story, &mut app.sess.calls);
             app.sess.stream.run.fold(&mut app.sess.story);
