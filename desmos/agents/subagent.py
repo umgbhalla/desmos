@@ -23,7 +23,6 @@ from desmos.kernel import prices
 # --- bundle -----------------------------------------------------------------
 
 PERSONAS: dict[str, str] = {
-    "terse": "Answer in the fewest words that are still correct. No preamble.",
     "researcher": "Map evidence before concluding. Cite file:line for every claim.",
     "builder": "Implement the smallest complete change, run its real entry point, and report artifacts.",
     "critic": "Look for what is wrong, missing, or unproven. Do not praise.",
@@ -221,33 +220,6 @@ class Run:
             "usage": dict(self.usage),
             "out": (self.result or self.error)[:120],
         }
-
-
-def _legacy_requires_tool(task: str) -> bool:
-    """Whether a free-text task makes claims that require observation."""
-    words = {
-        "analyze",
-        "audit",
-        "check",
-        "debug",
-        "edit",
-        "explore",
-        "find",
-        "fix",
-        "implement",
-        "inspect",
-        "map",
-        "read",
-        "research",
-        "review",
-        "run",
-        "search",
-        "test",
-        "trace",
-        "verify",
-    }
-    normalized = "".join(ch if ch.isalnum() else " " for ch in task.lower())
-    return bool(words & set(normalized.split()))
 
 
 RUNS: dict[str, Run] = {}
@@ -599,7 +571,13 @@ def _execute(run: Run, parent: Any) -> None:
         elif run.cfg.require_tool_use is not None:
             require_tool = run.cfg.require_tool_use
         else:
-            require_tool = _legacy_requires_tool(run.task)
+            # The shared child prompt states this unconditionally: "A run with
+            # no observed syscall is rejected, regardless of how plausible its
+            # report sounds." It used to be conditional on whether the task
+            # text happened to contain one of 19 trigger words, so "summarise
+            # the design" skipped the steer while "check the design" got it.
+            # Keep the promise the child was given.
+            require_tool = True
         no_tool_failure = False
         if require_tool and not run.observed_tools and not run.killed:
             run.steers += 1

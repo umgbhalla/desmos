@@ -70,6 +70,8 @@ def self_check() -> None:
             response("recovered report with observed arithmetic"),
             response("I plan to inspect it."),
             response("I still cannot inspect it."),
+            response("A summary written without looking at anything."),
+            response("I still will not use a tool."),
         ]
 
         def complete(_model: str, system: str, _messages: list[dict[str, Any]], _max: int) -> dict[str, Any]:
@@ -167,6 +169,23 @@ def self_check() -> None:
             assert failure.state == "failed"
             assert failure.stop_reason == "no_tool_evidence"
             assert failure.steers == 1 and not failure.observed_tools
+
+            # The steer is unconditional, matching what the child prompt
+            # promises. This task contains none of the 19 trigger words the old
+            # heuristic keyed on, so under that heuristic it was never required
+            # to act, never steered, and returned unevidenced narration.
+            assert not hasattr(subagents, "_legacy_requires_tool")
+            quiet_id = subagents.spawn(
+                "Summarise the design in one paragraph.",
+                agent="explore",
+                parent=parent,
+                model="claude-opus-5",
+            )
+            subagents.wait(quiet_id, timeout=5, poll=0.01)
+            quiet = subagents.RUNS[quiet_id]
+            assert quiet.steers == 1, quiet.steers
+            assert quiet.stop_reason == "no_tool_evidence", quiet.stop_reason
+            assert not quiet.observed_tools, quiet.observed_tools
 
             child = subagents._child_world(subagents.resolve("explore"), parent, contract)
             assert set(child.tools) <= {"python"} and "agents" not in child.tools

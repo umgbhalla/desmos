@@ -150,8 +150,17 @@ def check() -> None:
         S.set_emitter(evs_spawn.append)
         parent_sp = new_world(cwd, state_path=cwd / "harness-spawn.json")
 
-        def spawn_complete(_model, _system, _messages, _max_tokens):
-            return {"content": [{"type": "text", "text": "child said ok"}], "usage": {}}
+        def spawn_complete(_model, _system, messages, _max_tokens):
+            # The child has to actually call a syscall. The steer for a
+            # toolless run is unconditional, and this check is about spawn,
+            # wait, and brief plumbing rather than about tool policy, so give
+            # it one real call and then its answer.
+            if len(messages) <= 1:
+                _lt = chr(60)
+                text = f"{_lt}python>print(2 + 2){_lt}/python>"
+            else:
+                text = "child said ok"
+            return {"content": [{"type": "text", "text": text}], "usage": {}}
 
         parent_sp.complete_fn = spawn_complete
         S.bind(parent_sp)
@@ -159,7 +168,12 @@ def check() -> None:
         # not the repo's, for this spawn and everything below.
         prev_dir = Path.cwd()
         os.chdir(cwd)
-        rid = S.spawn("reply with ok", agent="explore", parent=parent_sp)
+        # Pin the dialect: explore defaults to an OpenAI model, and loop.turn
+        # never scans XML out of openai speech, so a prose-dialect fake like
+        # this one is only dispatched on the anthropic lane.
+        rid = S.spawn(
+            "reply with ok", agent="explore", parent=parent_sp, model="claude-opus-5"
+        )
         briefs = S.wait(rid, timeout=15.0)
         assert briefs and briefs[0]["state"] == "done", briefs
         phases = [e.get("phase") for e in evs_spawn if e.get("ev") == "subagent"]
@@ -343,7 +357,15 @@ def check() -> None:
             # char notice while the run record keeps every byte.
             big = "B" * 50_000
 
-            def big_complete(_model, _system, _messages, _max_tokens):
+            def big_complete(_model, _system, messages, _max_tokens):
+                # One real call first: the steer for a toolless run is
+                # unconditional, and this check is about notice clipping. Keyed
+                # on the message list, not a counter -- this fake serves more
+                # than one run, and a counter leaks across them.
+                if len(messages) <= 1:
+                    lt = chr(60)
+                    call = f"{lt}python>print(1){lt}/python>"
+                    return {"content": [{"type": "text", "text": call}], "usage": {}}
                 return {"content": [{"type": "text", "text": big}], "usage": {}}
 
             from desmos.agents import pending as P
@@ -385,7 +407,13 @@ def check() -> None:
             def orc_complete(_model, _system, messages, _max_tokens):
                 blob = json.dumps(messages)
                 if "coordinate the fleet" not in blob:
-                    text = "leaf ok"  # the explore grandchild
+                    # The explore grandchild. One real call first: the steer for
+                    # a toolless run is unconditional.
+                    if not any(m.get("role") == "assistant" for m in messages):
+                        lt = chr(60)
+                        text = f"{lt}python>print(1){lt}/python>"
+                    else:
+                        text = "leaf ok"
                 elif not any(m.get("role") == "assistant" for m in messages):
                     text = (
                         "delegating\n<agents>spawn explore model=claude-opus-5: "
