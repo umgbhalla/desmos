@@ -938,7 +938,8 @@ def check() -> None:
         ]
         assert typed_results[0]["call_id"] == "call_1" and ">42<" in typed_results[0]["output"]
 
-        bad_item = dict(call_item, id="ct_bad", call_id="call_bad", input=call_item["input"] + " lousy?")
+        bad_raw = call_item["input"] + " lousy?"
+        bad_item = dict(call_item, id="ct_bad", call_id="call_bad", input=bad_raw)
         w_bad = new_world(cwd, persist=False, ns={})
         w_bad.model = "gpt-5.6-sol"
         bad_resp = {
@@ -960,7 +961,12 @@ def check() -> None:
             if isinstance(b, dict) and b.get("type") == "custom_tool_call_output"
         ]
         assert len(bad_outputs) == 1 and bad_outputs[0]["call_id"] == "call_bad", bad_outputs
-        assert "syscall input rejected" in bad_outputs[0]["output"], bad_outputs
+        rejection_output = bad_outputs[0]["output"]
+        assert "syscall input rejected" in rejection_output, bad_outputs
+        assert (
+            f'preserved as ns["rejects"][-1] ({len(bad_raw)} chars)' in rejection_output
+        ), rejection_output
+        assert w_bad.ns["rejects"][-1] == bad_raw, w_bad.ns["rejects"][-1]
         assert any(
             e.get("ev") == "result"
             and e.get("phase") == "done"

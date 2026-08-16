@@ -40,6 +40,37 @@ def format_result_message(results: list[tuple[Block, str]], cwd: Path | None = N
     return "\n\n".join(parts)
 
 
+#: Rejected model output remains useful, but must not grow the persistent
+#: namespace without bound. The marker is part of the per-entry cap.
+_REJECT_RETENTION = 5
+_REJECT_BODY_CAP = 200_000
+_REJECT_TRUNCATION_MARKER = "\n[truncated: rejected syscall input exceeded 200000 chars]"
+
+
+def preserve_rejected_input(world: Any, raw: str) -> int | None:
+    """Keep bounded malformed input for recovery, without risking rejection."""
+
+    try:
+        ns = getattr(world, "ns", None)
+        if not isinstance(ns, dict):
+            return None
+        rejects = ns.setdefault("rejects", [])
+        if not isinstance(rejects, list):
+            return None
+        if len(raw) > _REJECT_BODY_CAP:
+            kept = raw[: _REJECT_BODY_CAP - len(_REJECT_TRUNCATION_MARKER)]
+            kept += _REJECT_TRUNCATION_MARKER
+        else:
+            kept = raw
+        rejects.append(kept)
+        del rejects[:-_REJECT_RETENTION]
+        return len(kept)
+    except Exception:
+        # A hostile/corrupt namespace must not turn a parse rejection into a
+        # dispatcher crash.
+        return None
+
+
 #: The summary line a successful `git commit` prints: `[branch shortsha] subject`
 #: (also `[main (root-commit) abc1234] …`, `[detached HEAD abc1234] …`). Only the
 #: command's own output can make this claim -- a failed commit prints no such
@@ -62,7 +93,7 @@ def committed_sha(command: str, output: str) -> str | None:
     return shas[-1] if shas else None
 
 
-def malformed_call_note(raw: str, stray: list[str]) -> str:
+def malformed_call_note(raw: str, stray: list[str], preserved_chars: int | None = None) -> str:
     """What the model reads when its syscall input did not parse.
 
     It has to say three things or the retry is blind: nothing ran, which text
@@ -75,10 +106,16 @@ def malformed_call_note(raw: str, stray: list[str]) -> str:
     else:
         shown = " … ".join(clip(s.strip(), 200) for s in stray[:3])
         detail = f"text outside any tag: {shown!r}"
+    preserved = (
+        f' Input preserved as ns["rejects"][-1] ({preserved_chars} chars).'
+        if preserved_chars is not None
+        else ""
+    )
     return (
         "[syscall input rejected — nothing ran. The input must be complete XML syscalls and"
-        f" nothing else; {detail}. Every tag must be opened and closed, and a body must never"
-        " contain its own closing tag (build it by concatenation instead). Send the call again.]"
+        f" nothing else; {detail}.{preserved} Every tag must be opened and closed, and a body"
+        " must never contain its own closing tag (build it by concatenation instead)."
+        " Send the call again.]"
     )
 
 
@@ -460,7 +497,8 @@ def turn(
             # here left the custom_tool_call unanswered and ended the whole
             # step. Reject the payload atomically, pair the call with an error,
             # and let run_turns ask the model for a corrected call.
-            problem = malformed_call_note(raw, stray)
+            preserved_chars = preserve_rejected_input(world, raw)
+            problem = malformed_call_note(raw, stray, preserved_chars)
             failed = Block("syscall", raw, {})
             results.append((failed, problem))
             recoverable = True
