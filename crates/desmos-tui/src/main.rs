@@ -4519,10 +4519,11 @@ mod tests {
     }
 
     #[test]
-    fn work_summary_enter_opens_scrollable_detail_and_escape_closes() {
+    fn work_summary_navigation_click_enter_and_viewer_controls_are_wired() {
         let mut app = App::new();
         app.ready = true;
         handle_event(&mut app, json!({"ev": "turn", "text": "go"}));
+        app.story_push(RenderBlock::system("ordinary status"));
         handle_event(
             &mut app,
             json!({"ev": "result", "tag": "python", "body": "first()", "text": "ok"}),
@@ -4532,18 +4533,67 @@ mod tests {
             json!({"ev": "result", "tag": "read", "attrs": {"path": "main.rs"}, "text": "ok"}),
         );
         let idx = (0..app.sess.story.len())
-            .find(|i| matches!(
-                app.sess.story.entry(*i).map(|entry| &entry.block),
-                Some(RenderBlock::System(_))
-            ))
+            .find(|i| {
+                app.sess
+                    .story
+                    .entry(*i)
+                    .is_some_and(|entry| app.sess.stream.run.detail(entry.id).is_some())
+            })
             .expect("work summary row");
+        let ordinary = (0..app.sess.story.len())
+            .find(|i| {
+                matches!(
+                    app.sess.story.entry(*i).map(|entry| &entry.block),
+                    Some(RenderBlock::System(system)) if system.text == "ordinary status"
+                )
+            })
+            .expect("ordinary system row");
         let id = app.sess.story.entry(idx).unwrap().id;
         let detail = app.sess.stream.run.detail(id).expect("archived detail");
         assert!(detail.contains("1. python"), "{detail}");
         assert!(detail.contains("2. read → main.rs"), "{detail}");
 
-        app.focus = Focus::Story;
-        app.sess.story.set_selected(Some(idx));
+        app.set_focus(Focus::Story);
+        let _ = paint(&mut app, 100, 40);
+        let area = app.traj_area;
+        let point = (area.y..area.bottom())
+            .find_map(|row| {
+                (area.x..area.right()).find_map(|col| {
+                    let block = app.sess.story_sel.hit_test_visible_block(col, row)?;
+                    (block.entry_idx == idx).then_some((col, row))
+                })
+            })
+            .expect("summary block has no clickable cell");
+        handle_scrollback_down(&mut app, false, point.0, point.1);
+        assert_eq!(
+            app.sess.story.selected(),
+            Some(idx),
+            "single click must select the work summary"
+        );
+
+        handle_key(
+            None,
+            &mut app,
+            KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert_ne!(
+            app.sess.story.selected(),
+            Some(ordinary),
+            "k must skip an ordinary system row"
+        );
+        handle_key(
+            None,
+            &mut app,
+            KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert_eq!(
+            app.sess.story.selected(),
+            Some(idx),
+            "j must navigate back onto the selectable work summary"
+        );
+
         handle_key(
             None,
             &mut app,
@@ -4551,6 +4601,28 @@ mod tests {
         )
         .unwrap();
         assert_eq!(app.viewer.as_ref().map(|viewer| viewer.kind), Some(ViewerKind::PlainText));
+        let popup = paint(&mut app, 100, 40);
+        assert!(popup.contains("search"), "{popup}");
+        assert!(popup.contains("wrap"), "{popup}");
+        {
+            let viewer = app.viewer.as_mut().expect("plain text viewer");
+            assert!(viewer.handle_key(&KeyEvent::new(
+                KeyCode::Char('/'),
+                KeyModifiers::NONE,
+            )));
+            assert!(viewer.handle_key(&KeyEvent::new(
+                KeyCode::Esc,
+                KeyModifiers::NONE,
+            )));
+            assert!(viewer.handle_key(&KeyEvent::new(
+                KeyCode::Char('w'),
+                KeyModifiers::NONE,
+            )));
+            assert!(viewer.handle_key(&KeyEvent::new(
+                KeyCode::Char('y'),
+                KeyModifiers::NONE,
+            )));
+        }
 
         handle_viewer_key(
             &mut app,

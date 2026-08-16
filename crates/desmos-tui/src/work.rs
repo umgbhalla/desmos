@@ -184,14 +184,14 @@ impl WorkRun {
         let id = match live {
             Some(id) => {
                 if let Some(entry) = story.get_by_id_mut(id) {
-                    entry.block = RenderBlock::system(line);
+                    entry.block = RenderBlock::selectable_system(line);
                 }
                 story.mark_structurally_dirty(id);
                 story.mark_height_dirty(id);
                 id
             }
             None => {
-                let id = story.push_block(RenderBlock::system(line));
+                let id = story.push_block(RenderBlock::selectable_system(line));
                 self.row = Some(id);
                 id
             }
@@ -239,7 +239,7 @@ impl WorkRun {
             return;
         };
         let tail = git_tail(committed.as_deref(), git);
-        entry.block = RenderBlock::system(row_line(&sentence, tail.as_deref()));
+        entry.block = RenderBlock::selectable_system(row_line(&sentence, tail.as_deref()));
         if let Some(detail) = self.details.get_mut(&id) {
             while detail.lines().last().is_some_and(|line| line.starts_with("Repository:")) {
                 let keep = detail.rfind('\n').unwrap_or(0);

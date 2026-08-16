@@ -13,12 +13,25 @@ use crate::theme::Theme;
 pub struct SystemMessageBlock {
     /// The message text.
     pub text: String,
+    /// Whether this exceptional system row participates in navigation.
+    selectable: bool,
 }
 
 impl SystemMessageBlock {
     /// Create a new system message block.
     pub fn new(text: impl Into<String>) -> Self {
-        Self { text: text.into() }
+        Self {
+            text: text.into(),
+            selectable: false,
+        }
+    }
+
+    /// Create the narrow system-style variant used for inspectable summaries.
+    pub fn selectable(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            selectable: true,
+        }
     }
 }
 
@@ -86,7 +99,7 @@ impl BlockContent for SystemMessageBlock {
     }
 
     fn is_selectable(&self) -> bool {
-        false // System messages are not navigable
+        self.selectable
     }
 
     fn is_groupable(&self) -> bool {

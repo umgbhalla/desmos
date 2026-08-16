@@ -793,6 +793,11 @@ impl RenderBlock {
         RenderBlock::System(SystemMessageBlock::new(text))
     }
 
+    /// Create an opt-in navigable system-style summary block.
+    pub fn selectable_system(text: impl Into<String>) -> Self {
+        RenderBlock::System(SystemMessageBlock::selectable(text))
+    }
+
     /// Create a `/context` snapshot block.
     ///
     /// The block stores the raw `ContextInfo` snapshot + model name and
