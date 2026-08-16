@@ -295,6 +295,7 @@ pub enum ChildEvent {
         parent: Option<String>,
         depth: u64,
         n: i64,
+        tasks: Vec<String>,
     },
     Resumed {
         id: String,
@@ -466,6 +467,7 @@ pub enum Event {
     },
     Pending {
         n: i64,
+        tasks: Vec<String>,
     },
     Resumed {
         n: i64,
