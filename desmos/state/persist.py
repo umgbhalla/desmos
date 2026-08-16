@@ -25,7 +25,7 @@ from desmos.kernel.types import Tool, World
 _UMASK = os.umask(0)
 os.umask(_UMASK)
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 #: One attach, one id, across SQL, provider routing, cache, presence, and wire.
 #: The environment survives reload_sdk; a new process gets a new session.
 SESSION_ID_ENV = "DESMOS_SESSION_ID"
@@ -446,6 +446,19 @@ CREATE TABLE IF NOT EXISTS workspaces (
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS seats (
+    id TEXT PRIMARY KEY,
+    workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+    slug TEXT NOT NULL,
+    name TEXT NOT NULL DEFAULT '',
+    charter TEXT NOT NULL DEFAULT '',
+    born_gen INTEGER NOT NULL DEFAULT 0,
+    status TEXT NOT NULL DEFAULT 'active'
+        CHECK (status IN ('active', 'retired')),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE (workspace_id, slug)
+);
 CREATE TABLE IF NOT EXISTS sessions (
     id TEXT PRIMARY KEY,
     workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
@@ -555,6 +568,8 @@ CREATE INDEX IF NOT EXISTS idx_sessions_workspace
     ON sessions(workspace_id, started_at);
 CREATE INDEX IF NOT EXISTS idx_channel_messages
     ON channel_messages(workspace_id, channel, id);
+CREATE INDEX IF NOT EXISTS idx_seats_workspace
+    ON seats(workspace_id, status, slug);
 """
 
 
@@ -570,6 +585,23 @@ def _execute_schema(conn: sqlite3.Connection) -> None:
         raise sqlite3.DatabaseError("incomplete persistence schema")
 
 
+def _add_column(
+    conn: sqlite3.Connection, table: str, column: str, decl: str
+) -> bool:
+    """Add a column that CREATE TABLE IF NOT EXISTS cannot reach.
+
+    The schema is declarative and re-executed on every open, which creates new
+    tables but never widens an existing one. An additive column is the only
+    migration shape this database supports; anything else still means removing
+    the file.
+    """
+    existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+    if not existing or column in existing:
+        return False
+    conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+    return True
+
+
 def _migrate(conn: sqlite3.Connection) -> None:
     """Create the current schema; old layouts are intentionally unsupported."""
     existing = {
@@ -582,6 +614,9 @@ def _migrate(conn: sqlite3.Connection) -> None:
     conn.execute("BEGIN IMMEDIATE")
     try:
         _execute_schema(conn)
+        _add_column(
+            conn, "sessions", "seat_id", "TEXT REFERENCES seats(id) ON DELETE SET NULL"
+        )
         versions = [
             int(row[0])
             for row in conn.execute(
@@ -943,6 +978,86 @@ def announce(world: World, conn: sqlite3.Connection | None = None) -> None:
     finally:
         if own:
             db.close()
+
+
+class WorkspaceBusy(RuntimeError):
+    """Another live front already owns this workspace."""
+
+    def __init__(self, holder: dict[str, Any] | None = None) -> None:
+        self.holder = dict(holder or {})
+        pid = self.holder.get("pid")
+        started = str(self.holder.get("started_at") or "")[:19]
+        model = self.holder.get("model") or "unknown model"
+        where = f"pid {pid}" if pid else "another process"
+        super().__init__(
+            "this workspace already has a live session: "
+            f"{where}, {model}, started {started or 'unknown'}. "
+            "Two fronts writing one workspace overwrite each other's "
+            "transcript rather than interleaving; close the other one first."
+        )
+
+
+#: One interactive front per workspace. Held for process lifetime; the OS
+#: releases it on exit, so a killed front never leaves a stale claim behind.
+_WORKSPACE_LEASE: dict[str, Any] = {}
+
+
+def _workspace_lock_path(world: World) -> Path:
+    return state_file(world).parent / "presence" / "workspace.lock"
+
+
+def _workspace_holder(world: World) -> dict[str, Any]:
+    """The live active_runs row for this workspace, if one is readable."""
+    try:
+        db = _open(state_file(world))
+    except Exception:  # noqa: BLE001 -- naming the holder is best effort
+        return {}
+    try:
+        workspace = _workspace_id(db, world, create=False)
+        if workspace is None:
+            return {}
+        row = db.execute(
+            "SELECT run_id, session_id, pid, model, started_at FROM active_runs"
+            " WHERE workspace_id = ? ORDER BY started_at DESC LIMIT 1",
+            (workspace,),
+        ).fetchone()
+        return dict(row) if row is not None else {}
+    finally:
+        db.close()
+
+
+def claim_workspace(world: World) -> None:
+    """Take the single-writer claim for this workspace, or refuse by name.
+
+    A world is loaded as one concatenation of every session in the workspace,
+    and every save rewrites that whole view -- so two live fronts do not
+    interleave, they overwrite. Interactive fronts take this claim. Headless
+    runs, checks and children deliberately do not: the peer rail exists to let
+    two live sessions in one workspace talk, and this must not forbid it.
+    """
+    if not world.persist:
+        return
+    path = _workspace_lock_path(world)
+    key = str(path.resolve())
+    if key in _WORKSPACE_LEASE:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lease = path.open("a+")
+    try:
+        fcntl.flock(lease.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        lease.close()
+        raise WorkspaceBusy(_workspace_holder(world)) from None
+    _WORKSPACE_LEASE[key] = lease
+
+
+def release_workspace(world: World) -> None:
+    """Drop the claim early. Process exit releases it anyway."""
+    key = str(_workspace_lock_path(world).resolve())
+    lease = _WORKSPACE_LEASE.pop(key, None)
+    if lease is not None:
+        fcntl.flock(lease.fileno(), fcntl.LOCK_UN)
+        lease.close()
 
 
 def peers(world: World) -> list[dict[str, Any]]:

@@ -341,6 +341,7 @@ def check() -> None:
         _check_call_ledger(cwd)
         _check_session_lineage(cwd)
         _check_session_channel(cwd)
+        _check_single_writer(cwd)
         _check_quarantine_manifest()
         _check_prune_manifest()
         _check_salvage()
@@ -823,6 +824,48 @@ def _check_call_ledger(cwd: Path) -> None:
     child.model = "gpt-5.6-luna"
     persist.record_call(child, {"usage": FIXTURE_USAGE})
     assert persist.runs(world)[0]["calls"] == 2
+
+
+def _check_single_writer(cwd: Path) -> None:
+    """One interactive front per workspace; a second is refused by name."""
+    from desmos.state import persist
+
+    home = cwd / "single-writer"
+    home.mkdir()
+    world = new_world(home, state_path=home / "harness.sqlite3")
+
+    persist.claim_workspace(world)
+    # Re-claiming in the same process is a no-op, not a refusal.
+    persist.claim_workspace(world)
+
+    # A second front is a second open file description. flock conflicts across
+    # descriptions even inside one process, so dropping the in-process memo is
+    # enough to make the lock itself decide.
+    memo = dict(persist._WORKSPACE_LEASE)
+    persist._WORKSPACE_LEASE.clear()
+    try:
+        try:
+            persist.claim_workspace(world)
+        except persist.WorkspaceBusy as exc:
+            assert "already has a live session" in str(exc), exc
+        else:
+            raise AssertionError("a second front was allowed to claim the workspace")
+    finally:
+        persist._WORKSPACE_LEASE.clear()
+        persist._WORKSPACE_LEASE.update(memo)
+
+    # Releasing hands the workspace to the next front rather than wedging it.
+    persist.release_workspace(world)
+    persist.claim_workspace(world)
+    persist.release_workspace(world)
+
+    # A non-persistent world -- every child -- is never a writer and never
+    # blocked, or the peer rail and every subagent would deadlock behind a TUI.
+    child = new_world(home, state_path=home / "harness.sqlite3", persist=False)
+    persist.claim_workspace(world)
+    persist.claim_workspace(child)
+    persist.release_workspace(world)
+    print("single writer check ok")
 
 
 def _check_session_channel(cwd: Path) -> None:

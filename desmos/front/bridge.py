@@ -455,7 +455,17 @@ def _watch_channel(
 
 
 def serve(cwd: Path) -> int:
+    from desmos.state.persist import WorkspaceBusy, claim_workspace
+
     world = new_world(cwd)
+    try:
+        claim_workspace(world)
+    except WorkspaceBusy as exc:
+        # Loading is read-only; refusing here is before the first save, which
+        # is the write that would have clobbered the other front.
+        _emit({"ev": "notice", "text": str(exc)})
+        print(f"desmos: {exc}", file=sys.stderr)
+        return 1
     from desmos.transport.settings import load as _load_settings
 
     saved = _load_settings()
