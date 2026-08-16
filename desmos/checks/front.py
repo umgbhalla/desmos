@@ -637,6 +637,13 @@ def check() -> None:
             bad = json.loads(proc.stdout.readline())
             assert bad["ev"] == "error" and "gpt-9-nope" in bad["text"], bad
 
+            # The TUI pokes the inbox when a follow-up is queued, so that a step
+            # parked on background work sees `has_input` and hands the turn back.
+            # The op must be swallowed silently: an "unknown op" error here would
+            # paint on the wire after every queued line. The picker reply that
+            # follows is the proof nothing was emitted in between.
+            proc.stdin.write(json.dumps({"op": "typed"}) + "\n")
+            proc.stdin.flush()
             proc.stdin.write(json.dumps({"op": "picker"}) + "\n")
             proc.stdin.flush()
             pick = json.loads(proc.stdout.readline())

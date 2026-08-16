@@ -12,6 +12,23 @@ OBSERVABLE_EVIDENCE = frozenset(
 )
 
 
+def _seq(value: Any) -> tuple[str, ...]:
+    """One string is one item, not a tuple of its characters.
+
+    `tuple("file:line for every claim")` is a 24-element tuple of letters, and
+    every letter became a required evidence kind -- so a run that did the work
+    and reported it properly was rejected for "missing required evidence kind:
+    f". A bare string is the shape a caller reaches for first on a
+    single-element field, so take it.
+    """
+    if value is None:
+        return ()
+    if isinstance(value, str):
+        value = value.strip()
+        return (value,) if value else ()
+    return tuple(str(item) for item in value)
+
+
 @dataclass(frozen=True)
 class TaskContract:
     objective: str
@@ -27,6 +44,18 @@ class TaskContract:
     compact: bool = False
 
     def __post_init__(self) -> None:
+        # Normalise before validating: the checks below compare path tuples,
+        # and a string that has been shredded into characters passes them.
+        for name in (
+            "non_goals",
+            "required_evidence",
+            "acceptance_checks",
+            "allowed_tools",
+            "allowed_paths",
+            "write_paths",
+            "dependencies",
+        ):
+            object.__setattr__(self, name, _seq(getattr(self, name)))
         if not self.objective.strip():
             raise ValueError("task objective is required")
         if not self.deliverable_schema.strip():
@@ -46,23 +75,25 @@ class TaskContract:
         cls,
         objective: str,
         *,
-        paths: tuple[str, ...] | list[str] = (),
-        write: tuple[str, ...] | list[str] = (),
-        checks: tuple[str, ...] | list[str] = (),
-        tools: tuple[str, ...] | list[str] = (),
-        depends: tuple[str, ...] | list[str] = (),
-        evidence: tuple[str, ...] | list[str] = (),
+        paths: tuple[str, ...] | list[str] | str = (),
+        write: tuple[str, ...] | list[str] | str = (),
+        checks: tuple[str, ...] | list[str] | str = (),
+        tools: tuple[str, ...] | list[str] | str = (),
+        depends: tuple[str, ...] | list[str] | str = (),
+        evidence: tuple[str, ...] | list[str] | str = (),
     ) -> TaskContract:
         """Build a judged contract without repeating the full schema vocabulary."""
 
+        # No coercion here: __post_init__ normalises, and coercing first is
+        # exactly what turned a string into characters.
         return cls(
             objective=objective,
-            allowed_paths=tuple(paths),
-            write_paths=tuple(write),
-            acceptance_checks=tuple(checks),
-            allowed_tools=tuple(tools),
-            dependencies=tuple(depends),
-            required_evidence=tuple(evidence),
+            allowed_paths=paths,
+            write_paths=write,
+            acceptance_checks=checks,
+            allowed_tools=tools,
+            dependencies=depends,
+            required_evidence=evidence,
             compact=True,
         )
 

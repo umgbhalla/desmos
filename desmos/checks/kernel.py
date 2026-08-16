@@ -101,6 +101,23 @@ def check() -> None:
         assert "resume" in _insp.signature(_sa.spawn).parameters and "resume" in caps
         for _f in _TC.__dataclass_fields__:
             assert _f in caps, f"TaskContract.{_f} is not described in the prompt"
+        # A bare string on a list field is one item, not a tuple of letters.
+        # tuple("file:line") shredded the evidence requirement into characters
+        # and rejected a run that had done the work and reported it properly.
+        _one = _TC.simple(
+            "do the thing",
+            paths="crates/x",
+            write="crates/x",
+            checks="cargo test",
+            evidence="file:line",
+        )
+        assert _one.required_evidence == ("file:line",), _one.required_evidence
+        assert _one.allowed_paths == ("crates/x",), _one.allowed_paths
+        assert _one.write_paths == ("crates/x",), _one.write_paths
+        assert _one.acceptance_checks == ("cargo test",), _one.acceptance_checks
+        # Lists and tuples still work, and empties stay empty.
+        _many = _TC.simple("do it", paths=["a", "b"], evidence=())
+        assert _many.allowed_paths == ("a", "b") and _many.required_evidence == ()
         for _n in ("structured_result", "judgment", "spawn", "fanout", "wait", "gather", "status"):
             assert callable(getattr(_sa, _n)), _n
             assert _n in caps, f"prompt names {_n} but subagent does not export it"
