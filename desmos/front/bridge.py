@@ -379,6 +379,37 @@ def _bind_socket(cwd: Path) -> socket.socket | None:
     return srv
 
 
+def _watch_channel(world: Any, stop: threading.Event) -> None:
+    """Emit one transient event per newly observed batch; SQLite owns unread state."""
+    from desmos.state.persist import channel_inbox
+
+    last_emitted = 0
+    while not stop.wait(0.25):
+        try:
+            info = channel_inbox(world, limit=50)
+        except Exception:  # noqa: BLE001 -- a popup must never kill the bridge
+            continue
+        fresh = [
+            message for message in info["messages"]
+            if int(message["id"]) > last_emitted
+        ]
+        if not fresh:
+            continue
+        last_emitted = max(int(message["id"]) for message in fresh)
+        latest = fresh[-1]
+        preview = " ".join(str(latest["body"]).split())
+        if len(preview) > 120:
+            preview = preview[:119].rstrip() + "…"
+        _emit({
+            "ev": "channel",
+            "channel": info["channel"],
+            "author": latest["author"],
+            "preview": preview,
+            "unread": info["unread"],
+            "message_id": int(latest["id"]),
+        })
+
+
 def serve(cwd: Path) -> int:
     world = new_world(cwd)
     from desmos.transport.settings import load as _load_settings
@@ -393,6 +424,7 @@ def serve(cwd: Path) -> int:
     S.bind(world)
     S.set_emitter(_emit)
     cancel = threading.Event()
+    channel_stop = threading.Event()
     inbox: queue.Queue[dict[str, Any] | None] = queue.Queue()
     # The log first: ready and everything after it must be in the replay file.
     _open_log(cwd)
@@ -459,9 +491,13 @@ def serve(cwd: Path) -> int:
             "text": "socket transport off: .desmos/bridge.sock is owned by a "
             "live bridge or could not be bound",
         })
+    threading.Thread(
+        target=_watch_channel, args=(world, channel_stop), daemon=True
+    ).start()
     try:
         return _drive(world, inbox, cancel)
     finally:
+        channel_stop.set()
         if sock_srv is not None:
             sock_srv.close()
             (cwd / ".desmos" / "bridge.sock").unlink(missing_ok=True)

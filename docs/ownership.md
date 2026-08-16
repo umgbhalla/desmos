@@ -97,6 +97,19 @@ Same fields as `ready` minus the picker block. Consumer: same
 ### `notice` — front/bridge.py:167-172 (effort clamp), front/bridge.py:184 (provider switch)
 `text` str → main.rs:2750-2755 (story system row).
 
+### `channel` — front/bridge.py `_watch_channel`
+| field | type | produced | consumed |
+|---|---|---|---|
+| `channel` | str | durable SQLite inbox channel | TUI transient notice |
+| `author` | str | newest unread peer message | TUI transient notice |
+| `preview` | str | whitespace-folded body, capped at 120 chars | TUI transient notice |
+| `unread` | int | unread peer-message count | TUI transient notice |
+| `message_id` | int | newest emitted durable message id | typed cursor/dedup contract |
+
+The popup never becomes a Story row and never marks a message read. The agent
+sees the same unread state through the volatile prompt notice and chooses
+`session` inbox, read, post, or dismiss.
+
 ### `error` — front/bridge.py:95, 98, 128, 177, 214, 216; kernel/loop.py:361, 530, 591
 | field | type | produced | consumed |
 |---|---|---|---|

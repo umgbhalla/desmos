@@ -400,6 +400,13 @@ pub enum Event {
     Notice {
         text: String,
     },
+    Channel {
+        channel: String,
+        author: String,
+        preview: String,
+        unread: u64,
+        message_id: u64,
+    },
     /// `intervention` — front/bridge.py `_intervene`: one per kill_run/rerun
     /// op arriving on any transport (stdio or socket); its prose twin rides
     /// the `notice` kind. `result` is subagent.py's answer — an unknown id is

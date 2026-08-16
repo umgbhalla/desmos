@@ -6811,6 +6811,31 @@ mod tests {
     }
 
     #[test]
+    fn channel_activity_pops_up_without_becoming_story_narration() {
+        let mut app = App::new();
+        app.running = true;
+        handle_event(
+            &mut app,
+            json!({
+                "ev": "channel",
+                "channel": "conflicts",
+                "author": "worker-b",
+                "preview": "persist.py conflict",
+                "unread": 2,
+                "message_id": 9
+            }),
+        );
+        assert!(app.running, "a channel popup is not a turn terminator");
+        assert_eq!(
+            app.status,
+            "IRC #conflicts · worker-b: persist.py conflict · 2 unread"
+        );
+        assert_eq!(app.sess.story.len(), 0, "transient IRC activity leaked into Story");
+        let painted = paint(&mut app, 120, 40);
+        assert!(painted.contains("persist.py conflict"), "{painted}");
+    }
+
+    #[test]
     fn model_and_dense_are_local_slashes_and_compact_still_answers() {
         for line in ["/model", "/model gpt-5.6-sol", "/dense", "/compact"] {
             assert!(is_local_slash(line), "{line} must not reach the model");

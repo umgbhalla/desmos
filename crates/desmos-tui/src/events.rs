@@ -564,6 +564,15 @@ pub(crate) fn handle_event(app: &mut App, ev: Value) {
                 app.story_push(RenderBlock::system(t));
             }
         }
+        // Cross-session activity is transient chrome, not harness narration:
+        // the durable conversation stays in SQLite and the agent's inbox.
+        "channel" => {
+            let channel = ev.get("channel").and_then(Value::as_str).unwrap_or("conflicts");
+            let author = ev.get("author").and_then(Value::as_str).unwrap_or("peer");
+            let preview = ev.get("preview").and_then(Value::as_str).unwrap_or("");
+            let unread = ev.get("unread").and_then(Value::as_u64).unwrap_or(1);
+            app.notify(format!("IRC #{channel} · {author}: {preview} · {unread} unread"));
+        }
         // Not a terminator. loop.py fires this for a reply the endpoint cut
         // short and keeps looping, and the reader thread synthesises one for
         // any unparseable NDJSON line. Clearing running here read as idle while
