@@ -6,7 +6,7 @@
 
 use std::collections::VecDeque;
 
-use ratatui::style::Style;
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use unicode_width::UnicodeWidthStr;
 use xai_grok_pager::theme::Theme;
@@ -186,7 +186,7 @@ impl QueryQueue {
                     .saturating_sub(UnicodeWidthStr::width(prefix.as_str()))
                     .saturating_sub(UnicodeWidthStr::width(suffix.as_str()));
                 let shown = truncate_width(&first, room);
-                let selected = focused && self.selected == Some(i);
+                let selected = self.selected == Some(i);
                 let body = Style::default().fg(theme.accent_user);
                 let mut line = Line::from(vec![
                     Span::styled(prefix, Style::default().fg(theme.gray)),
@@ -194,7 +194,18 @@ impl QueryQueue {
                     Span::styled(suffix, Style::default().fg(theme.gray)),
                 ]);
                 if selected {
-                    let band = Style::default().bg(theme.bg_highlight);
+                    // The row has to be findable at a glance, and a band one
+                    // shade off the pane is not. Bold ink, and a sharper
+                    // background while the pane has focus. The band leaves the
+                    // foregrounds alone so the queue number stays dim and the
+                    // text keeps its accent.
+                    let band = Style::default()
+                        .bg(if focused {
+                            theme.bg_hover
+                        } else {
+                            theme.bg_highlight
+                        })
+                        .add_modifier(Modifier::BOLD);
                     for span in &mut line.spans {
                         span.style = span.style.patch(band);
                     }

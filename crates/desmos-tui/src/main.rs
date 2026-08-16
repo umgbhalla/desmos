@@ -5719,6 +5719,14 @@ fn draw_files(f: &mut Frame, area: Rect, app: &mut App) {
         return;
     }
     let width = inner.width as usize;
+    // Keep the existing flat FilePane model, but borrow druk's tree grammar:
+    // a guide and one-column icon lead each name, while git marks own the right edge.
+    let git_marks: Vec<(String, String)> = app
+        .git
+        .status_rows()
+        .iter()
+        .map(|row| (row.text.clone(), row.mark.clone()))
+        .collect();
     // Two states, one pane: a directory listing, or the file opened out of it.
     // The title says which — `src/` against `side.rs`.
     let lines: Vec<Line> = if app.files.in_file() {
@@ -5746,20 +5754,91 @@ fn draw_files(f: &mut Frame, area: Rect, app: &mut App) {
             .skip(app.files.scroll)
             .take(inner.height as usize)
             .map(|(i, row)| {
-                let name = if row.is_dir && row.name != ".." {
-                    format!("{}/", row.name)
+                let status = git_marks.iter().find_map(|(path, mark)| {
+                    (path == &row.name
+                        || path
+                            .rsplit_once('/')
+                            .is_some_and(|(_, name)| name == row.name))
+                    .then_some(mark.as_str())
+                });
+                let (mark, mark_style) = match status {
+                    Some("??") => ("U".to_string(), Style::default().fg(theme.accent_success)),
+                    Some(mark) if mark.starts_with('D') => {
+                        ("D".to_string(), Style::default().fg(theme.accent_user))
+                    }
+                    Some("*") => ("M".to_string(), Style::default().fg(theme.accent_tool)),
+                    Some(mark) => (
+                        mark.trim().chars().next().map_or("M".to_string(), |c| c.to_string()),
+                        Style::default().fg(theme.accent_tool),
+                    ),
+                    None => (String::new(), Style::default().fg(theme.text_secondary)),
+                };
+                let guide = if row.name == ".." { "  " } else { "│ " };
+                let icon = if row.name == ".." {
+                    "▴ "
+                } else if row.is_dir {
+                    "▸ "
+                } else {
+                    "· "
+                };
+                let mark_width = usize::from(!mark.is_empty()) * 2;
+                let room = width.saturating_sub(guide.chars().count() + 2 + mark_width);
+                let name_chars: Vec<char> = row.name.chars().collect();
+                let name = if name_chars.len() > room {
+                    let mut clipped: String = name_chars
+                        .iter()
+                        .take(room.saturating_sub(1))
+                        .copied()
+                        .collect();
+                    if room > 0 {
+                        clipped.push('…');
+                    }
+                    clipped
                 } else {
                     row.name.clone()
                 };
-                let style = if row.is_dir {
-                    Style::default().fg(theme.accent_skill)
+                let padding = " ".repeat(room.saturating_sub(name.chars().count()));
+                let name_style = if row.is_dir {
+                    Style::default()
+                        .fg(theme.accent_skill)
+                        .add_modifier(Modifier::BOLD)
                 } else {
                     Style::default().fg(theme.text_primary)
                 };
-                let body: String = name.chars().take(width).collect();
-                let mut line = Line::from(Span::styled(body, style));
-                if focused && i == app.files.sel {
-                    line = line.style(Style::default().bg(theme.bg_highlight));
+                let icon_style = if row.is_dir {
+                    Style::default().fg(theme.accent_skill)
+                } else {
+                    Style::default().fg(theme.gray_bright)
+                };
+                let mut line = Line::from(vec![
+                    Span::styled(guide, Style::default().fg(theme.gray_bright)),
+                    Span::styled(icon, icon_style),
+                    Span::styled(name, name_style),
+                    Span::raw(padding),
+                    Span::styled(
+                        if mark.is_empty() {
+                            String::new()
+                        } else {
+                            format!("{mark} ")
+                        },
+                        mark_style,
+                    ),
+                ]);
+                if i == app.files.sel {
+                    let bg = if focused {
+                        theme.bg_hover
+                    } else {
+                        theme.bg_highlight
+                    };
+                    // Background and weight only: flattening the foregrounds
+                    // too would cost the selected row its directory accent and
+                    // the colour of its git mark, which is the information the
+                    // row is there to carry.
+                    let selected = Style::default().bg(bg).add_modifier(Modifier::BOLD);
+                    for span in &mut line.spans {
+                        span.style = span.style.patch(selected);
+                    }
+                    line = line.style(selected);
                 }
                 line
             })
@@ -6080,6 +6159,9 @@ fn draw_queue(f: &mut Frame, area: Rect, app: &App) {
     if inner.width == 0 || inner.height == 0 {
         return;
     }
+    // The band is drawn where `selected` and the scroll offset are both in
+    // scope. Reapplying it here indexed the visible slice with an absolute
+    // row number, which lands on the wrong row the moment the queue scrolls.
     f.render_widget(Paragraph::new(app.queue.lines(inner.width, focused)), inner);
 }
 
@@ -12852,5 +12934,125 @@ mod tests {
         let mut out: Vec<u8> = Vec::new();
         flush_media(&mut app, &mut out).unwrap();
         assert!(out.is_empty());
+    }
+
+    #[test]
+    fn files_tree_row_paints_icons_guides_and_strong_selection() {
+        let _theme = theme_lock();
+        let root = std::env::temp_dir().join(format!(
+            "desmos-files-render-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(root.join("folder")).unwrap();
+        std::fs::write(root.join("a_very_long_file_name.rs"), "fn main() {}\n").unwrap();
+
+        let mut app = App::new();
+        app.files = side::FilePane::new(&root);
+        app.focus = Focus::Files;
+        app.files.sel = app
+            .files
+            .entries
+            .iter()
+            .position(|row| row.name == "a_very_long_file_name.rs")
+            .unwrap();
+
+        let backend = TestBackend::new(18, 8);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| draw_files(f, Rect::new(0, 0, 18, 8), &mut app))
+            .unwrap();
+        let buf = term.backend().buffer();
+        let selected_y = 1 + app.files.sel as u16;
+        let selected = &buf[(5, selected_y)];
+        assert_eq!(buf[(1, selected_y)].symbol(), "│", "tree guide was not painted");
+        assert_eq!(buf[(3, selected_y)].symbol(), "·", "file icon was not painted");
+        assert!(
+            (1..17).any(|x| buf[(x, selected_y)].symbol() == "…"),
+            "long filename was not visibly truncated"
+        );
+        assert_eq!(selected.bg, Theme::current().bg_hover);
+        assert!(
+            selected.modifier.contains(Modifier::BOLD),
+            "selected file text is not bold"
+        );
+
+        let folder_y = (1..7)
+            .find(|&y| {
+                (0..18)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+                    .contains("folder")
+            })
+            .expect("directory row was not painted");
+        assert_eq!(buf[(3, folder_y)].symbol(), "▸", "directory icon was not painted");
+        assert!(
+            buf[(5, folder_y)].modifier.contains(Modifier::BOLD),
+            "directory name is not heavier than file names"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// The band belongs to an item, not to a row number. Reapplying it in the
+    /// pane indexed the visible slice with an absolute index, so once the
+    /// queue scrolled past six rows it landed on a different follow-up.
+    #[test]
+    fn queue_selection_follows_the_item_when_the_queue_scrolls() {
+        let _theme = theme_lock();
+        let mut app = App::new();
+        for i in 1..=9 {
+            app.queue.push(format!("follow-up {i}"));
+        }
+        app.queue.selected = Some(8);
+        app.focus = Focus::Queue;
+
+        let backend = TestBackend::new(40, 10);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| draw_queue(f, Rect::new(0, 0, 40, 10), &app))
+            .unwrap();
+        let buf = term.backend().buffer();
+        let want = Theme::current().bg_hover;
+        let banded: Vec<String> = (1..9)
+            .filter(|&y| buf[(2, y)].bg == want)
+            .map(|y| (0..40).map(|x| buf[(x, y)].symbol()).collect::<String>())
+            .collect();
+        assert_eq!(banded.len(), 1, "exactly one row carries the band: {banded:?}");
+        assert!(
+            banded[0].contains("follow-up 9"),
+            "band landed on the wrong row: {:?}",
+            banded[0]
+        );
+    }
+
+    #[test]
+    fn queue_selected_row_paints_strong_theme_highlight() {
+        let _theme = theme_lock();
+        let mut app = App::new();
+        app.queue.push("selected follow-up".into());
+        app.queue.push("ordinary follow-up".into());
+        app.queue.selected = Some(0);
+        app.focus = Focus::Queue;
+
+        let backend = TestBackend::new(40, 6);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| draw_queue(f, Rect::new(0, 0, 40, 6), &app))
+            .unwrap();
+        let buf = term.backend().buffer();
+        let (x, y) = (1..5)
+            .find_map(|y| {
+                let row = (0..40)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>();
+                row.find("selected follow-up").map(|x| (x as u16, y))
+            })
+            .expect("selected queue row was not painted");
+        let selected = &buf[(x, y)];
+        assert_eq!(selected.bg, Theme::current().bg_hover);
+        assert!(
+            selected.modifier.contains(Modifier::BOLD),
+            "selected queue text is not bold"
+        );
     }
 }

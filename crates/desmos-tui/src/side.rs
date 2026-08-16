@@ -139,6 +139,14 @@ impl GitPane {
         self.snap.read.then_some(self.snap.dirty)
     }
 
+    /// Working-tree status, whichever tab the pane is showing. The files pane
+    /// marks its rows from this: reading `rows()` there took whatever tab
+    /// happened to be selected, so a glance at Log painted commit subjects as
+    /// file marks.
+    pub fn status_rows(&self) -> &[GitRow] {
+        &self.snap.status
+    }
+
     pub fn rows(&self) -> &[GitRow] {
         match self.tab {
             GitTab::Status => &self.snap.status,
