@@ -92,6 +92,36 @@ def _check_vendor_patch() -> None:
         )
 
 
+def _check_release_tui_launcher() -> None:
+    """An installed wheel launches its release TUI without Rust or vendored source."""
+    import os
+    import subprocess
+    import sys
+    import tempfile
+
+    root = Path(__file__).resolve().parents[2]
+    with tempfile.TemporaryDirectory() as tmp:
+        fake = Path(tmp) / "desmos-tui"
+        fake.write_text('#!/bin/sh\nprintf "%s\\n" "$@"\n', encoding="utf-8")
+        fake.chmod(0o755)
+        env = dict(os.environ)
+        env["PYTHONPATH"] = str(root)
+        env["DESMOS_TUI_BINARY"] = str(fake)
+        ran = subprocess.run(
+            [sys.executable, "-m", "desmos", "tui", "--demo", "--cwd", tmp],
+            env=env,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        assert ran.stdout.splitlines() == [
+            "--python",
+            sys.executable,
+            "--cwd",
+            str(Path(tmp).resolve()),
+            "--demo",
+        ], ran
+
 
 # The stubbed gland for the socket checks: the REAL bridge subprocess and the
 # REAL loop, with canned responses -- the record-golden pattern, one code path,
@@ -215,6 +245,12 @@ def _check_socket() -> None:
     import subprocess
     import sys
     import tempfile
+    import time
+
+    def read_log(path: Path) -> list[dict]:
+        # The bridge may be appending while this check reads. A trailing
+        # fragment is not a durable JSONL record until its newline lands.
+        return [json.loads(line) for line in path.read_bytes().split(b"\n")[:-1] if line]
 
     root = Path(__file__).resolve().parents[2]
     # Tripwire for the cwd= on the Popen below: the check must not leave a
@@ -345,13 +381,26 @@ def _check_socket() -> None:
             # (a's queue still holds the kill-test fan-out that was read via
             # b, snapshot included; drain it or the flood wait stops early)
             a.until(lambda e: e.get("ev") == "snapshot")
-            a.send({"op": "step", "text": "flood test"})
-            flood: list[dict] = []
-            a.until(lambda e: e.get("ev") == "snapshot", seen=flood, limit=50000)
-            stamped_total = sum(
-                1 for l in log_file.read_text(encoding="utf-8").splitlines()
-                if json.loads(l).get("seq") is not None
+            before_flood = max(
+                event.get("seq") or 0 for event in read_log(log_file)
             )
+            a.send({"op": "step", "text": "flood test"})
+            # The live queue is deliberately bounded, so a 6,000-event burst
+            # may drop even a reading client on a slower runner. The event log
+            # is the replay contract under test; wait for its terminal
+            # snapshot instead of requiring the live queue to be unbounded.
+            deadline = time.monotonic() + 90
+            while time.monotonic() < deadline:
+                logged_now = read_log(log_file)
+                if any(
+                    event.get("seq", 0) > before_flood and event.get("ev") == "snapshot"
+                    for event in logged_now
+                ):
+                    break
+                time.sleep(0.05)
+            else:
+                raise AssertionError("flood step never reached its logged snapshot")
+            stamped_total = sum(e.get("seq") is not None for e in read_log(log_file))
             assert stamped_total > 4096, (
                 f"flood produced only {stamped_total} events; the attach "
                 f"ceiling under test starts at the 4096 queue bound"
@@ -367,7 +416,7 @@ def _check_socket() -> None:
             fresh.close()
 
             # the log holds everything, stamped, interventions included
-            logged = [json.loads(l) for l in log_file.read_text(encoding="utf-8").splitlines()]
+            logged = read_log(log_file)
             assert logged[0]["ev"] == "session"
             log_seqs = [e["seq"] for e in logged[1:]]
             assert log_seqs == list(range(1, len(log_seqs) + 1)), "log seq has gaps"
@@ -591,6 +640,7 @@ def check() -> None:
 
         bridge_env = dict(os.environ)
         bridge_env["DESMOS_SETTINGS"] = str(cwd / "settings.json")
+        bridge_env["OPENAI_API_KEY"] = "check-only"
         bridge_env["PYTHONPATH"] = str(Path(__file__).resolve().parents[2])
         (cwd / "bridgecwd").mkdir(exist_ok=True)
         proc = _sp.Popen(
@@ -660,4 +710,5 @@ def check() -> None:
         # pager compiles either way and just runs grok's agent instead of ours.
         _check_path_deps_tracked()
         _check_vendor_patch()
+        _check_release_tui_launcher()
     _check_socket()

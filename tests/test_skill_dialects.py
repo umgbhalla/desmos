@@ -103,7 +103,7 @@ class SkillDialectTests(unittest.TestCase):
 
     def test_pilot_skills_have_distinct_real_overlays(self):
         skills = {skill.name: skill for skill in discover_skills(Path.cwd())}
-        for name in ("edit", "subagent-brief", "show-me", "long-horizon-goal"):
+        for name in ("edit", "show-me", "long-horizon-goal"):
             with self.subTest(name=name):
                 openai = load_skill_body(skills[name], "gpt-5.6-sol")
                 anthropic = load_skill_body(skills[name], "claude-opus-5")

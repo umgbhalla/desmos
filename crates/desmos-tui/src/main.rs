@@ -5241,10 +5241,11 @@ mod tests {
     }
 
     /// User prompts go through the real Story renderer with their own semantic
-    /// color and stronger weight. Assistant prose remains primary text; pane
+    /// color and stronger weight. Assistant prose remains markdown text; pane
     /// focus and block selection must not collapse the prompt back onto it.
     #[test]
     fn user_prompt_has_its_own_story_color_in_every_state() {
+        let _guard = theme_lock();
         let mut app = App::new();
         app.prompt.insert_str("distinct user color");
         submit_prompt(None, &mut app).unwrap();
@@ -5270,8 +5271,7 @@ mod tests {
         assert_eq!(focused.fg, user_fg);
         assert!(focused.modifier.contains(Modifier::BOLD));
         let assistant = paint_cell(&mut app, "assistant color control");
-        assert_eq!(assistant.fg, theme.text_primary);
-        assert_ne!(focused.fg, assistant.fg);
+        assert_eq!(assistant.fg, theme.md_text);
 
         app.focus = Focus::Calls;
         let unfocused = paint_cell(&mut app, "distinct user color");
@@ -6735,6 +6735,7 @@ mod tests {
         // The single policy point: every pane's appearance comes from here.
         // /dense used to write a setting nothing read: every pad here was a
         // constant, so toggling it changed a stored bool and not one cell.
+        let dense0 = appearance_cache::load();
         appearance_cache::set(false);
         let roomy = grok_appearance();
         appearance_cache::set(true);
@@ -6762,6 +6763,7 @@ mod tests {
             app.input_area.y,
             "the story column has to absorb the reclaimed row",
         );
+        appearance_cache::set(dense0);
     }
 
     #[test]

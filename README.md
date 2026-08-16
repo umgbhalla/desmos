@@ -4,7 +4,7 @@
 
 **A coding agent that owns its harness.**
 
-[![check](https://github.com/umgbhalla/desmos/actions/workflows/check.yml/badge.svg)](https://github.com/umgbhalla/desmos/actions/workflows/check.yml)
+[![release](https://github.com/umgbhalla/desmos/actions/workflows/release.yml/badge.svg)](https://github.com/umgbhalla/desmos/actions/workflows/release.yml)
 [![license](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![python](https://img.shields.io/badge/python-3.11%2B-blue.svg)](pyproject.toml)
 [![dependencies](https://img.shields.io/badge/runtime%20deps-0-brightgreen.svg)](pyproject.toml)
@@ -37,7 +37,108 @@ names remain accepted as hidden compatibility aliases, while custom tools,
 descriptions, notes and skills can still be written by the agent into durable
 runtime state. The next `complete()` sees the change. No restart.
 
+## Runtime architecture
+
+```mermaid
+flowchart LR
+    subgraph Fronts[Fronts]
+        PY[Python / IPython<br/>step task]
+        TUI[desmos-tui<br/>story + wire + input]
+        GROK[grok pager<br/>ACP mode]
+    end
+
+    subgraph Kernel[Python kernel]
+        BR[bridge.py<br/>NDJSON events]
+        ACP[acp.py<br/>JSON-RPC 2.0]
+        LOOP[loop.py<br/>turn + run_turns]
+        WORLD[World<br/>ns + tools + notes + transcript]
+        PROMPT[catalog.py<br/>ABI + live catalog + runtime]
+        SCAN[typed syscall call<br/>scan + dispatch]
+    end
+
+    subgraph State[Durable state]
+        DB[(harness.sqlite3<br/>tail + notes + grown tools)]
+        FILES[skills + extensions<br/>memory + generations]
+        EVENTS[events + trajectories<br/>subagent records]
+    end
+
+    subgraph Wire[Model wire]
+        COMPLETE[complete.py<br/>provider dialect + cache split]
+        ANTH[Anthropic Messages]
+        OAI[OpenAI Responses]
+    end
+
+    PY --> LOOP
+    TUI <-->|stdio NDJSON| BR
+    GROK <-->|ACP NDJSON| ACP
+    BR --> LOOP
+    ACP --> LOOP
+    LOOP <--> WORLD
+    WORLD --> PROMPT --> COMPLETE
+    COMPLETE <--> ANTH
+    COMPLETE <--> OAI
+    COMPLETE --> LOOP --> SCAN
+    SCAN --> WORLD
+    WORLD <--> DB
+    WORLD <--> FILES
+    LOOP --> EVENTS --> BR
+```
+
+Python owns every fact and mutation. Rust paints bridge events, so closing the
+TUI does not redefine the kernel's state or syscall history.
+
 ## Quickstart
+
+Install the latest beta TUI and Python harness:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/umgbhalla/desmos/main/install.sh | sh
+desmos tui
+```
+
+Pass a tag to install an exact release:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/umgbhalla/desmos/main/install.sh | sh -s -- v0.0.1
+```
+
+Release binaries use the stable raw artifact path
+`https://github.com/umgbhalla/desmos/releases/download/<tag>/desmos-tui-<target>.tar.gz`.
+Linux and macOS are supported; these early releases are marked beta.
+
+```mermaid
+sequenceDiagram
+    participant Dev as annotated tag v0.0.1
+    participant GH as GitHub release gate
+    participant IX as persistent ix Linux builder
+    participant Native as macOS + Linux ARM runners
+    participant Release as GitHub beta release
+    participant Install as install.sh
+    participant Host as isolated venv + ~/.local/bin
+
+    Dev->>GH: git push origin v0.0.1
+    GH->>IX: start desmos-ci-linux with capped IX_TOKEN
+    IX->>IX: reuse Cargo target + checkout exact tag SHA
+    IX->>IX: Python checks + Linux tests + wheel + x64 TUI
+    IX-->>GH: checksummed wheel + Linux x64 tarball
+    GH->>Native: build macOS x64/ARM64 + Linux ARM64
+    Native-->>GH: target tarballs + SHA-256 files
+    GH->>IX: remove worktree + stop idle VM
+    GH->>Release: publish verified-tag assets
+    Install->>Release: resolve latest beta or exact tag
+    Release-->>Install: wheel + platform tarball + checksums
+    Install->>Install: verify both checksums
+    Install->>Host: install wheel, binary, desmos command
+    Host-->>Install: desmos tui
+```
+
+GitHub Actions is the public trigger and publisher. Linux x64 validation runs
+inside the stopped-when-idle `desmos-ci-linux` ix VM, so its Cargo target and
+toolchains survive between tags; the repository secret is a VM-only ix key
+with a `$2` spend cap. Native runners remain for Apple binaries and Linux
+ARM64, where a Linux x64 Cargo build is not an equivalent artifact.
+
+For development from a checkout:
 
 ```bash
 uv venv && uv pip install -e ".[kernel]"
@@ -85,18 +186,32 @@ so a body can contain tag text safely.
 
 ```mermaid
 sequenceDiagram
-    participant U as you (kernel)
-    participant L as loop
+    actor U as User
+    participant T as TUI / step()
+    participant B as bridge
+    participant L as run_turns
+    participant C as catalog + cache split
     participant P as provider
     participant D as dispatch
-    U->>L: step("task")
-    L->>P: system prompt + transcript
-    P-->>L: thinking, speech, syscalls (streamed)
-    L->>D: each tag, in written order
-    D-->>L: results (capped, spilled to a file if huge)
-    L->>P: next POST with the results appended
-    Note over L,P: until the reply has no syscalls
-    L-->>U: final speech
+    participant W as World + durable state
+
+    U->>T: submit task
+    T->>B: op: step
+    B->>L: start one step
+    loop until the model emits no syscall
+        L->>C: rediscover skills/extensions, assemble prompt
+        C->>P: ABI + catalog + last user + transcript
+        P-->>L: streamed thinking + speech + typed syscall call
+        L-->>B: story, POST, token, and call events
+        B-->>T: append-only render events
+        L->>D: ordered Block(tag, attrs, body)
+        D->>W: enforce scope, run hook, call real handler
+        W-->>D: result or bounded spill pointer
+        D-->>L: dispatcher-owned result block
+        L->>W: append user-role results, save aligned tail
+    end
+    L-->>B: final speech + snapshot + done
+    B-->>T: settle story, wire, cost, and status
 ```
 
 Grown tools, notes and the transcript tail live in `.desmos/harness.sqlite3`.
@@ -105,6 +220,47 @@ pair is what makes self-modification survivable.
 
 **Architecture, dispatch order, persistence and the invariants:
 [docs/design.md](docs/design.md).**
+
+## Evolution loop
+
+```mermaid
+flowchart TD
+    WORK[Do real work] --> MISS{Reusable miss<br/>or repeated tactic?}
+    MISS -- no --> WORK
+    MISS -- yes --> PICK{Smallest durable form}
+
+    PICK --> NOTE[system note<br/>doctrine every turn]
+    PICK --> TOOL[tool description<br/>better routing]
+    PICK --> SKILL[SKILL.md<br/>body loaded on demand]
+    PICK --> CODE[Python skill / extension<br/>real handler or hook]
+    PICK --> TAG[registered tag<br/>new dialect surface]
+
+    NOTE --> RELOAD[reload or next-turn rediscovery]
+    TOOL --> RELOAD
+    SKILL --> RELOAD
+    CODE --> RELOAD
+    TAG --> RELOAD
+    RELOAD --> LIVE[live catalog + ns + handlers]
+    LIVE --> USE[Use once against a real task]
+    USE --> PROVE{Evidence says it helps?}
+    PROVE -- no --> DELETE[delete or disable it]
+    DELETE --> RELOAD
+    PROVE -- yes --> SNAP[evolve: write generation N+1]
+    SNAP --> WORK
+
+    LIVE --> ROLLBACK[rollback n]
+    ROLLBACK --> RESTORE[restore notes + grown tools + prior]
+    RESTORE --> WORK
+
+    LIVE --> FORK[edit desmos/*.py + reload_sdk]
+    FORK --> SPECIES[species fork<br/>heap and transcript stay live]
+    SPECIES --> WORK
+```
+
+Speech and heap values are not memory. Notes, skills, registered tools, memory
+records, and generation snapshots write to stores that the next turn or process
+restart reads. Rollback restores notes, grown tools, and prior turns; it does
+not undo files, memory records, or the current transcript.
 
 ## The TUI
 

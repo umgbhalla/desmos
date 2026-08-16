@@ -1,0 +1,157 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  prepare:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Create draft beta release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 ||
+            gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
+              --verify-tag --generate-notes --draft --prerelease \
+              --title "$GITHUB_REF_NAME beta"
+
+  tui:
+    needs: prepare
+    strategy:
+      matrix:
+        include:
+          - runner: macos-15
+            target: aarch64-apple-darwin
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    steps:
+      - name: Fetch tagged source
+        run: |
+          git init .
+          git remote add origin "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY.git"
+          git fetch --depth=1 origin "$GITHUB_SHA"
+          git checkout --detach FETCH_HEAD
+      - name: Install build tools
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          rustup toolchain install stable --profile minimal --target "$TARGET"
+          rustup default stable
+          if ! command -v protoc >/dev/null; then
+            if [ "$RUNNER_OS" = macOS ]; then
+              brew install protobuf
+            else
+              sudo apt-get update
+              sudo apt-get install -y protobuf-compiler
+            fi
+          fi
+      - name: Build TUI
+        run: cargo build --locked -p desmos-tui --release --target "${{ matrix.target }}"
+      - name: Package and upload TUI
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          mkdir -p dist/package
+          cp "target/$TARGET/release/desmos-tui" dist/package/desmos-tui
+          tar -C dist/package -czf "dist/desmos-tui-$TARGET.tar.gz" desmos-tui
+          cd dist
+          shasum -a 256 "desmos-tui-$TARGET.tar.gz" > "desmos-tui-$TARGET.tar.gz.sha256"
+          gh release upload "$GITHUB_REF_NAME" desmos-tui-* --clobber --repo "$GITHUB_REPOSITORY"
+
+  ix-linux:
+    needs: prepare
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    concurrency:
+      group: desmos-ix-linux
+      cancel-in-progress: false
+    steps:
+      - name: Install ix
+        run: |
+          curl -fsSL https://ix.dev -o "$RUNNER_TEMP/install-ix.sh"
+          sh "$RUNNER_TEMP/install-ix.sh"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: Build and test on ix
+        env:
+          IX_TOKEN: ${{ secrets.IX_TOKEN }}
+        run: |
+          vm=desmos-ci-linux
+          state=/srv/desmos-ci
+          work=$state/work
+          export PATH="$HOME/.local/bin:$PATH"
+
+          ix start "$vm" >/dev/null 2>&1 || ix new default --name "$vm" --no-shell
+          cleanup() {
+            ix shell "$vm" --noninteractive -- sh -lc \
+              "git --git-dir='$state/repo.git' worktree remove --force '$work' >/dev/null 2>&1 || true" || true
+            ix stop "$vm" || true
+          }
+          trap cleanup EXIT
+
+          ix shell "$vm" --noninteractive -- env DESMOS_STATE="$state" sh -lc '
+            set -eu
+            export CARGO_HOME="$DESMOS_STATE/cargo"
+            export RUSTUP_HOME="$DESMOS_STATE/rustup"
+            if [ ! -x "$CARGO_HOME/bin/rustup" ]; then
+              curl -fsSL https://sh.rustup.rs -o "$DESMOS_STATE/rustup-init.sh"
+              sh "$DESMOS_STATE/rustup-init.sh" -y --no-modify-path --profile minimal
+            fi
+            if [ ! -x "$DESMOS_STATE/protobuf/bin/protoc" ]; then
+              curl -fsSL https://github.com/protocolbuffers/protobuf/releases/download/v30.2/protoc-30.2-linux-x86_64.zip -o "$DESMOS_STATE/protoc.zip"
+              mkdir -p "$DESMOS_STATE/protobuf"
+              python3 -m zipfile -e "$DESMOS_STATE/protoc.zip" "$DESMOS_STATE/protobuf"
+              chmod +x "$DESMOS_STATE/protobuf/bin/protoc"
+            fi
+            command -v rg >/dev/null
+          '
+          ix shell "$vm" --noninteractive -- env \
+            DESMOS_REPOSITORY="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY.git" \
+            DESMOS_SHA="$GITHUB_SHA" DESMOS_TAG="$GITHUB_REF_NAME" \
+            DESMOS_WORK="$work" DESMOS_STATE="$state" \
+            sh -lc '
+              mkdir -p "$DESMOS_STATE"
+              if [ ! -d "$DESMOS_STATE/repo.git" ]; then
+                git clone --bare "$DESMOS_REPOSITORY" "$DESMOS_STATE/repo.git"
+              fi
+              git --git-dir="$DESMOS_STATE/repo.git" fetch --force origin "$DESMOS_SHA"
+              git --git-dir="$DESMOS_STATE/repo.git" worktree prune
+              git --git-dir="$DESMOS_STATE/repo.git" worktree add --detach "$DESMOS_WORK" FETCH_HEAD
+              cd "$DESMOS_WORK"
+              scripts/ci-release-linux.sh "$DESMOS_TAG" "$DESMOS_STATE"
+            '
+          ix shell "$vm" --noninteractive -- tar -C "$work/dist" -czf - \
+            "desmos-tui-x86_64-unknown-linux-gnu.tar.gz" \
+            "desmos-tui-x86_64-unknown-linux-gnu.tar.gz.sha256" \
+            "desmos-${GITHUB_REF_NAME#v}-py3-none-any.whl" \
+            "desmos-${GITHUB_REF_NAME#v}-py3-none-any.whl.sha256" \
+            > "$RUNNER_TEMP/ix-release.tar.gz"
+          mkdir dist
+          tar -C dist -xzf "$RUNNER_TEMP/ix-release.tar.gz"
+      - name: Verify ix artifacts
+        run: |
+          cd dist
+          sha256sum -c *.sha256
+      - name: Upload ix artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$GITHUB_REF_NAME" dist/* --clobber --repo "$GITHUB_REPOSITORY"
+
+  publish:
+    needs: [tui, ix-linux]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Publish beta release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft=false --prerelease --title "$GITHUB_REF_NAME beta"

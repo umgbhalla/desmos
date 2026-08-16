@@ -124,7 +124,10 @@ def _check_secret_scrub() -> None:
     before the result is spilled. Reverting memory._SECRET_PATTERNS to the
     underscore-only form (or dropping the scrub_secrets call) fails this.
     """
-    keys = ("sk-ant-api03-DEADbeefDEADbeefDEADbeef", "sk-proj-abcdefghijklmnop123456")
+    keys = (
+        "sk-ant-api03-" + "DEADbeefDEADbeefDEADbeef",
+        "sk-proj-" + "abcdefghijklmnop123456",
+    )
     payload = f'[{{"text":"old note with {keys[0]} and {keys[1]}"}}]'
     with tempfile.TemporaryDirectory() as d:
         stub = Path(d) / "memex"

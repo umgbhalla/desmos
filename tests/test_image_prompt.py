@@ -7,9 +7,13 @@ These tests drive the real entry points -- ``run_turns`` and the bridge's step
 branch -- rather than ``vision.attach``, which was never the broken part.
 """
 
+import queue
 import tempfile
+import threading
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from desmos.loop import new_world, run_turns
 
@@ -79,9 +83,19 @@ class ImagePromptTests(unittest.TestCase):
 
 class BridgeStepTests(unittest.TestCase):
     def test_the_step_branch_forwards_images(self):
-        src = Path("desmos/bridge.py").read_text()
-        self.assertIn('msg.get("images")', src)
-        self.assertIn("images=images", src)
+        from desmos.front.bridge import _drive
+
+        inbox = queue.Queue()
+        inbox.put({"op": "step", "text": "look", "images": ["shot.png", ""]})
+        inbox.put(None)
+        with (
+            patch("desmos.front.bridge.run_turns") as run_turns,
+            patch("desmos.front.bridge._emit"),
+            patch("desmos.front.bridge._snapshot", return_value={"ev": "snapshot"}),
+        ):
+            self.assertEqual(_drive(SimpleNamespace(), inbox, threading.Event()), 0)
+
+        self.assertEqual(run_turns.call_args.kwargs["images"], ["shot.png"])
 
 
 if __name__ == "__main__":
