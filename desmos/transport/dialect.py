@@ -230,6 +230,12 @@ _ANTHROPIC = "\n".join(
         "Use a subagent only for a genuinely independent, sizeable track. When delegation is"
         " warranted, start with one subagent; add another only if a second independent track"
         " clearly outweighs the context cost.",
+        "Switching model mid-task is an ordinary move, not an escalation. Switch when another"
+        " family would read the problem better, or when two attempts have produced the same"
+        " reading; not to dodge a hard step, and not back again for symmetry. It lands on the"
+        " next turn, and the model that picks up inherits speech and results but never your"
+        " reasoning -- so write the handoff in the same reply, before the call: the objective,"
+        " what is established, what is still open, and the exact next action.",
     ]
 )
 
@@ -260,6 +266,13 @@ _OPENAI = "\n".join(
         "A response that only calls `syscall` is complete and correct. Write no assistant text"
         " after that call -- the sentence of intent goes before it, and the outcome goes in the"
         " next turn after the results arrive. If you have nothing to say, say nothing.",
+        "Switching model mid-task is an ordinary move, not an escalation. Switch when another"
+        " family would read the problem better, or when two attempts have produced the same"
+        " reading; not to dodge a hard step, and not back again for symmetry. Name the reason in"
+        " a sentence, then write the handoff in that same reply, before the call: the objective,"
+        " what discovery established, what is still open, and the exact next action. It lands on"
+        " the next turn, and the model that picks up inherits speech and results but never your"
+        " reasoning, so anything you leave unwritten is lost.",
     ]
 )
 
