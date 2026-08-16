@@ -163,6 +163,77 @@ def _check_secret_scrub() -> None:
             os.environ["PATH"] = prior_path
 
 
+def _check_cross_session_ranking() -> None:
+    """History spans sessions, and the live session must not drown it.
+
+    Session one records a decision. Session two asks about it and -- as really
+    happens -- repeats the same words while asking, so its rows match *more*
+    strongly on raw bm25. Without LIVE_SESSION_PENALTY the question outranks
+    the answer, which is the defect this test exists for: recall returning the
+    turn that asked instead of the turn that decided.
+
+    Reverting either fix fails this: drop the penalty and the live rows win on
+    term frequency; reindex `result` events and the tool output carrying the
+    query text comes back as if someone had said it.
+    """
+    root = Path(tempfile.mkdtemp())
+    prior = os.environ.get(persist.SESSION_ID_ENV)
+    try:
+        os.environ[persist.SESSION_ID_ENV] = "0" * 31 + "1"
+        past = new_world(root, persist=True)
+        past.messages.extend([
+            {"role": "user", "content": "should the kestrel index be sharded"},
+            {"role": "assistant", "content": "decision: kestrel index stays single-shard"},
+        ])
+        persist.save(past)
+
+        os.environ[persist.SESSION_ID_ENV] = "0" * 31 + "2"
+        live = new_world(root, persist=True)
+        live.messages.append({
+            "role": "assistant",
+            "content": "kestrel index kestrel index kestrel index -- looking up kestrel index",
+        })
+        persist.save(live)
+        # Tool output that merely echoes the query must never be indexed as
+        # something a participant said.
+        persist.record_event(
+            live,
+            {"ev": "result", "text": "kestrel index kestrel index sharded sharded"},
+            ts_ms=1,
+            mono_ns=1,
+        )
+        persist.record_event(
+            live, {"ev": "notice", "text": "kestrel notice retained"}, ts_ms=2, mono_ns=2
+        )
+
+        rows = persist.search_history(live, "kestrel index", limit=10)
+        assert rows, "cross-session history was not reachable at all"
+        top = rows[0]
+        assert top["session_id"].endswith("1"), (
+            "the live session outranked prior history: "
+            f"{[(r['session_id'][-1], r['kind'], round(r['score'], 2)) for r in rows]}"
+        )
+        assert any("single-shard" in r["text"] for r in rows), (
+            f"the recorded decision was not returned: {[r['text'][:40] for r in rows]}"
+        )
+        assert not any(r["kind"] == "event:result" for r in rows), (
+            f"tool output was indexed as authored history: {[r['kind'] for r in rows]}"
+        )
+        # The demotion is a penalty, not a filter: the live session stays
+        # reachable, which is what a post-fold lookup depends on.
+        assert any(r["session_id"].endswith("2") for r in rows), (
+            "the live session was excluded rather than demoted"
+        )
+        assert any(
+            r["kind"] == "event:notice" for r in persist.search_history(live, "kestrel notice")
+        ), "non-result events must still be indexed"
+    finally:
+        if prior is None:
+            os.environ.pop(persist.SESSION_ID_ENV, None)
+        else:
+            os.environ[persist.SESSION_ID_ENV] = prior
+
+
 def check() -> None:
     prior = os.environ.get("DESMOS_REGISTRY")
     with tempfile.TemporaryDirectory() as home:
@@ -177,6 +248,7 @@ def check() -> None:
     _check_absent_refusal()
     _check_secret_scrub()
     _check_sql_roundtrip()
+    _check_cross_session_ranking()
 
 
 if __name__ == "__main__":

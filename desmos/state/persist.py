@@ -1157,10 +1157,25 @@ def _strip_opaque(value: Any) -> Any:
     return value
 
 
+#: bm25 returns negative scores, more negative being a better match. Adding a
+#: positive offset to the live session's rows demotes them without hiding them:
+#: a strong current-session match still outranks a weak older one, but the turn
+#: that merely *asked* the question no longer outranks the history it asked
+#: about. Exclusion was the first design and it was wrong -- after a server-side
+#: fold, the current session's early turns are precisely what the caller can no
+#: longer see, so they must stay reachable.
+LIVE_SESSION_PENALTY = 10.0
+
+
 def search_history(
     world: World, query: str, limit: int = 12
 ) -> list[dict[str, Any]]:
-    """Rank this workspace's durable session history with SQLite FTS5."""
+    """Rank this workspace's durable session history with SQLite FTS5.
+
+    `save()` reindexes the whole current transcript on every save, so the live
+    session dominates the table by row count (237 of 314 when measured). Its
+    rows are demoted by `LIVE_SESSION_PENALTY` rather than dropped.
+    """
     path = state_file(world)
     if not path.is_file():
         return []
@@ -1178,12 +1193,19 @@ def search_history(
         rows = conn.execute(
             """
             SELECT session_id, kind, text, source_seq,
-                   bm25(history_fts) AS score
+                   bm25(history_fts)
+                   + (CASE WHEN session_id = ? THEN ? ELSE 0 END) AS score
             FROM history_fts
             WHERE history_fts MATCH ? AND workspace_id = ?
             ORDER BY score LIMIT ?
             """,
-            (match, workspace, max(1, min(int(limit), 100))),
+            (
+                run_id(),
+                LIVE_SESSION_PENALTY,
+                match,
+                workspace,
+                max(1, min(int(limit), 100)),
+            ),
         ).fetchall()
         return [dict(row) for row in rows]
     finally:
@@ -1240,7 +1262,12 @@ def record_event(
                     payload, len(raw.encode("utf-8")), digest,
                 ),
             )
-            if kind in {"prompt", "speech", "result", "notice", "error"}:
+            # A `result` is tool output: derived, already stored verbatim
+            # in `events`, and a quarter of this index by row count.
+            # Ranking it as authored history buries the turn that decided
+            # something under the output that turn happened to print.
+            # Index what someone said, not what a command returned.
+            if kind in {"prompt", "speech", "notice", "error"}:
                 text = _content_text(clean) or payload
                 conn.execute(
                     "INSERT INTO history_fts("
