@@ -44,7 +44,7 @@ Seven canonical capability families are advertised:
 <knowledge op="memory|recall|system|todo">fact, query, doctrine, or todo commands</knowledge>
 <harness op="register|describe|skill|reload|reload-sdk|evolve|rollback">body</harness>
 <observe op="usage|trajectory|retrace|error|symbol|threads">query</observe>
-<agents op="spawn|fanout|status|result|structured-result|judgment|wait">task or ids</agents>
+<agents op="spawn|fanout|resume|lineage|status|result|structured-result|judgment|wait">task or ids</agents>
 <session op="compact|status|switch|peers|read|post">arguments or channel message</session>
 
 The required op selects an existing proven operation. Its body and remaining
