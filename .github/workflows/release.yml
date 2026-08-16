@@ -99,13 +99,21 @@ jobs:
           }
           trap cleanup EXIT
 
-          ix shell "$vm" --noninteractive -- sh -lc \
-            'test -x /srv/desmos-ci/nix-profile/bin/rustup &&
-             test -x /srv/desmos-ci/nix-profile/bin/protoc &&
-             test -x /srv/desmos-ci/nix-profile/bin/rg || {
-              nix-channel --update nixos
-              nix-env -p /srv/desmos-ci/nix-profile -iA nixos.rustup nixos.protobuf nixos.ripgrep
-            }'
+          ix shell "$vm" --noninteractive -- env DESMOS_STATE="$state" sh -lc '
+            set -eu
+            export CARGO_HOME="$DESMOS_STATE/cargo"
+            export RUSTUP_HOME="$DESMOS_STATE/rustup"
+            if [ ! -x "$CARGO_HOME/bin/rustup" ]; then
+              curl -fsSL https://sh.rustup.rs -o "$DESMOS_STATE/rustup-init.sh"
+              sh "$DESMOS_STATE/rustup-init.sh" -y --no-modify-path --profile minimal
+            fi
+            if [ ! -x "$DESMOS_STATE/protobuf/bin/protoc" ]; then
+              curl -fsSL https://github.com/protocolbuffers/protobuf/releases/download/v30.2/protoc-30.2-linux-x86_64.zip -o "$DESMOS_STATE/protoc.zip"
+              mkdir -p "$DESMOS_STATE/protobuf"
+              python3 -m zipfile -e "$DESMOS_STATE/protoc.zip" "$DESMOS_STATE/protobuf"
+            fi
+            command -v rg >/dev/null
+          '
           ix shell "$vm" --noninteractive -- env \
             DESMOS_REPOSITORY="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY.git" \
             DESMOS_SHA="$GITHUB_SHA" DESMOS_TAG="$GITHUB_REF_NAME" \

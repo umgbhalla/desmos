@@ -6,7 +6,10 @@ state=${2:-/srv/desmos-ci}
 target=x86_64-unknown-linux-gnu
 export CARGO_HOME="$state/cargo"
 export RUSTUP_HOME="$state/rustup"
-export PATH="$state/nix-profile/bin:$CARGO_HOME/bin:$PATH"
+export PATH="$CARGO_HOME/bin:$state/protobuf/bin:$PATH"
+rg_path=$(command -v rg)
+export GROK_TOOLS_BUNDLE_RG_PATH="$rg_path"
+export GROK_SHELL_BUNDLE_RG_PATH="$rg_path"
 version=$(python3 -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')
 
 test "$tag" = "v$version"
