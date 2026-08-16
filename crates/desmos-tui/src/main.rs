@@ -5168,28 +5168,54 @@ mod tests {
         assert_eq!(sent["op"], "typed", "wrong op on the wire: {sent}");
     }
 
-    /// User prompts go through the real story renderer with stronger weight.
-    /// A terminal has fixed-size cells, so bold is the native larger-type
-    /// hierarchy; this catches an inert vendor-only style change.
+    /// User prompts go through the real Story renderer with their own semantic
+    /// color and stronger weight. Assistant prose remains primary text; pane
+    /// focus and block selection must not collapse the prompt back onto it.
     #[test]
-    fn user_prompt_is_bold_in_the_story_pane() {
+    fn user_prompt_has_its_own_story_color_in_every_state() {
         let mut app = App::new();
-        app.prompt.insert_str("make me larger");
+        app.prompt.insert_str("distinct user color");
         submit_prompt(None, &mut app).unwrap();
+        app.story_push(RenderBlock::agent_message("assistant color control"));
 
-        let backend = TestBackend::new(100, 28);
-        let mut term = Terminal::new(backend).unwrap();
-        term.draw(|f| draw(f, &mut app)).unwrap();
-        let text = buffer_text(&term);
-        let y = row_of(&text, "make me larger").expect("user prompt was not rendered") as u16;
-        let row = text.lines().nth(y as usize).unwrap();
-        let x = row.find("make me larger").unwrap() as u16;
-        assert!(
-            term.backend().buffer()[(x, y)]
-                .modifier
-                .contains(Modifier::BOLD),
-            "the real story path rendered user input at normal weight",
-        );
+        let theme = Theme::current();
+        let user_fg = match theme.accent_user {
+            Color::Reset => Color::Cyan,
+            color => color,
+        };
+        let paint_cell = |app: &mut App, needle: &str| {
+            let backend = TestBackend::new(100, 28);
+            let mut term = Terminal::new(backend).unwrap();
+            term.draw(|frame| draw(frame, app)).unwrap();
+            let text = buffer_text(&term);
+            let y = row_of(&text, needle).expect("story text was not rendered") as u16;
+            let row = text.lines().nth(y as usize).unwrap();
+            let x = row.find(needle).unwrap() as u16;
+            term.backend().buffer()[(x, y)].clone()
+        };
+
+        let focused = paint_cell(&mut app, "distinct user color");
+        assert_eq!(focused.fg, user_fg);
+        assert!(focused.modifier.contains(Modifier::BOLD));
+        let assistant = paint_cell(&mut app, "assistant color control");
+        assert_eq!(assistant.fg, theme.text_primary);
+        assert_ne!(focused.fg, assistant.fg);
+
+        app.focus = Focus::Calls;
+        let unfocused = paint_cell(&mut app, "distinct user color");
+        assert_eq!(unfocused.fg, user_fg, "pane focus changed prompt semantics");
+
+        let prompt_idx = (0..app.sess.story.len())
+            .find(|index| matches!(
+                app.sess.story.entry(*index).map(|entry| &entry.block),
+                Some(RenderBlock::UserPrompt(_))
+            ))
+            .unwrap();
+        app.focus = Focus::Story;
+        app.sess.story.set_selected(Some(prompt_idx));
+        let selected = paint_cell(&mut app, "distinct user color");
+        assert_eq!(selected.fg, user_fg, "selection erased the prompt color");
+        assert_ne!(selected.fg, selected.bg, "selected prompt lost text contrast");
     }
 
     /// Only the focused pane draws a visible frame. The border cells stay put

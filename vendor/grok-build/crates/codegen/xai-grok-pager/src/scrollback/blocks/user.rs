@@ -235,7 +235,7 @@ impl UserPromptBlock {
             c => c,
         };
         let prefix_style = theme.fg(prefix_color).add_modifier(Modifier::BOLD);
-        let text_style = theme.fg(theme.text_primary).add_modifier(Modifier::BOLD);
+        let text_style = theme.fg(prefix_color).add_modifier(Modifier::BOLD);
         let skill_style = theme.fg(theme.accent_skill).add_modifier(Modifier::BOLD);
         (prefix_style, text_style, skill_style)
     }
@@ -636,7 +636,7 @@ mod tests {
         assert_eq!(spans[1].content.as_ref(), "/pr-workflow");
         assert_eq!(spans[1].style.fg, Some(theme.accent_skill));
         assert_eq!(spans[2].content.as_ref(), " create a ticket for this");
-        assert_eq!(spans[2].style.fg, Some(theme.text_primary));
+        assert_eq!(spans[2].style.fg, UserPromptBlock::prompt_styles(&theme, false).1.fg);
     }
 
     #[test]
@@ -663,11 +663,11 @@ mod tests {
         assert_eq!(line0[1].content.as_ref(), "/foo");
         assert_eq!(line0[1].style.fg, Some(theme.accent_skill));
         assert_eq!(line0[2].content.as_ref(), " bar");
-        assert_eq!(line0[2].style.fg, Some(theme.text_primary));
+        assert_eq!(line0[2].style.fg, UserPromptBlock::prompt_styles(&theme, false).1.fg);
 
         let line1 = &lines[1].content.spans;
         assert_eq!(line1[1].content.as_ref(), "baz");
-        assert_eq!(line1[1].style.fg, Some(theme.text_primary));
+        assert_eq!(line1[1].style.fg, UserPromptBlock::prompt_styles(&theme, false).1.fg);
     }
 
     // --- Mid-text skill token styling (with_skill_tokens) ---
@@ -683,11 +683,11 @@ mod tests {
         let spans = &lines[0].content.spans;
         assert_eq!(spans.len(), 4);
         assert_eq!(spans[1].content.as_ref(), "great ");
-        assert_eq!(spans[1].style.fg, Some(theme.text_primary));
+        assert_eq!(spans[1].style.fg, UserPromptBlock::prompt_styles(&theme, false).1.fg);
         assert_eq!(spans[2].content.as_ref(), "/pr-workflow");
         assert_eq!(spans[2].style.fg, Some(theme.accent_skill));
         assert_eq!(spans[3].content.as_ref(), " all good now");
-        assert_eq!(spans[3].style.fg, Some(theme.text_primary));
+        assert_eq!(spans[3].style.fg, UserPromptBlock::prompt_styles(&theme, false).1.fg);
     }
 
     #[test]
@@ -724,7 +724,7 @@ mod tests {
         );
         let line1 = &lines[1].content.spans;
         assert_eq!(line1[1].content.as_ref(), "then ");
-        assert_eq!(line1[1].style.fg, Some(theme.text_primary));
+        assert_eq!(line1[1].style.fg, UserPromptBlock::prompt_styles(&theme, false).1.fg);
         assert_eq!(line1[2].content.as_ref(), "/model");
         assert_eq!(line1[2].style.fg, Some(theme.accent_skill));
         assert_eq!(line1[3].content.as_ref(), " here");
@@ -763,7 +763,7 @@ mod tests {
         assert!(block.skill_token_ranges.is_empty());
         let lines = block.wrap_prompt_lines(80, None, true, false);
         let theme = Theme::current();
-        assert_eq!(lines[0].content.spans[1].style.fg, Some(theme.text_primary));
+        assert_eq!(lines[0].content.spans[1].style.fg, UserPromptBlock::prompt_styles(&theme, false).1.fg);
     }
 
     // --- Token styling across soft-wrap and collapsed truncation ---
@@ -813,7 +813,7 @@ mod tests {
         let body: String = last
             .spans
             .iter()
-            .filter(|s| s.style.fg == Some(theme.text_primary))
+            .filter(|s| s.style.fg == UserPromptBlock::prompt_styles(&theme, false).1.fg)
             .map(|s| s.content.as_ref())
             .collect();
         assert!(body.contains("more"), "args stay body-styled, got {body:?}");
