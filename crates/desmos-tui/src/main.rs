@@ -6836,6 +6836,30 @@ mod tests {
     }
 
     #[test]
+    fn directed_peer_activity_is_persistent_story_content() {
+        let mut app = App::new();
+        app.running = true;
+        handle_event(
+            &mut app,
+            json!({
+                "ev": "channel",
+                "channel": "peer:self:reply",
+                "author": "peer-123",
+                "preview": "hello from the other side",
+                "unread": 1,
+                "message_id": 10,
+                "directed": "reply",
+                "body": "hello from the other side"
+            }),
+        );
+        assert!(app.running, "a peer message is not a turn terminator");
+        assert_eq!(app.sess.story.len(), 1, "directed peer message was not routed to Story");
+        let painted = paint(&mut app, 120, 40);
+        assert!(painted.contains("Peer reply · peer-123"), "{painted}");
+        assert!(painted.contains("hello from the other side"), "{painted}");
+    }
+
+    #[test]
     fn model_and_dense_are_local_slashes_and_compact_still_answers() {
         for line in ["/model", "/model gpt-5.6-sol", "/dense", "/compact"] {
             assert!(is_local_slash(line), "{line} must not reach the model");

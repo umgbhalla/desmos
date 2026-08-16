@@ -336,12 +336,12 @@ def _serve_client(conn: socket.socket, inbox: queue.Queue, cancel: threading.Eve
         wire.close()
 
 
-def _bind_socket(cwd: Path) -> socket.socket | None:
+def _bind_socket(cwd: Path) -> tuple[socket.socket | None, bool]:
     """The second transport: <cwd>/.desmos/bridge.sock, 0600, stdlib only.
 
     An existing path is probed: answering means another bridge owns this cwd
-    (refuse -- return None); silence means a stale file from a dead process
-    (unlink and take over).
+    (return its ownership separately); silence means a stale file from a dead
+    process (unlink and take over).
     """
     path = cwd / ".desmos" / "bridge.sock"
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -353,7 +353,7 @@ def _bind_socket(cwd: Path) -> socket.socket | None:
         except OSError:
             path.unlink()
         else:
-            return None
+            return None, True
         finally:
             probe.close()
     srv = socket.socket(socket.AF_UNIX)
@@ -363,7 +363,7 @@ def _bind_socket(cwd: Path) -> socket.socket | None:
     finally:
         os.umask(old)
     srv.listen()
-    return srv
+    return srv, False
 
 
 def _watch_channel(
@@ -410,6 +410,19 @@ def _watch_channel(
                         continue
                     sender = str(message["run_id"])
                     body = str(message["body"])
+                    preview = " ".join(body.split())
+                    if len(preview) > 120:
+                        preview = preview[:119].rstrip() + "…"
+                    _emit({
+                        "ev": "channel",
+                        "channel": channel,
+                        "author": sender,
+                        "preview": preview,
+                        "unread": directed["unread"],
+                        "message_id": message_id,
+                        "directed": kind,
+                        "body": body,
+                    })
                     if kind == "request":
                         text = (
                             f"[Peer session {sender} requested a one-round exchange]\\n\\n"
@@ -460,11 +473,12 @@ def serve(cwd: Path) -> int:
     # The log first: ready and everything after it must be in the replay file.
     _open_log(world)
     try:
-        sock_srv = _bind_socket(cwd)
+        sock_srv, socket_owned = _bind_socket(cwd)
     except OSError:
         # e.g. the AF_UNIX ~104-byte path limit on a deep cwd. The stdio
         # bridge must survive losing its second transport.
         sock_srv = None
+        socket_owned = False
 
     def acceptor() -> None:
         while True:
@@ -516,11 +530,10 @@ def serve(cwd: Path) -> int:
         **{k: v for k, v in _snapshot(world).items() if k != "ev"},
         **_picker(),
     })
-    if sock_srv is None:
+    if sock_srv is None and not socket_owned:
         _emit({
             "ev": "notice",
-            "text": "socket transport off: .desmos/bridge.sock is owned by a "
-            "live bridge or could not be bound",
+            "text": "socket transport off: .desmos/bridge.sock could not be bound",
         })
     threading.Thread(
         target=_watch_channel, args=(world, inbox, channel_stop), daemon=True

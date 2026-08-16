@@ -120,6 +120,15 @@ pub enum SessionEvent {
         /// The hook message
         message: String,
     },
+    /// A directed message delivered by another live Desmos session.
+    PeerMessage {
+        /// Stable peer session id.
+        author: String,
+        /// Full message body, not the notification preview.
+        body: String,
+        /// True for a reply, false for a request.
+        reply: bool,
+    },
     /// The session's persisted model is no longer available after re-auth.
     /// Both IDs are empty when re-shown on blocked prompt attempts.
     ModelUnavailable {
@@ -251,6 +260,14 @@ impl SessionEvent {
                 format!("Compaction completed in {}.", format_duration(*elapsed))
             }
             SessionEvent::HookAnnotation { message } => message.clone(),
+            SessionEvent::PeerMessage {
+                author,
+                body,
+                reply,
+            } => {
+                let kind = if *reply { "reply" } else { "request" };
+                format!("Peer {kind} · {author}\n{body}")
+            }
             SessionEvent::ModelUnavailable {
                 new_model_id,
                 reason,
@@ -293,6 +310,10 @@ impl SessionEvent {
     }
 
     /// Failures and actionable prompts stand out (warning color + accent bar).
+    fn is_peer_message(&self) -> bool {
+        matches!(self, SessionEvent::PeerMessage { .. })
+    }
+
     fn is_warning_banner(&self) -> bool {
         matches!(
             self,
@@ -563,6 +584,8 @@ impl BlockContent for SessionEventBlock {
         // informational — render them in the warning color, not muted noise.
         let style = if self.event.is_warning_banner() {
             ratatui::style::Style::default().fg(theme.warning)
+        } else if self.event.is_peer_message() {
+            ratatui::style::Style::default().fg(theme.accent_user)
         } else {
             theme.muted()
         };
@@ -606,6 +629,8 @@ impl BlockContent for SessionEventBlock {
         }
         if self.event.is_warning_banner() {
             Some(AccentStyle::static_color(theme.warning))
+        } else if self.event.is_peer_message() {
+            Some(AccentStyle::static_color(theme.accent_user))
         } else {
             None
         }

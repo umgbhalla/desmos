@@ -6,7 +6,9 @@
 use std::time::Duration;
 
 use serde_json::{Value, json};
-use xai_grok_pager::scrollback::blocks::{OtherToolCallBlock, SubagentBlock, ToolCallBlock};
+use xai_grok_pager::scrollback::blocks::{
+    OtherToolCallBlock, SessionEvent, SessionEventBlock, SubagentBlock, ToolCallBlock,
+};
 use xai_grok_pager::scrollback::{DisplayMode, RenderBlock, ScrollbackState};
 
 use crate::{
@@ -564,14 +566,27 @@ pub(crate) fn handle_event(app: &mut App, ev: Value) {
                 app.story_push(RenderBlock::system(t));
             }
         }
-        // Cross-session activity is transient chrome, not harness narration:
-        // the durable conversation stays in SQLite and the agent's inbox.
+        // Ordinary shared-channel activity is transient chrome. Directed peer
+        // exchanges are different: no local composer submission exists, so
+        // without a durable Story row the model receives a message the human
+        // never sees.
         "channel" => {
             let channel = ev.get("channel").and_then(Value::as_str).unwrap_or("conflicts");
             let author = ev.get("author").and_then(Value::as_str).unwrap_or("peer");
             let preview = ev.get("preview").and_then(Value::as_str).unwrap_or("");
             let unread = ev.get("unread").and_then(Value::as_u64).unwrap_or(1);
-            app.notify(format!("IRC #{channel} · {author}: {preview} · {unread} unread"));
+            if let Some(kind) = ev.get("directed").and_then(Value::as_str) {
+                let body = ev.get("body").and_then(Value::as_str).unwrap_or(preview);
+                app.story_push(RenderBlock::SessionEvent(SessionEventBlock::new(
+                    SessionEvent::PeerMessage {
+                        author: author.to_string(),
+                        body: body.to_string(),
+                        reply: kind == "reply",
+                    },
+                )));
+            } else {
+                app.notify(format!("IRC #{channel} · {author}: {preview} · {unread} unread"));
+            }
         }
         // Not a terminator. loop.py fires this for a reply the endpoint cut
         // short and keeps looping, and the reader thread synthesises one for

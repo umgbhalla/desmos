@@ -406,6 +406,8 @@ pub enum Event {
         preview: String,
         unread: u64,
         message_id: u64,
+        directed: Option<String>,
+        body: Option<String>,
     },
     /// `intervention` — front/bridge.py `_intervene`: one per kill_run/rerun
     /// op arriving on any transport (stdio or socket); its prose twin rides

@@ -365,6 +365,12 @@ def _check_socket() -> None:
                         "peer-check", "peer-check", "please answer", "2026-01-02",
                     ),
                 )
+            directed_request = a.until(
+                lambda e: e.get("ev") == "channel"
+                and e.get("directed") == "request",
+                seen=a_events,
+            )
+            assert directed_request["body"] == "please answer", directed_request
             a.until(lambda e: e.get("ev") == "snapshot", seen=a_events)
             with sqlite3.connect(cwd / ".desmos" / "harness.sqlite3") as db:
                 replies = db.execute(
@@ -388,6 +394,12 @@ def _check_socket() -> None:
                         "peer-check", "peer-check", "thanks", "2026-01-03",
                     ),
                 )
+            directed_reply = a.until(
+                lambda e: e.get("ev") == "channel"
+                and e.get("directed") == "reply",
+                seen=a_events,
+            )
+            assert directed_reply["body"] == "thanks", directed_reply
             a.until(lambda e: e.get("ev") == "snapshot", seen=a_events)
             with sqlite3.connect(cwd / ".desmos" / "harness.sqlite3") as db:
                 reply_count = db.execute(
@@ -742,6 +754,18 @@ def check() -> None:
         # --- bridge: the picker and the model op, driven as a real subprocess ---
         import subprocess as _sp
         import sys
+
+        from desmos.front.bridge import _bind_socket
+
+        owner_dir = cwd / "socket-owner"
+        owner, already_owned = _bind_socket(owner_dir)
+        assert owner is not None and not already_owned
+        try:
+            follower, already_owned = _bind_socket(owner_dir)
+            assert follower is None and already_owned
+        finally:
+            owner.close()
+            (owner_dir / ".desmos" / "bridge.sock").unlink(missing_ok=True)
 
         bridge_env = dict(os.environ)
         bridge_env["DESMOS_SETTINGS"] = str(cwd / "settings.json")
