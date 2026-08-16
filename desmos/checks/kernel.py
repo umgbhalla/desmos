@@ -69,7 +69,7 @@ def check() -> None:
         from desmos.dialect import capabilities as _caps
         from desmos import subagent as _sa
         from desmos.loop import RESULT_CLIP as _clip_cap
-        from desmos.subagent_contracts import TaskContract as _TC
+        from desmos.agents.subagent_contracts import TaskContract as _TC
         from desmos.agents import subagent_prompt as _sp
         import inspect as _insp
 
@@ -86,7 +86,7 @@ def check() -> None:
         _state_line = next(l for l in caps.split("\n") if l.startswith("state: exec op=python"))
         assert "timeout" not in _state_line, _state_line
         assert "Use exec op=bash only for a quick hermetic one-shot" in caps
-        for _name in _sa.AGENTS:
+        for _name in (*_sa.AGENTS, *_sa.ALIASES):
             assert _name in caps, _name
         # fanout's default agent is not spawn's. The prompt says so because a
         # reader would otherwise assume they match.

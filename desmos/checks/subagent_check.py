@@ -8,7 +8,7 @@ from typing import Any
 import desmos.agents.subagent as subagents
 from desmos.kernel import prices
 from desmos.loop import new_world
-from desmos.subagent_contracts import TaskContract
+from desmos.agents.subagent_contracts import TaskContract
 
 LT = chr(60)
 

@@ -52,16 +52,23 @@ CAPS: dict[str, tuple[str, ...]] = {
 # names are aliases so existing callers keep working.
 AGENTS: dict[str, dict[str, Any]] = {
     "general": {"persona": "builder", "capability": "edit", "model": "gpt-5.6-sol"},
-    "worker": {"persona": "builder", "capability": "edit", "model": "gpt-5.6-sol"},
     "explore": {"persona": "researcher", "capability": "read", "model": "gpt-5.6-luna"},
-    "scout": {"persona": "researcher", "capability": "read", "model": "gpt-5.6-luna"},
     "review": {"persona": "critic", "capability": "read", "model": "gpt-5.6-sol"},
-    "reviewer": {"persona": "critic", "capability": "read", "model": "gpt-5.6-sol"},
     "security": {"persona": "security", "capability": "read", "model": "gpt-5.6-sol"},
     "planner": {"persona": "planner", "capability": "read", "model": "gpt-5.6-sol"},
     "sniffer": {"persona": "debugger", "capability": "read", "model": "gpt-5.6-luna"},
     # budget 1 by default: an orchestrator that cannot fork is useless.
     "orchestrator": {"persona": "orchestrator", "capability": "orchestrator", "model": "gpt-5.6-sol", "budget": 1},
+}
+
+# The documented role names resolve to the definitions above instead of
+# repeating them. Three rows were byte-identical duplicates, which is one
+# silent drift away from two roles that are supposed to be the same behaving
+# differently. resolve() records the canonical name.
+ALIASES: dict[str, str] = {
+    "worker": "general",
+    "scout": "explore",
+    "reviewer": "review",
 }
 
 ROLE_GUIDE: dict[str, str] = {
@@ -97,15 +104,18 @@ class EffectiveConfig:
     # Re-anchor long runs without imposing a ceiling. Zero/None disables.
     guidance_every_turns: int | None = 8
     guidance_reminder: str | None = None
-    # None lets legacy free-text tasks infer whether they claim observations.
-    # Typed contracts carry their own explicit requirement.
+    # None means the default applies: a run must show tool use. Typed contracts
+    # carry their own explicit requirement, and a caller can still opt out here.
     require_tool_use: bool | None = None
 
 
 def resolve(agent: str = "general", **over: Any) -> EffectiveConfig:
     """override > agent definition > default. Unknown agent is a hard error."""
+    agent = ALIASES.get(agent, agent)
     if agent not in AGENTS:
-        raise KeyError(f"unknown agent {agent!r}; have {sorted(AGENTS)}")
+        raise KeyError(
+            f"unknown agent {agent!r}; have {sorted(set(AGENTS) | set(ALIASES))}"
+        )
     d = dict(AGENTS[agent])
     d.update({k: v for k, v in over.items() if v is not None})
     persona = d.get("persona")
