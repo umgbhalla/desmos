@@ -11,6 +11,8 @@
 
 [Design](docs/design.md) · [Tags](docs/tags.md) · [Self-growth](docs/self-growth.md) · [Constitution](docs/constitution.md) · [Subagents](docs/subagents.md) · [Contributing](CONTRIBUTING.md)
 
+<img src="docs/assets/tui.png" alt="desmos TUI: story, activity, POST panes, git, files and meta" width="900" />
+
 </div>
 
 ---
@@ -312,7 +314,7 @@ not undo files, memory records, or the current transcript.
 python -m desmos tui
 ```
 
-Left column, then right:
+Pictured above. Left column, then right:
 
 ```
 story        the turn: your prompt, speech as markdown, each edit as a
