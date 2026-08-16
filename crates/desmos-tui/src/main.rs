@@ -6735,6 +6735,7 @@ mod tests {
         // The single policy point: every pane's appearance comes from here.
         // /dense used to write a setting nothing read: every pad here was a
         // constant, so toggling it changed a stored bool and not one cell.
+        let dense0 = appearance_cache::load();
         appearance_cache::set(false);
         let roomy = grok_appearance();
         appearance_cache::set(true);
@@ -6762,6 +6763,7 @@ mod tests {
             app.input_area.y,
             "the story column has to absorb the reclaimed row",
         );
+        appearance_cache::set(dense0);
     }
 
     #[test]
