@@ -199,7 +199,7 @@ def _dispatch(
     if block.tag == "find":
         from desmos.state.find import find
 
-        return find(world, block.body, block.attrs.get("limit"))
+        return find(world, block.body, **block.attrs)
     if block.tag == "recall":
         from desmos.state.recall import handle_recall
 

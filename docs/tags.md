@@ -79,6 +79,33 @@ Shells are process-lifetime only. They are deliberately not persisted: a pty
 cannot be restored from JSON, and pretending otherwise would hand back a session
 whose `cd` silently did not survive.
 
+### find
+
+A long-lived, watched `fff` index over the world's cwd. The default `path` mode
+does typo-resistant fuzzy filename search, ranks by git state and frecency, and
+accepts inline constraints such as `*.rs`, `src/`, and `!tests/`. Successful
+edits automatically feed its frecency ranking.
+
+| attribute | meaning |
+|---|---|
+| `mode` | `path` (default), `glob`, `grep`, `symbol`, or `multi` |
+| `limit` | maximum returned paths or matching lines, default 20 |
+| `match` | content matcher: `plain` (default), `regex`, or `fuzzy` |
+| `context` | lines before and after each content match, clamped to 0–20 |
+| `constraints` | file constraints for `multi`; its body is one pattern per line |
+
+`grep` uses SIMD content search and marks classified definitions. `symbol` puts
+definitions before usages. `multi` performs one Aho–Corasick search for several
+identifiers rather than making sequential calls. Content queries can prepend
+the same constraints inline, for example `*.py Widget`. The index supports
+watcher updates, smart case, git-aware ranking, query history, and frecency;
+pagination and scan lifecycle are managed internally rather than exposed as
+agent-facing knobs.
+
+The Python extension is built by `scripts/build-fff-python.sh`. If absent,
+`find` refuses explicitly instead of silently falling back to a second
+implementation.
+
 ### edit
 
 Replace exactly one occurrence in a file. Fails loudly if the old text is absent

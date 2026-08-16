@@ -4,8 +4,9 @@
 # of `python -m desmos tui` launch. Absent module => the <find> syscall refuses
 # in prose and the model falls back to bash/rg.
 #
-# Default features only: the pure-Rust `ripgrep` walker. The `zlob` feature is
-# NEVER built here (it needs a Zig toolchain).
+# Default features: the pure-Rust `ripgrep` walker plus definition
+# classification used by symbol search. The `zlob` feature is NEVER built here
+# (it needs a Zig toolchain).
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

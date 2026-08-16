@@ -50,7 +50,7 @@ this for you.
 <edit path="file">old
 ---
 new</edit>
-<find limit="20">path fragment</find>      # fuzzy file paths in cwd (not content — that's bash/rg)
+<find mode="path|glob|grep|symbol|multi" limit="20">query</find>  # fff paths + content
 <recall limit="10">search prior sessions</recall>   # other/past sessions
 <memory>a durable fact to keep</memory>    # or action="search"/"read"/"forget"; only its summary rides the prompt
 <register name="tag" doc="one line">def handle(body, **attrs): ...</register>

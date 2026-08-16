@@ -217,12 +217,16 @@ Track 1.3 preconditions → 6.5→6.6→6.7 (memex); 6.8 last.
   module is the sqlite3 case, NOT the scanner tripwire (unchanged) — and the
   accepted risk is named: an abort in fff-core's unsafe SIMD/mmap kills the
   kernel; PanicException is handled, aborts are not.
-- 6.2 `<find>` syscall: body = fff-query-parser query, `limit=` attr; path
-  search only (grep already has an owner). Engine per world.cwd in a
-  module-global dict (reload-survival pattern), ctor with
-  `enable_content_indexing=False` explicit, frecency db at `.desmos/fff`,
-  watch=True; first query waits for the scan and SAYS SO if still scanning.
-  Absent module: loud refusal naming the build script. CAPS: read+edit.
+- 6.2 `<find>` syscall: body = fff-query-parser query, with `mode=` selecting
+  typo-resistant path search, glob, SIMD plain/regex/fuzzy grep,
+  definition-first symbol search, or Aho–Corasick multi-pattern grep. `limit=`,
+  `context=`, `match=`, and multi-pattern `constraints=` expose the bounded
+  agent-facing controls while pagination and scan lifecycle stay internal.
+  One content-capable engine per world.cwd lives in a module-global dict
+  (reload-survival pattern), uses `.desmos/fff` for frecency, and watches for
+  changes; first query waits for the scan and SAYS SO if still scanning.
+  The Python binding enables fff-core's `definitions` feature. Absent module:
+  loud refusal naming the build script. CAPS: read+edit.
 - 6.3 Frecency fed by the kernel's own `<edit>` results at the dispatch
   choke point — one call site, children covered by construction. touch()
   opens the frecency DB alone when no engine is live; full hydration stays

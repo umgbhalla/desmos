@@ -1,15 +1,15 @@
-"""The <find> syscall: fuzzy path search over the world's cwd via fff.
+"""The <find> syscall: fff-backed path, glob, content, and symbol search.
 
-Path search only — content grep already has an owner (bash + rg). One live
-``FileFinder`` per ``world.cwd`` lives in a module-global dict built lazily on
-the first <find> and kept across ``reload_sdk`` (the ``globals().get`` rail
-from ``dispatch._SCOPES``: re-executing this module must not orphan the native
-scan threads a live engine owns). The frecency LMDB under ``cwd/.desmos/fff``
-is fed by the kernel's own <edit> results through :func:`touch`, so a
-recently-edited file ranks higher without the model asking.
+One live content-capable ``FileFinder`` per ``world.cwd`` lives in a
+module-global dict built lazily on first use and kept across ``reload_sdk``
+(the ``globals().get`` rail from ``dispatch._SCOPES`` prevents orphaned native
+watch threads). The same engine provides typo-resistant fuzzy paths, query
+constraints, SIMD plain/regex/fuzzy grep, multi-pattern grep, and definition
+classification. The frecency LMDB under ``cwd/.desmos/fff`` is fed by the
+kernel's own <edit> results through :func:`touch`.
 
 An absent extension module is a loud refusal naming the build script, never a
-second search implementation as a fallback: the model uses bash/rg instead.
+second search implementation as a fallback: the model can use bash/rg instead.
 """
 
 from __future__ import annotations
@@ -48,15 +48,13 @@ def _import_fff() -> Any:
         return None
 
 
-def _new_finder(fff: Any, cwd: Path, *, watch: bool) -> Any:
-    # enable_content_indexing=False is explicit: <find> is path search only,
-    # so the content index (memory + scan cost) is never built.
+def _new_finder(fff: Any, cwd: Path, *, watch: bool, content: bool = True) -> Any:
     return fff.FileFinder(
         str(cwd),
         frecency_db_path=str(cwd / FRECENCY_DB),
         watch=watch,
         ai_mode=True,
-        enable_content_indexing=False,
+        enable_content_indexing=content,
     )
 
 
@@ -76,38 +74,129 @@ def _limit(raw: Any) -> int:
     return n if n > 0 else DEFAULT_LIMIT
 
 
-def find(world: Any, query: str, limit: Any = None) -> str:
-    """Rank cwd paths against a fuzzy query. One line per hit: path<TAB>score."""
+_MODE_ALIASES = {
+    "path": "path",
+    "file": "path",
+    "files": "path",
+    "glob": "glob",
+    "grep": "grep",
+    "content": "grep",
+    "symbol": "symbol",
+    "symbols": "symbol",
+    "multi": "multi",
+    "multi_grep": "multi",
+}
+
+
+def _context(raw: Any) -> int:
+    try:
+        return max(0, min(20, int(str(raw).strip())))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _format_grep(res: Any, limit: int, *, definitions_first: bool) -> list[str]:
+    items = list(res.items)
+    if definitions_first:
+        items.sort(key=lambda item: not item.is_definition)
+    lines: list[str] = []
+    for item in items[:limit]:
+        marker = " [def]" if item.is_definition else ""
+        text = item.line_content.strip()
+        lines.append(
+            f"{item.relative_path}:{item.line_number}:{item.col + 1}{marker}\t{text}"
+        )
+        lines.extend(f"  | {line.rstrip()}" for line in item.context_before)
+        lines.extend(f"  | {line.rstrip()}" for line in item.context_after)
+    if len(items) > limit or res.next_file_offset:
+        lines.append("(more matches available; raise limit or narrow the query)")
+    return lines
+
+
+def find(
+    world: Any,
+    query: str,
+    limit: Any = None,
+    mode: Any = None,
+    match: Any = None,
+    context: Any = None,
+    constraints: Any = None,
+    **_attrs: Any,
+) -> str:
+    """Search cwd with fff; mode is path, glob, grep, symbol, or multi."""
     fff = _import_fff()
     if fff is None:
         return REFUSAL
     q = (query or "").strip()
     if not q:
-        return "find: empty query — give a path fragment to search for"
+        return "find: empty query — give a path fragment, identifier, or pattern"
+
+    requested_mode = str(mode or "path").strip().lower()
+    operation = _MODE_ALIASES.get(requested_mode)
+    if operation is None:
+        return "find: invalid mode — use path, glob, grep, symbol, or multi"
+
+    matcher = str(match or "plain").strip().lower()
+    if matcher not in {"plain", "regex", "fuzzy"}:
+        return "find: invalid match — use plain, regex, or fuzzy"
+
     cwd = Path(world.cwd)
     key = str(cwd.resolve())
+    n = _limit(limit)
     try:
         finder = _engine(fff, key, cwd)
         # The first query (or any query landing during a rescan) waits for the
-        # scan and *says so* if it is still going, rather than silently ranking
-        # a half-built index the way shared.rs's true-on-uninitialized would.
+        # scan and says so if it is still going instead of silently searching
+        # a half-built index.
         note = ""
         if finder.is_scanning():
             finder.wait_for_scan_blocking(SCAN_WAIT_MS)
             if finder.is_scanning():
                 note = "(still scanning — results may be incomplete)\n"
-        res = finder.search(q, page_size=_limit(limit))
+
+        if operation == "path":
+            res = finder.search(q, page_size=n)
+            lines = [
+                f"{item.relative_path}\t{score.total}"
+                for item, score in zip(res.items, res.scores)
+            ]
+        elif operation == "glob":
+            res = finder.glob(q, page_size=n)
+            lines = [
+                f"{item.relative_path}\t{score.total}"
+                for item, score in zip(res.items, res.scores)
+            ]
+        else:
+            kwargs = {
+                "mode": matcher,
+                "max_matches_per_file": n,
+                "page_limit": n,
+                "before_context": _context(context),
+                "after_context": _context(context),
+                "classify_definitions": True,
+            }
+            if operation == "multi":
+                patterns = [line.strip() for line in q.splitlines() if line.strip()]
+                res = finder.multi_grep(
+                    patterns,
+                    constraints=str(constraints).strip() if constraints else None,
+                    **kwargs,
+                )
+            else:
+                res = finder.grep(q, **kwargs)
+            lines = _format_grep(
+                res,
+                n,
+                definitions_first=operation in {"grep", "symbol", "multi"},
+            )
     except Exception:
-        # A dead engine (closed handle, bad mmap) is dropped so the next <find>
+        # A dead engine (closed handle, bad mmap) is dropped so the next call
         # rebuilds it instead of failing forever.
         _ENGINES.pop(key, None)
         return traceback.format_exc()
-    if not res.items:
+
+    if not lines:
         return f"{note}no matches for {q!r}"
-    lines = [
-        f"{item.relative_path}\t{score.total}"
-        for item, score in zip(res.items, res.scores)
-    ]
     return spill(note + "\n".join(lines), RESULT_CAP, tag="find", cwd=cwd)
 
 
@@ -134,7 +223,7 @@ def touch(world: Any, path: str) -> None:
         if live is not None:
             live.track_access(str(abs_path))
             return
-        finder = _new_finder(fff, cwd, watch=False)
+        finder = _new_finder(fff, cwd, watch=False, content=False)
         try:
             finder.track_access(str(abs_path))
         finally:

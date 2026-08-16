@@ -9,12 +9,10 @@ handle on a deleted tempdir.
 (a) typo round-trip: <find>mian.py</find> ranks src/main.py first.
 (b) watcher liveness: a file created after the scan settles is findable within
     5s (proves watch=True).
-(c) absent-module refusal: with fff shimmed out of sys.modules, <find> refuses
-    and names the build script instead of crashing or ranking nothing.
-(d) frecency ordering: <edit> alpha_two, then <find>alpha</find> ranks
-    alpha_two ahead of alpha_one — the behavioural tripwire for the vendored
-    track_access patch (revert it and touch() writes no frecency, so the
-    order falls back and this fails).
+(c) absent-module refusal names the build script.
+(d) frecency ordering proves edit touches reach fff.
+(e) the real dispatch path exposes glob, constrained/context grep,
+    definition-first symbol search, and constrained multi-pattern grep.
 """
 
 from __future__ import annotations
@@ -144,6 +142,50 @@ def _frecency_ordering() -> None:
             find_mod.reset()
 
 
+def _content_modes() -> None:
+    """The real dispatch path exposes fff's glob, grep, symbol, and multi modes."""
+    from desmos.state import find as find_mod
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        (root / "src").mkdir()
+        (root / "docs").mkdir()
+        (root / "src" / "alpha.py").write_text(
+            "def AlphaSymbol():\n"
+            "    return 'needle'\n"
+            "\n"
+            "value = AlphaSymbol()\n"
+        )
+        (root / "src" / "beta.ts").write_text("const BetaSymbol = 1;\n")
+        (root / "docs" / "note.txt").write_text("needle outside code\n")
+        world = _world(root)
+        try:
+            globbed = _find(world, "*.py", mode="glob")
+            assert "src/alpha.py" in globbed and "beta.ts" not in globbed, globbed
+
+            grep = _find(world, "src/ needle", mode="grep", context=1)
+            assert "src/alpha.py:2:" in grep and "| def AlphaSymbol():" in grep, grep
+            assert "docs/note.txt" not in grep, grep
+
+            symbols = _find(world, "AlphaSymbol", mode="symbol")
+            lines = [line for line in symbols.splitlines() if line and not line.startswith("(")]
+            assert lines and "[def]" in lines[0] and "def AlphaSymbol" in lines[0], symbols
+            assert any("value = AlphaSymbol()" in line for line in lines[1:]), symbols
+
+            multi = _find(
+                world,
+                "AlphaSymbol\nBetaSymbol",
+                mode="multi",
+                constraints="src/",
+            )
+            assert "alpha.py" in multi and "beta.ts" in multi, multi
+
+            invalid = _find(world, "x", mode="unknown")
+            assert "invalid mode" in invalid, invalid
+        finally:
+            find_mod.reset()
+
+
 def check() -> None:
     try:
         import fff  # noqa: F401
@@ -155,6 +197,7 @@ def check() -> None:
     _watcher_liveness()
     _absent_module_refusal()
     _frecency_ordering()
+    _content_modes()
     print("find check ok")
 
 

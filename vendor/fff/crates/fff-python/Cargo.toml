@@ -12,8 +12,9 @@ crate-type = ["cdylib"]
 
 [features]
 # Pure-Rust walker by default; zlob is opt-in (needs Zig).
-default = ["ripgrep"]
+default = ["ripgrep", "definitions"]
 ripgrep = ["fff/ripgrep", "fff-query-parser/ripgrep"]
+definitions = ["fff/definitions"]
 zlob = ["fff/zlob", "fff-query-parser/zlob"]
 
 [dependencies]
