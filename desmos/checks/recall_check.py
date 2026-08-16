@@ -25,7 +25,10 @@ def _probe_fork() -> bool:
     try:
         return (
             subprocess.run(
-                [recall.MEMEX, "search", "--source", "desmos", "--limit", "1"],
+                # A query token is required: without it the fork also exits
+                # nonzero (missing QUERY), so the probe could never see it. The
+                # fork answers `[]` for any query; stock clap-rejects --source.
+                [recall.MEMEX, "search", "__probe__", "--source", "desmos", "--limit", "1"],
                 capture_output=True,
                 timeout=recall.TIMEOUT,
             ).returncode

@@ -27,10 +27,21 @@ FORK_REV="${MEMEX_DESMOS_REV:-}"
 # The fork detector: stock memex clap-rejects an unknown --source; the fork
 # answers. Exit 0 == the desmos source exists. This is the same probe
 # desmos/state/recall.py and recall_check.py use.
-probe() { "$MEMEX" search --source desmos --limit 1 >/dev/null 2>&1; }
+# A query token is required: without it the fork also exits nonzero (missing
+# QUERY). The fork answers `[]` for any query; stock clap-rejects --source.
+probe() { "$MEMEX" search __probe__ --source desmos --limit 1 >/dev/null 2>&1; }
+
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+VENDOR_FORK="$REPO/vendor/memex"
 
 if probe; then
   echo "memex-setup: memex-desmos fork already on PATH ($("$MEMEX" --version 2>/dev/null || echo memex))"
+elif [ -f "$VENDOR_FORK/src/sources/desmos.rs" ] && command -v cargo >/dev/null 2>&1; then
+  # The fork lives vendored (a gitignored clone with SourceKind::Desmos added,
+  # same as build-fff-python.sh builds fff from vendor/fff). Build from it.
+  echo "memex-setup: building memex-desmos from $VENDOR_FORK"
+  cargo install --path "$VENDOR_FORK" --locked memex 2>/dev/null \
+    || cargo install --path "$VENDOR_FORK" memex
 else
   if [ -z "$FORK_REPO" ] || [ -z "$FORK_REV" ]; then
     cat >&2 <<'EOF'
