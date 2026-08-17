@@ -1290,11 +1290,16 @@ fn apply_session_choice(
             // The bridge owns persistence; reset through its public operation
             // instead of moving the SQLite database out from under it.
             if let Some(b) = bridge.as_mut() {
-                b.send(&json!({"op": "reset"}))?;
+                b.send(&json!({"op": "session"}))?;
             }
             app.notify("new session");
         }
-        session::Choice::Resume => {
+        session::Choice::Resume(id) => {
+            // The bridge is older than the choice, so the session is named to
+            // it now rather than read from the environment it launched with.
+            if let Some(b) = bridge.as_mut() {
+                b.send(&json!({"op": "session", "id": id}))?;
+            }
             let turns = app.session_picker.resumed_turns().to_vec();
             for turn in turns {
                 app.story_push(RenderBlock::user_prompt(turn.prompt));
@@ -9095,10 +9100,18 @@ mod tests {
         let mut app = App::new();
         app.ready = true;
         app.story_push(RenderBlock::user_prompt("old prompt"));
-        app.session_picker = session::SessionPicker::with_turns(vec![session::Turn {
-            prompt: "old prompt".into(),
-            speech: "old answer".into(),
-        }]);
+        app.session_picker = session::SessionPicker::with_sessions(
+            vec![session::SessionRow {
+                id: "0191aaaa".into(),
+                started_at: "2026-08-17T04:00:00".into(),
+                messages: 2,
+                preview: "earlier line".into(),
+            }],
+            vec![session::Turn {
+                prompt: "old prompt".into(),
+                speech: "old answer".into(),
+            }],
+        );
 
         apply_session_choice(None, &mut app, session::Choice::New).unwrap();
 
@@ -9110,12 +9123,20 @@ mod tests {
     fn choosing_resume_rebuilds_saved_turns_in_the_story() {
         let mut app = App::new();
         app.ready = true;
-        app.session_picker = session::SessionPicker::with_turns(vec![session::Turn {
-            prompt: "saved question".into(),
-            speech: "saved answer".into(),
-        }]);
+        app.session_picker = session::SessionPicker::with_sessions(
+            vec![session::SessionRow {
+                id: "0191aaaa".into(),
+                started_at: "2026-08-17T04:00:00".into(),
+                messages: 2,
+                preview: "saved question".into(),
+            }],
+            vec![session::Turn {
+                prompt: "saved question".into(),
+                speech: "saved answer".into(),
+            }],
+        );
 
-        apply_session_choice(None, &mut app, session::Choice::Resume).unwrap();
+        apply_session_choice(None, &mut app, session::Choice::Resume("0191aaaa".into())).unwrap();
 
         let screen = paint(&mut app, 100, 30);
         assert!(screen.contains("saved question"), "prompt was not resumed:\n{screen}");
@@ -9126,17 +9147,25 @@ mod tests {
     fn rendered_entry_point_wires_picker_enter_to_resume() {
         let mut app = App::new();
         app.ready = true;
-        app.session_picker = session::SessionPicker::with_turns(vec![session::Turn {
-            prompt: "entry point question".into(),
-            speech: "entry point answer".into(),
-        }]);
+        app.session_picker = session::SessionPicker::with_sessions(
+            vec![session::SessionRow {
+                id: "0191aaaa".into(),
+                started_at: "2026-08-17T04:00:00".into(),
+                messages: 2,
+                preview: "entry point question".into(),
+            }],
+            vec![session::Turn {
+                prompt: "entry point question".into(),
+                speech: "entry point answer".into(),
+            }],
+        );
 
         let picker = paint(&mut app, 100, 30);
-        assert!(picker.contains("Resume transcript"), "startup picker not rendered:\n{picker}");
+        assert!(picker.contains("Which session?"), "startup picker not rendered:\n{picker}");
         handle_key(None, &mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)).unwrap();
         let resumed = paint(&mut app, 100, 30);
         assert!(resumed.contains("entry point question"), "Enter was not wired to resume:\n{resumed}");
-        assert!(!resumed.contains("Continue where you left off?"));
+        assert!(!resumed.contains("Which session?"));
     }
 
     /// The x of a tab label in the git title strip, laid out as `draw_git` does.
