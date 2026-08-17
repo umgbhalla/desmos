@@ -327,6 +327,11 @@ def turn(
     built = cached_payload(
         world.model, system, messages, max_tokens, thinking=world.thinking
     )
+    # The tail this request carried is spent: a lifetime counts renders, and
+    # the render already happened above.
+    from desmos.kernel.catalog import expire as _expire
+
+    _expire(world)
     req = {k: v for k, v in built.items() if k != "_betas"}
     fire(
         {

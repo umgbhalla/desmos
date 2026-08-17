@@ -73,6 +73,37 @@ def todo_digest(text: str) -> str:
 VOLATILE_VIEW = {"todo": todo_digest}
 
 
+def inject(world: World, name: str, text: str, turns: int = 1) -> str:
+    """Put a named block in the next turn's uncached tail.
+
+    turns counts renders: 1 is the next request only, and 0 or less stays
+    until retired. Editing the middle of a cached prefix destroys it, so a
+    steering block belongs here and nowhere else.
+    """
+    world.injections[str(name)] = {"text": str(text), "turns": int(turns)}
+    return str(name)
+
+
+def retire(world: World, name: str) -> bool:
+    """Drop a named block before its lifetime runs out."""
+    return world.injections.pop(str(name), None) is not None
+
+
+def expire(world: World) -> list[str]:
+    """One turn spent. Returns the names that just fell out."""
+    gone = []
+    for name, item in list(world.injections.items()):
+        turns = int(item.get("turns") or 0)
+        if turns <= 0:
+            continue
+        if turns <= 1:
+            world.injections.pop(name, None)
+            gone.append(name)
+        else:
+            item["turns"] = turns - 1
+    return gone
+
+
 def volatile(world: World, delta: str = "") -> str:
     """Per-turn mutable state, deliberately outside the cached prefix."""
     parts = []
@@ -89,6 +120,10 @@ def volatile(world: World, delta: str = "") -> str:
         view = VOLATILE_VIEW.get(key, str)(raw)
         if view.strip():
             parts.append(f"[{key}]\n{view}")
+    for name, item in world.injections.items():
+        body = str(item.get("text") or "").strip()
+        if body:
+            parts.append(f"[{name}]\n{body}")
     if delta.strip():
         parts.append(CATALOG_DELTA_HEADER + "\n" + delta)
     return VOLATILE_MARKER + "\n" + "\n".join(parts) if parts else ""

@@ -44,6 +44,9 @@ class World:
     #: When this world last reconciled shared workspace state, so a save
     #: can tell another session's newer row from one this world retired.
     synced_at: str = ""
+    #: Named blocks rendered into the uncached system tail, each with a
+    #: lifetime in turns. Volatile by definition: never persisted.
+    injections: dict[str, dict] = field(default_factory=dict)
     session_message_start: int = 0
     session_prior_start: int = 0
     # The catalog text as first sent this run. Frozen so a mid-run <register>,

@@ -342,6 +342,7 @@ def check() -> None:
         _check_session_lineage(cwd)
         _check_session_channel(cwd)
         _check_single_writer(cwd)
+        _check_injections(cwd)
         _check_quarantine_manifest()
         _check_prune_manifest()
         _check_salvage()
@@ -1006,3 +1007,30 @@ def _check_session_channel(cwd: Path) -> None:
         assert db.execute(
             "SELECT COUNT(*) FROM active_runs WHERE run_id = ?", (peer_id,)
         ).fetchone()[0] == 0
+
+
+def _check_injections(cwd: Path) -> None:
+    """Named injections render into the uncached system tail and expire."""
+    from desmos.kernel.catalog import expire, inject, retire
+    from desmos.transport.complete import split_system
+
+    home = cwd / "inject"
+    home.mkdir()
+    world = new_world(home, state_path=home / "harness.sqlite3", persist=False)
+
+    inject(world, "steer", "prefer the smaller edit", turns=1)
+    inject(world, "wake", "you are seat one", turns=0)
+    abi, cat, tail = split_system(system_prompt(world))
+    assert "[steer]" in tail and "prefer the smaller edit" in tail, tail[-400:]
+    assert "you are seat one" in tail, tail[-400:]
+    assert "prefer the smaller edit" not in abi + cat
+
+    assert expire(world) == ["steer"], world.injections
+    _, _, tail = split_system(system_prompt(world))
+    assert "prefer the smaller edit" not in tail
+    assert "you are seat one" in tail
+    assert expire(world) == []
+    assert retire(world, "wake") is True
+    _, _, tail = split_system(system_prompt(world))
+    assert "you are seat one" not in tail
+    print("injection check ok")
