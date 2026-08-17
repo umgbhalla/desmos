@@ -40,6 +40,9 @@ DIRECT_OPS = {
 }
 
 
+FAMILIES = tuple(dict.fromkeys(tuple(ROUTES) + tuple(DIRECT_OPS)))
+
+
 def operations(family):
     return tuple(ROUTES.get(family, ())) + DIRECT_OPS.get(family, ())
 
@@ -210,6 +213,8 @@ def _observe(world, op, body, attrs):
             return existing
         from desmos.kernel import prices
         from desmos.state import persist
+        if body.strip().lower() in {"ops", "op"}:
+            return _op_rollup(world, persist)
         totals = prices.totals([event.get("usage") or {} for event in world.log])
         cost = sum(prices.cost(event.get("usage") or {}, world.model or "") for event in world.log)
         return f"run {persist.run_id()}  {len(world.log)} calls  in={totals['input_tokens']} out={totals['output_tokens']} cost=${cost:.4f}"
@@ -380,3 +385,19 @@ def _session(world, op, body, attrs):
     if not callable(switch_fn):
         return "session switch: unavailable"
     return str(switch_fn(model, attrs.get("effort")))
+
+
+def _op_rollup(world, persist):
+    """Which advertised ops earn their catalog line, and which never ran."""
+    rows = persist.op_rollup(world)
+    seen = {name for name, _ in rows}
+    idle = [
+        f"{family} {name}"
+        for family in FAMILIES
+        for name in operations(family)
+        if f"{family} {name}" not in seen
+    ]
+    lines = [f"{count:>5}  {name}" for name, count in rows]
+    if idle:
+        lines.append("never called: " + ", ".join(idle))
+    return "\n".join(lines) or "no calls recorded"

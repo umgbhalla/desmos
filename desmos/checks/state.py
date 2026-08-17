@@ -344,6 +344,7 @@ def check() -> None:
         _check_single_writer(cwd)
         _check_injections(cwd)
         _check_steer(cwd)
+        _check_op_rollup(cwd)
         _check_quarantine_manifest()
         _check_prune_manifest()
         _check_salvage()
@@ -1071,3 +1072,28 @@ def _check_steer(cwd: Path) -> None:
     assert carrier["content"][2]["text"] == "guidance: keep going"
     assert world.steers == [], world.steers
     print("steer check ok")
+
+
+def _check_op_rollup(cwd: Path) -> None:
+    """observe usage ops counts real calls and names the ops nothing used."""
+    from desmos.state import persist
+
+    home = cwd / "rollup"
+    home.mkdir()
+    world = new_world(home, state_path=home / "harness.sqlite3")
+    calls = (("exec", "python"), ("exec", "python"), ("workspace", "edit"))
+    for tag, op in calls:
+        persist.record_event(
+            world,
+            {"ev": "result", "phase": "done", "tag": tag, "attrs": {"op": op}},
+            ts_ms=0,
+            mono_ns=0,
+        )
+    out = dispatch(world, Block("observe", "ops", {"op": "usage"}))
+    assert "2  exec python" in out, out
+    assert "1  workspace edit" in out, out
+    assert "never called:" in out, out
+    idle = out.split("never called:")[1]
+    assert "harness rollback" in idle and "exec bash" in idle, idle
+    assert "exec python" not in idle, idle
+    print("op rollup check ok")

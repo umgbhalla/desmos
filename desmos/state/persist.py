@@ -2002,3 +2002,44 @@ def load(world: World) -> None:
         conn.close()
     # After the write lock is released: record_event opens its own connection.
     _report_quarantines(world, path)
+
+
+def op_rollup(world: World) -> list[tuple[str, int]]:
+    """Calls per family/op across this session's line of descent."""
+    if not world.persist:
+        return []
+    import ast
+    from collections import Counter
+
+    db = _open(state_file(world))
+    try:
+        workspace = _workspace_id(db, world, create=False)
+        if workspace is None:
+            return []
+        chain = _lineage(db, _session_id(db, world, workspace))
+        slots = ",".join("?" for _ in chain)
+        rows = db.execute(
+            "SELECT payload_json FROM events WHERE kind = 'result'"
+            f" AND session_id IN ({slots})",
+            chain,
+        ).fetchall()
+    finally:
+        db.close()
+    counts: Counter[str] = Counter()
+    for row in rows:
+        try:
+            payload = json.loads(row[0])
+        except ValueError:
+            continue
+        if payload.get("phase") != "done":
+            continue
+        attrs = payload.get("attrs") or {}
+        if isinstance(attrs, str):
+            try:
+                attrs = ast.literal_eval(attrs)
+            except (ValueError, SyntaxError):
+                attrs = {}
+        tag = str(payload.get("tag") or "?")
+        op = str((attrs or {}).get("op") or "")
+        counts[f"{tag} {op}".strip()] += 1
+    return counts.most_common()
