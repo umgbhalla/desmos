@@ -565,6 +565,7 @@ def apply_stream_event(
         return
     if kind == "content_block_stop":
         idx = int(ev.get("index") or 0)
+        state.setdefault("closed", set()).add(idx)
         blocks = state.get("blocks") or []
         if 0 <= idx < len(blocks) and isinstance(blocks[idx], dict):
             block = blocks[idx]
@@ -619,6 +620,21 @@ def iter_sse_lines(resp: Any) -> Iterable[Any]:
         if not line:
             return
         yield line
+
+
+def drop_unfinished_calls(state: dict[str, Any]) -> int:
+    """Cut an aborted stream back to the last content_block_stop -- for calls."""
+    closed = set(state.get("closed") or ())
+    kept: list[Any] = []
+    dropped = 0
+    for i, block in enumerate(state.get("blocks") or []):
+        cut = isinstance(block, dict) and i not in closed
+        if cut and (block.get("type") == "tool_use" or not block.get("type")):
+            dropped += 1
+            continue
+        kept.append(block)
+    state["blocks"] = kept
+    return dropped
 
 
 def read_sse(
@@ -677,6 +693,12 @@ def read_sse(
         return msg
     if not saw_stop and not (should_stop is not None and should_stop()):
         raise RuntimeError("Anthropic stream ended before message_stop")
+    if not saw_stop:
+        # Aborted. A tool_use whose JSON never finished is a call the model
+        # never got to ask for: dispatching it answers an empty body, and
+        # replaying it makes the model read a call it did not write. Speech
+        # and thinking up to the cut are real, and they stay.
+        drop_unfinished_calls(state)
     return assemble_message(state)
 
 

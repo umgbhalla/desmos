@@ -24,6 +24,7 @@ from desmos.complete import (
     assemble_message,
     assistant_content,
     cached_payload,
+    read_sse,
     tool_result_text,
     wire_content,
 )
@@ -300,5 +301,59 @@ def self_check() -> None:
     _check_replay()
     _check_orphans()
     _check_stream()
+    _check_abort()
     _check_loop()
     print("anthropic tool syscall check ok")
+
+
+def _abort_events(closed: bool) -> list[dict[str, Any]]:
+    lt = chr(60)
+    evs: list[dict[str, Any]] = [
+        {"type": "message_start", "message": {"role": "assistant", "content": []}},
+        {"type": "content_block_start", "index": 0,
+         "content_block": {"type": "text", "text": "running "}},
+        {"type": "content_block_delta", "index": 0,
+         "delta": {"type": "text_delta", "text": "the check"}},
+        {"type": "content_block_stop", "index": 0},
+    ]
+    evs.append({"type": "content_block_start", "index": 1,
+                "content_block": {"type": "tool_use", "id": "toolu_5",
+                                  "name": "syscall", "input": {}}})
+    partial = json.dumps({"input": lt + "python>1" + lt + "/python>"})
+    if not closed:
+        partial = partial[:14]
+    evs.append({"type": "content_block_delta", "index": 1,
+                "delta": {"type": "input_json_delta", "partial_json": partial}})
+    if closed:
+        evs.append({"type": "content_block_stop", "index": 1})
+    return evs
+
+
+def _check_abort() -> None:
+    """A stop mid-call cuts back to the last content_block_stop."""
+
+    def run(evs: list[dict[str, Any]]) -> dict[str, Any]:
+        lines: list[str] = []
+        for ev in evs:
+            lines.append("event: " + ev["type"])
+            lines.append("data: " + json.dumps(ev))
+            lines.append("")
+        cut = {"now": False}
+
+        def feed() -> Iterator[str]:
+            for i, line in enumerate(lines):
+                if i == len(lines) - 1:
+                    cut["now"] = True
+                yield line
+
+        return read_sse(feed(), should_stop=lambda: cut["now"])
+
+    cut = run(_abort_events(closed=False))
+    assert [b.get("type") for b in cut["content"]] == ["text"], cut
+    assert cut["content"][0]["text"] == "running the check", cut
+    assert syscall_call(cut["content"]) is None, cut
+
+    whole = run(_abort_events(closed=True))
+    kinds = [b.get("type") for b in whole["content"]]
+    assert kinds == ["text", "tool_use"], kinds
+    assert syscall_body(syscall_call(whole["content"])).startswith(chr(60)), whole
