@@ -7,7 +7,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
-from desmos.kernel.catalog import advertised_names, header, ns_names, system_prompt
+from desmos.kernel.catalog import (
+    advertised_names,
+    drain_steers,
+    header,
+    ns_names,
+    system_prompt,
+)
 from desmos.kernel.const import FROZEN, MAX_TOKENS, PRIOR_KEEP
 from desmos.kernel.dispatch import dispatch
 from desmos.kernel.diagnostics import install_diagnostics
@@ -199,6 +205,20 @@ def result_content(
     if call["type"] == "tool_use":
         return [{"type": "tool_result", "tool_use_id": call["id"], "content": output}]
     return [{"type": "custom_tool_call_output", "call_id": call["call_id"], "output": output}]
+
+
+def deliver(world, text: str) -> None:
+    """Hand the model a line without opening a second user turn."""
+    msgs = world.messages
+    if msgs and msgs[-1].get("role") == "user":
+        content = msgs[-1].get("content")
+        if isinstance(content, str):
+            msgs[-1]["content"] = content + "\n\n" + text
+            return
+        if isinstance(content, list):
+            content.append({"type": "text", "text": text})
+            return
+    msgs.append({"role": "user", "content": text})
 
 
 _BUILTIN_DOCS = (
@@ -958,11 +978,14 @@ def _run_turns(
             )
         # A syscall in this batch may have handed work to a monitor. Say so now,
         # while the turn is still running, rather than at the park.
+        for line in drain_steers(world):
+            deliver(world, line)
+            emit({"ev": "steer", "n": n, "text": line})
         emit_pending()
         # After the results, never before: the note explains what did not run,
         # and reads as nonsense ahead of the output of what did.
         if cut_note:
-            world.messages.append({"role": "user", "content": cut_note})
+            deliver(world, cut_note)
             emit({"ev": "error", "n": n, "text": cut_note})
             if not quiet:
                 print(cut_note)
@@ -972,7 +995,7 @@ def _run_turns(
                 # the model's own tags, whichever results happened to run, and
                 # nothing saying it had been interrupted -- which reads as work
                 # that finished.
-                world.messages.append({"role": "user", "content": stop_note(n)})
+                deliver(world, stop_note(n))
                 _commit_step(world, prompt, speech)
                 return speech
             # The model stopped calling syscalls, but background work it started
@@ -990,7 +1013,7 @@ def _run_turns(
                 landed = pending.wait_next(world, stop=stopped, interrupt=has_input)
                 if landed:
                     text = pending.notice(landed)
-                    world.messages.append({"role": "user", "content": text})
+                    deliver(world, text)
                     # Durable before delivered: commit saves the transcript
                     # that now carries the notice, THEN renames the handoff
                     # files into delivered/. A kill anywhere in this stretch
@@ -1007,7 +1030,7 @@ def _run_turns(
         if on_continue is not None:
             reminder = on_continue(n)
             if reminder:
-                world.messages.append({"role": "user", "content": reminder})
+                deliver(world, reminder)
                 emit({"ev": "guidance", "n": n, "text": reminder})
     # Only reachable when a caller asked for a turn cap. Same for it as for the
     # rest: it was printed, and the bridge runs quiet=True, so the only signal

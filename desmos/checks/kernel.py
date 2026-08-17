@@ -783,8 +783,8 @@ def check() -> None:
         _run(w_ord, "batch then stop", quiet=True, on_event=stop_after_first, should_stop=lambda: halt["go"])
         tail = [m["role"] for m in w_ord.messages]
         # user prompt, assistant turn, its results, then the stop marker.
-        assert tail == ["user", "assistant", "user", "user"], tail
-        assert "<result" in str(w_ord.messages[-2]["content"]), "a stop must not eat results that ran"
+        assert tail == ["user", "assistant", "user"], tail
+        assert "<result" in str(w_ord.messages[-1]["content"]), "a stop must not eat results that ran"
         assert "stopped by the user" in str(w_ord.messages[-1]["content"]), w_ord.messages[-1]
 
         # A backgrounded grandchild inherits stdout and can hold the pipe open
@@ -915,9 +915,12 @@ def check() -> None:
             if m.get("role") == "user"
         ]
         note_at = [i for i, x in rows if "python (no closing tag)" in x]
-        res_at = [i for i, x in rows if "hi" in x and "no closing tag" not in x]
+        res_at = [i for i, x in rows if "hi" in x]
         assert note_at and res_at, (note_at, res_at, rows)
-        assert min(note_at) > max(res_at), (note_at, res_at)
+        assert min(note_at) >= max(res_at), (note_at, res_at)
+        if min(note_at) == max(res_at):
+            joined = dict(rows)[min(note_at)]
+            assert joined.index("no closing tag") > joined.index("hi"), joined
         assert any("result block" in x for _, x in rows), rows
 
         # Hitting the cap is not finishing either.

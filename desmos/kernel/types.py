@@ -47,6 +47,7 @@ class World:
     #: Named blocks rendered into the uncached system tail, each with a
     #: lifetime in turns. Volatile by definition: never persisted.
     injections: dict[str, dict] = field(default_factory=dict)
+    steers: list[str] = field(default_factory=list)
     session_message_start: int = 0
     session_prior_start: int = 0
     # The catalog text as first sent this run. Frozen so a mid-run <register>,

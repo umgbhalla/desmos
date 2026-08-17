@@ -104,6 +104,21 @@ def expire(world: World) -> list[str]:
     return gone
 
 
+def steer(world: World, text: str) -> int:
+    """Queue a line for the model to read at its next result."""
+    line = str(text).strip()
+    if line:
+        world.steers.append(line)
+    return len(world.steers)
+
+
+def drain_steers(world: World) -> list[str]:
+    """Take everything queued. The caller owns delivery."""
+    queued = list(world.steers)
+    world.steers.clear()
+    return queued
+
+
 def volatile(world: World, delta: str = "") -> str:
     """Per-turn mutable state, deliberately outside the cached prefix."""
     parts = []

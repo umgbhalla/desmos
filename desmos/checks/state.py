@@ -343,6 +343,7 @@ def check() -> None:
         _check_session_channel(cwd)
         _check_single_writer(cwd)
         _check_injections(cwd)
+        _check_steer(cwd)
         _check_quarantine_manifest()
         _check_prune_manifest()
         _check_salvage()
@@ -1034,3 +1035,39 @@ def _check_injections(cwd: Path) -> None:
     _, _, tail = split_system(system_prompt(world))
     assert "you are seat one" not in tail
     print("injection check ok")
+
+
+def _check_steer(cwd: Path) -> None:
+    """A steer rides in the carrier that answers the call already in flight."""
+    from desmos.kernel.catalog import steer
+    from desmos.kernel.loop import run_turns
+
+    home = cwd / "steer"
+    home.mkdir()
+    world = new_world(home, state_path=home / "harness.sqlite3", persist=False)
+    world.model = "claude-opus-5"
+    lt = chr(60)
+
+    def fake(_model, _system, messages, _max_tokens):
+        if len(messages) <= 1:
+            steer(world, "switch to the smaller file")
+            body = lt + "python>print(1)" + lt + "/python>"
+            call = {"type": "tool_use", "id": "toolu_1", "name": "syscall",
+                    "input": {"input": body}}
+            return {"content": [call], "usage": {}}
+        return {"content": [{"type": "text", "text": "done"}], "usage": {}}
+
+    world.complete_fn = fake
+    run_turns(world, "go", quiet=True, on_continue=lambda n: "guidance: keep going")
+
+    roles = [m["role"] for m in world.messages]
+    pairs = list(zip(roles, roles[1:]))
+    assert ("user", "user") not in pairs, roles
+    carrier = world.messages[2]
+    assert carrier["role"] == "user", carrier
+    kinds = [b.get("type") for b in carrier["content"]]
+    assert kinds == ["tool_result", "text", "text"], kinds
+    assert carrier["content"][1]["text"] == "switch to the smaller file"
+    assert carrier["content"][2]["text"] == "guidance: keep going"
+    assert world.steers == [], world.steers
+    print("steer check ok")
