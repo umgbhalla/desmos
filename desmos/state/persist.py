@@ -25,7 +25,7 @@ from desmos.kernel.types import Tool, World
 _UMASK = os.umask(0)
 os.umask(_UMASK)
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 #: One attach, one id, across SQL, provider routing, cache, presence, and wire.
 #: The environment survives reload_sdk; a new process gets a new session.
 SESSION_ID_ENV = "DESMOS_SESSION_ID"
@@ -447,19 +447,6 @@ CREATE TABLE IF NOT EXISTS workspaces (
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
-CREATE TABLE IF NOT EXISTS seats (
-    id TEXT PRIMARY KEY,
-    workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
-    slug TEXT NOT NULL,
-    name TEXT NOT NULL DEFAULT '',
-    charter TEXT NOT NULL DEFAULT '',
-    born_gen INTEGER NOT NULL DEFAULT 0,
-    status TEXT NOT NULL DEFAULT 'active'
-        CHECK (status IN ('active', 'retired')),
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL,
-    UNIQUE (workspace_id, slug)
-);
 CREATE TABLE IF NOT EXISTS sessions (
     id TEXT PRIMARY KEY,
     workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
@@ -571,8 +558,6 @@ CREATE INDEX IF NOT EXISTS idx_sessions_workspace
     ON sessions(workspace_id, started_at);
 CREATE INDEX IF NOT EXISTS idx_channel_messages
     ON channel_messages(workspace_id, channel, id);
-CREATE INDEX IF NOT EXISTS idx_seats_workspace
-    ON seats(workspace_id, status, slug);
 """
 
 
@@ -605,6 +590,21 @@ def _add_column(
     return True
 
 
+def _drop_seat_scaffold(conn: sqlite3.Connection) -> None:
+    """Retire a seat schema that landed before the seat was declared.
+
+    The constitution (B2) forbids seat storage before the seat's fields,
+    lifecycle and reset behaviour are written down and reviewed. The plural
+    `seats` table and `sessions.seat_id` arrived on a shared file with none of
+    that, no CRUD anywhere, and no rows. They go back out until the design is.
+    """
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(sessions)")}
+    if "seat_id" in columns:
+        conn.execute("ALTER TABLE sessions DROP COLUMN seat_id")
+    conn.execute("DROP INDEX IF EXISTS idx_seats_workspace")
+    conn.execute("DROP TABLE IF EXISTS seats")
+
+
 def _migrate(conn: sqlite3.Connection) -> None:
     """Create the current schema; old layouts are intentionally unsupported."""
     existing = {
@@ -617,9 +617,7 @@ def _migrate(conn: sqlite3.Connection) -> None:
     conn.execute("BEGIN IMMEDIATE")
     try:
         _execute_schema(conn)
-        _add_column(
-            conn, "sessions", "seat_id", "TEXT REFERENCES seats(id) ON DELETE SET NULL"
-        )
+        _drop_seat_scaffold(conn)
         for shared in ("notes", "tools"):
             _add_column(conn, shared, "updated_at", "TEXT NOT NULL DEFAULT ''")
         versions = [
