@@ -41,6 +41,9 @@ class World:
     messages: list[dict[str, Any]] = field(default_factory=list)
     # Prefixes inherited from prior sessions. save() writes only the suffix
     # born in this attach, preserving message provenance across restarts.
+    #: When this world last reconciled shared workspace state, so a save
+    #: can tell another session's newer row from one this world retired.
+    synced_at: str = ""
     session_message_start: int = 0
     session_prior_start: int = 0
     # The catalog text as first sent this run. Frozen so a mid-run <register>,

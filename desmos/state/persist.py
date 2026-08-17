@@ -25,7 +25,7 @@ from desmos.kernel.types import Tool, World
 _UMASK = os.umask(0)
 os.umask(_UMASK)
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 #: One attach, one id, across SQL, provider routing, cache, presence, and wire.
 #: The environment survives reload_sdk; a new process gets a new session.
 SESSION_ID_ENV = "DESMOS_SESSION_ID"
@@ -491,6 +491,7 @@ CREATE TABLE IF NOT EXISTS notes (
     workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
     name TEXT NOT NULL,
     body TEXT NOT NULL,
+    updated_at TEXT NOT NULL DEFAULT '',
     PRIMARY KEY (workspace_id, name)
 );
 CREATE TABLE IF NOT EXISTS tools (
@@ -499,6 +500,7 @@ CREATE TABLE IF NOT EXISTS tools (
     doc TEXT NOT NULL,
     source TEXT,
     frozen INTEGER NOT NULL CHECK (frozen IN (0, 1)),
+    updated_at TEXT NOT NULL DEFAULT '',
     PRIMARY KEY (workspace_id, name)
 );
 CREATE TABLE IF NOT EXISTS calls (
@@ -618,6 +620,8 @@ def _migrate(conn: sqlite3.Connection) -> None:
         _add_column(
             conn, "sessions", "seat_id", "TEXT REFERENCES seats(id) ON DELETE SET NULL"
         )
+        for shared in ("notes", "tools"):
+            _add_column(conn, shared, "updated_at", "TEXT NOT NULL DEFAULT ''")
         versions = [
             int(row[0])
             for row in conn.execute(
@@ -807,8 +811,27 @@ def _save_data(conn: sqlite3.Connection, world: World, data: dict[str, Any]) -> 
                 "DELETE FROM history_fts WHERE session_id = ? AND kind = 'prior'",
                 (session,),
             )
-        for table in ("notes", "tools"):
-            conn.execute(f"DELETE FROM {table} WHERE workspace_id = ?", (workspace,))
+        # A workspace is shared. Deleting every row and rewriting only the ones
+        # this world happens to hold erases whatever another session wrote
+        # since this one loaded, in silence. Retire what this world could have
+        # seen and has dropped; leave anything newer than its view alone.
+        watermark = str(world.synced_at or now)
+        for table, held in (
+            ("notes", set(data["notes"])),
+            ("tools", set(data["docs"]) | set(data["tools"])),
+        ):
+            rows = conn.execute(
+                f"SELECT name, updated_at FROM {table} WHERE workspace_id = ?",
+                (workspace,),
+            ).fetchall()
+            for row in rows:
+                name = str(row["name"])
+                if name in held or str(row["updated_at"] or "") > watermark:
+                    continue
+                conn.execute(
+                    f"DELETE FROM {table} WHERE workspace_id = ? AND name = ?",
+                    (workspace, name),
+                )
 
         for seq, item in enumerate(data["messages"]):
             if not isinstance(item, dict) or item.get("role") not in {"user", "assistant"}:
@@ -857,15 +880,18 @@ def _save_data(conn: sqlite3.Connection, world: World, data: dict[str, Any]) -> 
         for name, body in data["notes"].items():
             if isinstance(body, str):
                 conn.execute(
-                    "INSERT INTO notes(workspace_id, name, body) VALUES (?, ?, ?)",
-                    (workspace, str(name), body),
+                    "INSERT OR REPLACE INTO"
+                    " notes(workspace_id, name, body, updated_at)"
+                    " VALUES (?, ?, ?, ?)",
+                    (workspace, str(name), body, now),
                 )
         for name, doc in data["docs"].items():
             if isinstance(doc, str):
                 conn.execute(
-                    "INSERT INTO tools(workspace_id, name, doc, source, frozen)"
-                    " VALUES (?, ?, ?, NULL, 1)",
-                    (workspace, str(name), doc),
+                    "INSERT OR REPLACE INTO"
+                    " tools(workspace_id, name, doc, source, frozen, updated_at)"
+                    " VALUES (?, ?, ?, NULL, 1, ?)",
+                    (workspace, str(name), doc, now),
                 )
         for name, spec in data["tools"].items():
             if not isinstance(spec, dict):
@@ -873,10 +899,12 @@ def _save_data(conn: sqlite3.Connection, world: World, data: dict[str, Any]) -> 
             doc, source = spec.get("doc"), spec.get("source")
             if isinstance(doc, str) and (isinstance(source, str) or source is None):
                 conn.execute(
-                    "INSERT INTO tools(workspace_id, name, doc, source, frozen)"
-                    " VALUES (?, ?, ?, ?, 0)",
-                    (workspace, str(name), doc, source),
+                    "INSERT OR REPLACE INTO"
+                    " tools(workspace_id, name, doc, source, frozen, updated_at)"
+                    " VALUES (?, ?, ?, ?, 0, ?)",
+                    (workspace, str(name), doc, source, now),
                 )
+        world.synced_at = now
         conn.commit()
     except BaseException:
         conn.rollback()
@@ -1967,6 +1995,7 @@ def load(world: World) -> None:
         conn.commit()
         if data is not None:
             _apply_data(world, data)
+        world.synced_at = datetime.now(timezone.utc).isoformat()
         announce(world, conn)
     except BaseException:
         conn.rollback()
