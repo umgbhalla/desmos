@@ -1365,6 +1365,14 @@ def reload_sdk(world: World | None = None) -> str:
         importlib.reload(mod)
         reloaded.append(name)
     if world is not None:
+        from desmos.kernel.types import World as _World
+
+        fresh = _World()
+        for name, value in vars(fresh).items():
+            if not hasattr(world, name):
+                setattr(world, name, value)
+        world.__class__ = _World
+
         from desmos.kernel.loop import bind_step as _bind
         from desmos.kernel.loop import reload as _reload
         from desmos.kernel.loop import seed_builtins as _seed

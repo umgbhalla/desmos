@@ -1139,7 +1139,15 @@ def check() -> None:
         rec_before = rec_file.read_bytes()
         assert b"the sky is mauve" in rec_before
 
+        # A live World predating a dataclass field keeps its old __dict__.
+        # Reload must supply new defaults before any reloaded code reads it.
+        del w_id.injections
+        del w_id.steers
         _reload_sdk(w_id)
+        from desmos.kernel.types import World as _CurrentWorld
+
+        assert isinstance(w_id, _CurrentWorld), "reload_sdk left the live World on the old class"
+        assert w_id.injections == {} and w_id.steers == [], "reload_sdk missed new World defaults"
         assert w_id.ns.get("keepsake") == 42, "reload_sdk wiped ns"
         assert w_id.notes.get("identity-note") == "identity doctrine", "reload_sdk wiped notes"
         assert [m["content"] for m in w_id.messages] == ["kept line", "kept reply"], (
