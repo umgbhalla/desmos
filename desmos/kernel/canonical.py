@@ -31,7 +31,7 @@ DIRECT_TARGETS = {
 DIRECT_OPS = {
     "workspace": ("read", "see", "commit"),
     "knowledge": ("todo", "plan"),
-    "observe": ("usage", "trajectory", "error", "symbol", "threads"),
+    "observe": ("usage", "slice", "trajectory", "error", "symbol", "threads"),
     "agents": (
         "spawn", "fanout", "resume", "lineage",
         "status", "result", "structured-result", "judgment", "wait",
@@ -218,6 +218,8 @@ def _observe(world, op, body, attrs):
         totals = prices.totals([event.get("usage") or {} for event in world.log])
         cost = sum(prices.cost(event.get("usage") or {}, world.model or "") for event in world.log)
         return f"run {persist.run_id()}  {len(world.log)} calls  in={totals['input_tokens']} out={totals['output_tokens']} cost=${cost:.4f}"
+    if op == "slice":
+        return _slice(world, body)
     if op == "trajectory":
         existing = _legacy(world, "traj", body, attrs)
         if existing is not None:
@@ -401,3 +403,62 @@ def _op_rollup(world, persist):
     if idle:
         lines.append("never called: " + ", ".join(idle))
     return "\n".join(lines) or "no calls recorded"
+
+
+def _attrs(value):
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str) and value.strip():
+        import ast
+        try:
+            parsed = ast.literal_eval(value)
+        except (ValueError, SyntaxError):
+            return {}
+        if isinstance(parsed, dict):
+            return parsed
+    return {}
+
+
+def _render_exchange(events):
+    lines = []
+    speech = []
+
+    def flush():
+        if speech:
+            lines.append("said: " + " ".join("".join(speech).split())[:600])
+            speech.clear()
+
+    for event in events:
+        kind = event.get("kind")
+        text = str(event.get("text") or "")
+        if kind == "prompt":
+            lines.append("user: " + " ".join(text.split())[:400])
+        elif kind == "speech":
+            speech.append(text)
+        elif kind == "result" and event.get("phase") == "done":
+            flush()
+            attrs = _attrs(event.get("attrs"))
+            op = str(attrs.get("op") or "")
+            head = " ".join(str(event.get("text") or "").split())[:300]
+            lines.append(f"call {event.get('tag')} {op}".rstrip() + ": " + head)
+    flush()
+    return "\n".join(lines) or "exchange recorded no speech or calls"
+
+
+def _slice(world, body):
+    """The folded record, by exchange. Empty body is the index."""
+    from desmos.state import persist
+
+    raw = body.strip()
+    index = persist.exchange_index(world)
+    if not raw:
+        if not index:
+            return "no exchanges recorded"
+        return "\n".join(f"{item['n']:>3}. {item['text'][:110]}" for item in index)
+    if not raw.isdigit():
+        return "observe slice: body is an exchange number, or empty for the index"
+    n = int(raw)
+    events = persist.exchange_events(world, n)
+    if not events:
+        return f"observe slice: no exchange {n} (the index holds {len(index)})"
+    return _render_exchange(events)

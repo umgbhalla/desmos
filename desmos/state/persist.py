@@ -2043,3 +2043,80 @@ def op_rollup(world: World) -> list[tuple[str, int]]:
         op = str((attrs or {}).get("op") or "")
         counts[f"{tag} {op}".strip()] += 1
     return counts.most_common()
+
+
+def _lineage_chain(conn, world):
+    """This world's session line of descent, oldest first."""
+    workspace = _workspace_id(conn, world, create=False)
+    if workspace is None:
+        return []
+    session = _session_id(conn, world, workspace, create=False)
+    return _lineage(conn, session) if session else []
+
+
+def exchange_index(world: World) -> list[dict[str, Any]]:
+    """Every prompt in this line of descent, folded out of memory or not."""
+    if not world.persist:
+        return []
+    conn = _open(state_file(world))
+    try:
+        chain = _lineage_chain(conn, world)
+        if not chain:
+            return []
+        slots = ",".join("?" for _ in chain)
+        rows = conn.execute(
+            "SELECT events.session_id AS sid, events.seq AS seq,"
+            " events.payload_json AS payload"
+            " FROM events JOIN sessions ON sessions.id = events.session_id"
+            f" WHERE events.kind = 'prompt' AND events.session_id IN ({slots})"
+            " ORDER BY sessions.started_at, sessions.id, events.seq",
+            chain,
+        ).fetchall()
+    finally:
+        conn.close()
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        try:
+            payload = json.loads(row["payload"])
+        except ValueError:
+            continue
+        text = " ".join(str(payload.get("text") or "").split())
+        out.append({
+            "n": len(out) + 1,
+            "session": row["sid"],
+            "seq": int(row["seq"]),
+            "text": text,
+        })
+    return out
+
+
+def exchange_events(world: World, n: int) -> list[dict[str, Any]]:
+    """The verbatim event record of one exchange, by index position."""
+    index = exchange_index(world)
+    if not index or n < 1 or n > len(index):
+        return []
+    item = index[n - 1]
+    stop = None
+    for later in index[n:]:
+        if later["session"] == item["session"]:
+            stop = later["seq"]
+            break
+    conn = _open(state_file(world))
+    try:
+        sql = "SELECT kind, payload_json FROM events WHERE session_id = ? AND seq >= ?"
+        args: list[Any] = [item["session"], item["seq"]]
+        if stop is not None:
+            sql += " AND seq < ?"
+            args.append(stop)
+        rows = conn.execute(sql + " ORDER BY seq", args).fetchall()
+    finally:
+        conn.close()
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        try:
+            payload = json.loads(row["payload_json"])
+        except ValueError:
+            continue
+        payload["kind"] = row["kind"]
+        out.append(payload)
+    return out

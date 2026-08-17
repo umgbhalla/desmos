@@ -345,6 +345,7 @@ def check() -> None:
         _check_injections(cwd)
         _check_steer(cwd)
         _check_op_rollup(cwd)
+        _check_slice(cwd)
         _check_quarantine_manifest()
         _check_prune_manifest()
         _check_salvage()
@@ -1097,3 +1098,46 @@ def _check_op_rollup(cwd: Path) -> None:
     assert "harness rollback" in idle and "exec bash" in idle, idle
     assert "exec python" not in idle, idle
     print("op rollup check ok")
+
+
+def _check_slice(cwd: Path) -> None:
+    """A folded exchange stays readable verbatim from the event record."""
+    from desmos.state import persist
+
+    home = cwd / "slice"
+    home.mkdir()
+    world = new_world(home, state_path=home / "harness.sqlite3")
+    stream = [
+        {"ev": "prompt", "n": 1, "text": "the first ask"},
+        {"ev": "speech", "text": "a very particular sentence " + "pad " * 40
+         + "ENDMARK9f3", "delta": True},
+        {"ev": "result", "phase": "done", "tag": "exec",
+         "attrs": {"op": "python"}, "text": "4"},
+        {"ev": "prompt", "n": 2, "text": "the second ask"},
+        {"ev": "speech", "text": "later words", "delta": True},
+    ]
+    for i, event in enumerate(stream):
+        persist.record_event(world, event, ts_ms=i, mono_ns=i)
+    index = dispatch(world, Block("observe", "", {"op": "slice"}))
+    assert "1. the first ask" in index, index
+    assert "2. the second ask" in index, index
+    one = dispatch(world, Block("observe", "1", {"op": "slice"}))
+    assert "a very particular sentence" in one, one
+    assert "call exec python: 4" in one, one
+    assert "the second ask" not in one, one
+    world.messages = [
+        {"role": "user", "content": "the first ask"},
+        {"role": "assistant", "content": "a very particular sentence"},
+        {"role": "user", "content": "the second ask"},
+        {"role": "assistant", "content": "later words"},
+    ]
+    from desmos.state.compact import compact
+
+    compact(world, keep=2, floor=2)
+    import json as _json
+
+    live = _json.dumps(world.messages)
+    assert "ENDMARK9f3" not in live, live
+    again = dispatch(world, Block("observe", "1", {"op": "slice"}))
+    assert "ENDMARK9f3" in again, again
+    print("slice check ok")
