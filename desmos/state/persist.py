@@ -29,6 +29,7 @@ SCHEMA_VERSION = 7
 #: One attach, one id, across SQL, provider routing, cache, presence, and wire.
 #: The environment survives reload_sdk; a new process gets a new session.
 SESSION_ID_ENV = "DESMOS_SESSION_ID"
+NEW_SESSION_ENV = "DESMOS_SESSION_NEW"
 RUN_ID_ENV = SESSION_ID_ENV  # compatibility name for the public run_id() API
 DB_FILENAME = "harness.sqlite3"
 KEEP_MESSAGES = 80
@@ -725,11 +726,14 @@ def _session_id(
         return current
     if not create:
         return None
-    parent = conn.execute(
-        "SELECT id FROM sessions WHERE workspace_id = ?"
-        " ORDER BY started_at DESC, id DESC LIMIT 1",
-        (workspace,),
-    ).fetchone()
+    fresh = str(os.environ.get(NEW_SESSION_ENV, "")).strip().lower()
+    parent = None
+    if fresh not in {"1", "true", "yes", "on"}:
+        parent = conn.execute(
+            "SELECT id FROM sessions WHERE workspace_id = ?"
+            " ORDER BY started_at DESC, id DESC LIMIT 1",
+            (workspace,),
+        ).fetchone()
     parent_id = str(parent["id"]) if parent else None
     conn.execute(
         "INSERT INTO sessions(id, workspace_id, parent_id, kind, started_at,"
@@ -1847,6 +1851,20 @@ def _apply_data(world: World, data: dict[str, Any]) -> None:
         world.messages = repair_orphan_calls(aligned)
 
 
+def _lineage(conn: sqlite3.Connection, session: str) -> list[str]:
+    """This session and its ancestors, oldest first."""
+    chain: list[str] = []
+    seen: set[str] = set()
+    cur: str | None = session
+    while cur and cur not in seen:
+        seen.add(cur)
+        chain.append(cur)
+        row = conn.execute("SELECT parent_id FROM sessions WHERE id = ?", (cur,)).fetchone()
+        cur = str(row["parent_id"]) if row and row["parent_id"] else None
+    chain.reverse()
+    return chain
+
+
 def _read_data(
     conn: sqlite3.Connection, world: World
 ) -> dict[str, Any] | None:
@@ -1863,15 +1881,17 @@ def _read_data(
         "SELECT thinking FROM sessions WHERE id = ?", (current,)
     ).fetchone()
 
+    lineage = _lineage(conn, current)
+    slots = ",".join("?" * len(lineage))
     message_rows = conn.execute(
-        """
+        f"""
         SELECT messages.session_id, messages.role, messages.content_json
         FROM messages
         JOIN sessions ON sessions.id = messages.session_id
-        WHERE sessions.workspace_id = ?
+        WHERE messages.session_id IN ({slots})
         ORDER BY sessions.started_at, sessions.id, messages.seq
         """,
-        (workspace,),
+        lineage,
     ).fetchall()
     messages = [
         {"role": row["role"], "content": json.loads(row["content_json"])}
@@ -1882,14 +1902,14 @@ def _read_data(
     )
 
     prior_rows = conn.execute(
-        """
+        f"""
         SELECT prior_turns.session_id, prior_turns.prompt, prior_turns.speech
         FROM prior_turns
         JOIN sessions ON sessions.id = prior_turns.session_id
-        WHERE sessions.workspace_id = ?
+        WHERE prior_turns.session_id IN ({slots})
         ORDER BY sessions.started_at, sessions.id, prior_turns.seq
         """,
-        (workspace,),
+        lineage,
     ).fetchall()
     kept_prior = prior_rows[-PRIOR_KEEP:]
     prior = [
