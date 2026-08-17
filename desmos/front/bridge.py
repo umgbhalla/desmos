@@ -13,7 +13,14 @@ from pathlib import Path
 from typing import Any
 
 from desmos.kernel.catalog import advertised_names, ns_names
-from desmos.kernel.loop import new_world, reload, reload_sdk, reset_transcript, run_turns
+from desmos.kernel.loop import (
+    new_world,
+    reload,
+    reload_sdk,
+    reset_transcript,
+    run_turns,
+    switch_session,
+)
 
 
 def _billing(model: str) -> str:
@@ -607,6 +614,9 @@ def _drive(world: Any, inbox: queue.Queue, cancel: threading.Event) -> int:
                 _emit(_snapshot(world))
             elif op == "reset":
                 _emit({"ev": "speech", "text": reset_transcript(world)})
+                _emit(_snapshot(world))
+            elif op == "session":
+                _emit({"ev": "speech", "text": switch_session(world, msg.get("id"))})
                 _emit(_snapshot(world))
             elif op == "reload":
                 _emit({"ev": "speech", "text": reload_sdk(world)})

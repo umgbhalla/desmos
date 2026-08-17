@@ -1100,6 +1100,35 @@ def reset_transcript(world: World) -> str:
     return f"transcript cleared ({n} messages)"
 
 
+def switch_session(world: World, session: str | None = None) -> str:
+    """Point the live world at another session, or start a fresh line.
+
+    The bridge outlives the choice -- it is spawned before the picker is
+    answered -- so a session is chosen at runtime, never by an environment
+    variable read once at launch.
+    """
+    if world.running:
+        raise RuntimeError("cannot switch session from inside a running step")
+    import os
+
+    from desmos.state import persist
+
+    persist.save(world)
+    if session:
+        os.environ.pop(persist.NEW_SESSION_ENV, None)
+        os.environ[persist.SESSION_ID_ENV] = str(session)
+    else:
+        os.environ.pop(persist.SESSION_ID_ENV, None)
+        os.environ[persist.NEW_SESSION_ENV] = "1"
+        persist.run_id()
+    world.messages.clear()
+    world.prior.clear()
+    world.session_message_start = 0
+    world.session_prior_start = 0
+    persist.load(world)
+    return f"session {persist.run_id()[:8]}: {len(world.messages)} messages"
+
+
 #: Modules whose globals ARE live state, so re-executing the file destroys it.
 #: The facade next to each implementation is skipped too: reloading it would
 #: only re-export whatever the (unreloaded) implementation already holds.
