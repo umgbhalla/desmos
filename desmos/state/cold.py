@@ -8,6 +8,8 @@ copy does not match is not pruned at all.
 
 from __future__ import annotations
 
+import gzip
+import hashlib
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
@@ -146,5 +148,103 @@ def archived(path: Path) -> list[dict[str, Any]]:
         cold.close()
     return [
         {"session_id": str(r[0]), "archived_at": str(r[1]), "rows": int(r[2])}
+        for r in rows
+    ]
+
+
+def _ensure_files(cold: sqlite3.Connection) -> None:
+    cold.execute(
+        "CREATE TABLE IF NOT EXISTS cold_files ("
+        " name TEXT PRIMARY KEY,"
+        " sha256 TEXT NOT NULL,"
+        " bytes INTEGER NOT NULL DEFAULT 0,"
+        " stowed_at TEXT NOT NULL)"
+    )
+
+
+def stow(path: Path, files: list[Path]) -> dict[str, Any]:
+    """Compress dead files into the cold store, original removed last.
+
+    A file leaves the working directory only after its gzip reads back with
+    the same sha256, so the bytes are never trusted to have moved.
+    """
+    out: dict[str, Any] = {"stowed": [], "freed": 0, "kept": []}
+    if not files:
+        return out
+    target = cold_path(path).parent / "quarantine"
+    target.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(cold_path(path), timeout=5.0)
+    try:
+        _ensure_files(conn)
+        at = datetime.now(timezone.utc).isoformat()
+        for src in files:
+            if not src.is_file():
+                continue
+            raw = src.read_bytes()
+            digest = hashlib.sha256(raw).hexdigest()
+            dest = target / (src.name + ".gz")
+            with gzip.open(dest, "wb") as fh:
+                fh.write(raw)
+            with gzip.open(dest, "rb") as fh:
+                back = fh.read()
+            if hashlib.sha256(back).hexdigest() != digest:
+                out["kept"].append(src.name)
+                continue
+            conn.execute(
+                "INSERT OR REPLACE INTO cold_files(name, sha256, bytes,"
+                " stowed_at) VALUES (?, ?, ?, ?)",
+                (src.name, digest, len(raw), at),
+            )
+            conn.commit()
+            src.unlink()
+            out["stowed"].append(src.name)
+            out["freed"] += len(raw)
+    finally:
+        conn.close()
+    out["path"] = str(target)
+    return out
+
+
+def held(path: Path) -> set[str]:
+    """Session ids the cold store already answers for."""
+    return {row["session_id"] for row in archived(path)}
+
+
+def contents(path: Path) -> list[str]:
+    """Every archived message body, for callers that must not recover twice."""
+    target = cold_path(path)
+    if not target.is_file():
+        return []
+    conn = sqlite3.connect(target, timeout=5.0)
+    try:
+        return [str(r[0]) for r in conn.execute("SELECT content_json FROM messages")]
+    except sqlite3.DatabaseError:
+        return []
+    finally:
+        conn.close()
+
+
+def stowed(path: Path) -> list[dict[str, Any]]:
+    """Dead files the cold store now holds, oldest first."""
+    target = cold_path(path)
+    if not target.is_file():
+        return []
+    conn = sqlite3.connect(target, timeout=5.0)
+    try:
+        rows = conn.execute(
+            "SELECT name, sha256, bytes, stowed_at FROM cold_files"
+            " ORDER BY stowed_at, name"
+        ).fetchall()
+    except sqlite3.DatabaseError:
+        return []
+    finally:
+        conn.close()
+    return [
+        {
+            "name": str(r[0]),
+            "sha256": str(r[1]),
+            "bytes": int(r[2]),
+            "stowed_at": str(r[3]),
+        }
         for r in rows
     ]

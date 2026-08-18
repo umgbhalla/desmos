@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import Any
 
 from desmos.kernel.types import World
-from desmos.state import persist
+from desmos.state import cold, persist
 
 
 def dead_databases(path: Path) -> list[Path]:
@@ -142,11 +142,15 @@ def _candidates(
 ) -> tuple[list[dict[str, Any]], list[str]]:
     """Sessions worth recovering: not already present, and not all duplicate."""
     ordered, unreadable = _gather(path)
+    # The record is the live database plus the cold store: a session pruned
+    # into the archive is held, not lost, and must not be recovered twice.
     live_ids = {str(row[0]) for row in conn.execute("SELECT id FROM sessions")}
+    live_ids |= cold.held(path)
     seen = {
         _fingerprint(str(row[0]))
         for row in conn.execute("SELECT content_json FROM messages")
     }
+    seen |= {_fingerprint(text) for text in cold.contents(path)}
     out: list[dict[str, Any]] = []
     for record in ordered:
         if not record["messages"]:
@@ -273,3 +277,32 @@ def salvage(world: World, *, apply: bool = False) -> dict[str, Any]:
         return report
     finally:
         conn.close()
+
+
+def reclaim(world: World, *, apply: bool = False) -> dict[str, Any]:
+    """Move quarantined databases into the cold store, once nothing is left.
+
+    Reclaiming disk must follow a verified salvage, never accompany it. The
+    survey is the gate: while one unrecovered session remains in those files
+    nothing moves. What moves is compressed, checksummed and accounted, and
+    the original is removed last.
+    """
+    path = persist.state_file(world)
+    remaining = survey(path)
+    dead = sorted(
+        item for item in path.parent.glob(path.name + ".corrupt*") if item.is_file()
+    )
+    out: dict[str, Any] = {
+        "files": len(dead),
+        "bytes": sum(item.stat().st_size for item in dead),
+        "unrecovered": int(remaining["sessions"]),
+        "applied": False,
+    }
+    if remaining["sessions"]:
+        out["refused"] = "unrecovered sessions remain; salvage first"
+        return out
+    if not apply:
+        return out
+    out.update(cold.stow(path, dead))
+    out["applied"] = True
+    return out

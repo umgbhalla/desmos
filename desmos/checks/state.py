@@ -350,6 +350,7 @@ def check() -> None:
         _check_quarantine_manifest()
         _check_prune_manifest()
         _check_cold_store()
+        _check_stow()
         _check_salvage()
         _check_fold_keeps_transcript()
         _check_session_asks()
@@ -1256,3 +1257,35 @@ def _check_cold_store() -> None:
     assert len(rows) == 1, f"{len(rows)} archived messages for {sid}"
     assert "cold conversation" in rows[0][0], rows[0][0]
     print("cold store check ok")
+
+
+def _check_stow() -> None:
+    """Reclaiming disk is a move too: the gzip is proven, then the original goes.
+
+    Quarantined databases are dead weight, but deleting them is still a
+    delete. `stow` compresses each one into the cold store, reads it back,
+    and only then unlinks -- so a failed copy costs disk, never history.
+    """
+    import gzip
+    import tempfile
+
+    from desmos.state import cold
+
+    root = Path(tempfile.mkdtemp())
+    live = root / "harness.sqlite3"
+    live.write_bytes(b"the live database")
+    dead = root / "harness.sqlite3.corrupt"
+    raw = b"a dead database, mostly zeroes" * 200
+    dead.write_bytes(raw)
+
+    out = cold.stow(live, [dead])
+    assert out["stowed"] == [dead.name], out
+    assert out["freed"] == len(raw), out
+    assert not dead.exists(), "the original survived its own reclaim"
+    kept = Path(out["path"]) / (dead.name + ".gz")
+    with gzip.open(kept, "rb") as fh:
+        assert fh.read() == raw, "the archived copy is not the file"
+    names = {row["name"]: row for row in cold.stowed(live)}
+    assert dead.name in names, names
+    assert names[dead.name]["bytes"] == len(raw), names[dead.name]
+    print("stow check ok")
