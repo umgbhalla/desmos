@@ -185,3 +185,89 @@ it and the mutation that proves the check.
 - **A new inter-agent transport.** The peer rail exists.
 - **Copying exo's ungated creation.** The user asked for a gate, and the
   absence of one is exo's weakest point, not its strength.
+
+## 9. The declaration (B2, and the ARES 3 answer)
+
+Sections 1-8 are research and shape. This section is the thing the
+constitution's B2 demands before any seat row exists: fields, lifecycle,
+reset behaviour, and who gets one. It supersedes nothing above; it commits.
+
+### 9.1 Who gets a seat
+
+**A seat is a user-facing party, and nothing else is.** The test is not
+durability, or persistence, or having a transcript. It is whether the user
+names it, addresses it by that name, and holds it to a charter.
+
+- **Seated:** a party the user named. It has a slug they can type, a charter
+  they wrote or approved, and a history they can ask it about.
+- **Seatless — a sibling session.** A second `desmos run` on this workspace,
+  headless, doing work in parallel, is a *session*. It has its own process,
+  its own run id (272a28c), and it saves into the same harness db. It is not
+  a person and needs no name. Giving every concurrent process a seat would
+  make the roster a process list, which is exactly the failure the seat is
+  meant to avoid.
+- **Seatless — a subagent child.** A fork is anonymous by B3 and cannot write
+  a seat even if it wanted one.
+
+The consequence is structural, not editorial: **`sessions.seat_id` is
+nullable and no code path may require it.** Most sessions will have none.
+
+### 9.2 Fields
+
+`seats` — one row per party, per workspace.
+
+| field | type | meaning |
+| --- | --- | --- |
+| `id` | TEXT PK | opaque, minted at birth, never reused |
+| `workspace_id` | TEXT FK | seats are workspace-local; cross-repo is unspecified |
+| `slug` | TEXT | what the user types; unique per workspace, never freed |
+| `name` | TEXT | what the user says |
+| `charter` | TEXT | what this party is for, in the user's words |
+| `born_gen` | INTEGER | the generation at birth; a birth record, not a lease |
+| `status` | TEXT | `active`, `dormant`, `retired` |
+| `created_at` / `updated_at` | TEXT | ISO, as everywhere else |
+
+`seat_models` — append-only, one row per binding. Settles T2 in schema: a
+seat survives a model change because the binding is a row, not a column.
+
+| field | meaning |
+| --- | --- |
+| `seat_id`, `model`, `thinking` | the binding |
+| `bound_at`, `reason` | when, and why it changed |
+
+`sessions.seat_id` — nullable FK, `ON DELETE SET NULL`. Which party this
+incarnation belongs to, or nothing.
+
+### 9.3 Lifecycle
+
+1. **Birth** is gated. Minting a slug that does not exist requires the
+   user's approval, in a real user turn — not the model asserting it has it.
+   This is the deliberate divergence from exo, whose `newAgent` is ungated.
+2. **Resolution is free.** Attaching a session to an existing slug needs no
+   approval and no ceremony; it is how a party wakes up.
+3. **Model rebinding** appends to `seat_models`. Moving to a cheaper tier is
+   free; escalating to a more expensive one is gated like birth.
+4. **Dormancy** is the absence of a live session. It is observed, not
+   written: no timer retires anything.
+5. **Retirement** sets `status='retired'`. Rows are never deleted and the
+   slug is never freed, so old history keeps resolving to the party that
+   made it.
+
+### 9.4 Reset behaviour
+
+Read against `docs/identity.md`, which is the inventory of what survives
+what. A seat is **repo-durable**: it lives in the harness db beside notes,
+tools and generations.
+
+| event | effect on the seat |
+| --- | --- |
+| `reset()` — transcript dropped | none. The party outlives the conversation; that is the entire point of it. |
+| `harness op=rollback` | none. Rollback restores notes, tools and prior only. |
+| process restart | none. The next session re-resolves the same slug. |
+| fork / subagent child | none, and none possible: B3 makes it unwritable. |
+| generation bump | none. `born_gen` is a birth record and is never rewritten. |
+| `rm -rf .desmos` | the seats die with the workspace. They are repo-durable, not machine-global. A seat that follows a person across checkouts remains unspecified. |
+
+A seat therefore has exactly one way to end deliberately — retirement — and
+one way to end by accident: deleting the workspace db. Nothing else in the
+harness may remove one.
