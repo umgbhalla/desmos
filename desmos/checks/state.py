@@ -357,6 +357,7 @@ def check() -> None:
         _check_prune_manifest()
         _check_cold_store()
         _check_outbox()
+        _check_d1_sink()
         _check_stow()
         _check_salvage()
         _check_fold_keeps_transcript()
@@ -1729,3 +1730,85 @@ def _check_outbox() -> None:
     persist.save(world)
     assert len(outbox.pending(world)) == depth, (depth, outbox.pending(world))
     print("outbox check ok")
+
+
+def _check_d1_sink() -> None:
+    """The one part that speaks HTTP, against a socket on this machine.
+
+    A refusal must cost a retry and not a row, an unconfigured harness must
+    be an ordinary state rather than an error, and what goes on the wire must
+    be the fact plus its fingerprint -- never this machine's row ids.
+    """
+    import json as _json
+    import os as _os
+    import tempfile
+    import threading
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    from desmos.state import d1, outbox
+
+    seen: list = []
+    state = {"code": 200}
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):  # noqa: N802 - stdlib naming
+            length = int(self.headers.get("Content-Length", "0"))
+            seen.append({
+                "body": _json.loads(self.rfile.read(length) or b"{}"),
+                "auth": self.headers.get("Authorization", ""),
+            })
+            code = int(state["code"])
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(b'{"ok": true}' if code < 300 else b'{"error": "no"}')
+
+        def log_message(self, *_args):  # keep the check quiet
+            return
+
+    server = HTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    url = f"http://127.0.0.1:{server.server_address[1]}/sync"
+
+    root = Path(tempfile.mkdtemp())
+    world = new_world(root, persist=True)
+    outbox.enqueue(world, "cold_session", {"session_id": "d1-a", "rows": 1})
+    outbox.enqueue(world, "cold_session", {"session_id": "d1-b", "rows": 2})
+
+    saved = {k: _os.environ.get(k) for k in (d1.URL_ENV, d1.TOKEN_ENV)}
+    try:
+        _os.environ.pop(d1.URL_ENV, None)
+        idle = d1.push(world)
+        assert idle == {"configured": False, "sent": 0, "pending": 2, "error": ""}, idle
+        assert not seen, seen
+
+        _os.environ[d1.URL_ENV] = url
+        _os.environ[d1.TOKEN_ENV] = "shhh"
+        state["code"] = 500
+        refused = d1.push(world)
+        assert refused["sent"] == 0 and refused["pending"] == 2, refused
+        assert "500" in refused["error"], refused
+        still = outbox.pending(world)
+        assert all(int(r["attempts"]) == 1 for r in still), still
+
+        state["code"] = 200
+        pushed = d1.push(world)
+        assert pushed["sent"] == 2 and pushed["pending"] == 0, pushed
+        assert d1.push(world)["sent"] == 0, "an empty queue posted anyway"
+
+        wire = seen[-1]["body"]["rows"]
+        assert seen[-1]["auth"] == "Bearer shhh", seen[-1]["auth"]
+        assert len(wire) == 2, wire
+        assert {r["payload"]["session_id"] for r in wire} == {"d1-a", "d1-b"}, wire
+        assert all(len(r["fingerprint"]) == 64 for r in wire), wire
+        assert all("id" not in r and "attempts" not in r for r in wire), wire
+    finally:
+        for key, value in saved.items():
+            if value is None:
+                _os.environ.pop(key, None)
+            else:
+                _os.environ[key] = value
+        server.shutdown()
+        server.server_close()
+    print("d1 sink check ok")
