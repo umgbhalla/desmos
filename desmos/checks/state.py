@@ -360,6 +360,7 @@ def check() -> None:
         _check_d1_sink()
         _check_d1_worker()
         _check_budget_rail(cwd)
+        _check_witness(cwd)
         _check_stow()
         _check_salvage()
         _check_fold_keeps_transcript()
@@ -1860,6 +1861,77 @@ def _check_d1_worker() -> None:
     assert "fingerprint" in worker and "length !== 64" in worker, \
         "the worker accepts a row with no sha256 fingerprint"
     print("d1 worker check ok")
+
+
+def _check_witness(cwd: Path) -> None:
+    """The work graph is read back as an account, and wake is where it lands.
+
+    Three things can each fail alone: a refusal that leaves no trace, a
+    reopened item charged to nobody, and a digest nothing ever shows. So the
+    refusal is asserted as a row, rework is asserted against the run that
+    closed the item, and the paragraph is driven through persist.load rather
+    than called directly.
+    """
+    from desmos.state import persist, witness, work
+
+    home = cwd / "witness"
+    home.mkdir()
+    world = new_world(home, state_path=home / "harness.sqlite3")
+    world.model = "claude-opus-5"
+
+    plain = work.add(world, "write the sink")
+    gated = work.add(world, "release the beta", gate="tests green")
+    work.finish(world, plain["id"], evidence="9e9e261")
+
+    # A gated item without evidence is refused -- and the refusal is a row, not
+    # only an exception. Counting refusals is how a gate proves it gates.
+    try:
+        work.finish(world, gated["id"])
+    except work.WorkError as exc:
+        assert "gated on" in str(exc), exc
+    else:
+        raise AssertionError("a gated item closed with no evidence")
+    kinds = [e["kind"] for e in work.events(world, gated["id"])]
+    assert work.GATE_REFUSED in kinds, kinds
+    assert work.items(world, status="open"), "the refused item did not stay open"
+
+    # Reopening is the rework signal, and it is charged to whoever closed it.
+    work.reopen(world, plain["id"], "the sink dropped a row")
+    rows = witness.actors(world, hours=24)
+    assert len(rows) == 1, rows
+    mine = rows[0]
+    assert mine["done"] == 1 and mine["rework"] == 1 and mine["gates"] == 1, mine
+    assert mine["label"] == work.run_id()[:8], mine
+
+    closed = witness.finished(world, hours=24)
+    assert [r["title"] for r in closed] == ["write the sink"], closed
+    assert closed[0]["evidence"] == "9e9e261", closed
+
+    # Nothing older than the window is anyone's accomplishment.
+    assert witness.actors(world, hours=0) == []
+
+    # Commits are derived from git, not stored twice. Asserted against this
+    # checkout, since a store that can disagree with git is the thing avoided.
+    repo = new_world(Path(__file__).resolve().parents[2], state_path=home / "x.sqlite3")
+    landed = witness.commits(repo, hours=24 * 3650, limit=3)
+    assert len(landed) == 3 and all(" " in line for line in landed), landed
+    assert witness.commits(world, hours=24) == [], "a non-repo invented commits"
+
+    # The wiring: load() is where a session wakes, and the paragraph must be
+    # installed there. Drop the call and this fails.
+    world.injections.pop(witness.BLOCK, None)
+    persist.load(world)
+    block = world.injections.get(witness.BLOCK)
+    assert block, sorted(world.injections)
+    assert "Witnessed work, last" in block["text"], block
+    assert "write the sink" in block["text"], block
+    assert int(block["turns"]) == 1, block
+
+    # An empty workspace says nothing rather than saying zero.
+    quiet = new_world(cwd / "witness-quiet", state_path=cwd / "witness-quiet.sqlite3")
+    assert witness.wake(quiet) == ""
+    assert witness.BLOCK not in quiet.injections
+    print("witness check ok")
 
 
 def _check_budget_rail(cwd: Path) -> None:

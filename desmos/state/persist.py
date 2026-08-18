@@ -2221,6 +2221,15 @@ def load(world: World) -> None:
         conn.close()
     # After the write lock is released: record_event opens its own connection.
     _report_quarantines(world, path)
+    # What the last window actually finished, shown once in the next request's
+    # tail. Late import: witness reads the tables this module owns. A failure
+    # here is a missing paragraph, never a session that will not start.
+    from desmos.state import witness as _witness
+
+    try:
+        _witness.wake(world)
+    except Exception as exc:  # noqa: BLE001
+        warnings.warn(f"witness at wake failed: {exc}", RuntimeWarning)
 
 
 def op_rollup(world: World) -> list[tuple[str, int]]:

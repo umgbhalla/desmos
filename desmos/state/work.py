@@ -42,6 +42,9 @@ EDGE_KINDS = ("blocks", "child", "trigger")
 LEASE_SECONDS = 900
 MAX_TITLE = 200
 MAX_BODY = 8000
+#: The event a refused finish leaves behind: gated, and no evidence pointer.
+#: Read back by desmos.state.witness as this workspace's gate-failure count.
+GATE_REFUSED = "gate-refused"
 
 
 def _now() -> str:
@@ -366,23 +369,55 @@ def finish(
             workspace = _scope(db, world)
             row = _fetch(db, workspace, item_id)
             gate = str(row["gate"] or "")
-            if status == "done" and gate and not evidence.strip():
-                raise WorkError(
-                    f"work finish: {item_id} is gated on {gate!r};"
-                    " give an evidence pointer"
+            refused = bool(status == "done" and gate and not evidence.strip())
+            if refused:
+                # Recorded, then raised. A refusal that leaves no trace is a
+                # rule nobody can count, and that count is what tells a later
+                # session whether its gates are gating anything. The event
+                # commits when this block exits; the raise is deliberately
+                # outside it, because raising here would roll it back.
+                _record(db, item_id, GATE_REFUSED, gate)
+            else:
+                db.execute(
+                    "UPDATE work_items SET status = ?, updated_at = ? WHERE id = ?",
+                    (status, _now(), item_id),
                 )
+                db.execute("DELETE FROM work_leases WHERE item_id = ?", (item_id,))
+                _record(db, item_id, status, "", evidence)
+                done = _row(_fetch(db, workspace, item_id))
+                if status == "done":
+                    done["woke"] = _fire_triggers(
+                        db, world, workspace, item_id, str(row["title"])
+                    )
+                return done
+        raise WorkError(
+            f"work finish: {item_id} is gated on {gate!r};"
+            " give an evidence pointer"
+        )
+    finally:
+        db.close()
+
+
+def reopen(world: World, item_id: str, reason: str = "") -> dict[str, Any]:
+    """Put a closed item back to work.
+
+    The event this writes is the rework signal: an item called done that was
+    not. Witness counts it against whoever closed it, which is the only way a
+    gate that never gates shows up as a number rather than as a feeling.
+    """
+    db = _open(state_file(world))
+    try:
+        with db:
+            workspace = _scope(db, world)
+            row = _fetch(db, workspace, item_id)
+            if row["status"] not in ("done", "dropped"):
+                raise WorkError(f"work reopen: {item_id} is {row['status']}")
             db.execute(
-                "UPDATE work_items SET status = ?, updated_at = ? WHERE id = ?",
-                (status, _now(), item_id),
+                "UPDATE work_items SET status = 'open', updated_at = ? WHERE id = ?",
+                (_now(), item_id),
             )
-            db.execute("DELETE FROM work_leases WHERE item_id = ?", (item_id,))
-            _record(db, item_id, status, "", evidence)
-            done = _row(_fetch(db, workspace, item_id))
-            if status == "done":
-                done["woke"] = _fire_triggers(
-                    db, world, workspace, item_id, str(row["title"])
-                )
-            return done
+            _record(db, item_id, "open", reason)
+            return _row(_fetch(db, workspace, item_id))
     finally:
         db.close()
 
