@@ -26,7 +26,7 @@ from desmos.kernel.types import Tool, World
 _UMASK = os.umask(0)
 os.umask(_UMASK)
 
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 11
 #: Oldest build that can still read this schema. Additive changes leave it
 #: alone; anything an older reader would misread raises it.
 MIN_READER_VERSION = 9
@@ -596,6 +596,19 @@ CREATE TABLE IF NOT EXISTS work_leases (
     claimed_at TEXT NOT NULL,
     expires_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS outbox (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+    kind TEXT NOT NULL,
+    fingerprint TEXT NOT NULL UNIQUE,
+    payload_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    sent_at TEXT,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_outbox_pending
+    ON outbox(workspace_id, sent_at, id);
 CREATE INDEX IF NOT EXISTS idx_work_items_workspace
     ON work_items(workspace_id, status, created_at);
 CREATE INDEX IF NOT EXISTS idx_work_edges_child
@@ -1693,6 +1706,14 @@ def _prune_sessions(
             for entry in census
             if entry["session_id"] in safe
         ]
+        # The outbox row commits with the delete, not after it: a session
+        # that left the live database is a fact worth publishing exactly
+        # once, and a fingerprint makes a replayed prune a no-op rather than
+        # a duplicate. Imported here because outbox imports this module.
+        from desmos.state import outbox as _outbox
+
+        for entry in census:
+            _outbox.enqueue_conn(conn, workspace, "cold_session", entry)
         conn.executemany(
             "DELETE FROM history_fts WHERE session_id = ?", [(sid,) for sid in doomed]
         )

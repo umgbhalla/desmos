@@ -356,6 +356,7 @@ def check() -> None:
         _check_quarantine_manifest()
         _check_prune_manifest()
         _check_cold_store()
+        _check_outbox()
         _check_stow()
         _check_salvage()
         _check_fold_keeps_transcript()
@@ -1651,3 +1652,80 @@ def _check_work_graph() -> None:
     posted = persist.channel_read(world, work.TRIGGER_CHANNEL)
     assert any(sleeper["id"] in str(m["body"]) for m in posted), posted
     print("work graph check ok")
+
+
+def _check_outbox() -> None:
+    """A fact leaves this machine once, or not at all.
+
+    The outbox is the whole of local-first: the harness database is the
+    record, the cloud is a copy, and the copy is described by a row that
+    commits with the fact it describes. So the interesting properties are
+    that a repeat is not a second row, a dead sink loses nothing, and a
+    prune -- which nobody asked to publish anything -- fills the queue by
+    itself.
+    """
+    import tempfile
+
+    from desmos.state import outbox, persist
+
+    root = Path(tempfile.mkdtemp())
+    world = new_world(root, persist=True)
+    fact = {"session_id": "s-1", "rows": 3}
+    first = outbox.enqueue(world, "cold_session", fact)
+    again = outbox.enqueue(world, "cold_session", {"rows": 3, "session_id": "s-1"})
+    assert first == again, (first, again)
+    assert len(outbox.pending(world)) == 1, outbox.pending(world)
+
+    def angry(_batch: list) -> None:
+        raise RuntimeError("sink is down")
+
+    failed = outbox.drain(world, angry)
+    assert failed["failed"] == 1 and "down" in failed["error"], failed
+    still = outbox.pending(world)
+    assert len(still) == 1 and int(still[0]["attempts"]) == 1, still
+    assert "down" in str(still[0]["last_error"]), still
+
+    seen: list = []
+    sent = outbox.drain(world, lambda batch: seen.append(list(batch)))
+    assert sent["sent"] == 1, sent
+    assert seen and seen[0][0]["payload"] == fact, seen
+    assert outbox.pending(world) == [], outbox.pending(world)
+    assert outbox.drain(world, lambda batch: seen.append(batch))["sent"] == 0
+    assert len(seen) == 1, seen
+    assert outbox.stats(world)["sent"] == 1, outbox.stats(world)
+
+    # Wiring: pruning is the producer. Nothing in this block mentions the
+    # outbox, and the queue must fill anyway.
+    conn = persist._open(persist.state_file(world))
+    try:
+        workspace = conn.execute("SELECT id FROM workspaces").fetchone()[0]
+        with conn:
+            for i in range(persist.SESSION_KEEP + 2):
+                sid = f"out-{i:04d}"
+                conn.execute(
+                    "INSERT INTO sessions(id, workspace_id, kind, started_at,"
+                    " last_seen_at, cache_key) VALUES (?, ?, 'attach', ?, ?, ?)",
+                    (sid, workspace, f"2019-01-01T00:00:{i:02d}",
+                     f"2019-01-01T00:00:{i:02d}", sid),
+                )
+                conn.execute(
+                    "INSERT INTO messages(session_id, seq, role, content_json)"
+                    " VALUES (?, 0, 'user', ?)",
+                    (sid, json.dumps(f"outbox conversation {i}")),
+                )
+    finally:
+        conn.close()
+    persist.save(world)
+
+    queued = outbox.pending(world)
+    assert queued, "a prune published nothing"
+    assert {r["kind"] for r in queued} == {"cold_session"}, queued
+    pruned = {e["session_id"] for e in persist.pruned(persist.state_file(world))}
+    published = {str(r["payload"]["session_id"]) for r in queued}
+    assert published <= pruned, sorted(published - pruned)
+
+    # A replayed prune of the same sessions is the same fingerprints.
+    depth = len(queued)
+    persist.save(world)
+    assert len(outbox.pending(world)) == depth, (depth, outbox.pending(world))
+    print("outbox check ok")
