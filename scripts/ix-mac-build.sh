@@ -94,9 +94,16 @@ else
   git -C /srv/desmos worktree add --force "$WT" "slot-$IX_SLOT" > /dev/null
 fi
 # vendor/grok-build is a submodule now: the push moves only the gitlink, so
-# the sources come from GitHub over https (the VM holds no ssh key).
+# the sources come from GitHub over https (the VM holds no ssh key). A bare
+# reference clone under /srv makes that a delta fetch instead of a cold
+# clone, shared by every slot; it is bootstrapped once and survives stops.
+REF=/srv/grok-build.git
+if [ ! -d "$REF" ]; then
+  git clone --bare https://github.com/umgbhalla/grok-build.git "$REF"
+fi
+git -C "$REF" fetch -q origin '+refs/heads/*:refs/heads/*' || true
 git -C "$WT" -c url."https://github.com/".insteadOf="git@github.com:" \
-  submodule update --init vendor/grok-build
+  submodule update --init --reference "$REF" vendor/grok-build
 export RUSTUP_HOME=/srv/rustup CARGO_HOME=/srv/cargo
 export PATH="/srv/rustup/toolchains/nightly-x86_64-unknown-linux-gnu/bin:/srv/cargo/bin:$PATH"
 export CARGO_TARGET_DIR=/srv/target/$IX_SLOT

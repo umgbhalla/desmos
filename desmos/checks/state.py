@@ -1685,6 +1685,12 @@ def _check_stop_rail(cwd: Path) -> None:
 
         # A done mark still reads as done on a line that was waiting.
         shown = dispatch(world, Block("knowledge", "x 1", {"op": "todo"}))
+        assert world.notes["todo"].startswith("[x] write the fallback"), world.notes["todo"]
+        # The result answers with what is still work -- live items under
+        # their real numbers, history as a count -- and body "all" is the
+        # escape hatch that prints every line.
+        assert shown.splitlines() == ["2. [?] ask the user about seats", "(1 done)"], shown
+        shown = dispatch(world, Block("knowledge", "all", {"op": "todo"}))
         assert shown.startswith("1. [x] write the fallback"), shown
     finally:
         _os.environ.pop("DESMOS_PLAN_NUDGES", None)

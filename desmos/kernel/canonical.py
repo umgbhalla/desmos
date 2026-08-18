@@ -252,7 +252,19 @@ def _knowledge(world, op, body, attrs):
     else:
         world.notes.pop("todo", None)
     save(world)
-    return "\n".join(f"{i}. {item}" for i, item in enumerate(items, 1)) or "empty"
+    # The list is mostly history. Answer with the part that is still work --
+    # open and waiting items under their real numbers -- and count the rest,
+    # or the result outgrows the list it reports on. Body "all" shows history.
+    show_all = body.strip().lower() == "all"
+    shown, done = [], 0
+    for i, item in enumerate(items, 1):
+        if item.startswith("[x]") and not show_all:
+            done += 1
+            continue
+        shown.append(f"{i}. {item}")
+    if done:
+        shown.append(f"({done} done)")
+    return "\n".join(shown) or "empty"
 
 def _observe(world, op, body, attrs):
     if op == "usage":
