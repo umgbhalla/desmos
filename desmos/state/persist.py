@@ -26,6 +26,13 @@ _UMASK = os.umask(0)
 os.umask(_UMASK)
 
 SCHEMA_VERSION = 9
+#: Oldest build that can still read this schema. Additive changes leave it
+#: alone; anything an older reader would misread raises it.
+MIN_READER_VERSION = 9
+
+
+class SchemaTooNew(RuntimeError):
+    """Written by a schema this build cannot read. Never a corruption."""
 #: One attach, one id, across SQL, provider routing, cache, presence, and wire.
 #: The environment survives reload_sdk; a new process gets a new session.
 SESSION_ID_ENV = "DESMOS_SESSION_ID"
@@ -605,6 +612,28 @@ def _drop_seat_scaffold(conn: sqlite3.Connection) -> None:
     conn.execute("DROP TABLE IF EXISTS seats")
 
 
+def _version_rows(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    """Recorded versions, tolerating a file written before min_reader."""
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(schema_migrations)")}
+    if not cols:
+        return []
+    reader = "min_reader" if "min_reader" in cols else "NULL AS min_reader"
+    return conn.execute(
+        f"SELECT version, {reader} FROM schema_migrations ORDER BY version"
+    ).fetchall()
+
+
+def _check_reader(rows: list[sqlite3.Row]) -> None:
+    """Accept a newer file only when its writer vouched for this reader."""
+    newest = max(rows, key=lambda r: int(r["version"]))
+    floor = newest["min_reader"]
+    if floor is None or int(floor) > SCHEMA_VERSION:
+        raise SchemaTooNew(
+            f"harness schema {int(newest['version'])} wants reader"
+            f" >= {floor}; this build reads {SCHEMA_VERSION}"
+        )
+
+
 def _migrate(conn: sqlite3.Connection) -> None:
     """Create the current schema; old layouts are intentionally unsupported."""
     existing = {
@@ -616,25 +645,31 @@ def _migrate(conn: sqlite3.Connection) -> None:
         )
     conn.execute("BEGIN IMMEDIATE")
     try:
+        rows = _version_rows(conn)
+        if rows and max(int(r["version"]) for r in rows) > SCHEMA_VERSION:
+            # A newer additive schema: read it, never rewrite it, and never
+            # route a compatibility failure through corruption quarantine.
+            _check_reader(rows)
+            conn.commit()
+            return
         _execute_schema(conn)
         _drop_seat_scaffold(conn)
         for shared in ("notes", "tools"):
             _add_column(conn, shared, "updated_at", "TEXT NOT NULL DEFAULT ''")
-        versions = [
-            int(row[0])
-            for row in conn.execute(
-                "SELECT version FROM schema_migrations ORDER BY version"
-            )
-        ]
-        if versions and max(versions) > SCHEMA_VERSION:
-            raise RuntimeError(
-                f"harness schema versions {versions}, expected [{SCHEMA_VERSION}]"
-            )
+        _add_column(
+            conn, "schema_migrations", "min_reader", "INTEGER NOT NULL DEFAULT 0"
+        )
+        versions = [int(r["version"]) for r in _version_rows(conn)]
         if versions != [SCHEMA_VERSION]:
             conn.execute("DELETE FROM schema_migrations")
             conn.execute(
-                "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
-                (SCHEMA_VERSION, datetime.now(timezone.utc).isoformat()),
+                "INSERT INTO schema_migrations(version, applied_at, min_reader)"
+                " VALUES (?, ?, ?)",
+                (
+                    SCHEMA_VERSION,
+                    datetime.now(timezone.utc).isoformat(),
+                    MIN_READER_VERSION,
+                ),
             )
         conn.commit()
     except BaseException:
@@ -1103,7 +1138,8 @@ def peers(world: World) -> list[dict[str, Any]]:
         if workspace is None:
             return []
         rows = db.execute(
-            "SELECT * FROM active_runs WHERE workspace_id = ?"
+            "SELECT run_id, workspace_id, session_id, pid, cwd, generation,"
+            " model, started_at, seen_at FROM active_runs WHERE workspace_id = ?"
             " ORDER BY started_at, run_id",
             (workspace,),
         ).fetchall()
@@ -1982,7 +2018,14 @@ def load(world: World) -> None:
     if not world.persist:
         return
     path = state_file(world)
-    conn = _open(path)
+    try:
+        conn = _open(path)
+    except SchemaTooNew as exc:
+        # Degrade instead of dying: an older front keeps running in memory,
+        # and a reader that cannot understand the file must never write it.
+        world.persist = False
+        warnings.warn(f"{exc}; continuing without persistence", RuntimeWarning)
+        return
     try:
         conn.execute("BEGIN IMMEDIATE")
         workspace = _workspace_id(conn, world)

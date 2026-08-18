@@ -346,6 +346,7 @@ def check() -> None:
         _check_steer(cwd)
         _check_op_rollup(cwd)
         _check_slice(cwd)
+        _check_schema_tolerance()
         _check_quarantine_manifest()
         _check_prune_manifest()
         _check_salvage()
@@ -1141,3 +1142,55 @@ def _check_slice(cwd: Path) -> None:
     again = dispatch(world, Block("observe", "1", {"op": "slice"}))
     assert "ENDMARK9f3" in again, again
     print("slice check ok")
+
+
+def _check_schema_tolerance() -> None:
+    """A newer additive schema must not kill an older front."""
+    import tempfile
+    import warnings
+
+    from desmos.state import persist
+
+    root = Path(tempfile.mkdtemp())
+    world = new_world(root, persist=True)
+    world.messages.append({"role": "user", "content": "before the bump"})
+    persist.save(world)
+    path = persist.state_file(world)
+
+    def _stamp(version: int, floor: int) -> None:
+        conn = persist._connect(path)
+        conn.execute("DELETE FROM schema_migrations")
+        conn.execute(
+            "INSERT INTO schema_migrations(version, applied_at, min_reader)"
+            " VALUES (?, ?, ?)",
+            (version, "2026-01-01T00:00:00+00:00", floor),
+        )
+        conn.commit()
+        conn.close()
+
+    def _recorded() -> tuple:
+        conn = persist._connect(path)
+        row = conn.execute(
+            "SELECT version, min_reader FROM schema_migrations"
+        ).fetchone()
+        conn.close()
+        return int(row["version"]), int(row["min_reader"])
+
+    top = persist.SCHEMA_VERSION
+    _stamp(top + 1, top)
+    reader = new_world(root, persist=True)
+    persist.load(reader)
+    assert reader.persist, "a tolerable bump disabled persistence"
+    assert reader.messages, "a newer file read as empty"
+    assert _recorded() == (top + 1, top), _recorded()
+
+    _stamp(top + 2, top + 2)
+    before = persist.quarantines(path)
+    strict = new_world(root, persist=True)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        persist.load(strict)
+    assert not strict.persist, "an unreadable schema kept persistence on"
+    assert persist.quarantines(path) == before, "compatibility quarantined"
+    assert _recorded() == (top + 2, top + 2), _recorded()
+    print("schema tolerance check ok")
