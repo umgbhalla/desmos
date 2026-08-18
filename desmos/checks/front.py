@@ -53,6 +53,19 @@ def _check_path_deps_tracked() -> None:
     # One git call for the whole set. `--error-unmatch` fails the batch if any
     # path is untracked, so the per-path loop below only runs when something is
     # actually wrong -- which is the case that can afford to be slow.
+    # A path dep inside a committed submodule is tracked as a gitlink, which
+    # ls-files on the file path cannot see. A fresh clone gets those sources
+    # with `git submodule update --init`, so the guarantee this check exists
+    # for still holds.
+    listing = subprocess.run(
+        ["git", "-C", str(root), "ls-files", "-s"],
+        capture_output=True, text=True, check=False,
+    ).stdout
+    submods = [
+        line.split("\t", 1)[1]
+        for line in listing.splitlines()
+        if line.startswith("160000 ")
+    ]
     suspect: list[tuple[str, Path]] = []
     if present:
         batch = subprocess.run(
@@ -63,6 +76,8 @@ def _check_path_deps_tracked() -> None:
         if batch.returncode != 0:
             suspect = present
     for rel, target in suspect:
+        if any(rel == sub or rel.startswith(sub + "/") for sub in submods):
+            continue
         tracked = subprocess.run(
             ["git", "-C", str(root), "ls-files", "--error-unmatch", str(target)],
             capture_output=True, check=False,

@@ -47,6 +47,7 @@ async-openai = { version = "0.33.0", features = ["responses"] }
 async-stream = "0.3"
 async-trait = "0.1"
 axum = { version = "0.8", features = ["macros", "ws"] }
+axum-server = "0.8"
 backon = { version = "1.6" }
 backtrace = "0.3"
 base64 = "0.22"
@@ -206,6 +207,8 @@ tracing-subscriber = { version = "0.3.23", default-features = false, features = 
 ts-rs = "12.0"
 tui-scrollbar = "0.2"
 two-face = { version = "0.4", default-features = false, features = ["syntect-fancy"] }
+unicode-bidi = "0.3"
+unicode-bidi-mirroring = "0.4"
 unicode-normalization = "0.1"
 unicode-segmentation = "1.12.0"
 unicode-width = "0.2"
@@ -242,6 +245,7 @@ xai-grok-diag-server = { path = "vendor/grok-build/crates/codegen/xai-grok-diag-
 xai-grok-env = { path = "vendor/grok-build/crates/codegen/xai-grok-env" }
 xai-grok-extra-ca = { path = "vendor/grok-build/crates/codegen/xai-grok-extra-ca" }
 xai-grok-foreign-sessions = { path = "vendor/grok-build/crates/codegen/xai-grok-foreign-sessions" }
+xai-grok-home = { path = "vendor/grok-build/crates/codegen/xai-grok-home" }
 xai-grok-http = { path = "vendor/grok-build/crates/codegen/xai-grok-http" }
 xai-grok-markdown = { path = "crates/xai-grok-markdown" }
 xai-grok-markdown-core = { path = "crates/xai-grok-markdown-core" }
@@ -291,7 +295,6 @@ zstd = "0.13"
 # ponytail: no LTO, turn it on if frame time ever shows up in a profile.
 [profile.release]
 strip = "symbols"
-
 [workspace.lints.clippy]
 doc_lazy_continuation = "allow"
 doc_overindented_list_items = "allow"

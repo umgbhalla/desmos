@@ -7,3 +7,7 @@
 [submodule "vendor/herdr"]
 	path = vendor/herdr
 	url = git@github.com:umgbhalla/herdr.git
+[submodule "vendor/grok-build"]
+	path = vendor/grok-build
+	url = git@github.com:umgbhalla/grok-build.git
+	branch = desmos

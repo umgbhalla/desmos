@@ -1249,6 +1249,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "axum-server"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b1df331683d982a0b9492b38127151e6453639cd34926eb9c07d4cd8c6d22bfc"
+dependencies = [
+ "arc-swap",
+ "bytes",
+ "either",
+ "fs-err",
+ "http 1.5.0",
+ "http-body 1.1.0",
+ "hyper",
+ "hyper-util",
+ "pin-project-lite",
+ "rustls",
+ "rustls-pki-types",
+ "tokio",
+ "tokio-rustls",
+ "tower-service",
+]
+
+[[package]]
 name = "backoff"
 version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3786,6 +3808,16 @@ checksum = "e076045bb43dac435333ed5f04caf35c7463631d0dae2deb2638d94dd0a5b872"
 dependencies = [
  "lazy_static",
  "num",
+]
+
+[[package]]
+name = "fs-err"
+version = "3.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b91aa448ca50d7e79433bdf3ee8d99215430d2ec02ade5aefab2a073a1822e8a"
+dependencies = [
+ "autocfg",
+ "tokio",
 ]
 
 [[package]]
@@ -13586,7 +13618,6 @@ dependencies = [
  "clap",
  "crossbeam",
  "dashmap",
- "dirs 5.0.1",
  "dunce",
  "gix",
  "gix-status",
@@ -13605,6 +13636,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "xai-gix-status",
+ "xai-grok-home",
  "xai-sqlite-journal",
  "xai-test-utils",
  "xai-tty-utils",
@@ -13817,6 +13849,7 @@ dependencies = [
  "tracing",
  "urlencoding",
  "which",
+ "xai-grok-home",
  "xai-grok-version",
  "xai-tty-utils",
 ]
@@ -13830,6 +13863,7 @@ dependencies = [
  "serde",
  "serde_json",
  "strum 0.27.2",
+ "toml",
  "tracing",
  "xai-grok-announcements",
  "xai-grok-config",
@@ -13886,6 +13920,17 @@ dependencies = [
  "uuid",
  "xai-sqlite-journal",
  "zstd",
+]
+
+[[package]]
+name = "xai-grok-home"
+version = "0.1.0"
+dependencies = [
+ "dirs 5.0.1",
+ "dunce",
+ "pretty_assertions",
+ "tempfile",
+ "tracing",
 ]
 
 [[package]]
@@ -14021,10 +14066,10 @@ dependencies = [
  "xai-grok-auth",
  "xai-grok-config-types",
  "xai-grok-http",
- "xai-grok-telemetry",
  "xai-grok-tools",
  "xai-grok-version",
  "xai-sqlite-journal",
+ "xai-token-estimation",
 ]
 
 [[package]]
@@ -14055,7 +14100,7 @@ dependencies = [
 
 [[package]]
 name = "xai-grok-pager"
-version = "1.0.3"
+version = "1.0.5"
 dependencies = [
  "agent-client-protocol",
  "ansi-to-tui",
@@ -14216,6 +14261,8 @@ dependencies = [
  "toml_edit 0.22.27",
  "tracing",
  "tui-scrollbar",
+ "unicode-bidi",
+ "unicode-bidi-mirroring",
  "unicode-segmentation",
  "unicode-width 0.2.0",
  "url",
@@ -14406,7 +14453,7 @@ dependencies = [
 
 [[package]]
 name = "xai-grok-shell"
-version = "1.0.3"
+version = "1.0.5"
 dependencies = [
  "agent-client-protocol",
  "anyhow",
@@ -14619,6 +14666,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "axum",
+ "axum-server",
  "base64 0.22.1",
  "bytes",
  "chrono",
@@ -14826,7 +14874,7 @@ dependencies = [
 
 [[package]]
 name = "xai-grok-version"
-version = "1.0.3"
+version = "1.0.5"
 dependencies = [
  "semver",
 ]

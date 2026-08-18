@@ -93,6 +93,10 @@ else
   mkdir -p /srv/wt
   git -C /srv/desmos worktree add --force "$WT" "slot-$IX_SLOT" > /dev/null
 fi
+# vendor/grok-build is a submodule now: the push moves only the gitlink, so
+# the sources come from GitHub over https (the VM holds no ssh key).
+git -C "$WT" -c url."https://github.com/".insteadOf="git@github.com:" \
+  submodule update --init vendor/grok-build
 export RUSTUP_HOME=/srv/rustup CARGO_HOME=/srv/cargo
 export PATH="/srv/rustup/toolchains/nightly-x86_64-unknown-linux-gnu/bin:/srv/cargo/bin:$PATH"
 export CARGO_TARGET_DIR=/srv/target/$IX_SLOT
