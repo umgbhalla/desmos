@@ -558,6 +558,32 @@ pub(crate) fn handle_key(
         }
         return Ok(false);
     }
+    // Choice blocks own vertical movement while the story pane is focused.
+    // Enter turns the highlighted row into ordinary composer text and follows
+    // the exact same submit path as a typed prompt.
+    if app.focus == Focus::Story {
+        let choice_key = match key.code {
+            KeyCode::Char('j') | KeyCode::Down => {
+                app.focused_scroll().move_latest_choice_selection(1)
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                app.focused_scroll().move_latest_choice_selection(-1)
+            }
+            KeyCode::Enter => {
+                if let Some(prompt) = app.focused_scroll().take_latest_choice_prompt() {
+                    app.prompt.clear();
+                    app.prompt.insert_str(&prompt);
+                    app.set_focus(Focus::Input);
+                    return submit_prompt(bridge.as_deref_mut(), app);
+                }
+                false
+            }
+            _ => false,
+        };
+        if choice_key {
+            return Ok(false);
+        }
+    }
     if app.focus != Focus::Input {
         match key.code {
             KeyCode::Char('j') | KeyCode::Down => app.focused_scroll().select_next(),
