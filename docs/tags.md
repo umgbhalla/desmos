@@ -114,7 +114,7 @@ The accepted aliases are:
 
 - execution: `python`, `bash`, `shell`
 - workspace: `find`, `grep`, `read`, `edit`, `see`, `commit`
-- knowledge: `memory`, `recall`, `system`, `todo`
+- knowledge: `memory`, `recall`, `system`, `todo`, `decide`
 - harness: `register`, `tool`, `skill`, `reload`, `reload_sdk`, `evolve`,
   `rollback`
 - observation/session: `usage`, `traj`, `trajectory_retrace`, `compact`

@@ -928,6 +928,18 @@ def _run_turns(
     # is appended, so the event log's order is the transcript's order.
     world.prompt_ordinal = getattr(world, "prompt_ordinal", 0) + 1
     emit({"ev": "prompt", "text": prompt, "n": world.prompt_ordinal})
+    # Decision ingestion: TUI Enter submits "<prompt line>: <option>" which
+    # starts with "decide:<id>"; extract and close the record before appending.
+    _stripped = prompt.strip()
+    if _stripped.startswith("decide:"):
+        try:
+            from desmos.state.decisions import answer as _danswer
+            _head, _, _choice = _stripped.partition(": ")
+            _did = _head.split("—")[0].strip()[len("decide:"):]
+            if _did and _choice:
+                _danswer(world, _did, _choice.strip())
+        except Exception:
+            pass
     world.messages.append({"role": "user", "content": header(world) + "\n\n" + prompt})
     # Images the composer attached to this prompt. vision.attach appends its
     # blocks to the most recent user message, which is the one just pushed, so

@@ -59,6 +59,8 @@ ALLOWED_FN_EDGES = {
     ("desmos.kernel.canonical", "desmos.state.compact"),
     ("desmos.kernel.canonical", "desmos.state.persist"),
     ("desmos.kernel.canonical", "desmos.state.plan"),  # <knowledge op=plan> store
+    ("desmos.kernel.canonical", "desmos.state.decisions"),  # <knowledge op=decide> store
+    ("desmos.kernel.loop", "desmos.state.decisions"),  # decide: answer ingestion seam
     ("desmos.kernel.canonical", "desmos.transport.complete"),
     ("desmos.kernel.exec", "desmos.state.persist"),
     ("desmos.kernel.loop", "desmos.agents.pending"),  # resume seam

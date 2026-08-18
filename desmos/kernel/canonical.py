@@ -31,7 +31,7 @@ DIRECT_TARGETS = {
 
 DIRECT_OPS = {
     "workspace": ("read", "see", "commit"),
-    "knowledge": ("todo", "plan"),
+    "knowledge": ("todo", "plan", "decide"),
     "observe": ("usage", "slice", "trajectory", "error", "symbol", "threads"),
     "agents": (
         "spawn", "fanout", "resume", "lineage",
@@ -226,6 +226,8 @@ def _knowledge(world, op, body, attrs):
     if op == "plan":
         from desmos.state.plan import handle_plan
         return handle_plan(world, body, **attrs)
+    if op == "decide":
+        return _decide(world, body)
     existing = _legacy(world, "todo", body, attrs)
     if existing is not None:
         return existing
@@ -265,6 +267,59 @@ def _knowledge(world, op, body, attrs):
     if done:
         shown.append(f"({done} done)")
     return "\n".join(shown) or "empty"
+
+
+def _decide(world, body: str) -> str:
+    """Handle knowledge op=decide: ask | answer | list."""
+    from desmos.state.decisions import answer as _answer, pending as _pending, push as _push
+
+    stripped = body.strip()
+    low = stripped.lower()
+
+    # "list" or bare body
+    if not stripped or low == "list":
+        items = _pending(world)
+        if not items:
+            return "no pending decisions"
+        lines = []
+        for r in items:
+            opts = " | ".join(r["options"])
+            lines.append(f"decide:{r['id']} — {r['prompt']}  [{opts}]")
+        return "\n".join(lines)
+
+    # "answer <id> <choice>"
+    if low.startswith("answer "):
+        rest = stripped[7:].strip()
+        did, _, choice = rest.partition(" ")
+        did = did.strip()
+        choice = choice.strip()
+        if not did or not choice:
+            return "usage: answer <id> <choice>"
+        try:
+            _answer(world, did, choice)
+        except KeyError as exc:
+            return str(exc)
+        return f"decision {did} closed: {choice}"
+
+    # "ask <prompt> | opt1 | opt2 | ..."
+    if low.startswith("ask "):
+        rest = stripped[4:]
+    else:
+        rest = stripped
+    parts = [p.strip() for p in rest.split("|")]
+    prompt = parts[0]
+    options = parts[1:] if len(parts) > 1 else ["yes", "no"]
+    did = _push(world, prompt, options)
+    # Build ui-choice fence so the TUI renders it as an interactive block.
+    opt_lines = "\n".join(f"- {o}" for o in options)
+    fence = (
+        f"```ui-choice\n"
+        f"prompt: decide:{did} — {prompt}\n"
+        f"{opt_lines}\n"
+        f"```"
+    )
+    return fence
+
 
 def _observe(world, op, body, attrs):
     if op == "usage":

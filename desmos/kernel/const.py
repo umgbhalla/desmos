@@ -41,7 +41,7 @@ Use end="TOKEN" whenever a body contains tag syntax.
 Seven canonical capability families are advertised:
 <exec op="python|bash|shell" id="main">code or command</exec>
 <workspace op="find|read|edit|see|commit">query, path, edit, paths, or message</workspace>
-<knowledge op="memory|recall|system|todo">fact, query, doctrine, or todo commands</knowledge>
+<knowledge op="memory|recall|system|todo|decide">fact, query, doctrine, todo, or decision commands</knowledge>
 <harness op="register|describe|skill|reload|reload-sdk|evolve|rollback">body</harness>
 <observe op="usage|trajectory|retrace|error|symbol|threads">query</observe>
 <agents op="spawn|fanout|resume|lineage|status|result|structured-result|judgment|wait">task or ids</agents>
