@@ -346,6 +346,7 @@ def check() -> None:
         _check_handoff_rail(cwd)
         _check_plan_rail(cwd)
         _check_fold_consent(cwd)
+        _check_child_run_id()
         _check_steer(cwd)
         _check_op_rollup(cwd)
         _check_slice(cwd)
@@ -1464,3 +1465,33 @@ def _check_fold_consent(cwd: Path) -> None:
     assert "confirm or correct" in sent[1], sent[1][-400:]
     assert handoff.FOLD not in world.injections, world.injections
     print("fold consent check ok")
+
+
+def _check_child_run_id() -> None:
+    """A desmos launched from inside a desmos gets its own run id.
+
+    The environment is inherited whole, so an id kept in it is adopted by every
+    child unless the process that minted it is named. Adopting it meant taking
+    the parent's presence lease -- BlockingIOError out of announce, before the
+    child drew a single frame -- which is what stopped a second session in one
+    workspace from ever starting.
+    """
+    import os as _os
+    import subprocess as _sp
+    import sys as _sys
+
+    from desmos.state import persist
+
+    mine = persist.run_id()
+    assert _os.environ.get(persist.SESSION_PID_ENV) == str(_os.getpid())
+    root = str(Path(persist.__file__).resolve().parents[2])
+    out = _sp.run(
+        [_sys.executable, "-B", "-c",
+         "from desmos.state import persist; print(persist.run_id())"],
+        capture_output=True, text=True, cwd=root,
+        env={**_os.environ, "PYTHONPATH": root},
+    )
+    assert out.returncode == 0, out.stderr[-400:]
+    child = out.stdout.strip()
+    assert child and child != mine, (child, mine)
+    print("child run id check ok")

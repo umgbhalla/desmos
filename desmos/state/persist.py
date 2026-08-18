@@ -37,6 +37,10 @@ class SchemaTooNew(RuntimeError):
 #: One attach, one id, across SQL, provider routing, cache, presence, and wire.
 #: The environment survives reload_sdk; a new process gets a new session.
 SESSION_ID_ENV = "DESMOS_SESSION_ID"
+#: The pid that minted the id above. A child process inherits the environment
+#: whole, so without this it adopts its parent's run id, collides on the
+#: parent's presence lease, and dies before it draws a frame.
+SESSION_PID_ENV = "DESMOS_SESSION_PID"
 NEW_SESSION_ENV = "DESMOS_SESSION_NEW"
 RUN_ID_ENV = SESSION_ID_ENV  # compatibility name for the public run_id() API
 DB_FILENAME = "harness.sqlite3"
@@ -987,12 +991,20 @@ def _append_registry(cwd: Path) -> None:
 
 
 def run_id() -> str:
-    """The id of this attach, shared by every subsystem."""
+    """The id of this attach, shared by every subsystem in this process.
+
+    Only the process that minted the id may keep it. A `desmos` launched from
+    inside a desmos -- a bridge, a demo TUI, anything spawned from a syscall --
+    inherits the environment whole, and adopting the parent's id meant taking
+    the parent's presence lease: BlockingIOError, no session, no frame. The
+    environment still survives reload_sdk, which is what the variable is for.
+    """
     existing = os.environ.get(SESSION_ID_ENV)
-    if existing:
+    if existing and os.environ.get(SESSION_PID_ENV) == str(os.getpid()):
         return existing
     fresh = _uuid7()
     os.environ[SESSION_ID_ENV] = fresh
+    os.environ[SESSION_PID_ENV] = str(os.getpid())
     return fresh
 
 
