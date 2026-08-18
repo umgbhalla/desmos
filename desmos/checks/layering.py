@@ -53,6 +53,7 @@ ALLOWED_FN_EDGES = {
     ("desmos.kernel.dispatch", "desmos.state.recall"),  # <recall> shells the memex-desmos fork
     ("desmos.kernel.dispatch", "desmos.state.generations"),
     ("desmos.kernel.dispatch", "desmos.state.memory"),
+    ("desmos.kernel.dispatch", "desmos.state.refine"),
     ("desmos.kernel.dispatch", "desmos.state.persist"),
     ("desmos.kernel.canonical", "desmos.agents.subagent"),
     ("desmos.kernel.canonical", "desmos.state.compact"),

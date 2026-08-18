@@ -361,6 +361,7 @@ def check() -> None:
         _check_d1_worker()
         _check_budget_rail(cwd)
         _check_witness(cwd)
+        _check_refine(cwd)
         _check_stow()
         _check_salvage()
         _check_fold_keeps_transcript()
@@ -1322,6 +1323,104 @@ def _check_cold_store() -> None:
     assert after > before, sorted(after)
     assert after <= {r["session_id"] for r in cold.archived(path)}, sorted(after)
     print("cold store check ok")
+
+
+def _check_refine(cwd: Path) -> None:
+    """A grown tool that only ever fails is retired, and retiring it is a move.
+
+    The rot signal is read off the record the loop already writes: a raising
+    syscall's result text *is* its traceback, so the failure this drives is a
+    real one, formatted the way loop.turn formats it, and refine has to
+    recognise it. Tombstoning then has to survive a save -- the buried row is
+    absent from world.tools, which to the delete sweep looks exactly like a
+    tool the session removed.
+    """
+    from desmos.state import persist, refine
+
+    home = cwd / "refine"
+    home.mkdir()
+    world = new_world(home, state_path=home / "harness.sqlite3")
+
+    rot_src = "def rotter(world, body, attrs):\n    raise RuntimeError('always')\n"
+    out = dispatch(
+        world, Block("harness", rot_src, {"op": "register", "name": "rotter", "doc": "rots"})
+    )
+    assert out == "registered <rotter>", out
+
+    for _ in range(2):
+        # dispatch turns a raising handler into its traceback -- that string is
+        # the result the loop records, so it is the string refine must read.
+        text = dispatch(world, Block("rotter", "", {}))
+        assert text.startswith("Traceback (most recent call last)"), text
+        persist.record_event(
+            world,
+            {"ev": "result", "phase": "done", "tag": "rotter", "attrs": {}, "text": text},
+            ts_ms=0,
+            mono_ns=0,
+        )
+
+    rows = {item["name"]: item for item in refine.census(world)}
+    assert rows["rotter"]["calls"] == 2, rows["rotter"]
+    assert rows["rotter"]["errors"] == 2, rows["rotter"]
+    assert rows["rotter"]["verdict"] == "broken", rows["rotter"]
+    out = dispatch(world, Block("harness", "", {"op": "refine"}))
+    assert "broken" in out and "rotter" in out, out
+
+    # The other rot: never called, while sessions came and went.
+    nap_src = "def napper(world, body, attrs):\n    return 'zzz'\n"
+    dispatch(
+        world, Block("harness", nap_src, {"op": "register", "name": "napper", "doc": "naps"})
+    )
+    conn = persist._open(persist.state_file(world))
+    try:
+        with conn:
+            workspace = conn.execute("SELECT id FROM workspaces").fetchone()[0]
+            for i in range(refine.UNUSED_SESSIONS):
+                conn.execute(
+                    "INSERT INTO sessions(id, workspace_id, kind, started_at,"
+                    " last_seen_at, cache_key) VALUES (?, ?, 'attach', ?, ?, ?)",
+                    (f"later-{i}", workspace, f"2999-01-0{i + 1}", "2999-01-09", f"later-{i}"),
+                )
+    finally:
+        conn.close()
+    rows = {item["name"]: item for item in refine.census(world)}
+    assert rows["napper"]["verdict"] == "unused", rows["napper"]
+
+    out = dispatch(
+        world,
+        Block("harness", "", {"op": "refine", "tombstone": "rotter", "reason": "only ever raised"}),
+    )
+    assert "tombstoned <rotter>" in out, out
+    assert "rotter" not in world.tools, sorted(world.tools)
+    persist.save(world)
+
+    back = new_world(home, state_path=home / "harness.sqlite3")
+    persist.load(back)
+    assert "rotter" not in back.tools, sorted(back.tools)
+    assert "napper" in back.tools, sorted(back.tools)
+
+    # The row survives the tombstoning session's own save because the D4b
+    # watermark keeps anything newer than the view. A sibling that merely
+    # loaded this workspace has neither: no rotter in world.tools, and a
+    # watermark newer than the tombstone. To the delete sweep that is
+    # indistinguishable from a tool someone removed.
+    persist.save(back)
+
+    conn = persist._open(persist.state_file(world))
+    try:
+        row = conn.execute(
+            "SELECT source, tombstone_reason FROM tools WHERE name = 'rotter'"
+        ).fetchone()
+    finally:
+        conn.close()
+    assert row is not None, "the tombstoned row was deleted by the next save"
+    assert "RuntimeError" in str(row["source"] or ""), row["source"]
+    assert row["tombstone_reason"] == "only ever raised", row["tombstone_reason"]
+
+    out = dispatch(back, Block("harness", "", {"op": "refine", "revive": "rotter"}))
+    assert "revived <rotter>" in out, out
+    assert "rotter" in back.tools, sorted(back.tools)
+    print("refine check ok")
 
 
 def _check_stow() -> None:

@@ -26,7 +26,7 @@ from desmos.kernel.types import Tool, World
 _UMASK = os.umask(0)
 os.umask(_UMASK)
 
-SCHEMA_VERSION = 12
+SCHEMA_VERSION = 13
 #: Oldest build that can still read this schema. Additive changes leave it
 #: alone; anything an older reader would misread raises it.
 MIN_READER_VERSION = 9
@@ -720,6 +720,10 @@ def _migrate(conn: sqlite3.Connection) -> None:
         # Which purse paid for a call. Older rows keep '' and are counted
         # against whatever account asks, because they predate the question.
         _add_column(conn, "calls", "account", "TEXT NOT NULL DEFAULT ''")
+        # A grown tool that rotted is retired, not erased: the source stays,
+        # the date and the reason are recorded, and revive undoes it.
+        _add_column(conn, "tools", "tombstoned_at", "TEXT NOT NULL DEFAULT ''")
+        _add_column(conn, "tools", "tombstone_reason", "TEXT NOT NULL DEFAULT ''")
         _add_column(
             conn, "schema_migrations", "min_reader", "INTEGER NOT NULL DEFAULT 0"
         )
@@ -913,9 +917,20 @@ def _save_data(conn: sqlite3.Connection, world: World, data: dict[str, Any]) -> 
         # since this one loaded, in silence. Retire what this world could have
         # seen and has dropped; leave anything newer than its view alone.
         watermark = str(world.synced_at or now)
+        # A tombstoned tool is absent from world.tools by design, which to
+        # the sweep below looks exactly like a tool the session deleted. It is
+        # a record, not a deletion: hold it.
+        buried = {
+            str(r[0])
+            for r in conn.execute(
+                "SELECT name FROM tools WHERE workspace_id = ?"
+                " AND tombstoned_at <> ''",
+                (workspace,),
+            )
+        }
         for table, held in (
             ("notes", set(data["notes"])),
-            ("tools", set(data["docs"]) | set(data["tools"])),
+            ("tools", set(data["docs"]) | set(data["tools"]) | buried),
         ):
             rows = conn.execute(
                 f"SELECT name, updated_at FROM {table} WHERE workspace_id = ?",
@@ -2183,7 +2198,8 @@ def _read_data(
     docs: dict[str, str] = {}
     tools: dict[str, dict[str, Any]] = {}
     for row in conn.execute(
-        "SELECT name, doc, source, frozen FROM tools WHERE workspace_id = ?",
+        "SELECT name, doc, source, frozen FROM tools WHERE workspace_id = ?"
+        " AND tombstoned_at = ''",
         (workspace,),
     ):
         if row["frozen"]:

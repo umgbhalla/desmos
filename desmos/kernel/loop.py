@@ -237,6 +237,7 @@ _BUILTIN_DOCS = (
     ("reload_sdk", "reimport desmos.* and rebind step; next complete() uses the new ABI"),
     ("evolve", "snapshot grown state as the next generation"),
     ("rollback", "restore generation n="),
+    ("refine", "review grown tags against the record: the census, or tombstone=NAME reason=, or revive=NAME"),
     (
         "memory",
         "structured durable memory: body remembers; actions show/search/read/forget/verify/consolidate",
@@ -244,7 +245,7 @@ _BUILTIN_DOCS = (
     ("exec", "op=python|bash|shell — computation and persistent process sessions"),
     ("workspace", "op=find|read|edit|see|commit — repository search, files, media, and version control"),
     ("knowledge", "op=memory|recall|system|todo — durable facts, history, doctrine, and work state"),
-    ("harness", "op=register|describe|skill|reload|reload-sdk|evolve|rollback — self-extension lifecycle"),
+    ("harness", "op=register|describe|skill|reload|reload-sdk|evolve|rollback|refine — self-extension lifecycle"),
     ("observe", "op=usage|trajectory|retrace|error|symbol|threads — bounded diagnostics and telemetry"),
     ("agents", "op=spawn|fanout|status|result|structured-result|judgment|wait — child orchestration"),
     ("session", "op=compact|status|switch — conversation and model lifecycle"),

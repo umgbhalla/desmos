@@ -13,6 +13,7 @@ ROUTES = {
     "harness": {
         "register": "register", "describe": "tool", "skill": "skill",
         "reload": "reload", "reload-sdk": "reload_sdk", "evolve": "evolve", "rollback": "rollback",
+        "refine": "refine",
     },
     "observe": {"retrace": "trajectory_retrace"},
 }

@@ -6,7 +6,7 @@ LEGACY_FROZEN = frozenset(
     {
         "python", "bash", "shell", "edit", "find", "recall", "register",
         "system", "tool", "skill", "reload", "reload_sdk", "evolve",
-        "rollback", "memory",
+        "rollback", "refine", "memory",
     }
 )
 CANONICAL = frozenset(

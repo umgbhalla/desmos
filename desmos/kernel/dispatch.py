@@ -258,6 +258,10 @@ def _dispatch(
         except ValueError:
             return f"rollback failed: bad n {raw!r}"
         return rollback(world, n)
+    if block.tag == "refine":
+        from desmos.state.refine import handle_refine
+
+        return handle_refine(world, block.body, block.attrs)
     if block.tag == "memory":
         from desmos.state.memory import handle_memory
 
