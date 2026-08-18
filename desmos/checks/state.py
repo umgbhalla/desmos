@@ -1554,6 +1554,13 @@ def _check_work_graph() -> None:
 
     from desmos.state import persist, work
 
+    # Ids are minted from _uuid7, whose first twelve hex digits are the
+    # millisecond alone. A burst inside one millisecond must still be eight
+    # distinct items, not one primary-key collision.
+    burst_world = new_world(Path(tempfile.mkdtemp()), persist=True)
+    burst = [work.add(burst_world, f"burst {i}")["id"] for i in range(8)]
+    assert len(set(burst)) == 8, burst
+
     root = Path(tempfile.mkdtemp())
     world = new_world(root, persist=True)
 
@@ -1628,4 +1635,19 @@ def _check_work_graph() -> None:
     assert kinds[0] == "done" and "claimed" in kinds, kinds
     assert any(str(e["evidence"]).startswith("check ok") for e in
                work.events(world, parent["id"])), kinds
+
+    # A trigger does not block: it wakes. Finishing the parent puts a message
+    # on the peer channel naming the item that just came up.
+    waker = work.add(world, "run the suite")
+    sleeper = work.add(world, "read what it said")
+    work.link(world, waker["id"], sleeper["id"], kind="trigger")
+    open_now = [str(r["id"]) for r in work.ready(world)]
+    assert sleeper["id"] in open_now, open_now
+    woke = work.finish(world, waker["id"], evidence="6a88165")
+    assert woke["woke"] == [sleeper["id"]], woke
+    assert "triggered" in [
+        str(e["kind"]) for e in work.events(world, sleeper["id"])
+    ]
+    posted = persist.channel_read(world, work.TRIGGER_CHANNEL)
+    assert any(sleeper["id"] in str(m["body"]) for m in posted), posted
     print("work graph check ok")

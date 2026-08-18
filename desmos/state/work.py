@@ -108,7 +108,10 @@ def add(
         with db:
             workspace = _scope(db, world)
             session = _session_id(db, world, workspace)
-            item_id = _uuid7()[:12]
+            # _uuid7() is 48 bits of millisecond then randomness: a
+            # 12-char slice is the timestamp alone, so two items added
+            # inside one millisecond collide on the primary key.
+            item_id = _uuid7()[:20]
             now = _now()
             db.execute(
                 "INSERT INTO work_items(id, workspace_id, session_id, title, body,"
@@ -305,6 +308,52 @@ def note(
     return {"item": item_id, "detail": detail, "evidence": evidence}
 
 
+TRIGGER_CHANNEL = "work"
+
+
+def _fire_triggers(
+    conn: sqlite3.Connection,
+    world: World,
+    workspace: str,
+    item_id: str,
+    title: str,
+) -> list[str]:
+    """A trigger is a row: finishing this item wakes whoever waits on it.
+
+    The wake goes out on the peer channel that already exists, in the same
+    transaction as the finish, so a trigger cannot fire for work that rolled
+    back. Waking a *seat* is the eventual shape; until seats are stored, the
+    workspace channel reaches every live sibling and none of the dead ones.
+    """
+    woken: list[str] = []
+    rows = conn.execute(
+        "SELECT e.child_id AS child, i.title AS title FROM work_edges AS e"
+        " JOIN work_items AS i ON i.id = e.child_id"
+        " WHERE e.parent_id = ? AND e.kind = 'trigger'"
+        " AND i.status NOT IN ('done', 'dropped')",
+        (item_id,),
+    ).fetchall()
+    if not rows:
+        return woken
+    session = _session_id(conn, world, workspace)
+    now = _now()
+    run = run_id()
+    for row in rows:
+        child = str(row["child"])
+        _record(conn, child, "triggered", f"{item_id} finished: {title}")
+        conn.execute(
+            "INSERT INTO channel_messages(workspace_id, session_id, channel,"
+            " run_id, author, body, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                workspace, session or "", TRIGGER_CHANNEL, run, "work",
+                f"{item_id} finished ({title}) -- {child} is up: {row['title']}",
+                now,
+            ),
+        )
+        woken.append(child)
+    return woken
+
+
 def finish(
     world: World, item_id: str, evidence: str = "", status: str = "done"
 ) -> dict[str, Any]:
@@ -328,7 +377,12 @@ def finish(
             )
             db.execute("DELETE FROM work_leases WHERE item_id = ?", (item_id,))
             _record(db, item_id, status, "", evidence)
-            return _row(_fetch(db, workspace, item_id))
+            done = _row(_fetch(db, workspace, item_id))
+            if status == "done":
+                done["woke"] = _fire_triggers(
+                    db, world, workspace, item_id, str(row["title"])
+                )
+            return done
     finally:
         db.close()
 
