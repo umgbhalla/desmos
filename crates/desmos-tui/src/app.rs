@@ -30,6 +30,7 @@ use crate::{
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Focus {
+    Rail,
     Story,
     Calls,
     Meter,
@@ -54,6 +55,7 @@ impl Focus {
     pub(crate) fn next(self) -> Self {
         match self {
             // Across the top and down the right column.
+            Self::Rail => Self::Story,
             Self::Story => Self::Calls,
             Self::Calls => Self::Git,
             Self::Git => Self::Files,
@@ -65,13 +67,14 @@ impl Focus {
             // The POST split is one row of two panes; going left inside it is
             // still going anti-clockwise around the ring.
             Self::PostOut => Self::PostIn,
-            Self::PostIn => Self::Story,
+            Self::PostIn => Self::Rail,
         }
     }
 
     pub(crate) fn prev(self) -> Self {
         match self {
-            Self::Story => Self::PostIn,
+            Self::Rail => Self::PostIn,
+            Self::Story => Self::Rail,
             Self::PostIn => Self::PostOut,
             Self::PostOut => Self::Queue,
             Self::Queue => Self::Input,
@@ -86,7 +89,7 @@ impl Focus {
     /// Tab cycle. A pane collapsed to zero rows is not a pane.
     pub(crate) fn next_open(self, open: &dyn Fn(Focus) -> bool) -> Self {
         let mut f = self.next();
-        for _ in 0..8 {
+        for _ in 0..9 {
             if open(f) {
                 break;
             }
@@ -97,7 +100,7 @@ impl Focus {
 
     pub(crate) fn prev_open(self, open: &dyn Fn(Focus) -> bool) -> Self {
         let mut f = self.prev();
-        for _ in 0..8 {
+        for _ in 0..9 {
             if open(f) {
                 break;
             }
@@ -215,7 +218,7 @@ impl PaneLayout {
                     .clamp(Self::MIN_SPLIT as i16, Self::MAX_SPLIT as i16)
                     as u16
             }
-            (Focus::Queue | Focus::Input, _) => {}
+            (Focus::Rail | Focus::Queue | Focus::Input, _) => {}
         }
     }
 
@@ -473,6 +476,9 @@ pub(crate) struct App {
     pub(crate) queue_edit: Option<usize>,
     pub(crate) drain_after: bool,
     pub(crate) children: HashMap<String, ChildSess>,
+    pub(crate) rail_sel: usize,
+    pub(crate) rail_seen: HashSet<String>,
+    pub(crate) rail_area: Rect,
     /// Tree-of-runs mode on the Activity column (`t` toggles it): one row per
     /// subagent run, nested by the kernel's parent/depth. Selection is an
     /// index into `tree::order`.
@@ -557,6 +563,9 @@ impl App {
             queue_edit: None,
             drain_after: false,
             children: HashMap::new(),
+            rail_sel: 0,
+            rail_seen: HashSet::new(),
+            rail_area: Rect::default(),
             tree_open: false,
             tree_sel: 0,
             viewing: None,
@@ -903,7 +912,8 @@ impl App {
         match focus {
             Focus::Story => self.sess_mut().story.on_activate(),
             Focus::Calls => self.sess_mut().calls.on_activate(),
-            Focus::Meter
+            Focus::Rail
+            | Focus::Meter
             | Focus::Git
             | Focus::Files
             | Focus::PostIn

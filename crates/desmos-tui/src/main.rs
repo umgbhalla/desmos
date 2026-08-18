@@ -40,6 +40,7 @@ mod json_tree;
 mod picker;
 mod prompt;
 mod queue;
+mod rail;
 mod session;
 mod side;
 mod slash;
@@ -2056,17 +2057,33 @@ fn draw(f: &mut Frame, app: &mut App) {
         reflow_wire(&mut c.sess.calls, &c.sess.wire_manual);
     }
 
-    // Columns first, because the composer wraps at the story column's width and
-    // not the terminal's. Measuring against the whole frame under-counted rows
-    // by the width of the wire column, so a paragraph overflowed a box that had
-    // decided three rows were enough.
+    // The navigator is a real outer pane, but narrow terminals keep every
+    // column for the transcript and composer.
+    let frame_area = f.area();
+    let work_area = if frame_area.width >= 90 {
+        let outer = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Length(26), Constraint::Min(1)])
+            .split(frame_area);
+        app.rail_area = outer[0];
+        rail::draw(f, outer[0], app);
+        outer[1]
+    } else {
+        app.rail_area = Rect::default();
+        if app.focus == Focus::Rail {
+            app.focus = Focus::Story;
+        }
+        frame_area
+    };
+
+    // Columns first, because the composer wraps at the story column's width.
     let body = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
             Constraint::Percentage(100 - app.layout.wire_pct),
             Constraint::Percentage(app.layout.wire_pct),
         ])
-        .split(f.area());
+        .split(work_area);
 
     // The composer frame shares the Story column edges; only its own border is
     // removed when measuring wrapped text.
@@ -2094,7 +2111,7 @@ fn draw(f: &mut Frame, app: &mut App) {
     let default_rows = COMPOSER_DEFAULT_ROWS.min(cap);
     let prompt_rows = app.prompt.display_rows(inner_w).clamp(default_rows, cap);
     let input_h = (2 + float_rows + prompt_rows)
-        .min(f.area().height.saturating_sub(8 + queue_h))
+        .min(work_area.height.saturating_sub(8 + queue_h))
         .max(2 + float_rows + default_rows);
     let bottom_h = queue_h + input_h;
     let post_h = app
@@ -3252,6 +3269,7 @@ fn draw_tree_pane(f: &mut Frame, area: Rect, app: &mut App) {
 /// What to call the focused pane in the legend title.
 fn focus_name(focus: Focus) -> &'static str {
     match focus {
+        Focus::Rail => "sessions",
         Focus::Input => "input",
         Focus::Story => "story",
         Focus::Calls => "Activity",
@@ -3426,6 +3444,10 @@ fn draw_input(f: &mut Frame, area: Rect, app: &mut App) {
 /// ended up describing keys that had moved.
 fn pane_keys(focus: Focus) -> (&'static str, &'static [(&'static str, &'static str)]) {
     match focus {
+        Focus::Rail => (
+            "sessions",
+            &[("j k", "select a session"), ("enter", "open selected session")],
+        ),
         Focus::Story | Focus::Calls => (
             "story / Activity",
             &[
@@ -4418,6 +4440,7 @@ mod tests {
         let top = app.input_area.y as usize;
         let left: String = rows[top]
             .chars()
+            .skip(app.input_area.x as usize)
             .take(app.input_area.width as usize)
             .collect();
         assert!(
@@ -4446,6 +4469,7 @@ mod tests {
         let top = app.queue_area.y as usize;
         let left: String = rows[top]
             .chars()
+            .skip(app.queue_area.x as usize)
             .take(app.queue_area.width as usize)
             .collect();
         assert!(
@@ -4469,20 +4493,16 @@ mod tests {
         let rows: Vec<&str> = text.lines().collect();
 
         let last = app.queue_area.y as usize + app.queue_area.height as usize - 1;
+        let x = app.queue_area.x as usize;
+        let queue_bottom: String = rows[last].chars().skip(x).collect();
+        let below: String = rows[last + 1].chars().skip(x).collect();
         assert!(
-            rows[last].trim_start().starts_with('\u{2514}'),
-            "queue_area does not end on the box's bottom edge: {:?}",
-            rows[last]
+            queue_bottom.starts_with('\u{2514}'),
+            "queue_area does not end on its left edge: {queue_bottom:?}"
         );
-        let below = rows[last + 1];
         assert!(
-            below.trim_start().starts_with('\u{250c}'),
+            below.starts_with('\u{250c}'),
             "a blank row sits between the queue and the composer: {below:?}"
-        );
-        assert_eq!(
-            rows[last].find('\u{2514}'),
-            below.find('\u{250c}'),
-            "the queue and the composer do not share a left edge",
         );
         // The slot lost the float row, so it must lose the height too, or the
         // composer draws one blank row of its own instead.
@@ -4501,17 +4521,18 @@ mod tests {
         // Only the story column: the wire column paints its own panes there.
         let left: String = rows[top]
             .chars()
+            .skip(bare.input_area.x as usize)
             .take(bare.input_area.width as usize)
             .collect();
         assert!(
             left.trim().is_empty(),
             "the composer lost its float row: {left:?}"
         );
-        assert!(
-            rows[top + 1].trim_start().starts_with('\u{250c}'),
-            "{:?}",
-            rows[top + 1]
-        );
+        let below: String = rows[top + 1]
+            .chars()
+            .skip(bare.input_area.x as usize)
+            .collect();
+        assert!(below.starts_with('\u{250c}'), "{below:?}");
     }
 
     pub(crate) fn paint(app: &mut App, w: u16, h: u16) -> String {
@@ -5258,7 +5279,7 @@ mod tests {
         let top = app.input_area.y + input_float_rows(&app);
         let row = text.lines().nth(top as usize).unwrap_or_default();
         assert_eq!(
-            row.find('\u{250c}'),
+            row.chars().position(|ch| ch == '\u{250c}'),
             Some(app.traj_area.x as usize),
             "painted composer frame is inset from Story: {row:?}"
         );
@@ -5546,7 +5567,12 @@ mod tests {
         term.draw(|f| draw(f, &mut app)).unwrap();
         let buf = term.backend().buffer();
         // Top-left corner of the story pane (focused) and of the calls pane.
-        let story_corner = buf.cell((0, 0)).unwrap().style().fg.unwrap();
+        let story_corner = buf
+            .cell((app.traj_area.x, app.traj_area.y))
+            .unwrap()
+            .style()
+            .fg
+            .unwrap();
         let calls_x = app.call_area.x;
         let calls_corner = buf
             .cell((calls_x, app.call_area.y))
@@ -7339,7 +7365,7 @@ mod tests {
             0,
             "transient IRC activity leaked into Story"
         );
-        let painted = paint(&mut app, 120, 40);
+        let painted = paint(&mut app, 220, 40);
         assert!(painted.contains("persist.py conflict"), "{painted}");
     }
 
@@ -9019,6 +9045,7 @@ mod tests {
         app.queue.push("later".into());
         let _ = paint(&mut app, 160, 60);
         let rect = |app: &App, f: Focus| match f {
+            Focus::Rail => app.rail_area,
             Focus::Story => app.traj_area,
             Focus::Calls => app.call_area,
             Focus::PostIn => app.post_in_area,
@@ -9030,6 +9057,7 @@ mod tests {
             Focus::Input => app.input_area,
         };
         let ring = [
+            Focus::Rail,
             Focus::Story,
             Focus::Calls,
             Focus::Git,
@@ -9352,7 +9380,7 @@ mod tests {
     fn the_composer_grows_to_fit_at_its_own_width() {
         let mut app = App::new();
         let idle = {
-            let _ = paint(&mut app, 140, 40);
+            let _ = paint(&mut app, 140, 50);
             app.input_area.height
         };
         let body = "the quick brown fox jumps over the lazy dog and keeps \
@@ -9364,7 +9392,7 @@ mod tests {
                     grows when a genuinely long request needs the space."
             .repeat(3);
         app.prompt.handle_paste(&body);
-        let text = paint(&mut app, 140, 40);
+        let text = paint(&mut app, 140, 50);
         assert!(
             app.input_area.height > idle,
             "composer did not grow: {} -> {}",

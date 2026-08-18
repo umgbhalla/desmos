@@ -371,6 +371,18 @@ pub(crate) fn handle_key(
         _ => {}
     }
 
+    if app.focus == Focus::Rail {
+        let last = rail::rows(app).len().saturating_sub(1);
+        match key.code {
+            KeyCode::Char('j') | KeyCode::Down => app.rail_sel = (app.rail_sel + 1).min(last),
+            KeyCode::Char('k') | KeyCode::Up => app.rail_sel = app.rail_sel.saturating_sub(1),
+            KeyCode::Enter | KeyCode::Right => rail::activate(app),
+            KeyCode::Char('i') => app.set_focus(Focus::Input),
+            _ => {}
+        }
+        return Ok(false);
+    }
+
     if matches!(app.focus, Focus::PostIn | Focus::PostOut) {
         let view_h = if app.focus == Focus::PostIn {
             app.post_in_area.height.saturating_sub(2)
@@ -717,12 +729,14 @@ pub(crate) fn pane_open(app: &App) -> impl Fn(Focus) -> bool + use<> {
     // land on it anyway — j/k then went to a pane with nothing on screen. This
     // is the same ground truth the mouse hit-tests use, and one frame is
     // always painted before the first key is read.
+    let rail = app.rail_area.width > 0;
     let queue = !app.queue.is_empty();
     let post = app.post_in_area.height > 0;
     let meter = app.cache.area.height > 0;
     let git = app.git_area.height > 0;
     let files = app.files_area.height > 0;
     move |f| match f {
+        Focus::Rail => rail,
         Focus::Queue => queue,
         Focus::PostIn | Focus::PostOut => post,
         Focus::Meter => meter,

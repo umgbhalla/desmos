@@ -202,6 +202,9 @@ pub(crate) fn handle_subagent(app: &mut App, ev: &Value) {
             child.state = phase.to_string();
             child.accepted = ev.get("accepted").and_then(Value::as_bool);
             child.op_sent = None;
+            // A fresh terminal transition is unseen even if this worker was
+            // inspected while it was still running.
+            app.rail_seen.remove(id);
             let secs = ev.get("secs").and_then(Value::as_f64).unwrap_or(0.0);
             let elapsed = Duration::from_secs_f64(secs.max(0.0));
             let err = ev
