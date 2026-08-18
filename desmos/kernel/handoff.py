@@ -94,3 +94,34 @@ def watch(world: World) -> bool:
         catalog.retire(world, BLOCK)
         return False
     return BLOCK in getattr(world, "injections", {})
+
+
+#: Injection name for the turn that wakes up after a fold.
+FOLD = "fold"
+
+
+def consent_text(kept: int, summary: str) -> str:
+    """What the turn after a fold is told before it does anything else.
+
+    The model that wakes up here cannot read what was folded. It can read a
+    summary someone else wrote, and it has no way to know what that summary
+    dropped -- so the first thing it does is say what it believes and let the
+    person who does remember correct it.
+    """
+    size = f"{len(summary)} chars" if summary else "no summary text"
+    return (
+        f"A fold just happened: {kept} messages remain, and the turns before "
+        f"them are gone from the wire ({size}). You cannot read what was "
+        "folded. Before any irreversible step -- a commit, a push, a delete, a "
+        "release -- restate from the summary, in your own words: the "
+        "objective, what is established and by what evidence, what is still "
+        "open, and the exact next action. Then ask the user to confirm or "
+        "correct it. Reading a syscall result or a file to re-establish a fact "
+        "is fine and does not need permission."
+    )
+
+
+def after_fold(world: World, kept: int, summary: str = "") -> str:
+    """Arm the consent turn and drop the pre-fold rail it replaces."""
+    catalog.retire(world, BLOCK)
+    return catalog.inject(world, FOLD, consent_text(kept, summary), turns=1)

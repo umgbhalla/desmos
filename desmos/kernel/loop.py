@@ -499,6 +499,11 @@ def turn(
             except Exception:
                 if world.log:
                     world.log[-1]["hook_error"] = traceback.format_exc()
+        # The turn that wakes up after this cannot read what was folded, only a
+        # summary it did not write. Arm the consent block so it states what it
+        # believes and lets the person who does remember correct it before
+        # anything irreversible happens on the strength of a summary.
+        handoff.after_fold(world, len(messages), summary)
     # What the model wrote after its last closing tag. Never rewritten -- the
     # stored message must stay byte-exact for the cached prefix -- but recorded,
     # so a degenerate suffix is visible the first time instead of the fiftieth.

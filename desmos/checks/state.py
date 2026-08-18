@@ -345,6 +345,7 @@ def check() -> None:
         _check_injections(cwd)
         _check_handoff_rail(cwd)
         _check_plan_rail(cwd)
+        _check_fold_consent(cwd)
         _check_steer(cwd)
         _check_op_rollup(cwd)
         _check_slice(cwd)
@@ -1388,3 +1389,43 @@ def _check_plan_rail(cwd: Path) -> None:
     prose = plan.create(world, "prose", "no list here, just a paragraph")
     assert prose["steps"] == [], prose
     print("plan rail check ok")
+
+
+def _check_fold_consent(cwd: Path) -> None:
+    """The turn after a fold is told it cannot read what was folded.
+
+    Driven through run_turns with a compaction block on the wire, because the
+    thing worth proving is that the real fold path arms the block -- not that a
+    helper can format a sentence.
+    """
+    import json as _json
+    from desmos.kernel import handoff
+    from desmos.kernel.loop import run_turns
+    from desmos.transport.complete import COMPACT_BLOCK
+
+    home = cwd / "foldconsent"
+    home.mkdir()
+    world = new_world(home, state_path=home / "harness.sqlite3", persist=False)
+    world.model = "claude-opus-5"
+    sent: list[str] = []
+    lt = chr(60)
+
+    def fake(_model, system, messages, _max_tokens):
+        sent.append(_json.dumps(system))
+        if len(sent) == 1:
+            return {
+                "content": [
+                    {"type": COMPACT_BLOCK, "summary": "the work so far, folded"},
+                    {"type": "text", "text": lt + "python>1" + lt + "/python>"},
+                ],
+                "usage": {},
+            }
+        return {"content": [{"type": "text", "text": "understood"}], "usage": {}}
+
+    world.complete_fn = fake
+    run_turns(world, "go", quiet=True)
+    assert len(sent) >= 2, sent
+    assert "A fold just happened" in sent[1], sent[1][-400:]
+    assert "confirm or correct" in sent[1], sent[1][-400:]
+    assert handoff.FOLD not in world.injections, world.injections
+    print("fold consent check ok")
