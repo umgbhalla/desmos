@@ -361,6 +361,7 @@ def check() -> None:
         _check_d1_worker()
         _check_budget_rail(cwd)
         _check_witness(cwd)
+        _check_observer_rail(cwd)
         _check_refine(cwd)
         _check_stow()
         _check_salvage()
@@ -2074,6 +2075,75 @@ def _check_witness(cwd: Path) -> None:
     assert witness.wake(quiet) == ""
     assert witness.BLOCK not in quiet.injections
     print("witness check ok")
+
+
+def _check_observer_rail(cwd: Path) -> None:
+    """An observer opens work items and never closes them (constitution T4).
+
+    Recommend-only is safe and ignorable; publish authority is useful and
+    dangerous. The rail that makes the middle position real is asymmetric:
+    add, note and reopen stay open to an observer, while finish and claim are
+    refused -- claim too, because a lease nobody may discharge leaves the item
+    held by a run with no authority to close it.
+    """
+    from desmos.state import work
+
+    home = cwd / "observer"
+    home.mkdir()
+    world = new_world(home, state_path=home / "harness.sqlite3")
+
+    item = work.add(world, "file the sink defect")
+    prior = os.environ.get("DESMOS_ROLE")
+    os.environ["DESMOS_ROLE"] = work.OBSERVER
+    try:
+        assert work.role() == work.OBSERVER, work.role()
+
+        # Opening is the observer's whole job, and it still works.
+        filed = work.add(world, "nobody asked for this one")
+        assert filed["status"] == "open", filed
+        work.note(world, filed["id"], "seen twice in the last two sessions")
+
+        try:
+            work.finish(world, item["id"], evidence="deadbeef")
+        except work.WorkError as exc:
+            assert "observer" in str(exc), exc
+        else:
+            raise AssertionError("an observer closed a work item")
+
+        # Refused, and the refusal is a row. An unrecorded rule cannot be
+        # audited, and the item must be exactly as open as it was.
+        kinds = [e["kind"] for e in work.events(world, item["id"])]
+        assert work.OBSERVER_REFUSED in kinds, kinds
+        assert kinds.count("done") == 0, kinds
+        still = [r["id"] for r in work.items(world, status="open")]
+        assert item["id"] in still, still
+
+        # Dropping is closing too. Neither door.
+        try:
+            work.finish(world, item["id"], status="dropped")
+        except work.WorkError as exc:
+            assert "observer" in str(exc), exc
+        else:
+            raise AssertionError("an observer dropped a work item")
+
+        try:
+            work.claim(world, item["id"])
+        except work.WorkError as exc:
+            assert "observer" in str(exc), exc
+        else:
+            raise AssertionError("an observer took a lease")
+    finally:
+        if prior is None:
+            os.environ.pop("DESMOS_ROLE", None)
+        else:
+            os.environ["DESMOS_ROLE"] = prior
+
+    # And with the role gone, the same call closes the same item. The rail is
+    # the role, not a broken finish.
+    assert work.role() == "worker", work.role()
+    closed = work.finish(world, item["id"], evidence="deadbeef")
+    assert closed["status"] == "done", closed
+    print("observer rail check ok")
 
 
 def _check_budget_rail(cwd: Path) -> None:

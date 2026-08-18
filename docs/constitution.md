@@ -178,13 +178,28 @@ results but never reasoning. A seat that spans models is a *role*; a seat that
 does not is a person-analogue. Not decided, and the answer determines the seat
 schema.
 
-**T3 -- Ambient evolution versus reviewability.** Policy that changes every
-turn is exactly the policy nobody reviews. The refinement loop must not become
-an unaudited write channel.
+**T3 -- Ambient evolution versus reviewability.** *Resolved.* A change may be
+made between turns, without review, exactly when three things hold: its
+provenance is recorded (D2), an existing rollback path reverts it, and it
+touches no version-controlled file, no frozen ABI line, and no schema. That
+is precisely notes, grown tools, injections, todos, plan revisions and work
+rows -- everything else is substrate and goes through commit, suite and diff
+(D1). Reviewability is bought periodically rather than per-write: STEER F's
+`refine` census reports every grown tag as keep, unused or broken from the
+result events themselves, the usage rollup prices each catalog line, and a
+tombstone removes one without deleting it. So "changes every turn" and
+"nobody reviews it" are separable, and the refinement loop is an audited
+channel because its own output is the audit.
 
-**T4 -- Shadow observer authority.** Recommend-only is safe and ignorable;
-publish authority is useful and dangerous. Working proposal: it may open work
-items and may never close them.
+**T4 -- Shadow observer authority.** *Resolved as proposed, and built.* An
+observer opens work items and never closes them. `DESMOS_ROLE=observer` makes
+`work.add`, `work.note` and `work.reopen` ordinary and refuses `work.finish`
+and `work.claim` -- claim included, because a lease nobody may discharge
+leaves the item held by a run with no authority to close it. A refused close
+writes an `observer-refused` event before it raises, so the rail can be
+counted rather than believed. The asymmetry is the whole point: an observer
+is useful because it files items nobody asked for, and safe because it cannot
+mark one done. Acceptance stays where G2 and D3 put it.
 
 **T5 -- Peer agency versus bounded exchange.** Cross-session peer messaging
 works. Nothing prevents an amplifying loop except the convention that a reply
