@@ -190,8 +190,13 @@ items and may never close them.
 works. Nothing prevents an amplifying loop except the convention that a reply
 is not auto-replied. A convention is not a rail.
 
-**T6 -- Verification budget.** Every invariant above wants a test, and a full
-check already runs several minutes. The budget is finite and unallocated.
+**T6 -- Verification budget.** *Resolved.* The floor was measured rather than
+guessed: a sampling profiler (`desmos check --profile`) blamed the seconds on
+fixed sleeps and a polling wait, not on the number of invariants. Cutting
+those took a full check from 33s to ~21s. The budget is therefore allocated
+per invariant, not per suite: a new rail may add a check if the floor stays
+under ~30s, and the floor itself is a control in section 7 -- a metric that
+improves while the floor rots is not an improvement.
 
 **T7 -- Single-mutator assumption.** Another writer is active in this
 worktree; files changed under an in-flight task this session. D2's attribution
@@ -272,3 +277,43 @@ a record that can silently empty itself.
 Deliberately excluded: any seat schema before 2.1; welfare features that need
 a metaphysical premise; a merge-queue replacement; and the frozen six-track
 plan `bcc818bc`, which these phases supersede.
+
+## 7. Evaluation
+
+What measures this harness improving itself, and on what.
+
+**The unit is an accepted item.** Only a gate mints one, and only a human
+accepts (G2, D3). Every number below is denominated in items, because the
+alternatives are all writable by the thing being measured: turn count, tokens,
+lines changed, commits per session, tools grown. A session that wants a better
+score on any of those can produce one without doing any work.
+
+**Three numbers, all derived, none stored.**
+
+| number | definition | source | direction |
+|---|---|---|---|
+| rework rate | closures that came back / closures | `work_events` via `witness.actors` | down |
+| cost per accepted item | window spend / items closed | `calls` via `budget.spend` | down |
+| the floor | seconds to green for a full check | `desmos check` | flat or down |
+
+The first two are reported by `witness.digest`, and land in the paragraph a
+session reads at wake -- the same place the account of its work already lands.
+The floor is a *control*, not an objective: a period in which rework or cost
+improved while the floor rotted is not an improvement, it is a debt moved.
+
+**The task set is the real work.** The samples are the work graph's own gated
+items, not a synthetic benchmark. The check suite is a regression control. A
+cold-store replay of past user asks is admissible as qualitative evidence
+only, because the model is not deterministic and a replay cannot be scored
+against its original run.
+
+**Falsifiable claim.** A period is an improvement only if rework rate or cost
+per accepted item falls while the floor stays green and gate refusals do not
+rise. Refusals rising with rework falling is a gate getting stricter, not a
+worker getting better; both falling together with the floor flat is the only
+shape that counts.
+
+**What the harness may not do.** It measures; it does not accept. Nothing in
+this section lets a session mark its own item accepted, and nothing here is
+an input to any automatic change -- section 5's inert-feature and truthful-
+surface rails apply to these numbers as much as to any other output.
