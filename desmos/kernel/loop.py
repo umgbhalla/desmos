@@ -1065,7 +1065,7 @@ def _run_turns(
             from desmos.state import plan as _plan
 
             if plan_nudges < _plan.nudge_limit():
-                reminder = _plan.nudge(world)
+                reminder = _plan.stop_rail(world, sent=plan_nudges)
                 if reminder:
                     plan_nudges += 1
                     deliver(world, reminder)

@@ -196,8 +196,16 @@ def _knowledge(world, op, body, attrs):
         command, _, rest = line.partition(" ")
         if command == "+":
             items.append(f"[ ] {rest.strip()}")
-        elif command.lower() == "x" and rest.isdigit() and 0 < int(rest) <= len(items):
-            items[int(rest) - 1] = items[int(rest) - 1].replace("[ ]", "[x]", 1)
+        elif command.lower() in {"x", "?"} and rest.isdigit() and 0 < int(rest) <= len(items):
+            # Three states, not two: an item waiting on somebody else is
+            # neither open nor done, and the stop rail skips it rather than
+            # demanding work this session cannot do.
+            mark = "[x]" if command.lower() == "x" else "[?]"
+            item = items[int(rest) - 1]
+            head = item[:3]
+            items[int(rest) - 1] = (
+                mark + item[3:] if head in ("[ ]", "[x]", "[?]") else mark + " " + item
+            )
         elif command == "-" and rest.isdigit() and 0 < int(rest) <= len(items):
             items.pop(int(rest) - 1)
     if items:

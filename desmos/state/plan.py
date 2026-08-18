@@ -489,7 +489,19 @@ def current_step(rec: dict[str, Any]) -> dict[str, Any] | None:
     return None
 
 
-def nudge(world: World) -> str | None:
+def _allowance(sent: int, limit: int | None = None) -> str:
+    """How much rail is left, said out loud.
+
+    A reminder that does not declare its own budget reads as an argument the
+    model cannot win, and the honest answer -- that the rail yields after a
+    fixed number and hands the turn back -- is exactly what makes pausing on
+    purpose, with a reason, the better move than outlasting it.
+    """
+    cap = nudge_limit() if limit is None else limit
+    return f"Reminder {sent + 1} of {cap}; after the last one the turn is yours."
+
+
+def nudge(world: World, sent: int = 0, limit: int | None = None) -> str | None:
     """What to say to a step that stopped while a plan is still open.
 
     A stop is not a decision. The loop ends a step the moment the model writes
@@ -515,8 +527,61 @@ def nudge(world: World) -> str | None:
         f"({left} of {len(steps)} open)\n"
         "Carry on with that step now. If it truly cannot proceed, block the "
         f"plan with the reason -- knowledge op=plan, body: block {rec['plan_id']} "
-        "<why> -- which stops these reminders and hands the turn back."
+        "<why> -- which stops these reminders and hands the turn back.\n"
+        + _allowance(sent, limit)
     )
+
+
+#: A todo line is open, done, or waiting on somebody else. Only the first is
+#: work the rail may demand, and the marks are the plan's own vocabulary.
+TODO_OPEN = "[ ]"
+
+
+def open_todos(world: World) -> list[tuple[int, str]]:
+    """The numbered todo lines that are nobody else's to do."""
+    raw = str((getattr(world, "notes", None) or {}).get("todo", "") or "")
+    rows = [line.strip() for line in raw.splitlines() if line.strip()]
+    return [
+        (i, line[len(TODO_OPEN):].strip())
+        for i, line in enumerate(rows, 1)
+        if line.startswith(TODO_OPEN)
+    ]
+
+
+def todo_nudge(
+    world: World, sent: int = 0, limit: int | None = None
+) -> str | None:
+    """The same answer for a stop when the open work is a todo, not a plan.
+
+    The plan rail only ever knew about plan steps, so a session working from
+    the todo list -- which is most of them -- stopped and stayed stopped. The
+    list is the same kind of declaration a plan is: work this session said was
+    open. A line marked waiting is skipped, for the reason a waiting step is.
+    """
+    todos = open_todos(world)
+    if not todos:
+        return None
+    number, title = todos[0]
+    return (
+        f"[{len(todos)} open todo(s) and no plan step to work]\n"
+        f"next todo {number}: {title}\n"
+        "Carry on with that now. If it is not yours to do, mark it waiting "
+        f"-- knowledge op=todo, body: ? {number} -- or close it with x "
+        f"{number}, either of which stops these reminders.\n"
+        + _allowance(sent, limit)
+    )
+
+
+def stop_rail(
+    world: World, sent: int = 0, limit: int | None = None
+) -> str | None:
+    """One answer to a stop, from whichever declaration still has work in it.
+
+    The plan comes first because it carries order and reasons; the todo list
+    is the fallback because it is what most sessions actually run on. Both
+    yield to the same allowance, so a wedged rail cannot hold the turn.
+    """
+    return nudge(world, sent, limit) or todo_nudge(world, sent, limit)
 
 
 def block(world: World, plan_id: str, reason: str) -> dict[str, Any]:

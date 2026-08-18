@@ -345,6 +345,7 @@ def check() -> None:
         _check_injections(cwd)
         _check_handoff_rail(cwd)
         _check_plan_rail(cwd)
+        _check_stop_rail(cwd)
         _check_fold_consent(cwd)
         _check_child_run_id()
         _check_concurrent_notes()
@@ -1559,6 +1560,79 @@ def _check_plan_rail(cwd: Path) -> None:
     plan.set_step(world, idle["plan_id"], 1, "waiting", "the user decides")
     assert plan.nudge(world) is None, plan.render(plan.read(world, idle["plan_id"]))
     print("plan rail check ok")
+
+
+def _check_stop_rail(cwd: Path) -> None:
+    """A stop is answered from the todo list too, and every reminder says
+    how much rail is left.
+
+    The plan rail only knew about plan steps, so a session running off the
+    todo list -- which is most of them -- stopped and stayed stopped with
+    work still declared open. Driven through run_turns, because the defect is
+    a reminder nothing sends.
+    """
+    import os as _os
+
+    from desmos.kernel.loop import run_turns
+    from desmos.state import plan
+
+    home = cwd / "stoprail"
+    home.mkdir()
+    world = new_world(home, state_path=home / "harness.sqlite3", persist=False)
+    world.model = "claude-opus-5"
+    listing = dispatch(
+        world,
+        Block("knowledge", "+ write the fallback\n+ ask the user about seats",
+              {"op": "todo"}),
+    )
+    assert listing.startswith("1. [ ] write the fallback"), listing
+    assert plan.active(world) is None, "this check must run without a plan"
+
+    calls: list[int] = []
+
+    def fake(_model, _system, messages, _max_tokens):
+        calls.append(len(messages))
+        return {"content": [{"type": "text", "text": "narrating, not working"}],
+                "usage": {}}
+
+    world.complete_fn = fake
+    _os.environ["DESMOS_PLAN_NUDGES"] = "2"
+    try:
+        run_turns(world, "go", quiet=True)
+
+        sent = [
+            str(m.get("content")) for m in world.messages
+            if m.get("role") == "user" and "open todo(s)" in str(m.get("content"))
+        ]
+        assert len(calls) == 3, calls
+        assert len(sent) == 2, sent
+        assert "next todo 1: write the fallback" in sent[0], sent[0]
+        # The allowance is part of the reminder: a rail that will not say how
+        # long it keeps going reads as an argument nobody can end.
+        assert "Reminder 1 of 2" in sent[0], sent[0]
+        assert "Reminder 2 of 2" in sent[1], sent[1]
+
+        # Waiting is the third state. Marking the first item hands the rail
+        # to the second, and marking both silences it -- without dropping
+        # either line, which is what `-` is for.
+        dispatch(world, Block("knowledge", "? 1", {"op": "todo"}))
+        assert [n for n, _ in plan.open_todos(world)] == [2], world.notes["todo"]
+        assert "next todo 2:" in str(plan.stop_rail(world)), plan.stop_rail(world)
+
+        dispatch(world, Block("knowledge", "? 2", {"op": "todo"}))
+        assert plan.open_todos(world) == [], world.notes["todo"]
+        assert plan.stop_rail(world) is None, world.notes["todo"]
+        calls.clear()
+        world.messages.clear()
+        run_turns(world, "again", quiet=True)
+        assert len(calls) == 1, calls
+
+        # A done mark still reads as done on a line that was waiting.
+        shown = dispatch(world, Block("knowledge", "x 1", {"op": "todo"}))
+        assert shown.startswith("1. [x] write the fallback"), shown
+    finally:
+        _os.environ.pop("DESMOS_PLAN_NUDGES", None)
+    print("stop rail check ok")
 
 
 def _check_fold_consent(cwd: Path) -> None:
