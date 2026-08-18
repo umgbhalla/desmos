@@ -2052,6 +2052,23 @@ def _check_witness(cwd: Path) -> None:
     assert "write the sink" in block["text"], block
     assert int(block["turns"]) == 1, block
 
+    # The eval numbers ride that same paragraph. Both are denominated in items
+    # a gate accepted, so a session cannot move either by spending more turns:
+    # more spend with the same closures makes the number worse, not better.
+    from datetime import datetime, timezone
+
+    persist.record_call(
+        world, {"ts": datetime.now(timezone.utc).isoformat(), "usage": FIXTURE_USAGE}
+    )
+    state = witness.digest(world, hours=24)
+    assert state["done"] == 1 and state["rework"] == 1, state
+    assert abs(state["spend"] - FIXTURE_COST_OPUS) < 1e-12, state
+    assert abs(state["per_item"] - FIXTURE_COST_OPUS) < 1e-12, state
+    assert abs(state["rework_rate"] - 0.5) < 1e-12, state
+    body = witness.text(state)
+    assert "1 accepted" in body and "rework 50%" in body, body
+    assert witness.digest(world, hours=0)["per_item"] is None, "cost per nothing"
+
     # An empty workspace says nothing rather than saying zero.
     quiet = new_world(cwd / "witness-quiet", state_path=cwd / "witness-quiet.sqlite3")
     assert witness.wake(quiet) == ""

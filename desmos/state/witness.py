@@ -157,17 +157,39 @@ def commits(world: World, hours: float = DEFAULT_HOURS, limit: int = 8) -> list[
     return [line for line in done.stdout.splitlines() if line.strip()][:limit]
 
 
+def cost(world: World, hours: float = DEFAULT_HOURS) -> float:
+    """What the window cost, in dollars, from the ledger the budget reads."""
+    # Late import: budget reads persist's tables and persist wakes this module,
+    # so importing it at module scope would close a cycle.
+    from desmos.state import budget
+
+    try:
+        return float(budget.spend(world, hours).get("usd", 0.0))
+    except Exception:  # noqa: BLE001 - a missing ledger is not a cost of zero
+        return 0.0
+
+
 def digest(world: World, hours: float = DEFAULT_HOURS) -> dict[str, Any]:
     who = actors(world, hours)
+    done = sum(int(a["done"]) for a in who)
+    rework = sum(int(a["rework"]) for a in who)
+    spend = cost(world, hours)
+    # Two rates, both derived and neither storable: cost per item the work
+    # graph actually closed, and the share of closures that came back. Both
+    # are denominated in items, which only a gate can mint -- a session
+    # cannot improve either by talking more, editing more, or growing tools.
     return {
         "hours": float(hours),
         "since": _since(hours),
         "actors": who,
         "finished": finished(world, hours),
         "commits": commits(world, hours),
-        "done": sum(int(a["done"]) for a in who),
-        "rework": sum(int(a["rework"]) for a in who),
+        "done": done,
+        "rework": rework,
         "gates": sum(int(a["gates"]) for a in who),
+        "spend": spend,
+        "per_item": (spend / done) if done else None,
+        "rework_rate": (rework / (done + rework)) if (done + rework) else None,
     }
 
 
@@ -185,6 +207,14 @@ def text(state: dict[str, Any]) -> str:
         lines.append("  [" + mark + "] " + str(row["title"]) + note)
     if state["commits"]:
         lines.append("  landed: " + "; ".join(state["commits"][:3]))
+    if state["done"]:
+        rate = state["rework_rate"]
+        lines.append(
+            "  cost ${:.2f} for {} accepted, ${:.2f} each; rework {:.0%}.".format(
+                state["spend"], state["done"], state["per_item"] or 0.0,
+                rate if rate is not None else 0.0,
+            )
+        )
     lines.append(
         "This is the record another session reads as what you did. An item "
         "closed with no evidence pointer reads, later, as a claim."
