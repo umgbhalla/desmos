@@ -12,6 +12,73 @@ from desmos.scan import scan
 from desmos.types import Block
 
 
+def check_shell_peek_history(cwd: Path) -> None:
+    """Shell peek reports bounded PTY history without touching the live PTY."""
+    import os
+    import select
+
+    from desmos.kernel.shell import close_all
+    from desmos.loop import new_world
+
+    world = new_world(cwd, state_path=None, persist=False, ns={})
+
+    def sh(body: str = "", **attrs: str) -> str:
+        return dispatch(world, Block("shell", body, attrs))
+
+    try:
+        sentinel = b"pty-history-sentinel"
+        sh("printf pty-history-sentinel")
+        shell = world.shells["main"]
+        assert sentinel in shell._history, "PTY output was not recorded in _history"
+
+        tail = b"history-tail-kept"
+        sh(
+            "python3 -c \"import os;"
+            "os.write(1, b'H' * 140000 + b'history-tail-kept')\""
+        )
+        if shell.monitoring:
+            from desmos import pending
+
+            assert pending.wait_next(world, timeout=5), "large-output probe did not finish"
+        assert len(shell._history) <= 131072, (
+            f"_history exceeded its 128KB cap: {len(shell._history)} bytes"
+        )
+        assert tail in shell._history[-1024:], "rolling _history discarded its newest tail"
+
+        before_history = bytes(shell._history)
+        before_state = (
+            shell.mark,
+            shell._generation,
+            shell._interrupted_generation,
+            shell.monitoring,
+            shell.at_prompt,
+            shell.cwd,
+        )
+        os.write(shell.master, b"printf unread-peek-sentinel\n")
+        ready, _, _ = select.select([shell.master], [], [], 1)
+        assert ready, "shell did not put the probe output on its PTY"
+
+        peeked = sh(peek="1")
+        assert "[shell at prompt]" in peeked and "history-tail-kept" in peeked, peeked
+        assert "unread-peek-sentinel" not in peeked, "peek drained unread PTY output"
+        assert bytes(shell._history) == before_history, "peek mutated _history"
+        assert (
+            shell.mark,
+            shell._generation,
+            shell._interrupted_generation,
+            shell.monitoring,
+            shell.at_prompt,
+            shell.cwd,
+        ) == before_state, "peek mutated shell state"
+        ready, _, _ = select.select([shell.master], [], [], 0)
+        assert ready, "peek consumed the pending PTY output"
+        drained = shell._drain(0.2)
+        assert b"unread-peek-sentinel" in drained, "pending output was not left for the reader"
+        assert b"unread-peek-sentinel" in shell._history, "later PTY read missed _history"
+    finally:
+        close_all(world)
+
+
 def check() -> None:
     import tempfile
 
@@ -1014,6 +1081,8 @@ def check() -> None:
         )
         _idle_was, _quiet_was = _shell_mod.PROMPT_IDLE, _shell_mod.QUIET
         _shell_mod.PROMPT_IDLE, _shell_mod.QUIET = 0.05, 0.05
+
+        check_shell_peek_history(cwd)
 
         w_sh = new_world(cwd, state_path=None, persist=False, ns={})
         try:
