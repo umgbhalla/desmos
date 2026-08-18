@@ -346,6 +346,7 @@ def check() -> None:
         _check_handoff_rail(cwd)
         _check_plan_rail(cwd)
         _check_stop_rail(cwd)
+        _check_commit_attribution(cwd)
         _check_fold_consent(cwd)
         _check_child_run_id()
         _check_concurrent_notes()
@@ -1560,6 +1561,61 @@ def _check_plan_rail(cwd: Path) -> None:
     plan.set_step(world, idle["plan_id"], 1, "waiting", "the user decides")
     assert plan.nudge(world) is None, plan.render(plan.read(world, idle["plan_id"]))
     print("plan rail check ok")
+
+
+def _check_commit_attribution(cwd: Path) -> None:
+    """A commit says which staged files this session did not write (T7).
+
+    `git add path` stages the whole file, so a second writer in the worktree
+    rides along with a clean exit code. Concurrent writes are not
+    attributable and the harness does not pretend otherwise -- but a file
+    untouched since before this session began was demonstrably not written by
+    it, and the commit result says so.
+    """
+    import subprocess
+    import time
+
+    from desmos.state import persist
+
+    repo = cwd / "attrib"
+    repo.mkdir()
+
+    def git(*args: str) -> subprocess.CompletedProcess:
+        return subprocess.run(["git", *args], cwd=repo, capture_output=True, text=True)
+
+    git("init", "-q")
+    git("config", "user.email", "check@desmos.local")
+    git("config", "user.name", "desmos check")
+    (repo / "seed.txt").write_text("seed\n")
+    git("add", "seed.txt")
+    git("commit", "-q", "-m", "seed")
+
+    world = new_world(repo, state_path=cwd / "attrib.sqlite3")
+    world.model = "claude-opus-5"
+    persist.save(world)
+    started = persist.session_started(world)
+    assert started > 0, "no session row, so nothing can be attributed"
+
+    theirs, mine = repo / "theirs.txt", repo / "mine.txt"
+    theirs.write_text("somebody else was here\n")
+    os.utime(theirs, (started - 600, started - 600))
+    mine.write_text("this session wrote this\n")
+    os.utime(mine, (time.time(), time.time()))
+    git("add", "theirs.txt", "mine.txt")
+
+    landed = dispatch(world, Block("workspace", "carry both files", {"op": "commit"}))
+    assert "HEAD " in landed, landed
+    assert "not written during this session" in landed, landed
+    assert "theirs.txt" in landed, landed
+    assert "mine.txt" not in landed.split("WARNING not written", 1)[1], landed
+
+    # A commit of only this session's own work says nothing extra, or the
+    # warning is noise and gets ignored exactly when it matters.
+    (repo / "second.txt").write_text("also mine\n")
+    git("add", "second.txt")
+    quiet = dispatch(world, Block("workspace", "only my own work", {"op": "commit"}))
+    assert "not written during this session" not in quiet, quiet
+    print("commit attribution check ok")
 
 
 def _check_stop_rail(cwd: Path) -> None:

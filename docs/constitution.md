@@ -201,9 +201,14 @@ counted rather than believed. The asymmetry is the whole point: an observer
 is useful because it files items nobody asked for, and safe because it cannot
 mark one done. Acceptance stays where G2 and D3 put it.
 
-**T5 -- Peer agency versus bounded exchange.** Cross-session peer messaging
-works. Nothing prevents an amplifying loop except the convention that a reply
-is not auto-replied. A convention is not a rail.
+**T5 -- Peer agency versus bounded exchange.** *Resolved, and built.*
+Directed peer messages are drawn against an allowance denominated in human
+asks -- one allotment for the session, one more per ask, recovered from the
+stored transcript by content so a tool result or a harness nudge cannot mint
+any. A conversation with a person in it is never throttled; a conversation
+with only peers in it runs out and says why. The shared channel stays
+unbounded on purpose: nobody replies to it automatically, so it is not the
+amplification mode. The convention is now a count.
 
 **T6 -- Verification budget.** *Resolved.* The floor was measured rather than
 guessed: a sampling profiler (`desmos check --profile`) blamed the seconds on
@@ -213,9 +218,16 @@ per invariant, not per suite: a new rail may add a check if the floor stays
 under ~30s, and the floor itself is a control in section 7 -- a metric that
 improves while the floor rots is not an improvement.
 
-**T7 -- Single-mutator assumption.** Another writer is active in this
-worktree; files changed under an in-flight task this session. D2's attribution
-claims do not currently hold.
+**T7 -- Single-mutator assumption.** *Resolved by dropping it.* The harness
+assumes other writers. D2's claim is therefore scoped: it attributes the
+records this harness wrote -- notes, tools, work events, plan revisions,
+calls, memories -- and it does not attribute worktree files, where git is the
+record and a concurrent write is indistinguishable from mine. What it can
+still say it does say: `git add path` stages a whole file, so a commit result
+now names every staged file untouched since before this session began. Those
+were demonstrably written by somebody else. A write that lands *during* the
+session remains unattributable, and the honest surface is to say that rather
+than to infer an author.
 
 ## 5. Failure modes
 

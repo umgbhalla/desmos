@@ -171,6 +171,7 @@ def _commit(world, body, attrs):
         args.append("--no-edit")
     if attrs.get("only"):
         args += ["--", *attrs["only"].split()]
+    carried = _carried_in(world, git)
     result = git(*args)
     if path:
         os.unlink(path)
@@ -180,7 +181,45 @@ def _commit(world, body, attrs):
     landed = git("log", "-1", "--format=%B").stdout.strip()
     stat = git("show", "--stat", "--format=", "HEAD").stdout.strip().splitlines()
     suffix = f"message verified ({len(landed)} chars)" if landed == message or not message else "WARNING message differs"
-    return "\n".join([f"HEAD {head}", *stat[-1:], suffix])
+    lines = [f"HEAD {head}", *stat[-1:], suffix]
+    if carried:
+        lines.append(
+            "WARNING not written during this session: " + ", ".join(carried)
+            + " -- another writer's changes are in this commit; say so or amend"
+        )
+    return "\n".join(lines)
+
+
+def _carried_in(world, git):
+    """Staged files whose contents predate this session, newest-mtime first.
+
+    `git add path` stages the whole file, so a worktree with a second writer
+    in it puts their in-flight work inside my commit with a clean exit code.
+    The harness cannot attribute a *concurrent* write and should not pretend
+    to -- but a file that has not been touched since before this session
+    began was demonstrably not written by it, and that is worth saying out
+    loud before the commit message claims otherwise.
+    """
+    from desmos.state.persist import session_started
+
+    started = session_started(world)
+    if not started:
+        return []
+    staged = git("diff", "--cached", "--name-only")
+    if staged.returncode:
+        return []
+    older = []
+    for name in staged.stdout.split("\n"):
+        name = name.strip()
+        if not name:
+            continue
+        target = world.cwd / name
+        try:
+            if target.stat().st_mtime < started:
+                older.append(name)
+        except OSError:
+            continue  # deleted or unreadable: git's record, not the harness's
+    return older[:8]
 
 
 def _knowledge(world, op, body, attrs):

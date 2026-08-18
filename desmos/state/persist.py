@@ -1892,6 +1892,34 @@ def _human_ask(content_json: str) -> str:
     return _strip_preamble("\n".join(parts))
 
 
+def session_started(world: World) -> float:
+    """When this run's session row was opened, as a POSIX timestamp.
+
+    Zero when there is no row to read: an unattributable commit is better
+    than an invented attribution.
+    """
+    if not getattr(world, "persist", False):
+        return 0.0
+    try:
+        conn = _open(state_file(world))
+    except Exception:  # noqa: BLE001 - no ledger is not a claim about time
+        return 0.0
+    try:
+        row = conn.execute(
+            "SELECT started_at FROM sessions WHERE id = ?", (run_id(),)
+        ).fetchone()
+    except Exception:  # noqa: BLE001
+        return 0.0
+    finally:
+        conn.close()
+    if row is None or not row["started_at"]:
+        return 0.0
+    try:
+        return datetime.fromisoformat(str(row["started_at"])).timestamp()
+    except ValueError:
+        return 0.0
+
+
 def session_asks(
     world: World, *, session: str | None = None, limit: int = 20
 ) -> list[dict[str, Any]]:
