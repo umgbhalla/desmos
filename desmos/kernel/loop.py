@@ -16,6 +16,7 @@ from desmos.kernel.catalog import (
 )
 from desmos.kernel.const import FROZEN, MAX_TOKENS, PRIOR_KEEP
 from desmos.kernel.dispatch import dispatch
+from desmos.kernel import handoff
 from desmos.kernel.diagnostics import install_diagnostics
 from desmos.kernel.scan import clip, dropped_openers, scan, scan_spans, trailing_residue
 from desmos.kernel.spill import spill
@@ -432,6 +433,10 @@ def turn(
     from desmos.state import persist as _persist
 
     _persist.record_call(world, world.log[-1])
+    # The fill of the prompt that just landed decides whether the next request
+    # carries the handoff rail. Injections ride in the uncached tail, so asking
+    # here costs nothing cached and warns before the fold rather than after.
+    handoff.watch(world)
     if len(world.log) > 1:
         # Only the newest entry's wire bodies are ever read -- by the complete
         # event three lines below, and by nothing else in the process. Keeping

@@ -52,6 +52,21 @@ def rates(model: str | None) -> tuple[float, float]:
     return float(fallback["input"]), float(fallback["output"])
 
 
+def window(model: str | None) -> int:
+    """Context window in tokens for a model name, same prefix match as rates.
+
+    The wire never reports the ceiling, so the fill of a context is only
+    knowable against a table. This is that table -- the Rust meter keeps its
+    own copy of the same numbers in `model_window`.
+    """
+    name = model or ""
+    data = table()
+    for entry in data["models"]:
+        if name.startswith(entry["prefix"]):
+            return int(entry.get("window") or data["default"]["window"])
+    return int(data["default"]["window"])
+
+
 def cost(usage: dict[str, Any] | None, model: str | None) -> float:
     """USD for one call's usage dict, cache tiers included.
 

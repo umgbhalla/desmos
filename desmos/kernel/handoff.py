@@ -1,0 +1,96 @@
+"""Ask for the handoff while the turns that hold it are still on the wire.
+
+A server-side fold is not something the model gets to prepare for: the API
+folds earlier turns and hands back a summary someone else wrote. Whatever the
+next context needs -- the objective, what is established, the exact next
+action -- has to be written down before that, not after.
+
+So watch the fill. The last response's usage is the real size of the prompt
+that produced it (fresh input plus both cache tiers), and the window is in
+prices.json. Crossing SOFT injects a named block, which lands on the *next*
+request -- the one before the fold. Dropping back under retires it.
+"""
+
+from __future__ import annotations
+
+import os
+from typing import Any
+
+from desmos.kernel import catalog, prices
+from desmos.kernel.types import World
+
+def _share(name: str, default: float) -> float:
+    """A threshold, overridable by env so a demo or a small model can move it."""
+    raw = os.environ.get(name)
+    try:
+        value = float(raw) if raw else default
+    except ValueError:
+        return default
+    return value if 0.0 < value <= 1.0 else default
+
+
+#: Fraction of the window that opens the handoff rail.
+SOFT = _share("DESMOS_HANDOFF_SOFT", 0.75)
+
+#: Hysteresis: retire a little below SOFT so a flat context cannot flap.
+CLEAR = _share("DESMOS_HANDOFF_CLEAR", SOFT - 0.05)
+
+#: Injection name. Idempotent by name -- re-injecting refreshes the number.
+BLOCK = "handoff"
+
+
+def prompt_tokens(usage: dict[str, Any] | None) -> int:
+    """How large the prompt actually was: fresh input plus both cache tiers.
+
+    Output tokens are not in the next prompt as output -- they come back as
+    assistant content, which the next request bills as input. Counting them
+    here would double them once the turn is replayed.
+    """
+    if not usage:
+        return 0
+    total = 0
+    for key in ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"):
+        value = usage.get(key)
+        if isinstance(value, (int, float)):
+            total += int(value)
+    return total
+
+
+def fill(world: World) -> float:
+    """Where the last real request sat in the model's window, 0.0 if unknown."""
+    log = getattr(world, "log", None) or []
+    if not log:
+        return 0.0
+    size = prompt_tokens(log[-1].get("usage"))
+    if size <= 0:
+        return 0.0
+    ceiling = prices.window(getattr(world, "model", None))
+    return size / float(ceiling) if ceiling > 0 else 0.0
+
+
+def text(share: float) -> str:
+    """The block itself. The number is in it because "soon" is not actionable."""
+    return (
+        f"Context is at {share * 100:.0f}% of this model's window. The fold is "
+        "close, and it takes the turns your handoff would have been written "
+        "from. Before the next syscall, write the handoff where it survives: "
+        "the objective, what is established with its evidence, what is still "
+        "open, and the exact next action. A note, a memory record or a file "
+        "-- never only speech. Then carry on with the work."
+    )
+
+
+def watch(world: World) -> bool:
+    """Install or retire the handoff block for the fill right now.
+
+    Returns whether the block is installed after this call. Injections land in
+    the uncached tail, so this never invalidates the cached prefix.
+    """
+    share = fill(world)
+    if share >= SOFT:
+        catalog.inject(world, BLOCK, text(share), turns=0)
+        return True
+    if share < CLEAR:
+        catalog.retire(world, BLOCK)
+        return False
+    return BLOCK in getattr(world, "injections", {})

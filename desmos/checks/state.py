@@ -343,6 +343,7 @@ def check() -> None:
         _check_session_channel(cwd)
         _check_single_writer(cwd)
         _check_injections(cwd)
+        _check_handoff_rail(cwd)
         _check_steer(cwd)
         _check_op_rollup(cwd)
         _check_slice(cwd)
@@ -1289,3 +1290,47 @@ def _check_stow() -> None:
     assert dead.name in names, names
     assert names[dead.name]["bytes"] == len(raw), names[dead.name]
     print("stow check ok")
+
+
+def _check_handoff_rail(cwd: Path) -> None:
+    """Crossing the soft threshold puts the handoff block in the next request.
+
+    Driven through run_turns, not through watch(): the failure this guards
+    against is a policy nothing calls, which a direct unit test cannot see.
+    """
+    import json as _json
+    from desmos.kernel import handoff, prices
+    from desmos.kernel.loop import run_turns
+
+    home = cwd / "handoff"
+    home.mkdir()
+    world = new_world(home, state_path=home / "harness.sqlite3", persist=False)
+    world.model = "claude-opus-5"
+    ceiling = prices.window(world.model)
+    assert ceiling >= 100_000, ceiling
+    big = int(ceiling * handoff.SOFT) + 1000
+    small = int(ceiling * handoff.CLEAR) - 1000
+    sent: list[str] = []
+
+    def answer(tokens: int):
+        def fake(_model, system, _messages, _max_tokens):
+            sent.append(_json.dumps(system))
+            return {
+                "content": [{"type": "text", "text": "ok"}],
+                "usage": {"input_tokens": tokens // 2,
+                          "cache_read_input_tokens": tokens - tokens // 2},
+            }
+
+        return fake
+
+
+    world.complete_fn = answer(big)
+    run_turns(world, "work", quiet=True)
+    assert handoff.BLOCK in world.injections, world.injections
+    assert world.injections[handoff.BLOCK]["turns"] == 0
+
+    world.complete_fn = answer(small)
+    run_turns(world, "more work", quiet=True)
+    assert "Context is at" in sent[-1], sent[-1][-400:]
+    assert handoff.BLOCK not in world.injections, world.injections
+    print("handoff rail check ok")
