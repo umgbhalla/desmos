@@ -1319,6 +1319,53 @@ def peers(world: World) -> list[dict[str, Any]]:
     return live
 
 
+#: Directed peer messages one run may send per human ask (constitution T5).
+#: Four is one request, one reply, and one round of follow-up -- past that an
+#: exchange with nobody in it is amplifying, not working.
+PEER_BUDGET = 4
+
+
+def peer_spend(world: World, *, session: str | None = None) -> dict[str, Any]:
+    """How much of this run's directed-peer allowance is left.
+
+    The failure mode is two sessions replying to each other forever with no
+    person in the loop, so the allowance is denominated in human asks: each
+    ask buys PEER_BUDGET directed messages, cumulatively over the session, and
+    a run nobody has spoken to yet gets exactly one ask's worth. A long
+    conversation with a person is never throttled; a conversation with only
+    peers in it runs out. The count is over what was actually sent, so a
+    convention cannot be mistaken for the rail.
+    """
+    run = session or run_id()
+    empty = {"sent": 0, "asks": 0, "allowance": PEER_BUDGET, "left": PEER_BUDGET}
+    if not getattr(world, "persist", False):
+        return empty
+    try:
+        db = _open(state_file(world))
+    except Exception:  # noqa: BLE001 - no ledger is not an open channel
+        return empty
+    try:
+        sent = int(
+            db.execute(
+                "SELECT count(*) FROM channel_messages"
+                " WHERE run_id = ? AND channel LIKE 'peer:%'",
+                (run,),
+            ).fetchone()[0]
+        )
+    finally:
+        db.close()
+    asks = len(session_asks(world, session=run, limit=0))
+    # One allotment for the session itself, one more per human ask: a run
+    # nobody has spoken to yet can still open an exchange, and every turn a
+    # person takes buys the next round. max(1, asks) would have made the
+    # first ask free of charge and bought nothing.
+    allowance = PEER_BUDGET * (asks + 1)
+    return {
+        "sent": sent, "asks": asks,
+        "allowance": allowance, "left": allowance - sent,
+    }
+
+
 def peer_channel(target_run: str, kind: str) -> str:
     """Private directed channel for one bounded peer request or reply."""
     target = str(target_run).strip()
@@ -1335,6 +1382,15 @@ def channel_post(
     text = body.strip()
     if not text:
         raise ValueError("session post: message is empty")
+    if str(channel or "").startswith("peer:"):
+        spend = peer_spend(world)
+        if spend["left"] <= 0:
+            raise ValueError(
+                "session post: this run has sent {} directed message(s) on {}"
+                " human ask(s), which is its whole allowance. A peer exchange"
+                " that keeps going with nobody in it is amplification; wait"
+                " for a human turn.".format(spend["sent"], spend["asks"])
+            )
     announce(world)
     db = _open(state_file(world))
     now = datetime.now(timezone.utc).isoformat()

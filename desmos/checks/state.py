@@ -362,6 +362,7 @@ def check() -> None:
         _check_budget_rail(cwd)
         _check_witness(cwd)
         _check_observer_rail(cwd)
+        _check_peer_budget(cwd)
         _check_refine(cwd)
         _check_stow()
         _check_salvage()
@@ -2075,6 +2076,61 @@ def _check_witness(cwd: Path) -> None:
     assert witness.wake(quiet) == ""
     assert witness.BLOCK not in quiet.injections
     print("witness check ok")
+
+
+def _check_peer_budget(cwd: Path) -> None:
+    """A directed peer exchange is bounded by human asks (constitution T5).
+
+    Cross-session messaging works, and nothing but a convention stopped two
+    sessions replying to each other forever. The allowance is denominated in
+    asks a person actually made, read back out of the stored transcript, so a
+    long conversation with a person is never throttled and a conversation
+    with only peers in it runs out.
+    """
+    from desmos.state import persist
+
+    home = cwd / "peers"
+    home.mkdir()
+    world = new_world(home, state_path=home / "harness.sqlite3")
+
+    to_peer = persist.peer_channel("peer-run", "request")
+    fresh = persist.peer_spend(world)
+    assert fresh["asks"] == 0 and fresh["left"] == persist.PEER_BUDGET, fresh
+
+    for i in range(persist.PEER_BUDGET):
+        persist.channel_post(world, f"peer message {i}", channel=to_peer)
+    spent = persist.peer_spend(world)
+    assert spent["sent"] == persist.PEER_BUDGET and spent["left"] == 0, spent
+
+    try:
+        persist.channel_post(world, "and another", channel=to_peer)
+    except ValueError as exc:
+        assert "amplification" in str(exc), exc
+    else:
+        raise AssertionError("a directed peer exchange ran past its allowance")
+
+    # The shared channel is not the amplification mode and is not bounded:
+    # nobody replies to it automatically.
+    open_room = persist.channel_post(world, "still talking here")
+    assert open_room["channel"] == "conflicts", open_room
+
+    # A human turn buys more. The ask is recovered from the stored record by
+    # content, so a tool result or a harness nudge cannot mint allowance.
+    world.messages.extend(
+        [
+            {"role": "user", "content": [{"type": "tool_result", "content": "out"}]},
+            {"role": "user", "content": "ask the peer whether it saw the drop"},
+        ]
+    )
+    world.session_message_start = 0
+    persist.save(world)
+    after = persist.peer_spend(world)
+    assert after["asks"] == 1, after
+    assert after["left"] == persist.PEER_BUDGET, after
+    again = persist.channel_post(world, "one more, with a person in the loop",
+                                 channel=to_peer)
+    assert again["channel"] == to_peer, again
+    print("peer budget check ok")
 
 
 def _check_observer_rail(cwd: Path) -> None:
