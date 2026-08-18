@@ -64,7 +64,9 @@ mod work;
 fn theme_lock() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     static SEED: std::sync::Once = std::sync::Once::new();
-    let guard = LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let guard = LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     SEED.call_once(|| theme_cache::set(initial_theme()));
     guard
 }
@@ -85,38 +87,36 @@ use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
-use unicode_width::UnicodeWidthStr;
 use ratatui::prelude::CrosstermBackend;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::{Frame, Terminal};
 use serde_json::{Value, json};
+use unicode_width::UnicodeWidthStr;
+use xai_grok_pager::acp::tracker::{TurnActivity, WaitingReason};
 use xai_grok_pager::appearance::{
     self, AppearanceConfig, RawAppearanceConfig, cache as appearance_cache,
 };
+use xai_grok_pager::clipboard::SystemClipboard;
+use xai_grok_pager::glyphs;
+use xai_grok_pager::input::is_mod_enter;
+#[cfg(test)]
+use xai_grok_pager::scrollback::blocks::SubagentBlockKind;
 use xai_grok_pager::scrollback::blocks::{
     EditToolCallBlock, ExecuteToolCallBlock, OtherToolCallBlock, SubagentBlock, ToolCallBlock,
 };
-use xai_grok_pager_diff::diff_hunks_from_strings;
-#[cfg(test)]
-use xai_grok_pager::scrollback::blocks::SubagentBlockKind;
-use xai_grok_pager::clipboard::SystemClipboard;
 use xai_grok_pager::scrollback::render::InlineMediaPlacement;
-use xai_grok_pager::terminal::image as gfx;
 use xai_grok_pager::scrollback::{
-    EntryId, RenderBlock, ScratchBuffer, ScrollbackEntry, ScrollbackPane,
-    ScrollbackState,
+    EntryId, RenderBlock, ScratchBuffer, ScrollbackEntry, ScrollbackPane, ScrollbackState,
     text_selection::{
-        ActiveTextDrag, PendingTextDrag, PersistentTextSelection,
-        ResolvedSelectionModel, SelectionEndpoint, SelectionKind, SelectionOrigin,
-        configured_word_separators, drag_threshold_exceeded, reconstruct_selection_text,
-        render_active_selection_overlay, render_persistent_selection_overlay,
-        semantic_selection_at,
+        ActiveTextDrag, PendingTextDrag, PersistentTextSelection, ResolvedSelectionModel,
+        SelectionEndpoint, SelectionKind, SelectionOrigin, configured_word_separators,
+        drag_threshold_exceeded, reconstruct_selection_text, render_active_selection_overlay,
+        render_persistent_selection_overlay, semantic_selection_at,
     },
 };
-use xai_grok_pager::acp::tracker::{TurnActivity, WaitingReason};
-use xai_grok_pager::input::is_mod_enter;
+use xai_grok_pager::terminal::image as gfx;
 use xai_grok_pager::theme::{Theme, ThemeKind, cache as theme_cache};
 use xai_grok_pager::util;
 use xai_grok_pager::views::block_viewer::{BlockViewerPane, ViewerKind};
@@ -124,17 +124,16 @@ use xai_grok_pager::views::modal_window::{
     ModalSizing, ModalWindowConfig, ModalWindowOutcome, ModalWindowState, Shortcut,
     handle_modal_key, handle_modal_mouse, render_modal_window,
 };
-use xai_grok_pager::glyphs;
+use xai_grok_pager_diff::diff_hunks_from_strings;
 
 use app::*;
 use events::*;
 use input::*;
+use json_tree::JsonTree;
+use prompt::{clipboard_text, coalesce_events, is_inline_paste_key, is_paste_key, is_text_key};
 use stream::*;
 use wire::*;
 use work::*;
-use json_tree::JsonTree;
-use prompt::{clipboard_text, coalesce_events, is_inline_paste_key, is_paste_key, is_text_key};
-
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ViewerSrc {
@@ -194,8 +193,6 @@ fn pretty_json(v: &Value) -> String {
     }
     serde_json::to_string_pretty(v).unwrap_or_else(|_| v.to_string())
 }
-
-
 
 struct Bridge {
     child: Child,
@@ -282,7 +279,6 @@ impl Drop for Bridge {
     }
 }
 
-
 /// How long a notice stays on the composer's edge. Long enough to read after
 /// the keystroke that caused it, short enough that it is never stale chrome.
 const NOTICE_TTL: Duration = Duration::from_secs(4);
@@ -323,7 +319,6 @@ impl ExecStream {
         self.pending.clear();
     }
 }
-
 
 /// Prompt-cache window for the meter under the calls pane.
 ///
@@ -480,7 +475,11 @@ impl CacheMeter {
     /// Cache share of this one call's prompt.
     fn hit(&self) -> u64 {
         let total = self.read + self.write + self.fresh;
-        if total == 0 { 0 } else { self.read * 100 / total }
+        if total == 0 {
+            0
+        } else {
+            self.read * 100 / total
+        }
     }
 
     fn observe_roles(&mut self, request: &Value) {
@@ -502,11 +501,17 @@ impl CacheMeter {
                     let item_len = item.to_string().len() as u64;
                     let kind = match item_type {
                         "reasoning" => 3,
-                        "function_call" | "function_call_output"
-                        | "custom_tool_call" | "custom_tool_call_output" => 2,
+                        "function_call"
+                        | "function_call_output"
+                        | "custom_tool_call"
+                        | "custom_tool_call_output" => 2,
                         "message" => match item.get("role").and_then(Value::as_str) {
                             Some("user") => {
-                                if item.to_string().contains("<result") { 2 } else { 1 }
+                                if item.to_string().contains("<result") {
+                                    2
+                                } else {
+                                    1
+                                }
                             }
                             Some("assistant") => 4,
                             _ => 0,
@@ -652,8 +657,6 @@ impl CacheMeter {
         let left = 1.0 - at.elapsed().as_secs_f32() / ttl;
         (left > 0.0).then_some(left)
     }
-
-
 }
 
 /// desmos launches on Oscura Midnight.
@@ -691,7 +694,6 @@ fn config_theme() -> Option<ThemeKind> {
         .and_then(toml::Value::as_str)
         .and_then(ThemeKind::from_name)
 }
-
 
 fn grok_appearance() -> AppearanceConfig {
     let mut cfg = std::fs::read_to_string(util::pager_toml_path())
@@ -914,7 +916,8 @@ fn seed_demo(app: &mut App) {
     );
     seed_spawn(app);
     app.queue.push("then list what grew".into());
-    app.queue.push("then show cache hit\nacross two lines".into());
+    app.queue
+        .push("then show cache hit\nacross two lines".into());
 }
 
 fn seed_spawn(app: &mut App) {
@@ -959,7 +962,9 @@ fn seed_spawn(app: &mut App) {
         );
     }
     app.sess.story.finish_running(eid);
-    app.sess.story.push_block(RenderBlock::Subagent(SubagentBlock::completed(
+    app.sess
+        .story
+        .push_block(RenderBlock::Subagent(SubagentBlock::completed(
         task,
         id,
         Duration::from_secs(4),
@@ -981,6 +986,7 @@ fn main() -> io::Result<()> {
         app.demo = true;
         seed_demo(&mut app);
     }
+    wait_ready(bridge.as_mut(), &mut app)?;
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -1066,7 +1072,6 @@ fn run(
     // caches — it does not advance the frame.
     const DRAIN: usize = 32;
     const ANIM: Duration = Duration::from_millis(33);
-    wait_ready(bridge.as_deref_mut(), app);
     let mut dirty = true;
     let mut last_anim = Instant::now();
     let mut last_cache = Instant::now();
@@ -1215,13 +1220,13 @@ fn run(
 /// Apply the bridge `ready` snapshot before the first chrome paint.
 /// Demo (no bridge) already has model/gen; a silent bridge still paints
 /// after 2s so the user is not stuck on a blank alternate screen.
-fn wait_ready(bridge: Option<&mut Bridge>, app: &mut App) {
+fn wait_ready(bridge: Option<&mut Bridge>, app: &mut App) -> io::Result<()> {
     if app.ready {
-        return;
+        return Ok(());
     }
     let Some(b) = bridge else {
         app.ready = true;
-        return;
+        return Ok(());
     };
     let deadline = Instant::now() + Duration::from_secs(2);
     while !app.ready {
@@ -1238,16 +1243,18 @@ fn wait_ready(bridge: Option<&mut Bridge>, app: &mut App) {
                 app.ready = true;
             }
             Err(RecvTimeoutError::Disconnected) => {
-                app.notify("bridge died");
-                app.ready = true;
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "harness process exited before ready",
+                ));
             }
         }
     }
     while let Ok(ev) = b.rx.try_recv() {
         handle_event(app, ev);
     }
+    Ok(())
 }
-
 
 /// Ctrl+C: stop the in-flight step and persist; quit only when idle.
 /// A second Ctrl+C while stopping force-quits.
@@ -1481,7 +1488,11 @@ fn submit_prompt(mut bridge: Option<&mut Bridge>, app: &mut App) -> io::Result<b
         let on = !appearance_cache::load_timestamps();
         appearance_cache::set_timestamps(on);
         app.apply_grok_settings();
-        app.notify(if on { "timestamps on" } else { "timestamps off" });
+            app.notify(if on {
+                "timestamps on"
+            } else {
+                "timestamps off"
+            });
     } else if line == "/compact" || line == "/dense" {
         // `/compact` reads like "fold the transcript" and does not — folding is
         // the server's, on its own trigger, and there is no client verb for it.
@@ -1589,9 +1600,7 @@ fn viewer_for_entry(entry: &ScrollbackEntry) -> Option<BlockViewerPane> {
                 .unwrap_or_else(|| other.summary.clone());
             Some(BlockViewerPane::for_plain_text(&title, &body))
         }
-        RenderBlock::UserPrompt(p) => {
-            Some(BlockViewerPane::for_plain_text("you", &p.text.clone()))
-        }
+        RenderBlock::UserPrompt(p) => Some(BlockViewerPane::for_plain_text("you", &p.text.clone())),
         RenderBlock::System(s) => Some(BlockViewerPane::for_plain_text("system", &s.text.clone())),
         RenderBlock::Subagent(_) => None,
         _ => None,
@@ -1671,7 +1680,8 @@ fn draw_viewer(f: &mut Frame, app: &mut App) {
         };
         let area = f.area();
         let buf = f.buffer_mut();
-        let Some(content) = render_modal_window(buf, area, &mut viewer.modal, &config, &theme) else {
+        let Some(content) = render_modal_window(buf, area, &mut viewer.modal, &config, &theme)
+        else {
             return;
         };
         viewer.render_content(content.content, buf, entry, true, &[]);
@@ -1802,11 +1812,7 @@ fn draw_scrollback(
     media: &mut Vec<InlineMediaPlacement>,
 ) {
     let theme = Theme::current();
-    let border = if focused {
-        accent
-    } else {
-        theme.bg_base
-    };
+    let border = if focused { accent } else { theme.bg_base };
     // Lay out before drawing the frame: the border title carries the count of
     // rows scrolled off the top, so it has to be known before the block is
     // rendered. Overflow below is stamped on the bottom border afterwards.
@@ -2020,10 +2026,15 @@ fn streaming(app: &App) -> bool {
 }
 
 fn flush_streams(app: &mut App) {
-    app.sess.stream.flush(&mut app.sess.story, &mut app.sess.calls);
+    app.sess
+        .stream
+        .flush(&mut app.sess.story, &mut app.sess.calls);
     app.sess.exec.flush(&mut app.sess.calls);
     for child in app.children.values_mut() {
-        child.sess.stream.flush(&mut child.sess.story, &mut child.sess.calls);
+        child
+            .sess
+            .stream
+            .flush(&mut child.sess.story, &mut child.sess.calls);
         child.sess.exec.flush(&mut child.sess.calls);
     }
 }
@@ -2070,7 +2081,11 @@ fn draw(f: &mut Frame, app: &mut App) {
     // queue kept its float and left two blank rows under the story, its own
     // border and then the spacer.
     let queue_float = u16::from(queue_h > 0 && app.layout.post_h > 0);
-    let queue_h = if queue_h > 0 { queue_h + queue_float } else { 0 };
+    let queue_h = if queue_h > 0 {
+        queue_h + queue_float
+    } else {
+        0
+    };
     let float_rows = input_float_rows(app);
     // Grow with what is typed, up to half the column. The old ceiling of ten
     // rows existed to leave a legend band matching it opposite; there is no
@@ -2419,10 +2434,7 @@ fn meter_row(
     let total: u64 = segments.iter().map(|(v, _)| *v).sum();
     if filled > 0 {
         if total == 0 {
-            let fallback = segments
-                .first()
-                .map(|(_, c)| *c)
-                .unwrap_or(ink_on_track);
+            let fallback = segments.first().map(|(_, c)| *c).unwrap_or(ink_on_track);
             for cell in bg.iter_mut().take(filled) {
                 *cell = fallback;
             }
@@ -2463,7 +2475,11 @@ fn meter_row(
     let mut run_style: Option<Style> = None;
     for i in 0..w {
         let filled_here = bg[i] != track;
-        let ink = if filled_here { ink_on_fill } else { ink_on_track };
+        let ink = if filled_here {
+            ink_on_fill
+        } else {
+            ink_on_track
+        };
         let style = Style::default().bg(bg[i]).fg(ink);
         let ch = text[i].unwrap_or(' ');
         if run_style == Some(style) {
@@ -2519,7 +2535,10 @@ fn sequence_bar_spans(
             run.push('█');
         } else {
             if let Some(prev) = cur {
-                spans.push(Span::styled(std::mem::take(&mut run), Style::default().fg(prev)));
+                spans.push(Span::styled(
+                    std::mem::take(&mut run),
+                    Style::default().fg(prev),
+                ));
             }
             run.push('█');
             cur = Some(color);
@@ -2713,7 +2732,10 @@ fn draw_files(f: &mut Frame, area: Rect, app: &mut App) {
                     }
                     Some("*") => ("M".to_string(), Style::default().fg(theme.accent_tool)),
                     Some(mark) => (
-                        mark.trim().chars().next().map_or("M".to_string(), |c| c.to_string()),
+                        mark.trim()
+                            .chars()
+                            .next()
+                            .map_or("M".to_string(), |c| c.to_string()),
                         Style::default().fg(theme.accent_tool),
                     ),
                     None => (String::new(), Style::default().fg(theme.text_secondary)),
@@ -2831,20 +2853,18 @@ fn cache_stage(meter: &CacheMeter, theme: &Theme) -> (f64, Vec<(u64, ratatui::st
     }
 }
 
-fn draw_meta(
-    f: &mut Frame,
-    area: Rect,
-    meter: &CacheMeter,
-    focused: bool,
-    id: &MetaId,
-) {
+fn draw_meta(f: &mut Frame, area: Rect, meter: &CacheMeter, focused: bool, id: &MetaId) {
     if area.height == 0 || area.width == 0 {
         return;
     }
     let theme = Theme::current();
     let left = meter.left();
     let secs = left.map(|l| (l * meter.ttl.as_secs_f32()).round() as u64);
-    let ttl_label = if meter.ttl.as_secs() >= 3600 { "1h" } else { "5m" };
+    let ttl_label = if meter.ttl.as_secs() >= 3600 {
+        "1h"
+    } else {
+        "5m"
+    };
     // Cache status belongs on the cache row, not jammed into the pane title.
     // That keeps Meta's chrome aligned with every other pane.
     let cache_value = match secs {
@@ -2964,7 +2984,10 @@ fn draw_meta(
                     .add_modifier(Modifier::BOLD),
             ),
             label(" spent   "),
-            Span::styled(money(meter.saved), Style::default().fg(theme.accent_success)),
+            Span::styled(
+                money(meter.saved),
+                Style::default().fg(theme.accent_success),
+            ),
             label(" saved"),
         ])
     };
@@ -3021,10 +3044,7 @@ fn draw_meta(
     // task" does not say whether it is a build or a sleep.
     let background_row = || {
         let mut spans = vec![
-            Span::styled(
-                "\u{21bb} ",
-                Style::default().fg(theme.accent_tool),
-            ),
+            Span::styled("\u{21bb} ", Style::default().fg(theme.accent_tool)),
             Span::styled(
                 format!("{}", id.background.len()),
                 Style::default()
@@ -3329,7 +3349,11 @@ fn draw_input(f: &mut Frame, area: Rect, app: &mut App) {
             .saturating_sub(used + 2) as usize;
         let mut text = msg.clone();
         if UnicodeWidthStr::width(text.as_str()) > room {
-            text = text.chars().take(room.saturating_sub(1)).collect::<String>() + "\u{2026}";
+            text = text
+                .chars()
+                .take(room.saturating_sub(1))
+                .collect::<String>()
+                + "\u{2026}";
         }
         left_title.push(Span::styled(
             format!(" {text} "),
@@ -3364,7 +3388,9 @@ fn draw_input(f: &mut Frame, area: Rect, app: &mut App) {
     app.input_inner = inner;
     let lay = app.prompt.layout(prefix, inner.width);
     // Past the growth cap this becomes a viewport over the wrapped prompt.
-    app.input_scroll = lay.cursor_row.saturating_sub(inner.height.saturating_sub(1));
+    app.input_scroll = lay
+        .cursor_row
+        .saturating_sub(inner.height.saturating_sub(1));
     f.render_widget(block, card);
     if inner.width > 0 && inner.height > 0 {
         f.render_widget(
@@ -3438,7 +3464,10 @@ fn pane_keys(focus: Focus) -> (&'static str, &'static [(&'static str, &'static s
             &[
                 ("j k", "select a queued row"),
                 ("[ ] h l", "move it earlier / later (arrows too)"),
-                ("e", "edit it in the composer (enter returns it to its slot)"),
+                (
+                    "e",
+                    "edit it in the composer (enter returns it to its slot)",
+                ),
                 ("d del", "drop it"),
                 ("enter", "send now: stop this step and run the front row"),
                 ("i", "back to the composer"),
@@ -3532,7 +3561,12 @@ fn draw_help(f: &mut Frame, app: &App) {
         .saturating_add(pane.height / 2)
         .saturating_sub(h / 2)
         .min(full.height.saturating_sub(h));
-    let area = Rect { x, y, width: w, height: h };
+    let area = Rect {
+        x,
+        y,
+        width: w,
+        height: h,
+    };
     f.render_widget(Clear, area);
     let block = Block::default()
         .borders(Borders::ALL)
@@ -3574,14 +3608,21 @@ fn draw_file_picker(f: &mut Frame, app: &mut App) {
     let h = (full.height * 3 / 5).clamp(6, full.height.saturating_sub(2));
     let x = (full.width.saturating_sub(w)) / 2;
     let y = (full.height.saturating_sub(h)) / 2;
-    let area = Rect { x, y, width: w, height: h };
+    let area = Rect {
+        x,
+        y,
+        width: w,
+        height: h,
+    };
     f.render_widget(Clear, area);
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(theme.accent_tool))
         .title(Span::styled(
             " find file (ctrl-t) ",
-            Style::default().fg(theme.accent_tool).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(theme.accent_tool)
+                .add_modifier(Modifier::BOLD),
         ));
     let inner = block.inner(area);
     f.render_widget(block, area);
@@ -3589,7 +3630,8 @@ fn draw_file_picker(f: &mut Frame, app: &mut App) {
         return;
     }
     // The result list gets the rows below the query line; clamp the scroll to it.
-    app.file_picker.clamp(inner.height.saturating_sub(1) as usize);
+    app.file_picker
+        .clamp(inner.height.saturating_sub(1) as usize);
     let mut lines: Vec<Line> = Vec::new();
     lines.push(Line::from(vec![
         Span::styled("> ", Style::default().fg(theme.accent_tool)),
@@ -3607,10 +3649,19 @@ fn draw_file_picker(f: &mut Frame, app: &mut App) {
     let rows = inner.height.saturating_sub(1) as usize;
     let sel = app.file_picker.sel();
     let scroll = app.file_picker.scroll();
-    for (i, path) in app.file_picker.results().iter().enumerate().skip(scroll).take(rows) {
+    for (i, path) in app
+        .file_picker
+        .results()
+        .iter()
+        .enumerate()
+        .skip(scroll)
+        .take(rows)
+    {
         let shown = path.to_string_lossy().to_string();
         let style = if i == sel {
-            Style::default().fg(theme.accent_success).add_modifier(Modifier::BOLD)
+            Style::default()
+                .fg(theme.accent_success)
+                .add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(theme.text_primary)
         };
@@ -3637,10 +3688,7 @@ fn slash_popup_area(input: Rect, app: &App) -> Option<Rect> {
         return None;
     }
     let rows = app.slash.items.len().min(8);
-    let note = !matches!(
-        verdict,
-        slash::Verdict::Ready | slash::Verdict::NotACommand
-    );
+    let note = !matches!(verdict, slash::Verdict::Ready | slash::Verdict::NotACommand);
     let h = rows as u16 + if note { 3 } else { 2 };
     if input.width < 12 || input.y < h {
         return None;
@@ -3665,7 +3713,9 @@ fn draw_slash(f: &mut Frame, input: Rect, app: &App) {
     let (mark, note, tone) = match &verdict {
         slash::Verdict::Ready => ("✓", String::new(), theme.accent_success),
         slash::Verdict::NeedsArg(help) => ("·", (*help).to_string(), theme.text_secondary),
-        slash::Verdict::Unknown(what) => ("✗", format!("no such command {what}"), theme.accent_user),
+        slash::Verdict::Unknown(what) => {
+            ("✗", format!("no such command {what}"), theme.accent_user)
+        }
         slash::Verdict::BadArg { got, expected } => (
             "✗",
             format!("{got} is not one of: {expected}"),
@@ -3754,16 +3804,18 @@ fn draw_paste_preview(f: &mut Frame, input: Rect, body: &str, on_chip: bool) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(theme.paste_dim))
-        .title(Span::styled(
-            " paste ",
-            Style::default().fg(theme.paste_fg),
-        ))
+        .title(Span::styled(" paste ", Style::default().fg(theme.paste_fg)))
         .style(Style::default().bg(theme.paste_bg).fg(theme.paste_fg));
     let inner = block.inner(area);
     f.render_widget(block, area);
     let mut lines: Vec<Line> = shown
         .into_iter()
-        .map(|l| Line::from(Span::styled(l.to_string(), Style::default().fg(theme.paste_fg))))
+        .map(|l| {
+            Line::from(Span::styled(
+                l.to_string(),
+                Style::default().fg(theme.paste_fg),
+            ))
+        })
         .collect();
     if extra > 0 {
         lines.push(Line::from(Span::styled(
@@ -3779,7 +3831,6 @@ fn draw_paste_preview(f: &mut Frame, input: Rect, body: &str, on_chip: bool) {
     )));
     f.render_widget(Paragraph::new(lines), inner);
 }
-
 
 fn result_block(ev: &Value) -> RenderBlock {
     let tag = ev.get("tag").and_then(Value::as_str).unwrap_or("?");
@@ -3820,7 +3871,6 @@ fn wire_complete(
     ))
 }
 
-
 /// The story's copy of an `<edit>` result, or `None` for any other syscall.
 ///
 /// The story is otherwise a whitelist of narrative kinds and syscalls are the
@@ -3837,11 +3887,18 @@ fn wire_complete(
 /// derived here — reading the file back would race the next edit. Absent
 /// (failed edit, start phase, non-edit tags) the card carries no hunks and
 /// therefore claims no line, honestly.
-fn wire_syscall(tag: &str, body: &str, attrs: &Value, result: &str, line: Option<u64>) -> RenderBlock {
-    match exec_tag(tag, attrs) {
-        Some(exec) => {
+fn wire_syscall(
+    tag: &str,
+    body: &str,
+    attrs: &Value,
+    result: &str,
+    line: Option<u64>,
+) -> RenderBlock {
+    let operation = syscall_operation(tag, attrs);
+    match operation {
+        exec @ ("python" | "bash" | "shell") => {
             let cmd = if body.trim().is_empty() {
-                syscall_label(exec, if tag == "exec" { &Value::Null } else { attrs })
+                syscall_label(exec, attrs, operation != tag)
             } else {
                 body.to_string()
             };
@@ -3855,19 +3912,13 @@ fn wire_syscall(tag: &str, body: &str, attrs: &Value, result: &str, line: Option
             };
             let mut block = ExecuteToolCallBlock::new(cmd)
                 .with_description(desc)
-                .with_output(result);
+                .with_output(format_result(result));
             if looks_failed(exec, result) {
-                block = block.with_error(
-                    result
-                        .lines()
-                        .next()
-                        .unwrap_or("failed")
-                        .to_string(),
-                );
+                block = block.with_error(result.lines().next().unwrap_or("failed").to_string());
             }
             RenderBlock::ToolCall(ToolCallBlock::Execute(block))
         }
-        None if tag == "edit" => {
+        "edit" => {
             let path = attrs
                 .get("path")
                 .and_then(Value::as_str)
@@ -3892,32 +3943,38 @@ fn wire_syscall(tag: &str, body: &str, attrs: &Value, result: &str, line: Option
             }
             RenderBlock::ToolCall(ToolCallBlock::Edit(block))
         }
-        None => {
+        _ => {
+            let routed = operation != tag;
+            let attrs_s = attr_summary(attrs, routed);
             let summary = card_summary(&{
-                let attrs_s = attr_summary(attrs);
                 if !body.trim().is_empty() {
                     first_line(body)
                 } else if !attrs_s.is_empty() {
-                    attrs_s
+                    attrs_s.clone()
+                } else if let Some(summary) = structured_result_summary(result) {
+                    summary
                 } else {
                     first_line(result)
                 }
             });
+            let shown_result = format_result(result);
             let payload = match (body.trim().is_empty(), result.trim().is_empty()) {
-                (true, _) => result.to_string(),
+                (true, _) => shown_result,
                 (_, true) => body.to_string(),
-                _ => format!("{body}\n\n→ {result}"),
+                _ => format!("{body}\n\n→ {shown_result}"),
             };
-            let target = card_summary(&attr_summary(attrs));
-            let head = if target.is_empty() {
+            let target = card_summary(&attrs_s);
+            let head = if routed {
+                format!("{tag}: {operation}")
+            } else if target.is_empty() {
                 format!("{tag}: {summary}")
             } else {
                 format!("{tag}: {target}")
             };
-            let sub = if target.is_empty() {
-                String::new()
-            } else {
+            let sub = if routed || !target.is_empty() {
                 summary
+            } else {
+                String::new()
             };
             RenderBlock::ToolCall(ToolCallBlock::Other(
                 OtherToolCallBlock::new(head, sub).with_output(payload),
@@ -3954,7 +4011,11 @@ fn split_edit_body(body: &str) -> (String, String) {
             seen = true;
             continue;
         }
-        if seen { after.push(line) } else { before.push(line) }
+        if seen {
+            after.push(line)
+        } else {
+            before.push(line)
+        }
     }
     if !seen {
         return (String::new(), body.to_string());
@@ -3962,8 +4023,8 @@ fn split_edit_body(body: &str) -> (String, String) {
     (before.join("\n"), after.join("\n"))
 }
 
-fn syscall_label(tag: &str, attrs: &Value) -> String {
-    let extra = attr_summary(attrs);
+fn syscall_label(tag: &str, attrs: &Value, routed: bool) -> String {
+    let extra = attr_summary(attrs, routed);
     if extra.is_empty() {
         format!("<{tag}/>")
     } else {
@@ -3971,14 +4032,47 @@ fn syscall_label(tag: &str, attrs: &Value) -> String {
     }
 }
 
-fn attr_summary(attrs: &Value) -> String {
+fn attr_summary(attrs: &Value, without_route: bool) -> String {
     match attrs {
         Value::Object(map) if !map.is_empty() => map
             .iter()
+            .filter(|(k, _)| !without_route || !matches!(k.as_str(), "op" | "action"))
             .filter_map(|(k, v)| v.as_str().map(|s| format!("{k}=\"{s}\"")))
             .collect::<Vec<_>>()
             .join(" "),
         _ => String::new(),
+    }
+}
+
+/// Pretty-print structured syscall output for Activity only. The transcript
+/// keeps the exact result text the kernel produced.
+pub(crate) fn format_result(result: &str) -> String {
+    let Ok(value @ (Value::Object(_) | Value::Array(_))) = serde_json::from_str(result.trim())
+    else {
+        return result.to_string();
+    };
+    serde_json::to_string_pretty(&value).unwrap_or_else(|_| result.to_string())
+}
+
+/// A stable one-line sidebar summary for structured results. Detailed fields
+/// remain in the expanded, pretty-printed body.
+fn structured_result_summary(result: &str) -> Option<String> {
+    match serde_json::from_str::<Value>(result.trim()).ok()? {
+        Value::Array(items) => Some(format!("{} items", items.len())),
+        Value::Object(fields) => {
+            let kind = fields.get("type").and_then(Value::as_str);
+            let n = fields.get("n").and_then(|v| match v {
+                Value::String(s) => Some(s.clone()),
+                Value::Number(n) => Some(n.to_string()),
+                _ => None,
+            });
+            match (kind, n) {
+                (Some(kind), Some(n)) => Some(format!("{kind} #{n}")),
+                (Some(kind), None) => Some(kind.to_string()),
+                (None, _) => Some(format!("{} fields", fields.len())),
+            }
+        }
+        _ => None,
     }
 }
 
@@ -4022,7 +4116,14 @@ fn looks_failed(tag: &str, result: &str) -> bool {
         || t.starts_with("SyntaxError")
         || t.starts_with("NameError")
         || t.starts_with("TypeError")
-        || (matches!(tag, "bash" | "shell") && t.starts_with("exit "))
+        || (matches!(tag, "bash" | "shell")
+            && (t.starts_with("exit ")
+                || result.lines().any(|line| {
+                    line.trim()
+                        .strip_prefix("[exit ")
+                        .and_then(|code| code.strip_suffix(']'))
+                        .is_some_and(|code| code != "0")
+                })))
 }
 
 fn format_usage_line(usage: &Value, thoughts: u64, redacted: u64) -> String {
@@ -4034,9 +4135,7 @@ fn format_usage_line(usage: &Value, thoughts: u64, redacted: u64) -> String {
     let hit = if total == 0 { 0 } else { 100 * read / total };
     // Labels left, counts right — the columns have to line up down the pane,
     // and ragged numbers were unreadable at a glance.
-    format!(
-        "hit {hit:>3}%  in {fresh:>4}+{read:>6}  out {out:>5}  think {thoughts}/{redacted}"
-    )
+    format!("hit {hit:>3}%  in {fresh:>4}+{read:>6}  out {out:>5}  think {thoughts}/{redacted}")
 }
 
 fn format_usage(
@@ -4077,19 +4176,33 @@ mod tests {
             &mut app,
             serde_json::json!({"ev": "snapshot", "model": "gpt-5.6-luna", "billing": "plan"}),
         );
-        assert!(app.cache.plan, "the bridge said plan, the meter must believe it");
+        assert!(
+            app.cache.plan,
+            "the bridge said plan, the meter must believe it"
+        );
         // and list price for a gpt model is not opus price
         assert_eq!(model_price("gpt-5.6-luna"), (1.25, 10.0));
         assert_eq!(model_window("gpt-5.6-luna"), 400_000);
 
-        app.cache
-            .observe(&serde_json::json!({"input_tokens": 1_000_000, "output_tokens": 0}), "gpt-5.6-luna");
+        app.cache.observe(
+            &serde_json::json!({"input_tokens": 1_000_000, "output_tokens": 0}),
+            "gpt-5.6-luna",
+        );
         assert!((app.cache.spent - 1.25).abs() < 1e-9, "{}", app.cache.spent);
 
         let painted = paint(&mut app, 120, 36);
-        assert!(painted.contains("plan"), "plan sessions say plan:\n{painted}");
-        assert!(painted.contains("at list"), "and label the figure as list price:\n{painted}");
-        assert!(!painted.contains("spent"), "never a bill on a subscription:\n{painted}");
+        assert!(
+            painted.contains("plan"),
+            "plan sessions say plan:\n{painted}"
+        );
+        assert!(
+            painted.contains("at list"),
+            "and label the figure as list price:\n{painted}"
+        );
+        assert!(
+            !painted.contains("spent"),
+            "never a bill on a subscription:\n{painted}"
+        );
 
         handle_event(
             &mut app,
@@ -4098,7 +4211,6 @@ mod tests {
         assert!(!app.cache.plan);
         assert!(paint(&mut app, 120, 36).contains("spent"));
     }
-
 
     #[test]
     fn the_picker_opens_from_a_real_ready_event() {
@@ -4122,13 +4234,18 @@ mod tests {
         assert!(app.picker.open, "a fresh machine must land on the picker");
         let rows = app.picker.lines().join("\n");
         assert!(rows.contains("anthropic"), "{rows}");
-        assert!(rows.contains("enter to sign in"), "unauthed provider must offer login:\n{rows}");
+        assert!(
+            rows.contains("enter to sign in"),
+            "unauthed provider must offer login:\n{rows}"
+        );
 
         // an unauthed provider cannot be chosen: enter starts a login instead
         app.picker.sel = 1;
         assert_eq!(
             app.picker.key(KeyCode::Enter),
-            picker::PickerAction::Login { provider: "openai".into() }
+            picker::PickerAction::Login {
+                provider: "openai".into()
+            }
         );
         assert!(app.picker.open, "login must not close the picker");
 
@@ -4157,7 +4274,10 @@ mod tests {
         let done = app.picker.key(KeyCode::Enter);
         assert_eq!(
             done,
-            picker::PickerAction::Apply { model: "gpt-5.6-luna".into(), effort: "xhigh".into() }
+            picker::PickerAction::Apply {
+                model: "gpt-5.6-luna".into(),
+                effort: "xhigh".into()
+            }
         );
         assert!(!app.picker.open, "choosing an effort closes the picker");
     }
@@ -4180,7 +4300,10 @@ mod tests {
                 ]
             }),
         );
-        assert!(!app.picker.open, "a configured session boots straight into the chat");
+        assert!(
+            !app.picker.open,
+            "a configured session boots straight into the chat"
+        );
         // ...and reopening points at what is already in use. This is the whole
         // contract: point_at only fires for an event carrying `current`, and a
         // model switch emits a snapshot, which has none — so opening the picker
@@ -4195,8 +4318,8 @@ mod tests {
 
     use super::*;
     use ratatui::backend::TestBackend;
-    use xai_grok_pager::scrollback::DisplayMode;
     use xai_grok_pager::glyphs;
+    use xai_grok_pager::scrollback::DisplayMode;
 
     fn buffer_text(term: &Terminal<TestBackend>) -> String {
         let buf = term.backend().buffer();
@@ -4224,8 +4347,14 @@ mod tests {
         seed_demo(&mut app);
         let text = paint(&mut app, 100, 40);
         let calls = rows_of(&text, app.call_area);
-        assert!(!calls.contains("POST #"), "POST rows are on by default:\n{calls}");
-        assert!(calls.contains("[+posts]"), "no switch in the title:\n{calls}");
+        assert!(
+            !calls.contains("POST #"),
+            "POST rows are on by default:\n{calls}"
+        );
+        assert!(
+            calls.contains("[+posts]"),
+            "no switch in the title:\n{calls}"
+        );
 
         let chip = app.calls_chip.expect("the chip has no hit box");
         handle_mouse(
@@ -4234,7 +4363,10 @@ mod tests {
         );
         let text = paint(&mut app, 100, 40);
         let calls = rows_of(&text, app.call_area);
-        assert!(calls.contains("POST #"), "the chip did not put them back:\n{calls}");
+        assert!(
+            calls.contains("POST #"),
+            "the chip did not put them back:\n{calls}"
+        );
         assert!(calls.contains("[-posts]"), "{calls}");
 
         handle_mouse(
@@ -4243,7 +4375,10 @@ mod tests {
         );
         let text = paint(&mut app, 100, 40);
         let calls = rows_of(&text, app.call_area);
-        assert!(!calls.contains("POST #"), "the chip is not a toggle:\n{calls}");
+        assert!(
+            !calls.contains("POST #"),
+            "the chip is not a toggle:\n{calls}"
+        );
     }
 
     /// A hidden POST card is held, not dropped: it goes back in front of the
@@ -4281,7 +4416,10 @@ mod tests {
             "a layout row survived between story and composer",
         );
         let top = app.input_area.y as usize;
-        let left: String = rows[top].chars().take(app.input_area.width as usize).collect();
+        let left: String = rows[top]
+            .chars()
+            .take(app.input_area.width as usize)
+            .collect();
         assert!(
             left.trim_start().starts_with('\u{250c}'),
             "the collapsed POST left a blank row above the composer: {left:?}",
@@ -4361,7 +4499,10 @@ mod tests {
         let rows: Vec<&str> = text.lines().collect();
         let top = bare.input_area.y as usize;
         // Only the story column: the wire column paints its own panes there.
-        let left: String = rows[top].chars().take(bare.input_area.width as usize).collect();
+        let left: String = rows[top]
+            .chars()
+            .take(bare.input_area.width as usize)
+            .collect();
         assert!(
             left.trim().is_empty(),
             "the composer lost its float row: {left:?}"
@@ -4408,9 +4549,15 @@ mod tests {
         app.ready = true;
         handle_event(&mut app, json!({"ev": "turn", "text": "go"}));
         for i in 0..3 {
-            handle_event(&mut app, json!({"ev": "speech", "delta": true,
-                "text": format!("<bash>ls</bash>\n\nWaiting on {i}.")}));
-            handle_event(&mut app, json!({"ev": "result", "tag": "bash", "text": "ok"}));
+            handle_event(
+                &mut app,
+                json!({"ev": "speech", "delta": true,
+                "text": format!("<bash>ls</bash>\n\nWaiting on {i}.")}),
+            );
+            handle_event(
+                &mut app,
+                json!({"ev": "result", "tag": "bash", "text": "ok"}),
+            );
         }
         let text = paint(&mut app, 90, 40);
         let first = row_of(&text, "Waiting on 0.").expect("prose on screen");
@@ -4447,10 +4594,13 @@ mod tests {
         app.ready = true;
         handle_event(&mut app, json!({"ev": "turn", "text": "go"}));
         for i in 0..8 {
-            handle_event(&mut app, json!({
+            handle_event(
+                &mut app,
+                json!({
                 "ev": "thinking", "delta": true,
                 "text": format!("reasoning line number {i} with enough words to fill a row\n"),
-            }));
+                }),
+            );
         }
         let text = paint(&mut app, 70, 30);
         assert!(
@@ -4475,7 +4625,10 @@ mod tests {
         );
 
         // One row, labelled, the moment it stops.
-        handle_event(&mut app, json!({"ev": "speech", "delta": true, "text": "Answer.\n"}));
+        handle_event(
+            &mut app,
+            json!({"ev": "speech", "delta": true, "text": "Answer.\n"}),
+        );
         let text = paint(&mut app, 70, 30);
         assert!(
             text.contains("Thought for"),
@@ -4498,29 +4651,64 @@ mod tests {
         let mut app = App::new();
         handle_event(&mut app, json!({"ev": "turn", "text": "go"}));
         let row = |app: &App| {
-            (0..app.sess.story.len()).find_map(|i| match app.sess.story.entry(i).map(|e| &e.block) {
+            (0..app.sess.story.len()).find_map(|i| {
+                match app.sess.story.entry(i).map(|e| &e.block) {
                 Some(RenderBlock::System(b)) => Some(b.text.clone()),
                 _ => None,
+                }
             })
         };
-        handle_event(&mut app, json!({"ev": "thinking", "delta": true, "text": "planning\n"}));
-        handle_event(&mut app, json!({"ev": "result", "tag": "bash", "body": "cargo build", "text": "ok"}));
-        assert!(row(&app).is_none(), "one call is not a run: {:?}", row(&app));
+        handle_event(
+            &mut app,
+            json!({"ev": "thinking", "delta": true, "text": "planning\n"}),
+        );
+        handle_event(
+            &mut app,
+            json!({"ev": "result", "tag": "bash", "body": "cargo build", "text": "ok"}),
+        );
+        assert!(
+            row(&app).is_none(),
+            "one call is not a run: {:?}",
+            row(&app)
+        );
 
-        handle_event(&mut app, json!({"ev": "thinking", "delta": true, "text": "reading\n"}));
-        handle_event(&mut app, json!({"ev": "result", "tag": "bash", "body": "cargo test", "text": "ok"}));
+        handle_event(
+            &mut app,
+            json!({"ev": "thinking", "delta": true, "text": "reading\n"}),
+        );
+        handle_event(
+            &mut app,
+            json!({"ev": "result", "tag": "bash", "body": "cargo test", "text": "ok"}),
+        );
         let mid = row(&app).expect("the row must exist mid-run, before any speech");
-        assert!(mid.contains("bash"), "mid-run row says nothing about the work: {mid}");
+        assert!(
+            mid.contains("bash"),
+            "mid-run row says nothing about the work: {mid}"
+        );
 
         // A third call rewrites the same row rather than stacking a second.
-        handle_event(&mut app, json!({"ev": "result", "tag": "read", "body": "main.rs", "text": "ok"}));
+        handle_event(
+            &mut app,
+            json!({"ev": "result", "tag": "read", "body": "main.rs", "text": "ok"}),
+        );
         let rows = (0..app.sess.story.len())
-            .filter(|i| matches!(app.sess.story.entry(*i).map(|e| &e.block), Some(RenderBlock::System(_))))
+            .filter(|i| {
+                matches!(
+                    app.sess.story.entry(*i).map(|e| &e.block),
+                    Some(RenderBlock::System(_))
+                )
+            })
             .count();
         assert_eq!(rows, 1, "the run must own exactly one row");
         let grown = row(&app).unwrap();
-        assert!(grown.contains("read"), "the row did not grow with the run: {grown}");
-        assert_ne!(mid, grown, "the row must be rewritten, not frozen at its first shape");
+        assert!(
+            grown.contains("read"),
+            "the row did not grow with the run: {grown}"
+        );
+        assert_ne!(
+            mid, grown,
+            "the row must be rewritten, not frozen at its first shape"
+        );
     }
 
     #[test]
@@ -4605,28 +4793,19 @@ mod tests {
             KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
         )
         .unwrap();
-        assert_eq!(app.viewer.as_ref().map(|viewer| viewer.kind), Some(ViewerKind::PlainText));
+        assert_eq!(
+            app.viewer.as_ref().map(|viewer| viewer.kind),
+            Some(ViewerKind::PlainText)
+        );
         let popup = paint(&mut app, 100, 40);
         assert!(popup.contains("search"), "{popup}");
         assert!(popup.contains("wrap"), "{popup}");
         {
             let viewer = app.viewer.as_mut().expect("plain text viewer");
-            assert!(viewer.handle_key(&KeyEvent::new(
-                KeyCode::Char('/'),
-                KeyModifiers::NONE,
-            )));
-            assert!(viewer.handle_key(&KeyEvent::new(
-                KeyCode::Esc,
-                KeyModifiers::NONE,
-            )));
-            assert!(viewer.handle_key(&KeyEvent::new(
-                KeyCode::Char('w'),
-                KeyModifiers::NONE,
-            )));
-            assert!(viewer.handle_key(&KeyEvent::new(
-                KeyCode::Char('y'),
-                KeyModifiers::NONE,
-            )));
+            assert!(viewer.handle_key(&KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE,)));
+            assert!(viewer.handle_key(&KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE,)));
+            assert!(viewer.handle_key(&KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE,)));
+            assert!(viewer.handle_key(&KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE,)));
         }
 
         handle_viewer_key(
@@ -4635,7 +4814,10 @@ mod tests {
         );
         assert!(app.viewer.is_some(), "scrolling closed the detail popup");
         handle_viewer_key(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-        assert!(app.viewer.is_none(), "escape did not close the detail popup");
+        assert!(
+            app.viewer.is_none(),
+            "escape did not close the detail popup"
+        );
         assert_eq!(app.focus, Focus::Story, "popup close changed pane focus");
     }
 
@@ -4644,27 +4826,34 @@ mod tests {
         let mut app = App::new();
         app.ready = true;
         handle_event(&mut app, json!({"ev": "turn", "text": "go"}));
-        handle_event(&mut app, json!({"ev": "result", "tag": "python", "text": "ok"}));
+        handle_event(
+            &mut app,
+            json!({"ev": "result", "tag": "python", "text": "ok"}),
+        );
         handle_event(
             &mut app,
             json!({"ev": "result", "tag": "read", "attrs": {"path": "main.rs"}, "text": "ok"}),
         );
         let idx = (0..app.sess.story.len())
-            .find(|i| matches!(
+            .find(|i| {
+                matches!(
                 app.sess.story.entry(*i).map(|entry| &entry.block),
                 Some(RenderBlock::System(_))
-            ))
+                )
+            })
             .expect("work summary row");
         let _ = paint(&mut app, 100, 40);
         let area = app.traj_area;
-        let point = (area.y..area.bottom()).find_map(|row| {
+        let point = (area.y..area.bottom())
+            .find_map(|row| {
             (area.x..area.right()).find_map(|col| {
                 let block = app.sess.story_sel.hit_test_visible_block(col, row)?;
                 (block.entry_idx == idx
                     && app.sess.story_sel.hit_test_text_exact(col, row).is_none())
                     .then_some((col, row))
             })
-        }).expect("summary block has no clickable non-text cell");
+            })
+            .expect("summary block has no clickable non-text cell");
 
         app.focus = Focus::Story;
         handle_scrollback_down(&mut app, false, point.0, point.1);
@@ -4684,7 +4873,10 @@ mod tests {
             &mut app,
             json!({"ev": "thinking", "delta": true, "text": "planning the change\n"}),
         );
-        for (tag, body) in [("bash", "cd /tmp && cargo build"), ("bash", "cd /tmp && cargo test")] {
+        for (tag, body) in [
+            ("bash", "cd /tmp && cargo build"),
+            ("bash", "cd /tmp && cargo test"),
+        ] {
             handle_event(
                 &mut app,
                 json!({"ev": "result", "tag": tag, "body": body, "text": "ok"}),
@@ -4697,12 +4889,14 @@ mod tests {
         let _ = paint(&mut app, 120, 34);
 
         let kinds: Vec<&str> = (0..app.sess.story.len())
-            .filter_map(|i| app.sess.story.entry(i).map(|e| match &e.block {
+            .filter_map(|i| {
+                app.sess.story.entry(i).map(|e| match &e.block {
                 RenderBlock::Thinking(_) => "Thinking",
                 RenderBlock::System(_) => "System",
                 RenderBlock::AgentMessage(_) => "AgentMessage",
                 _ => "other",
-            }))
+                })
+            })
             .collect();
         assert_eq!(
             kinds,
@@ -4715,7 +4909,10 @@ mod tests {
                 _ => None,
             })
             .expect("work row");
-        assert!(row.contains("bash \u{00d7}2"), "calls not compressed: {row}");
+        assert!(
+            row.contains("bash \u{00d7}2"),
+            "calls not compressed: {row}"
+        );
         assert!(row.contains("thought"), "thinking not folded in: {row}");
         assert!(!row.contains("cargo build"), "a command body leaked: {row}");
     }
@@ -4730,7 +4927,11 @@ mod tests {
         // them back the way the chip does.
         app.toggle_posts();
 
-        assert_eq!(activity_edits(&app).len(), 1, "demo edit missing from Activity");
+        assert_eq!(
+            activity_edits(&app).len(),
+            1,
+            "demo edit missing from Activity"
+        );
         assert!(
             !(0..app.sess.story.len()).any(|i| matches!(
                 app.sess.story.entry(i).map(|e| &e.block),
@@ -4843,7 +5044,12 @@ mod tests {
         // The parent was painted, so it already carries a cursor. Whatever it
         // is, a step taken inside the child must leave it exactly there.
         let parent_sel = app.sess.calls.selected();
-        app.children.get_mut("deadbeef").unwrap().sess.calls.set_selected(None);
+        app.children
+            .get_mut("deadbeef")
+            .unwrap()
+            .sess
+            .calls
+            .set_selected(None);
         assert!(app.select_call_group(true));
         assert_eq!(
             app.children["deadbeef"].sess.calls.selected(),
@@ -4971,9 +5177,11 @@ mod tests {
         for f in ["a.rs", "b.rs", "c.rs"] {
             handle_event(&mut app, edit_ev(f, "old", "new", "ok"));
         }
-        let row = (0..app.sess.story.len()).find_map(|i| match app.sess.story.entry(i).map(|e| &e.block) {
+        let row = (0..app.sess.story.len()).find_map(|i| {
+            match app.sess.story.entry(i).map(|e| &e.block) {
             Some(RenderBlock::System(b)) => Some(b.text.clone()),
             _ => None,
+            }
         });
         assert!(row.is_none(), "edits created a Story work row: {row:?}");
         assert_eq!(activity_edits(&app).len(), 3, "one Activity card per edit");
@@ -5065,10 +5273,7 @@ mod tests {
             "meta must be the bottom-right pane: {:?}",
             app.cache.area
         );
-        assert!(
-            !text.contains("keys "),
-            "the key legend is gone:\n{text}"
-        );
+        assert!(!text.contains("keys "), "the key legend is gone:\n{text}");
     }
 
     /// The failure this guards: a command body streamed into the story one
@@ -5114,13 +5319,22 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert!(story.contains("Checking the repo."), "prose lost: {story:?}");
-        assert!(story.contains("Done."), "prose after the call lost: {story:?}");
+        assert!(
+            story.contains("Checking the repo."),
+            "prose lost: {story:?}"
+        );
+        assert!(
+            story.contains("Done."),
+            "prose after the call lost: {story:?}"
+        );
         assert!(!story.contains("bash"), "tag name leaked: {story:?}");
         // And still absent once the closer has landed: holding the body during
         // the stream is worthless if the finished block prints it anyway.
         for leak in ["cd /tmp", "git rev-parse", "wc -l", "HEAD="] {
-            assert!(!story.contains(leak), "final story leaked {leak:?}: {story:?}");
+            assert!(
+                !story.contains(leak),
+                "final story leaked {leak:?}: {story:?}"
+            );
         }
     }
 
@@ -5142,13 +5356,15 @@ mod tests {
                 "a\n\nb",
             ),
             (format!("c\n{lt}skill name=\"edit\"/{gt}\nd"), "c\n\nd"),
-            (format!("e\n{lt}python{gt}x=1{lt}/python{gt} tail"), "e\n tail"),
+            (
+                format!("e\n{lt}python{gt}x=1{lt}/python{gt} tail"),
+                "e\n tail",
+            ),
             (format!("f {lt}bash{gt}inline cmd{lt}/bash{gt} g"), "f  g"),
         ] {
             assert_eq!(strip_syscalls(&src), want, "leaked from {src:?}");
         }
     }
-
 
     /// The cache bar is a countdown, staged by colour. Cold is blue and does
     /// not look like an emergency; the window turns yellow at halfway and
@@ -5221,6 +5437,22 @@ mod tests {
         assert!(seen, "the cache row never painted the past-halfway stage");
     }
 
+    /// A TUI without a ready bridge is not interactive. Keep it out of the
+    /// alternate screen instead of accepting prompts that cannot run.
+    #[test]
+    fn launch_fails_if_the_bridge_exits_before_ready() {
+        let mut app = App::new();
+        let mut bridge = match Bridge::loopback() {
+            Ok(b) => b,
+            Err(_) => return,
+        };
+        bridge.child.kill().unwrap();
+        bridge.child.wait().unwrap();
+
+        let err = wait_ready(Some(&mut bridge), &mut app).expect_err("dead bridge launched TUI");
+        assert_eq!(err.kind(), io::ErrorKind::BrokenPipe);
+    }
+
     /// A follow-up typed while a step runs must reach the bridge, not just the
     /// local queue. `run_turns` parks on `pending.wait_next` while background
     /// tasks are outstanding and only releases when its inbox is non-empty, so
@@ -5283,16 +5515,21 @@ mod tests {
         assert_eq!(unfocused.fg, user_fg, "pane focus changed prompt semantics");
 
         let prompt_idx = (0..app.sess.story.len())
-            .find(|index| matches!(
+            .find(|index| {
+                matches!(
                 app.sess.story.entry(*index).map(|entry| &entry.block),
                 Some(RenderBlock::UserPrompt(_))
-            ))
+                )
+            })
             .unwrap();
         app.focus = Focus::Story;
         app.sess.story.set_selected(Some(prompt_idx));
         let selected = paint_cell(&mut app, "distinct user color");
         assert_eq!(selected.fg, user_fg, "selection erased the prompt color");
-        assert_ne!(selected.fg, selected.bg, "selected prompt lost text contrast");
+        assert_ne!(
+            selected.fg, selected.bg,
+            "selected prompt lost text contrast"
+        );
     }
 
     /// Only the focused pane draws a visible frame. The border cells stay put
@@ -5311,7 +5548,12 @@ mod tests {
         // Top-left corner of the story pane (focused) and of the calls pane.
         let story_corner = buf.cell((0, 0)).unwrap().style().fg.unwrap();
         let calls_x = app.call_area.x;
-        let calls_corner = buf.cell((calls_x, app.call_area.y)).unwrap().style().fg.unwrap();
+        let calls_corner = buf
+            .cell((calls_x, app.call_area.y))
+            .unwrap()
+            .style()
+            .fg
+            .unwrap();
         let calls_bg = buf
             .cell((calls_x + 1, app.call_area.y + 1))
             .unwrap()
@@ -5328,8 +5570,6 @@ mod tests {
         );
     }
 
-
-
     #[test]
     fn the_story_pane_shows_prose_and_not_commands() {
         // Drives the real event path. Asserts on the painted story, so a
@@ -5342,7 +5582,10 @@ mod tests {
         );
         handle_event(&mut app, json!({"ev": "speech", "text": speech}));
         let text = paint(&mut app, 100, 40);
-        assert!(text.contains("Checking the meter"), "prose missing:\n{text}");
+        assert!(
+            text.contains("Checking the meter"),
+            "prose missing:\n{text}"
+        );
         assert!(text.contains("All green"), "prose missing:\n{text}");
         assert!(
             !text.contains("cargo test --workspace"),
@@ -5378,13 +5621,22 @@ mod tests {
         //   [('_probe', 8, 38)]  (ascii, so bytes == chars)
         handle_event(&mut app, json!({"ev": "complete", "spans": [[8, 38]]}));
         let text = paint(&mut app, 100, 40);
-        assert!(text.contains("hold on"), "prose before the call missing:\n{text}");
-        assert!(text.contains("done"), "prose after the call missing:\n{text}");
+        assert!(
+            text.contains("hold on"),
+            "prose before the call missing:\n{text}"
+        );
+        assert!(
+            text.contains("done"),
+            "prose after the call missing:\n{text}"
+        );
         assert!(
             !text.contains("<_probe>"),
             "the kernel dispatched this call; the story kept it as prose:\n{text}"
         );
-        assert!(!text.contains("rm -rf"), "a dispatched body survived reconcile:\n{text}");
+        assert!(
+            !text.contains("rm -rf"),
+            "a dispatched body survived reconcile:\n{text}"
+        );
     }
 
     /// The spans are UTF-8 *byte* offsets — the kernel converts scan.py's char
@@ -5403,7 +5655,10 @@ mod tests {
         let text = paint(&mut app, 100, 40);
         assert!(text.contains("héllo"), "prose missing:\n{text}");
         assert!(text.contains("done"), "prose missing:\n{text}");
-        assert!(!text.contains("<bash>"), "call survived byte-span reconcile:\n{text}");
+        assert!(
+            !text.contains("<bash>"),
+            "call survived byte-span reconcile:\n{text}"
+        );
     }
 
     #[test]
@@ -5446,7 +5701,12 @@ mod tests {
                 ]}
             ]
         }));
-        assert_eq!(m.chunks.len(), 5, "one chunk per message or block: {:?}", m.chunks);
+        assert_eq!(
+            m.chunks.len(),
+            5,
+            "one chunk per message or block: {:?}",
+            m.chunks
+        );
         let mut from_chunks = [0u64; 5];
         for (len, kind) in &m.chunks {
             from_chunks[*kind as usize] += *len;
@@ -5473,7 +5733,12 @@ mod tests {
         assert!(m.roles[2] > 0, "tool slot empty: {:?}", m.roles);
         assert!(m.roles[3] > 0, "reasoning slot empty: {:?}", m.roles);
         assert!(m.roles[4] > 0, "speech slot empty: {:?}", m.roles);
-        assert_eq!(m.chunks.len(), 5, "one chunk per Responses item: {:?}", m.chunks);
+        assert_eq!(
+            m.chunks.len(),
+            5,
+            "one chunk per Responses item: {:?}",
+            m.chunks
+        );
     }
 
     #[test]
@@ -5503,7 +5768,10 @@ mod tests {
         assert!(app.cache.roles[1] > 0, "prompt was not recorded");
         assert!(app.cache.roles[3] > 0, "reasoning was not recorded");
         assert!(app.cache.roles[4] > 0, "speech was not recorded");
-        assert!(!app.cache.chunks.is_empty(), "event path recorded no chunks");
+        assert!(
+            !app.cache.chunks.is_empty(),
+            "event path recorded no chunks"
+        );
     }
 
     #[test]
@@ -5556,11 +5824,7 @@ mod tests {
         for w in [1u16, 12, 40, 77] {
             for ratio in [0.0f64, 0.13, 0.5, 0.999, 1.0] {
                 let line = meter_row(w, "ctx", "62k / 200k", &[(3, c), (7, c)], ratio, t, t, c);
-                let painted: usize = line
-                    .spans
-                    .iter()
-                    .map(|s| s.content.chars().count())
-                    .sum();
+                let painted: usize = line.spans.iter().map(|s| s.content.chars().count()).sum();
                 assert_eq!(painted, w as usize, "w={w} ratio={ratio}");
             }
         }
@@ -5574,7 +5838,10 @@ mod tests {
         let line = meter_row(14, "context", "62k / 200k", &[(1, c)], 0.5, t, t, c);
         let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(text.contains("62k / 200k"), "value dropped: {text:?}");
-        assert!(!text.contains("context"), "label should have yielded: {text:?}");
+        assert!(
+            !text.contains("context"),
+            "label should have yielded: {text:?}"
+        );
         // One cell of gutter on the right, so the value never touches the border.
         assert!(
             text.ends_with(' '),
@@ -5619,13 +5886,22 @@ mod tests {
         );
         assert_eq!(app.post_n, 5);
         assert_eq!(app.post_out_n, 5);
-        handle_event(&mut app, json!({"ev":"post","n":6,"request":{"seq":"REQSIX"}}));
+        handle_event(
+            &mut app,
+            json!({"ev":"post","n":6,"request":{"seq":"REQSIX"}}),
+        );
         assert_eq!(app.post_n, 6, "in pane must advance at once");
         assert_eq!(app.post_out_n, 5, "held reply keeps its own number");
         let text = paint(&mut app, 150, 34);
         assert!(text.contains("POST in #6"), "in title wrong:\n{text}");
-        assert!(text.contains("POST out #5"), "out title must still say 5:\n{text}");
-        assert!(text.contains("RESPFIVE"), "held reply body was cleared:\n{text}");
+        assert!(
+            text.contains("POST out #5"),
+            "out title must still say 5:\n{text}"
+        );
+        assert!(
+            text.contains("RESPFIVE"),
+            "held reply body was cleared:\n{text}"
+        );
         handle_event(
             &mut app,
             json!({"ev":"complete","n":6,"model":"m",
@@ -5670,7 +5946,6 @@ mod tests {
         assert!(text.contains("hi"), "output not visible:\n{text}");
     }
 
-
     #[test]
     fn canonical_and_legacy_exec_events_make_equivalent_execute_cards() {
         for (legacy, failure) in [
@@ -5705,6 +5980,105 @@ mod tests {
                 }
             }
         }
+
+        let RenderBlock::ToolCall(ToolCallBlock::Execute(shell)) =
+            wire_syscall("exec", "", &json!({"op": "shell", "id": "build"}), "", None)
+        else {
+            panic!("canonical shell did not produce an execute card");
+        };
+        assert_eq!(shell.command, "<shell id=\"build\">");
+    }
+
+    #[test]
+    fn canonical_workspace_edit_keeps_the_real_diff_card() {
+        let event = json!({
+            "ev": "result",
+            "phase": "done",
+            "tag": "workspace",
+            "attrs": {"op": "edit", "path": "notes.txt"},
+            "body": "old\n---\nnew",
+            "text": "Edited notes.txt",
+            "line": 9,
+        });
+        let RenderBlock::ToolCall(ToolCallBlock::Edit(edit)) = result_block(&event) else {
+            panic!("workspace op=edit fell back to a generic card");
+        };
+        assert_eq!(edit.path, "notes.txt");
+        assert_eq!(edit.hunks[0][0].lo, 9);
+        assert!(edit.hunks[0].iter().any(|line| line.text.contains("old")));
+        assert!(edit.hunks[0].iter().any(|line| line.text.contains("new")));
+    }
+
+    #[test]
+    fn structured_results_get_a_typed_summary_and_pretty_body() {
+        let card = wire_syscall(
+            "agents",
+            "",
+            &json!({"op": "status"}),
+            r#"{"type":"worker","n":3,"state":"done"}"#,
+            None,
+        );
+        let RenderBlock::ToolCall(ToolCallBlock::Other(other)) = card else {
+            panic!("agents status should use the generic structured card");
+        };
+        assert_eq!(other.name, "agents: status");
+        assert_eq!(other.summary, "worker #3");
+        assert_eq!(
+            other.output.as_deref(),
+            Some("{\n  \"type\": \"worker\",\n  \"n\": 3,\n  \"state\": \"done\"\n}")
+        );
+    }
+
+    #[test]
+    fn canonical_streaming_shell_marks_its_real_exit_failure() {
+        let mut app = App::new();
+        handle_event(
+            &mut app,
+            json!({"ev":"result","phase":"start","tag":"exec",
+                   "attrs":{"op":"shell","id":"main"},"body":"false"}),
+        );
+        assert_eq!(app.sess.exec.tag, "shell");
+        handle_event(
+            &mut app,
+            json!({"ev":"result","phase":"done","tag":"exec",
+                   "attrs":{"op":"shell","id":"main"},"body":"false",
+                   "text":"command failed\n[exit 1]"}),
+        );
+        let RenderBlock::ToolCall(ToolCallBlock::Execute(exec)) =
+            &app.sess.calls.entry(0).expect("shell card").block
+        else {
+            panic!("canonical shell lost its execute card");
+        };
+        assert!(!exec.is_success(), "[exit 1] was painted as success");
+    }
+
+    #[test]
+    fn streamed_json_finishes_as_a_formatted_result() {
+        let mut app = App::new();
+        let compact = r#"{"type":"worker","n":3}"#;
+        handle_event(
+            &mut app,
+            json!({"ev":"result","phase":"start","tag":"exec",
+                   "attrs":{"op":"python"},"body":"print(status)"}),
+        );
+        handle_event(
+            &mut app,
+            json!({"ev":"result","phase":"delta","tag":"exec","text":compact}),
+        );
+        handle_event(
+            &mut app,
+            json!({"ev":"result","phase":"done","tag":"exec",
+                   "attrs":{"op":"python"},"body":"print(status)","text":compact}),
+        );
+        let RenderBlock::ToolCall(ToolCallBlock::Execute(exec)) =
+            &app.sess.calls.entry(0).expect("python card").block
+        else {
+            panic!("canonical python lost its execute card");
+        };
+        assert_eq!(
+            exec.output.as_deref(),
+            Some("{\n  \"type\": \"worker\",\n  \"n\": 3\n}")
+        );
     }
 
     /// Row colouring is NOT verified. The hunks carry the right Delete/Insert
@@ -5751,7 +6125,11 @@ mod tests {
         let RenderBlock::ToolCall(ToolCallBlock::Edit(e)) = result_block(&ev) else {
             panic!("expected an edit block");
         };
-        let first = e.hunks.first().and_then(|h| h.first()).expect("hunks present");
+        let first = e
+            .hunks
+            .first()
+            .and_then(|h| h.first())
+            .expect("hunks present");
         assert_eq!(first.lo, 41, "diff must anchor at the kernel's line");
         // No field, no line: an event without `line` must not invent one.
         let mut bare = ev.clone();
@@ -5759,13 +6137,22 @@ mod tests {
         let RenderBlock::ToolCall(ToolCallBlock::Edit(e2)) = result_block(&bare) else {
             panic!("expected an edit block");
         };
-        assert!(e2.hunks.is_empty(), "an absent line field must not fabricate an anchor");
+        assert!(
+            e2.hunks.is_empty(),
+            "an absent line field must not fabricate an anchor"
+        );
     }
 
     #[test]
     fn edit_tag_becomes_a_real_diff_block() {
         let attrs = json!({"path": "notes.txt"});
-        let block = wire_syscall("edit", "alpha\nbeta\n---\nalpha\nGAMMA\n", &attrs, "Edited notes.txt", Some(1));
+        let block = wire_syscall(
+            "edit",
+            "alpha\nbeta\n---\nalpha\nGAMMA\n",
+            &attrs,
+            "Edited notes.txt",
+            Some(1),
+        );
         let RenderBlock::ToolCall(ToolCallBlock::Edit(e)) = block else {
             panic!("edit must render as a diff, not a generic Other card");
         };
@@ -5776,15 +6163,27 @@ mod tests {
             .iter()
             .flat_map(|h| h.iter().map(|l| format!("{:?}", l.tag)))
             .collect();
-        assert!(tags.iter().any(|t| t == "Delete"), "no removed line: {tags:?}");
-        assert!(tags.iter().any(|t| t == "Insert"), "no added line: {tags:?}");
+        assert!(
+            tags.iter().any(|t| t == "Delete"),
+            "no removed line: {tags:?}"
+        );
+        assert!(
+            tags.iter().any(|t| t == "Insert"),
+            "no added line: {tags:?}"
+        );
         let texts: Vec<&str> = e
             .hunks
             .iter()
             .flat_map(|h| h.iter().map(|l| l.text.as_str()))
             .collect();
-        assert!(texts.iter().any(|t| t.contains("beta")), "old text missing: {texts:?}");
-        assert!(texts.iter().any(|t| t.contains("GAMMA")), "new text missing: {texts:?}");
+        assert!(
+            texts.iter().any(|t| t.contains("beta")),
+            "old text missing: {texts:?}"
+        );
+        assert!(
+            texts.iter().any(|t| t.contains("GAMMA")),
+            "new text missing: {texts:?}"
+        );
     }
 
     #[test]
@@ -5846,7 +6245,10 @@ mod tests {
         // Paint once so prepare_layout establishes a viewport; scroll_up is a
         // no-op while viewport_height is 0.
         let first = paint(&mut app, 120, 30);
-        assert!(first.contains("more up"), "tail view hides rows above:\n{first}");
+        assert!(
+            first.contains("more up"),
+            "tail view hides rows above:\n{first}"
+        );
         assert!(
             !first.contains("more down"),
             "follow mode is pinned to the tail, nothing is below it:\n{first}"
@@ -5854,7 +6256,10 @@ mod tests {
         app.sess.story.scroll_up(20);
         let text = paint(&mut app, 120, 30);
         assert!(text.contains("more up"), "no up-overflow marker:\n{text}");
-        assert!(text.contains("more down"), "no down-overflow marker:\n{text}");
+        assert!(
+            text.contains("more down"),
+            "no down-overflow marker:\n{text}"
+        );
     }
 
     #[test]
@@ -5862,7 +6267,10 @@ mod tests {
         let mut app = App::new();
         app.story_push(RenderBlock::agent_message("just one short line"));
         let text = paint(&mut app, 120, 30);
-        assert!(!text.contains("more up"), "spurious overflow marker:\n{text}");
+        assert!(
+            !text.contains("more up"),
+            "spurious overflow marker:\n{text}"
+        );
     }
 
     #[test]
@@ -6042,7 +6450,9 @@ mod tests {
     fn the_cheatsheet_lists_every_key_its_pane_answers_to() {
         let src = include_str!("input.rs");
         let slice = |from: &str, to: &str| -> String {
-            let a = src.find(from).unwrap_or_else(|| panic!("anchor gone: {from}"));
+            let a = src
+                .find(from)
+                .unwrap_or_else(|| panic!("anchor gone: {from}"));
             let b = src[a..]
                 .find(to)
                 .unwrap_or_else(|| panic!("end anchor gone: {to}"));
@@ -6058,11 +6468,17 @@ mod tests {
             ),
             (
                 Focus::Git,
-                slice("if app.focus == Focus::Git &&", "if app.focus == Focus::Files"),
+                slice(
+                    "if app.focus == Focus::Git &&",
+                    "if app.focus == Focus::Files",
+                ),
             ),
             (
                 Focus::Files,
-                slice("if app.focus == Focus::Files &&", "// The meter has no cursor"),
+                slice(
+                    "if app.focus == Focus::Files &&",
+                    "// The meter has no cursor",
+                ),
             ),
             (
                 Focus::PostIn,
@@ -6127,7 +6543,11 @@ mod tests {
         app.set_focus(Focus::Queue);
         let key = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE);
         handle_key(None, &mut app, key('e')).unwrap();
-        assert_eq!(app.queue.len(), 2, "the row is lifted out while you edit it");
+        assert_eq!(
+            app.queue.len(),
+            2,
+            "the row is lifted out while you edit it"
+        );
         assert_eq!(app.prompt.to_send(), "middel one");
         assert_eq!(app.focus, Focus::Input, "editing happens in the composer");
         // Fix the typo and send it back.
@@ -6141,7 +6561,10 @@ mod tests {
         .unwrap();
         let rows: Vec<String> = app.queue.iter().map(|q| q.text.clone()).collect();
         assert_eq!(rows, vec!["first", "middle one", "third"]);
-        assert!(app.queue_edit.is_none(), "the slot is spent once it is used");
+        assert!(
+            app.queue_edit.is_none(),
+            "the slot is spent once it is used"
+        );
         assert_eq!(app.sess.story.len(), 0, "editing a queued row runs no turn");
     }
 
@@ -6188,7 +6611,11 @@ mod tests {
         assert!(!quit);
         assert_eq!(app.queue.len(), 1);
         assert!(app.prompt.to_send().is_empty());
-        assert_eq!(app.sess.story.len(), 0, "queued follow-up must not hit story yet");
+        assert_eq!(
+            app.sess.story.len(),
+            0,
+            "queued follow-up must not hit story yet"
+        );
     }
 
     #[test]
@@ -6226,7 +6653,10 @@ mod tests {
         try_drain(None, &mut app).unwrap();
         assert!(app.queue.is_empty());
         assert!(matches!(
-            app.sess.story.entry(app.sess.story.len() - 1).map(|entry| &entry.block),
+            app.sess
+                .story
+                .entry(app.sess.story.len() - 1)
+                .map(|entry| &entry.block),
             Some(RenderBlock::UserPrompt(_))
         ));
     }
@@ -6285,7 +6715,10 @@ mod tests {
         assert!(text.contains("POST in"), "{text}");
         assert!(text.contains("POST out"), "{text}");
         assert!(text.contains("WIREPROBE"), "request body missing:\n{text}");
-        assert!(text.contains("WIREANSWER"), "response body missing:\n{text}");
+        assert!(
+            text.contains("WIREANSWER"),
+            "response body missing:\n{text}"
+        );
         assert!(!text.contains("opaque-secret"), "{text}");
         assert_eq!(app.post_n, 4);
     }
@@ -6345,7 +6778,11 @@ mod tests {
         }
         assert_eq!(l.wire_pct, PaneLayout::MIN_WIRE);
         assert_eq!(l.post_split, PaneLayout::MIN_SPLIT);
-        assert_eq!((l.meter_h, l.post_h), (0, 0), "both panes must reach hidden");
+        assert_eq!(
+            (l.meter_h, l.post_h),
+            (0, 0),
+            "both panes must reach hidden"
+        );
     }
 
     #[test]
@@ -6539,11 +6976,19 @@ mod tests {
         }
         assert!(app.slash.open, "typing a slash opens the list");
         handle_key(None, &mut app, tab()).unwrap();
-        assert_eq!(app.focus, Focus::Input, "Tab must complete, not cycle panes");
+        assert_eq!(
+            app.focus,
+            Focus::Input,
+            "Tab must complete, not cycle panes"
+        );
         assert_eq!(app.prompt.to_send(), "/model");
         handle_key(None, &mut app, press(KeyCode::Esc)).unwrap();
         assert!(!app.slash.open);
-        assert_eq!(app.focus, Focus::Input, "Esc dismissed the list, not the pane");
+        assert_eq!(
+            app.focus,
+            Focus::Input,
+            "Esc dismissed the list, not the pane"
+        );
 
         // A command taking nothing has nothing to complete.
         s.update("/reset ", &pick);
@@ -6630,7 +7075,11 @@ mod tests {
         // Sent: the composer is empty and the list is gone. Looping would have
         // left "/reset" sitting in the composer with the list still open.
         assert!(!app.slash.open, "the list must not survive the send");
-        assert_eq!(app.prompt.to_send(), "", "Enter sent it instead of re-completing");
+        assert_eq!(
+            app.prompt.to_send(),
+            "",
+            "Enter sent it instead of re-completing"
+        );
 
         // A prefix still has something to add, so Enter completes there.
         for c in "/the".chars() {
@@ -6665,11 +7114,24 @@ mod tests {
         use slash::Verdict;
         assert_eq!(slash::verdict("hello there", &pick), Verdict::NotACommand);
         assert_eq!(slash::verdict("/reset", &pick), Verdict::Ready);
-        assert_eq!(slash::verdict("/model", &pick), Verdict::Ready, "bare /model opens the picker");
-        assert_eq!(slash::verdict("/model claude-opus-5", &pick), Verdict::Ready);
+        assert_eq!(
+            slash::verdict("/model", &pick),
+            Verdict::Ready,
+            "bare /model opens the picker"
+        );
+        assert_eq!(
+            slash::verdict("/model claude-opus-5", &pick),
+            Verdict::Ready
+        );
         assert_eq!(slash::verdict("/theme rosepine", &pick), Verdict::Ready);
-        assert!(matches!(slash::verdict("/thinking", &pick), Verdict::NeedsArg(_)));
-        assert!(matches!(slash::verdict("/nonsense", &pick), Verdict::Unknown(_)));
+        assert!(matches!(
+            slash::verdict("/thinking", &pick),
+            Verdict::NeedsArg(_)
+        ));
+        assert!(matches!(
+            slash::verdict("/nonsense", &pick),
+            Verdict::Unknown(_)
+        ));
         match slash::verdict("/model gpt-9", &pick) {
             Verdict::BadArg { got, expected } => {
                 assert_eq!(got, "gpt-9");
@@ -6678,7 +7140,10 @@ mod tests {
             other => panic!("{other:?}"),
         }
         // An effort the current build cannot serve is caught the same way.
-        assert!(matches!(slash::verdict("/thinking ludicrous", &pick), Verdict::BadArg { .. }));
+        assert!(matches!(
+            slash::verdict("/thinking ludicrous", &pick),
+            Verdict::BadArg { .. }
+        ));
         assert_eq!(slash::verdict("/thinking xhigh", &pick), Verdict::Ready);
     }
 
@@ -6705,7 +7170,10 @@ mod tests {
         assert!(app.cache.ephemeral, "anthropic does declare one");
         app.cache.observe(&usage, "claude-opus-5");
         let painted = paint(&mut app, 130, 40);
-        assert!(painted.contains("81%") && painted.contains("5m"), "{painted}");
+        assert!(
+            painted.contains("81%") && painted.contains("5m"),
+            "{painted}"
+        );
     }
 
     #[test]
@@ -6716,9 +7184,15 @@ mod tests {
         let _ = apply_picker(
             None,
             &mut app,
-            picker::PickerAction::Apply { model: "gpt-5.6-sol".into(), effort: "low".into() },
+            picker::PickerAction::Apply {
+                model: "gpt-5.6-sol".into(),
+                effort: "low".into(),
+            },
         );
-        assert_eq!(app.model, "claude-opus-5", "the wire is still on the old model");
+        assert_eq!(
+            app.model, "claude-opus-5",
+            "the wire is still on the old model"
+        );
         assert!(app.model_pending.is_some());
         // The badge has to survive a composer that is not the whole screen —
         // the right column takes roughly a third of it.
@@ -6730,7 +7204,10 @@ mod tests {
         );
 
         // The bridge's snapshot is what promotes it.
-        handle_event(&mut app, json!({"ev": "snapshot", "model": "gpt-5.6-sol", "thinking": "low"}));
+        handle_event(
+            &mut app,
+            json!({"ev": "snapshot", "model": "gpt-5.6-sol", "thinking": "low"}),
+        );
         assert_eq!(app.model, "gpt-5.6-sol");
         assert!(app.model_pending.is_none());
     }
@@ -6755,14 +7232,21 @@ mod tests {
             !cfg.scrollback.blocks.edit.vpad && roomy.scrollback.blocks.edit.vpad,
             "and an edit card's blank rows, which were never toggled at all"
         );
-        assert!(!cfg.scrollback.blocks.prompt.vpad, "a prompt does not need two blank rows");
+        assert!(
+            !cfg.scrollback.blocks.prompt.vpad,
+            "a prompt does not need two blank rows"
+        );
         assert!(!cfg.turn_status.gap);
 
         // And it reaches the frame: an idle composer exposes eight text rows,
         // plus its border and the floating spacer above the card.
         let mut app = App::new();
         let _ = paint(&mut app, 140, 34);
-        assert_eq!(app.input_area.height, 11, "idle composer: {:?}", app.input_area);
+        assert_eq!(
+            app.input_area.height, 11,
+            "idle composer: {:?}",
+            app.input_area
+        );
         assert_eq!(
             app.traj_area.y + app.traj_area.height + app.layout.post_h,
             app.input_area.y,
@@ -6779,14 +7263,26 @@ mod tests {
         let _ = apply_picker(
             None,
             &mut app,
-            picker::PickerAction::Apply { model: "gpt-5.6-sol".into(), effort: "low".into() },
+            picker::PickerAction::Apply {
+                model: "gpt-5.6-sol".into(),
+                effort: "low".into(),
+            },
         );
         assert!(app.model_pending.is_some());
         // No snapshot arrives mid-step, but the request does — and the request
         // is what the model is actually being asked as.
-        handle_event(&mut app, json!({"ev": "post", "n": 3, "request": {"model": "gpt-5.6-sol"}}));
-        assert_eq!(app.model, "gpt-5.6-sol", "the body on the wire is the authority");
-        assert!(app.model_pending.is_none(), "nothing left to queue once it is in a request");
+        handle_event(
+            &mut app,
+            json!({"ev": "post", "n": 3, "request": {"model": "gpt-5.6-sol"}}),
+        );
+        assert_eq!(
+            app.model, "gpt-5.6-sol",
+            "the body on the wire is the authority"
+        );
+        assert!(
+            app.model_pending.is_none(),
+            "nothing left to queue once it is in a request"
+        );
     }
 
     #[test]
@@ -6798,7 +7294,10 @@ mod tests {
         );
         let painted = paint(&mut app, 120, 40);
         assert!(painted.contains("context folded"), "{painted}");
-        assert!(painted.contains("24"), "kept count is the fact that matters: {painted}");
+        assert!(
+            painted.contains("24"),
+            "kept count is the fact that matters: {painted}"
+        );
         assert_eq!(app.status, "context folded");
     }
 
@@ -6835,7 +7334,11 @@ mod tests {
             app.status,
             "IRC #conflicts · worker-b: persist.py conflict · 2 unread"
         );
-        assert_eq!(app.sess.story.len(), 0, "transient IRC activity leaked into Story");
+        assert_eq!(
+            app.sess.story.len(),
+            0,
+            "transient IRC activity leaked into Story"
+        );
         let painted = paint(&mut app, 120, 40);
         assert!(painted.contains("persist.py conflict"), "{painted}");
     }
@@ -6858,7 +7361,11 @@ mod tests {
             }),
         );
         assert!(app.running, "a peer message is not a turn terminator");
-        assert_eq!(app.sess.story.len(), 1, "directed peer message was not routed to Story");
+        assert_eq!(
+            app.sess.story.len(),
+            1,
+            "directed peer message was not routed to Story"
+        );
         let painted = paint(&mut app, 120, 40);
         assert!(painted.contains("Peer reply · peer-123"), "{painted}");
         assert!(painted.contains("hello from the other side"), "{painted}");
@@ -6895,9 +7402,16 @@ mod tests {
 
         // The evidence is the card; the story gets exactly one harness row that
         // says what happened. It must be a System row — a fold is not speech.
-        assert_eq!(app.sess.story.len(), 1, "the fold went unexplained where it is read");
+        assert_eq!(
+            app.sess.story.len(),
+            1,
+            "the fold went unexplained where it is read"
+        );
         assert!(
-            matches!(app.sess.story.entry(0).map(|e| &e.block), Some(RenderBlock::System(_))),
+            matches!(
+                app.sess.story.entry(0).map(|e| &e.block),
+                Some(RenderBlock::System(_))
+            ),
             "a fold is not speech, but it must be said",
         );
     }
@@ -7042,11 +7556,17 @@ mod tests {
         app.story_push(RenderBlock::thinking_streaming());
         app.sess.story.set_last_running(true);
         let t0 = app.sess.story.animation_tick();
-        assert!(app.sess.story.tick(), "visible running entry must request redraw");
+        assert!(
+            app.sess.story.tick(),
+            "visible running entry must request redraw"
+        );
         assert!(app.sess.story.animation_tick() > t0);
         app.set_focus(Focus::Input);
         let text = paint(&mut app, 120, 30);
-        assert!(!text.contains('❯'), "input must not show a chevron:\n{text}");
+        assert!(
+            !text.contains('❯'),
+            "input must not show a chevron:\n{text}"
+        );
         assert!(
             !text.contains(" … "),
             "running must not replace the prompt with ellipsis:\n{text}"
@@ -7160,8 +7680,15 @@ mod tests {
         apply_paste(&mut pasted_command, "/reset", false);
         assert!(pasted_command.slash_paste_guard);
         assert!(!pasted_command.slash.open);
-        assert!(matches!(slash_verdict(&pasted_command), slash::Verdict::NotACommand));
-        handle_key(None, &mut pasted_command, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        assert!(matches!(
+            slash_verdict(&pasted_command),
+            slash::Verdict::NotACommand
+        ));
+        handle_key(
+            None,
+            &mut pasted_command,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )
             .unwrap();
         assert_ne!(
             pasted_command.status, "transcript cleared",
@@ -7172,7 +7699,11 @@ mod tests {
         for c in "/reset".chars() {
             handle_key(None, &mut typed_command, press(KeyCode::Char(c))).unwrap();
         }
-        handle_key(None, &mut typed_command, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        handle_key(
+            None,
+            &mut typed_command,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )
             .unwrap();
         assert_eq!(typed_command.status, "transcript cleared");
 
@@ -7182,7 +7713,10 @@ mod tests {
         assert_eq!(image_path.prompt.images().len(), 1);
         assert!(image_path.prompt.to_send().is_empty());
         assert!(image_path.slash_paste_guard);
-        assert!(matches!(slash_verdict(&image_path), slash::Verdict::NotACommand));
+        assert!(matches!(
+            slash_verdict(&image_path),
+            slash::Verdict::NotACommand
+        ));
     }
 
     #[test]
@@ -7441,10 +7975,17 @@ mod tests {
             !parent.contains("CHILDONLY"),
             "child speech leaked onto parent story:\n{parent}"
         );
-        assert_eq!(app.sess.calls.len(), 0, "child wire must not hit parent calls");
+        assert_eq!(
+            app.sess.calls.len(),
+            0,
+            "child wire must not hit parent calls"
+        );
 
         let child = app.children.get("deadbeef").expect("child session");
-        assert!(child.sess.story.len() >= 2, "task + speech stay in child Story");
+        assert!(
+            child.sess.story.len() >= 2,
+            "task + speech stay in child Story"
+        );
         assert_eq!(
             child.sess.calls.len(),
             3,
@@ -7468,7 +8009,9 @@ mod tests {
         let inside = paint(&mut app, 120, 30);
         assert!(inside.contains("Session a1b2c3d4"), "{inside}");
         assert!(
-            inside.contains("last-user") || inside.contains("CHILDONLY") || inside.contains("cache"),
+            inside.contains("last-user")
+                || inside.contains("CHILDONLY")
+                || inside.contains("cache"),
             "child speech missing inside session:\n{inside}"
         );
         let _ = handle_key(
@@ -7585,7 +8128,10 @@ mod tests {
         let mut app = App::new();
         app.running = true;
         handle_event(&mut app, json!({"ev": "turn", "text": "go"}));
-        assert!(app.sess.calls.is_empty(), "turn eagerly created Activity chrome");
+        assert!(
+            app.sess.calls.is_empty(),
+            "turn eagerly created Activity chrome"
+        );
 
         let waiting = paint(&mut app, 120, 34);
         assert!(rows_of(&waiting, app.input_area).contains("Inference"));
@@ -7651,7 +8197,11 @@ mod tests {
         // The `1` is the call's body: it belongs to the calls pane, and it must
         // never appear in the story even for the one frame before it closes.
         assert_eq!(spoken, vec!["see  more".to_string()]);
-        assert!(!spoken.iter().any(|s| s.contains("<python>") || s.contains('1')));
+        assert!(
+            !spoken
+                .iter()
+                .any(|s| s.contains("<python>") || s.contains('1'))
+        );
     }
 
     #[test]
@@ -7696,7 +8246,6 @@ mod tests {
         assert_eq!(outs, vec!["hi".to_string()]);
         assert!(app.sess.exec.id.is_none());
     }
-
 
     /// A folded work row is owed one git read: the one that saw its last
     /// syscall. Rewriting it from whichever snapshot arrives first prints a
@@ -7791,7 +8340,10 @@ mod tests {
         // carried verdict, never from a git snapshot.
         handle_event(&mut app, json!({"ev": "done"}));
         app.sess.stream.run.settle(&mut app.sess.story, &app.git);
-        assert!(app.sess.stream.run.settled.is_none(), "a kernel claim needs no git read");
+        assert!(
+            app.sess.stream.run.settled.is_none(),
+            "a kernel claim needs no git read"
+        );
         let folded = rows(&app);
         assert!(
             folded.iter().any(|r| r.contains("committed beef123")),
@@ -7809,8 +8361,16 @@ mod tests {
         app.bridge_gone = true;
         start_step(None, &mut app, "carry on".into(), Vec::new()).unwrap();
         assert!(!app.running, "nothing is running");
-        assert_eq!(app.sess.posts.len(), 0, "no POST group for a step that cannot run");
-        let last = app.sess.story.entry(app.sess.story.len() - 1).map(|e| e.block.clone());
+        assert_eq!(
+            app.sess.posts.len(),
+            0,
+            "no POST group for a step that cannot run"
+        );
+        let last = app
+            .sess
+            .story
+            .entry(app.sess.story.len() - 1)
+            .map(|e| e.block.clone());
         assert!(
             matches!(last, Some(RenderBlock::System(ref b)) if b.text == BRIDGE_GONE),
             "the story must carry the death under the prompt, not a 4s notice: {last:?}"
@@ -7832,14 +8392,23 @@ mod tests {
     #[test]
     fn an_unclosed_fence_hides_nothing_from_the_story() {
         let ran = |src: &str| !strip_syscalls(src).contains("<bash>");
-        assert!(ran("here:\n```bash\ngit status\n\n<bash>ls</bash>\n"), "stray info fence");
+        assert!(
+            ran("here:\n```bash\ngit status\n\n<bash>ls</bash>\n"),
+            "stray info fence"
+        );
         assert!(ran("a\n```\n<bash>ls</bash>\n"), "stray backtick fence");
         assert!(ran("a\n~~~\n<bash>ls</bash>\n"), "stray tilde fence");
-        assert!(!ran("here:\n```bash\n<bash>ls</bash>\n```\ndone\n"), "closed fence");
+        assert!(
+            !ran("here:\n```bash\n<bash>ls</bash>\n```\ndone\n"),
+            "closed fence"
+        );
         // The fence never closes, so its lines are ordinary lines again --
         // including their backticks, which is the only reason this one is
         // inert to the kernel.
-        assert!(!ran("a\n```\nuse `<bash>ls</bash>` here\n"), "inline span under a stray fence");
+        assert!(
+            !ran("a\n```\nuse `<bash>ls</bash>` here\n"),
+            "inline span under a stray fence"
+        );
     }
 
     /// The stream holds a bare `<bash>` back in case its closer is still
@@ -7849,8 +8418,16 @@ mod tests {
     #[test]
     fn a_held_mention_is_released_when_the_stream_ends() {
         let mut app = App::new();
-        apply_speech(&mut app.sess.story, &mut app.sess.calls, &mut app.sess.stream, "use the <bash> tool for that", true);
-        app.sess.stream.flush(&mut app.sess.story, &mut app.sess.calls);
+        apply_speech(
+            &mut app.sess.story,
+            &mut app.sess.calls,
+            &mut app.sess.stream,
+            "use the <bash> tool for that",
+            true,
+        );
+        app.sess
+            .stream
+            .flush(&mut app.sess.story, &mut app.sess.calls);
         let held = (0..app.sess.story.len())
             .filter_map(|i| match app.sess.story.entry(i).map(|e| &e.block) {
                 Some(RenderBlock::AgentMessage(m)) => Some(m.text()),
@@ -7858,8 +8435,13 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("");
-        assert!(!held.contains("tool for that"), "printed before the closer could arrive");
-        app.sess.stream.finish(&mut app.sess.story, &mut app.sess.calls);
+        assert!(
+            !held.contains("tool for that"),
+            "printed before the closer could arrive"
+        );
+        app.sess
+            .stream
+            .finish(&mut app.sess.story, &mut app.sess.calls);
         let text = (0..app.sess.story.len())
             .filter_map(|i| match app.sess.story.entry(i).map(|e| &e.block) {
                 Some(RenderBlock::AgentMessage(m)) => Some(m.text()),
@@ -7891,8 +8473,14 @@ mod tests {
             &mut app,
             KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
         );
-        assert!(app.viewer.is_some(), "Enter on speech must open BlockViewerPane");
-        assert!(app.viewing.is_none(), "speech must not open a spawn session");
+        assert!(
+            app.viewer.is_some(),
+            "Enter on speech must open BlockViewerPane"
+        );
+        assert!(
+            app.viewing.is_none(),
+            "speech must not open a spawn session"
+        );
         let text = paint(&mut app, 120, 36);
         assert!(
             text.contains("esc close") || text.contains("wrap") || text.contains("speech"),
@@ -7968,14 +8556,20 @@ mod tests {
         assert!(app.post_inspect.is_some());
         assert!(app.viewer.is_none());
         let text = paint(&mut app, 120, 36);
-        assert!(text.contains("WIREPROBE"), "tree in popup missing request:\n{text}");
+        assert!(
+            text.contains("WIREPROBE"),
+            "tree in popup missing request:\n{text}"
+        );
         let _ = handle_key(
             None,
             &mut app,
             KeyEvent::new(KeyCode::Char(']'), KeyModifiers::NONE),
         );
         let out = paint(&mut app, 120, 36);
-        assert!(out.contains("WIREANSWER"), "out tab missing response:\n{out}");
+        assert!(
+            out.contains("WIREANSWER"),
+            "out tab missing response:\n{out}"
+        );
         let _ = handle_key(
             None,
             &mut app,
@@ -8026,9 +8620,6 @@ mod tests {
             "viewer must re-wrap at the new width: narrow={narrow} wide={wide}"
         );
     }
-
-
-
 
     /// Every card in the calls pane has one left edge. The bullet sits in the
     /// gutter and the header text starts two columns in; the body has to start
@@ -8241,7 +8832,12 @@ mod tests {
             appearance_cache::load(),
         );
         let _pin = theme_lock();
-        for cmd in ["/timestamps", "/dense", "/theme tokyonight", "/thinking high"] {
+        for cmd in [
+            "/timestamps",
+            "/dense",
+            "/theme tokyonight",
+            "/thinking high",
+        ] {
             app.prompt.clear();
             for ch in cmd.chars() {
                 app.prompt.insert_char(ch);
@@ -8310,18 +8906,36 @@ mod tests {
         // The whole point of a notice: it is drawn, on the one piece of chrome
         // that is always on screen, and then it lapses.
         let text = paint(&mut app, 120, 36);
-        let top = rows_of(&text, Rect { height: 2, ..app.input_area });
+        let top = rows_of(
+            &text,
+            Rect {
+                height: 2,
+                ..app.input_area
+            },
+        );
         assert!(
             top.contains("copied"),
             "a notice must land on the composer's top edge:\n{top}"
         );
         let (t, msg) = app.notice.clone().expect("notice");
         app.notice = Some((t - NOTICE_TTL - Duration::from_secs(1), msg));
-        assert!(expire_notice(&mut app), "a stale notice must ask for a repaint");
+        assert!(
+            expire_notice(&mut app),
+            "a stale notice must ask for a repaint"
+        );
         assert!(app.notice.is_none());
         let text = paint(&mut app, 120, 36);
-        let top = rows_of(&text, Rect { height: 2, ..app.input_area });
-        assert!(!top.contains("copied"), "a lapsed notice must be gone:\n{top}");
+        let top = rows_of(
+            &text,
+            Rect {
+                height: 2,
+                ..app.input_area
+            },
+        );
+        assert!(
+            !top.contains("copied"),
+            "a lapsed notice must be gone:\n{top}"
+        );
     }
 
     fn tab() -> KeyEvent {
@@ -8432,7 +9046,12 @@ mod tests {
             let want = ring[(i + 1) % ring.len()];
             assert!(open(*f), "{} is not on screen", focus_name(*f));
             assert_eq!(f.next_open(&open), want, "Tab from {}", focus_name(*f));
-            assert_eq!(want.prev_open(&open), *f, "Shift-Tab from {}", focus_name(want));
+            assert_eq!(
+                want.prev_open(&open),
+                *f,
+                "Shift-Tab from {}",
+                focus_name(want)
+            );
         }
         // Down the right edge: x stays on the right column, y only grows.
         for pair in [
@@ -8540,8 +9159,14 @@ mod tests {
         assert!(app.prompt.is_multiline());
         let painted = paint(&mut app, 120, 24);
         let card = rows_of(&painted, app.input_area);
-        assert!(card.contains("second line"), "composer lost its text:\n{card}");
-        assert!(!card.contains("multiline"), "composer still labels itself:\n{card}");
+        assert!(
+            card.contains("second line"),
+            "composer lost its text:\n{card}"
+        );
+        assert!(
+            !card.contains("multiline"),
+            "composer still labels itself:\n{card}"
+        );
     }
 
     #[test]
@@ -8556,22 +9181,40 @@ mod tests {
 
         let tail = paint(&mut app, 80, 24);
         let tail_card = rows_of(&tail, app.input_area);
-        assert!(app.input_scroll > 0, "long prompt never entered viewport mode");
-        assert!(tail_card.contains("line-29"), "caret tail is not visible:\n{tail_card}");
-        assert!(!tail_card.contains("line-00"), "viewport did not scroll:\n{tail_card}");
+        assert!(
+            app.input_scroll > 0,
+            "long prompt never entered viewport mode"
+        );
+        assert!(
+            tail_card.contains("line-29"),
+            "caret tail is not visible:\n{tail_card}"
+        );
+        assert!(
+            !tail_card.contains("line-00"),
+            "viewport did not scroll:\n{tail_card}"
+        );
 
         for _ in 0..40 {
             handle_key(None, &mut app, press(KeyCode::Up)).unwrap();
         }
         let head = paint(&mut app, 80, 24);
         let head_card = rows_of(&head, app.input_area);
-        assert_eq!(app.input_scroll, 0, "Up did not scroll back to the first row");
-        assert!(head_card.contains("line-00"), "prompt head is not visible:\n{head_card}");
+        assert_eq!(
+            app.input_scroll, 0,
+            "Up did not scroll back to the first row"
+        );
+        assert!(
+            head_card.contains("line-00"),
+            "prompt head is not visible:\n{head_card}"
+        );
         let backend = TestBackend::new(80, 24);
         let mut term = Terminal::new(backend).unwrap();
         term.draw(|f| draw(f, &mut app)).unwrap();
         let pos = term.get_cursor_position().expect("composer cursor");
-        assert!(hit(app.input_inner, pos.x, pos.y), "caret escaped its viewport");
+        assert!(
+            hit(app.input_inner, pos.x, pos.y),
+            "caret escaped its viewport"
+        );
     }
 
     #[test]
@@ -8583,9 +9226,15 @@ mod tests {
         let (first, inference_color, first_mod) = paint_input_state(&mut inference, 140, 30);
         assert!(rows_of(&first, inference.input_area).contains("Inference"));
         let meta = rows_of(&first, inference.cache.area);
-        assert!(!meta.contains("idle") && !meta.contains("thinking"), "{meta}");
+        assert!(
+            !meta.contains("idle") && !meta.contains("thinking"),
+            "{meta}"
+        );
         assert!(rows_of(&first, inference.input_area).contains("[stop]"));
-        assert!(inference.turn_cancel.is_some(), "running composer lost [stop] hit box");
+        assert!(
+            inference.turn_cancel.is_some(),
+            "running composer lost [stop] hit box"
+        );
 
         for _ in 0..6 {
             inference.sess.story.tick();
@@ -8604,7 +9253,10 @@ mod tests {
         let (queued_text, queued_color, _) = paint_input_state(&mut queued, 140, 30);
         let queued_rows = rows_of(&queued_text, queued.input_area);
         assert!(queued_rows.contains("Queued"), "{queued_rows}");
-        assert!(!queued_rows.contains("Queued 1"), "composer duplicates the queue count:\n{queued_rows}");
+        assert!(
+            !queued_rows.contains("Queued 1"),
+            "composer duplicates the queue count:\n{queued_rows}"
+        );
 
         // A queued follow-up must not hide what the turn is actually doing.
         let mut busy = App::new();
@@ -8614,7 +9266,10 @@ mod tests {
         busy.queue.push("next prompt".into());
         let (busy_text, _, _) = paint_input_state(&mut busy, 140, 30);
         let busy_rows = rows_of(&busy_text, busy.input_area);
-        assert!(busy_rows.contains("Inference") && !busy_rows.contains("Queued"), "{busy_rows}");
+        assert!(
+            busy_rows.contains("Inference") && !busy_rows.contains("Queued"),
+            "{busy_rows}"
+        );
 
         let mut tool = App::new();
         tool.running = true;
@@ -8653,7 +9308,11 @@ mod tests {
             .unwrap();
         let theme = Theme::current();
         let buf = term.backend().buffer();
-        assert_eq!(buf[(1, 1)].fg, theme.accent_tool, "selected run lost its tool hue");
+        assert_eq!(
+            buf[(1, 1)].fg,
+            theme.accent_tool,
+            "selected run lost its tool hue"
+        );
         assert_eq!(
             buf[(1, 2)].fg,
             less_saturated(theme.accent_tool),
@@ -8675,8 +9334,14 @@ mod tests {
         assert!(text.contains(" Activity "), "{text}");
         assert!(text.contains(" Meta "), "{text}");
         let meta = rows_of(&text, app.cache.area);
-        assert!(!meta.contains("idle") && !meta.contains("waiting"), "{meta}");
-        assert!(!meta.lines().next().unwrap_or_default().contains("cache"), "{meta}");
+        assert!(
+            !meta.contains("idle") && !meta.contains("waiting"),
+            "{meta}"
+        );
+        assert!(
+            !meta.lines().next().unwrap_or_default().contains("cache"),
+            "{meta}"
+        );
     }
 
     /// The composer grows with what is typed, and it measures against the
@@ -8729,13 +9394,20 @@ mod tests {
         let mut app = App::new();
         let _ = paint(&mut app, 160, 48);
         let idle = rows_of(&paint(&mut app, 160, 48), app.cache.area);
-        assert!(!idle.contains("waiting"), "idle Meta claims background work:\n{idle}");
+        assert!(
+            !idle.contains("waiting"),
+            "idle Meta claims background work:\n{idle}"
+        );
 
         handle_event(
             &mut app,
             json!({"ev": "pending", "n": 1, "tasks": ["shell main [t7-abc]"]}),
         );
-        assert_eq!(app.background.len(), 1, "the pending event never reached App");
+        assert_eq!(
+            app.background.len(),
+            1,
+            "the pending event never reached App"
+        );
         let busy = rows_of(&paint(&mut app, 160, 48), app.cache.area);
         assert!(
             busy.contains("1 waiting") && busy.contains("shell main"),
@@ -8744,7 +9416,10 @@ mod tests {
 
         handle_event(&mut app, json!({"ev": "pending", "n": 0, "tasks": []}));
         let cleared = rows_of(&paint(&mut app, 160, 48), app.cache.area);
-        assert!(!cleared.contains("waiting"), "the row outlived the task:\n{cleared}");
+        assert!(
+            !cleared.contains("waiting"),
+            "the row outlived the task:\n{cleared}"
+        );
     }
 
     fn rows_of(text: &str, area: Rect) -> String {
@@ -8792,7 +9467,11 @@ mod tests {
         let meta = app.cache.area;
         handle_mouse(
             &mut app,
-            click(MouseEventKind::Down(MouseButton::Left), meta.x + 2, meta.y + 1),
+            click(
+                MouseEventKind::Down(MouseButton::Left),
+                meta.x + 2,
+                meta.y + 1,
+            ),
         );
         assert_eq!(app.focus, Focus::Meter);
 
@@ -8823,7 +9502,11 @@ mod tests {
         let row = 2u16;
         handle_mouse(
             &mut app,
-            click(MouseEventKind::Down(MouseButton::Left), files.x + 2, files.y + 1 + row),
+            click(
+                MouseEventKind::Down(MouseButton::Left),
+                files.x + 2,
+                files.y + 1 + row,
+            ),
         );
         assert_eq!(app.focus, Focus::Files);
         assert_eq!(app.files.sel, app.files.scroll + row as usize);
@@ -8831,11 +9514,14 @@ mod tests {
         let fixed = app.files.sel;
         handle_mouse(
             &mut app,
-            click(MouseEventKind::Down(MouseButton::Left), files.x + 2, files.y),
+            click(
+                MouseEventKind::Down(MouseButton::Left),
+                files.x + 2,
+                files.y,
+            ),
         );
         assert_eq!(app.files.sel, fixed, "border clicks must not move a cursor");
     }
-
 
     /// `error` is not a terminator. loop.py fires it for a reply the endpoint
     /// cut short and keeps looping, and the reader thread synthesises one for
@@ -8853,8 +9539,14 @@ mod tests {
             &mut app,
             json!({"ev": "error", "n": 1, "text": "[reply was cut short: max_tokens]"}),
         );
-        assert!(app.running, "error ended a step that run_turns is still running");
-        assert!(app.turn_started.is_some(), "the turn clock was reset mid-step");
+        assert!(
+            app.running,
+            "error ended a step that run_turns is still running"
+        );
+        assert!(
+            app.turn_started.is_some(),
+            "the turn clock was reset mid-step"
+        );
         handle_event(&mut app, json!({"ev": "turn", "n": 2}));
         handle_event(&mut app, json!({"ev": "done"}));
         assert!(!app.running, "done is the terminator");
@@ -8925,7 +9617,11 @@ mod tests {
             DisplayMode::Expanded,
         );
         let _ = paint(&mut app, 140, 40);
-        let mode = app.children["kid"].sess.calls.get_by_id(kid[0]).map(|e| e.display_mode);
+        let mode = app.children["kid"]
+            .sess
+            .calls
+            .get_by_id(kid[0])
+            .map(|e| e.display_mode);
         assert_eq!(
             mode,
             Some(DisplayMode::Collapsed),
@@ -8934,7 +9630,12 @@ mod tests {
 
         // And a fold made inside the child survives the next frame.
         let last = *kid.last().unwrap();
-        app.children.get_mut("kid").unwrap().sess.calls.set_selected(Some(7));
+        app.children
+            .get_mut("kid")
+            .unwrap()
+            .sess
+            .calls
+            .set_selected(Some(7));
         pin_selected_wire(&mut app);
         set_wire_mode(
             &mut app.children.get_mut("kid").unwrap().sess.calls,
@@ -8942,13 +9643,21 @@ mod tests {
             DisplayMode::Collapsed,
         );
         let _ = paint(&mut app, 140, 40);
-        let mode = app.children["kid"].sess.calls.get_by_id(last).map(|e| e.display_mode);
+        let mode = app.children["kid"]
+            .sess
+            .calls
+            .get_by_id(last)
+            .map(|e| e.display_mode);
         assert_eq!(
             mode,
             Some(DisplayMode::Collapsed),
             "reflow re-expanded a card the reader folded in the child pane"
         );
-        assert_eq!(app.sess.wire_manual.len(), 1, "a child fold landed in the parent's set");
+        assert_eq!(
+            app.sess.wire_manual.len(),
+            1,
+            "a child fold landed in the parent's set"
+        );
     }
 
     /// A subagent's POST is billed to the same key. It used to be spent and
@@ -8975,7 +9684,10 @@ mod tests {
             app.cache.spent > parent_spent,
             "a subagent's tokens never reached the money row"
         );
-        assert_eq!(app.cache.calls, 2, "the child's POST is a call that happened");
+        assert_eq!(
+            app.cache.calls, 2,
+            "the child's POST is a call that happened"
+        );
         assert_eq!(
             app.cache.fresh, parent_fresh,
             "the child overwrote the parent's context bar"
@@ -9006,7 +9718,10 @@ mod tests {
         app.sess.calls_text.persist = Some(sel);
         handle_key(None, &mut app, press(KeyCode::Esc)).unwrap();
         assert!(app.sess.story_text.persist.is_none());
-        assert!(app.sess.calls_text.persist.is_none(), "the wire pane kept its highlight");
+        assert!(
+            app.sess.calls_text.persist.is_none(),
+            "the wire pane kept its highlight"
+        );
     }
 
     /// ctrl+←/→ on the POST panes moves a divider that draw ignored: the row
@@ -9070,7 +9785,6 @@ mod tests {
         }
     }
 
-
     /// The work row's git tail comes from the git pane's background snapshot.
     /// `sync` used to fork `git rev-parse` plus `git status --porcelain`
     /// itself, and it runs after every syscall result and every finished
@@ -9116,7 +9830,10 @@ mod tests {
         apply_session_choice(None, &mut app, session::Choice::New).unwrap();
 
         let screen = paint(&mut app, 100, 30);
-        assert!(!screen.contains("old prompt"), "new session retained history:\n{screen}");
+        assert!(
+            !screen.contains("old prompt"),
+            "new session retained history:\n{screen}"
+        );
     }
 
     #[test]
@@ -9139,8 +9856,14 @@ mod tests {
         apply_session_choice(None, &mut app, session::Choice::Resume("0191aaaa".into())).unwrap();
 
         let screen = paint(&mut app, 100, 30);
-        assert!(screen.contains("saved question"), "prompt was not resumed:\n{screen}");
-        assert!(screen.contains("saved answer"), "answer was not resumed:\n{screen}");
+        assert!(
+            screen.contains("saved question"),
+            "prompt was not resumed:\n{screen}"
+        );
+        assert!(
+            screen.contains("saved answer"),
+            "answer was not resumed:\n{screen}"
+        );
     }
 
     #[test]
@@ -9161,10 +9884,21 @@ mod tests {
         );
 
         let picker = paint(&mut app, 100, 30);
-        assert!(picker.contains("Which session?"), "startup picker not rendered:\n{picker}");
-        handle_key(None, &mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)).unwrap();
+        assert!(
+            picker.contains("Which session?"),
+            "startup picker not rendered:\n{picker}"
+        );
+        handle_key(
+            None,
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )
+        .unwrap();
         let resumed = paint(&mut app, 100, 30);
-        assert!(resumed.contains("entry point question"), "Enter was not wired to resume:\n{resumed}");
+        assert!(
+            resumed.contains("entry point question"),
+            "Enter was not wired to resume:\n{resumed}"
+        );
         assert!(!resumed.contains("Which session?"));
     }
 
@@ -9263,9 +9997,9 @@ mod tests {
         let png = png_file("see");
         let p = png.to_string_lossy().into_owned();
         let card = wire_syscall(
-            "see",
+            "workspace",
             &p,
-            &json!({}),
+            &json!({"op": "see"}),
             &format!("attached 1 image(s): {p} [1KB]"),
             None,
         );
@@ -9352,8 +10086,16 @@ mod tests {
         let buf = term.backend().buffer();
         let selected_y = 1 + app.files.sel as u16;
         let selected = &buf[(5, selected_y)];
-        assert_eq!(buf[(1, selected_y)].symbol(), "│", "tree guide was not painted");
-        assert_eq!(buf[(3, selected_y)].symbol(), "·", "file icon was not painted");
+        assert_eq!(
+            buf[(1, selected_y)].symbol(),
+            "│",
+            "tree guide was not painted"
+        );
+        assert_eq!(
+            buf[(3, selected_y)].symbol(),
+            "·",
+            "file icon was not painted"
+        );
         assert!(
             (1..17).any(|x| buf[(x, selected_y)].symbol() == "…"),
             "long filename was not visibly truncated"
@@ -9372,7 +10114,11 @@ mod tests {
                     .contains("folder")
             })
             .expect("directory row was not painted");
-        assert_eq!(buf[(3, folder_y)].symbol(), "▸", "directory icon was not painted");
+        assert_eq!(
+            buf[(3, folder_y)].symbol(),
+            "▸",
+            "directory icon was not painted"
+        );
         assert!(
             buf[(5, folder_y)].modifier.contains(Modifier::BOLD),
             "directory name is not heavier than file names"
@@ -9403,7 +10149,11 @@ mod tests {
             .filter(|&y| buf[(2, y)].bg == want)
             .map(|y| (0..40).map(|x| buf[(x, y)].symbol()).collect::<String>())
             .collect();
-        assert_eq!(banded.len(), 1, "exactly one row carries the band: {banded:?}");
+        assert_eq!(
+            banded.len(),
+            1,
+            "exactly one row carries the band: {banded:?}"
+        );
         assert!(
             banded[0].contains("follow-up 9"),
             "band landed on the wrong row: {:?}",
@@ -9427,9 +10177,7 @@ mod tests {
         let buf = term.backend().buffer();
         let (x, y) = (1..5)
             .find_map(|y| {
-                let row = (0..40)
-                    .map(|x| buf[(x, y)].symbol())
-                    .collect::<String>();
+                let row = (0..40).map(|x| buf[(x, y)].symbol()).collect::<String>();
                 row.find("selected follow-up").map(|x| (x as u16, y))
             })
             .expect("selected queue row was not painted");

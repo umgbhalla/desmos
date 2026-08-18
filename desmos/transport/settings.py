@@ -16,7 +16,7 @@ from typing import Any
 from desmos.transport import auth
 from desmos.transport.openai import EFFORTS as OPENAI_EFFORTS, MODELS as OPENAI_MODELS
 
-ANTHROPIC_MODELS = ("claude-opus-5", "claude-sonnet-4-6")
+ANTHROPIC_MODELS = ("claude-opus-5", "claude-fable-5", "claude-sonnet-4-6")
 # Probed against the API, which answers "Input should be 'low', 'medium',
 # 'high', 'xhigh' or 'max'" -- the same five rungs OpenAI offers. The old
 # three-value list was a guess that hid medium and max from the picker.

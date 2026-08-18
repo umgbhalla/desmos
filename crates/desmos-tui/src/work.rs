@@ -10,18 +10,24 @@ use xai_grok_pager::scrollback::{EntryId, RenderBlock, ScrollbackState};
 
 use crate::side;
 
-/// The legacy execution tag represented by an event.
+/// The operation represented by a result event.
 ///
-/// Canonical events keep their `exec` kernel tag; only the TUI interpretation
-/// is normalized here.
-pub(crate) fn exec_tag<'a>(tag: &'a str, attrs: &'a Value) -> Option<&'a str> {
-    match tag {
-        "python" | "bash" | "shell" => Some(tag),
-        "exec" => attrs
+/// Canonical events keep the capability family in `tag` and the operation in
+/// `attrs.op`; compatibility events already carry the operation as `tag`.
+/// Normalize only at the TUI boundary so both paint the same Activity card.
+pub(crate) fn syscall_operation<'a>(tag: &'a str, attrs: &'a Value) -> &'a str {
+    if matches!(
+        tag,
+        "exec" | "workspace" | "knowledge" | "harness" | "observe" | "agents" | "session"
+    ) {
+        attrs
             .get("op")
+            .or_else(|| attrs.get("action"))
             .and_then(Value::as_str)
-            .filter(|op| matches!(*op, "python" | "bash" | "shell")),
-        _ => None,
+            .filter(|op| !op.is_empty())
+            .unwrap_or(tag)
+    } else {
+        tag
     }
 }
 
@@ -52,7 +58,7 @@ impl CallTarget {
 pub(crate) fn call_target(tag: &str, ev: &Value) -> CallTarget {
     let empty = Value::Null;
     let attrs = ev.get("attrs").unwrap_or(&empty);
-    let tag = exec_tag(tag, attrs).unwrap_or(tag);
+    let tag = syscall_operation(tag, attrs);
     if let Some(p) = attrs.get("path").and_then(Value::as_str) {
         let target = Some(
             p.rsplit('/')
@@ -276,7 +282,11 @@ impl WorkRun {
         let tail = git_tail(committed.as_deref(), git);
         entry.block = RenderBlock::selectable_system(row_line(&sentence, tail.as_deref()));
         if let Some(detail) = self.details.get_mut(&id) {
-            while detail.lines().last().is_some_and(|line| line.starts_with("Repository:")) {
+            while detail
+                .lines()
+                .last()
+                .is_some_and(|line| line.starts_with("Repository:"))
+            {
                 let keep = detail.rfind('\n').unwrap_or(0);
                 detail.truncate(keep);
             }
@@ -314,13 +324,19 @@ fn work_detail(segs: &[Seg], tail: Option<&str>) -> String {
     for (index, seg) in segs.iter().enumerate() {
         let value = match seg {
             Seg::Thought(ms) => format!("thought {} ({ms} ms)", human_secs(*ms)),
-            Seg::Call { tag, target: Some(target) } => format!("{tag} → {target}"),
+            Seg::Call {
+                tag,
+                target: Some(target),
+            } => format!("{tag} → {target}"),
             Seg::Call { tag, target: None } => tag.clone(),
         };
         rows.push(format!("{:>2}. {value}", index + 1));
     }
     if let Some(tail) = tail {
-        rows.push(format!("Repository: {}", tail.trim_start_matches('·').trim()));
+        rows.push(format!(
+            "Repository: {}",
+            tail.trim_start_matches('·').trim()
+        ));
     }
     rows.join("\n")
 }
@@ -436,11 +452,23 @@ mod tests {
         }
         let summary = work_sentence(&segs);
         let detail = work_detail(&segs, Some("· tree clean"));
-        assert!(summary.contains('\u{2026}'), "fixture must exercise summary elision");
-        assert!(!detail.contains('\u{2026}'), "detail must never elide: {detail}");
-        assert_eq!(detail.lines().filter(|line| line.contains(". ")).count(), 16);
+        assert!(
+            summary.contains('\u{2026}'),
+            "fixture must exercise summary elision"
+        );
+        assert!(
+            !detail.contains('\u{2026}'),
+            "detail must never elide: {detail}"
+        );
+        assert_eq!(
+            detail.lines().filter(|line| line.contains(". ")).count(),
+            16
+        );
         for i in 0..8 {
-            assert!(detail.contains(&format!("file-{i}.rs")), "missing segment {i}: {detail}");
+            assert!(
+                detail.contains(&format!("file-{i}.rs")),
+                "missing segment {i}: {detail}"
+            );
         }
         assert!(detail.ends_with("Repository: tree clean"));
     }
@@ -454,28 +482,28 @@ mod tests {
     }
 
     #[test]
-    fn canonical_exec_ops_use_their_legacy_work_tags() {
-        for op in ["python", "bash", "shell"] {
+    fn canonical_ops_use_their_operation_in_work_rows() {
+        for (family, op) in [
+            ("exec", "python"),
+            ("exec", "bash"),
+            ("exec", "shell"),
+            ("workspace", "edit"),
+            ("knowledge", "todo"),
+            ("agents", "status"),
+            ("session", "status"),
+        ] {
             let attrs = json!({"op": op});
-            assert_eq!(exec_tag("exec", &attrs), Some(op));
-            assert_eq!(exec_tag(op, &json!({})), Some(op));
+            assert_eq!(syscall_operation(family, &attrs), op);
+            assert_eq!(syscall_operation(op, &json!({})), op);
 
             let ev = json!({"attrs": attrs});
             let mut run = WorkRun::default();
-            run.call("exec", call_target("exec", &ev));
+            run.call(family, call_target(family, &ev));
             assert!(matches!(
                 run.segs.as_slice(),
                 [Seg::Call { tag, target: None }] if tag == op
             ));
         }
-        assert_eq!(exec_tag("exec", &json!({"op": "unknown"})), None);
-        let ev = json!({"attrs": {"op": "unknown"}});
-        let mut run = WorkRun::default();
-        run.call("exec", call_target("exec", &ev));
-        assert!(matches!(
-            run.segs.as_slice(),
-            [Seg::Call { tag, target: None }] if tag == "exec"
-        ));
     }
 
     /// A shell command contributes its program and nothing else. This is the
@@ -497,7 +525,10 @@ mod tests {
         assert_eq!(call_target("shell", &legacy_shell).as_deref(), Some("git"));
         let canonical_shell =
             json!({"tag": "exec", "attrs": {"op": "shell"}, "body": "/usr/bin/git status"});
-        assert_eq!(call_target("exec", &canonical_shell).as_deref(), Some("git"));
+        assert_eq!(
+            call_target("exec", &canonical_shell).as_deref(),
+            Some("git")
+        );
         let edit = json!({"tag": "edit", "attrs": {"path": "crates/desmos-tui/src/main.rs"}});
         assert_eq!(call_target("edit", &edit).as_deref(), Some("main.rs"));
     }

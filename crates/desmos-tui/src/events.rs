@@ -12,8 +12,8 @@ use xai_grok_pager::scrollback::blocks::{
 use xai_grok_pager::scrollback::{DisplayMode, RenderBlock, ScrollbackState};
 
 use crate::{
-    App, ExecStream, PostArgs, StreamCursor, call_target, looks_failed, result_block, set_wire_mode,
-    wire_push,
+    App, ExecStream, PostArgs, StreamCursor, call_target, format_result, looks_failed,
+    result_block, set_wire_mode, syscall_operation, wire_push,
 };
 
 /// The kernel's syscall spans off a `complete` event: UTF-8 byte ranges of the
@@ -236,12 +236,7 @@ pub(crate) fn handle_subagent(app: &mut App, ev: &Value) {
             let terminal = if phase == "done" && err.is_none() {
                 RenderBlock::Subagent(SubagentBlock::completed(&desc, id, elapsed))
             } else {
-                RenderBlock::Subagent(SubagentBlock::failed(
-                    &desc,
-                    id,
-                    elapsed,
-                    err.clone(),
-                ))
+                RenderBlock::Subagent(SubagentBlock::failed(&desc, id, elapsed, err.clone()))
             };
             app.sess.story.push_block(terminal);
             // Child speech already landed via `child` events. Only surface a
@@ -315,7 +310,10 @@ pub(crate) fn handle_child(app: &mut App, ev: &Value) {
                     &mut child.sess.calls,
                     &spans,
                 ),
-                None => child.sess.stream.finish(&mut child.sess.story, &mut child.sess.calls),
+                None => child
+                    .sess
+                    .stream
+                    .finish(&mut child.sess.story, &mut child.sess.calls),
             }
             finish_exec(&mut child.sess.calls, &mut child.sess.exec);
             let n = ev.get("n").and_then(Value::as_u64).unwrap_or(0);
@@ -335,11 +333,17 @@ pub(crate) fn handle_child(app: &mut App, ev: &Value) {
             }
         }
         "result" => {
-            child.sess.stream.finish(&mut child.sess.story, &mut child.sess.calls);
+            child
+                .sess
+                .stream
+                .finish(&mut child.sess.story, &mut child.sess.calls);
             apply_result(&mut child.sess.calls, &mut child.sess.exec, ev);
         }
         "turn" => {
-            child.sess.stream.finish(&mut child.sess.story, &mut child.sess.calls);
+            child
+                .sess
+                .stream
+                .finish(&mut child.sess.story, &mut child.sess.calls);
         }
         _ => {}
     }
@@ -415,10 +419,18 @@ pub(crate) fn handle_event(app: &mut App, ev: Value) {
         "speech" => {
             let delta = ev.get("delta").and_then(Value::as_bool).unwrap_or(false);
             let text = ev.get("text").and_then(Value::as_str).unwrap_or("");
-            apply_speech(&mut app.sess.story, &mut app.sess.calls, &mut app.sess.stream, text, delta);
+            apply_speech(
+                &mut app.sess.story,
+                &mut app.sess.calls,
+                &mut app.sess.stream,
+                text,
+                delta,
+            );
         }
         "result" => {
-            app.sess.stream.finish(&mut app.sess.story, &mut app.sess.calls);
+            app.sess
+                .stream
+                .finish(&mut app.sess.story, &mut app.sess.calls);
             let phase = ev.get("phase").and_then(Value::as_str).unwrap_or("done");
             if phase != "start" && phase != "delta" {
                 let tag = ev.get("tag").and_then(Value::as_str).unwrap_or("?");
@@ -491,7 +503,10 @@ pub(crate) fn handle_event(app: &mut App, ev: Value) {
                     &mut app.sess.calls,
                     &spans,
                 ),
-                None => app.sess.stream.finish(&mut app.sess.story, &mut app.sess.calls),
+                None => app
+                    .sess
+                    .stream
+                    .finish(&mut app.sess.story, &mut app.sess.calls),
             }
             finish_exec(&mut app.sess.calls, &mut app.sess.exec);
             let n = ev.get("n").and_then(Value::as_u64).unwrap_or(0);
@@ -517,7 +532,9 @@ pub(crate) fn handle_event(app: &mut App, ev: Value) {
         }
         "turn" => {
             app.status = "running".into();
-            app.sess.stream.finish(&mut app.sess.story, &mut app.sess.calls);
+            app.sess
+                .stream
+                .finish(&mut app.sess.story, &mut app.sess.calls);
         }
         // Outstanding background work, re-sent whenever the set changes. Meta
         // is the only reader: this is state, not an event worth a card.
@@ -534,7 +551,9 @@ pub(crate) fn handle_event(app: &mut App, ev: Value) {
                 .unwrap_or_default();
         }
         "done" => {
-            app.sess.stream.finish(&mut app.sess.story, &mut app.sess.calls);
+            app.sess
+                .stream
+                .finish(&mut app.sess.story, &mut app.sess.calls);
             app.sess.stream.run.fold(&mut app.sess.story);
             finish_exec(&mut app.sess.calls, &mut app.sess.exec);
             app.running = false;
@@ -543,7 +562,9 @@ pub(crate) fn handle_event(app: &mut App, ev: Value) {
             app.drain_after = !app.queue.is_empty();
         }
         "stopped" => {
-            app.sess.stream.finish(&mut app.sess.story, &mut app.sess.calls);
+            app.sess
+                .stream
+                .finish(&mut app.sess.story, &mut app.sess.calls);
             finish_exec(&mut app.sess.calls, &mut app.sess.exec);
             let t = ev
                 .get("text")
@@ -571,7 +592,10 @@ pub(crate) fn handle_event(app: &mut App, ev: Value) {
         // without a durable Story row the model receives a message the human
         // never sees.
         "channel" => {
-            let channel = ev.get("channel").and_then(Value::as_str).unwrap_or("conflicts");
+            let channel = ev
+                .get("channel")
+                .and_then(Value::as_str)
+                .unwrap_or("conflicts");
             let author = ev.get("author").and_then(Value::as_str).unwrap_or("peer");
             let preview = ev.get("preview").and_then(Value::as_str).unwrap_or("");
             let unread = ev.get("unread").and_then(Value::as_u64).unwrap_or(1);
@@ -585,7 +609,9 @@ pub(crate) fn handle_event(app: &mut App, ev: Value) {
                     },
                 )));
             } else {
-                app.notify(format!("IRC #{channel} · {author}: {preview} · {unread} unread"));
+                app.notify(format!(
+                    "IRC #{channel} · {author}: {preview} · {unread} unread"
+                ));
             }
         }
         // Not a terminator. loop.py fires this for a reply the endpoint cut
@@ -594,7 +620,9 @@ pub(crate) fn handle_event(app: &mut App, ev: Value) {
         // run_turns was still going, so Enter sent a second op:step that fired
         // later, out of order. Only done/stopped end a step.
         "error" => {
-            app.sess.stream.finish(&mut app.sess.story, &mut app.sess.calls);
+            app.sess
+                .stream
+                .finish(&mut app.sess.story, &mut app.sess.calls);
             finish_exec(&mut app.sess.calls, &mut app.sess.exec);
             let t = ev.get("text").and_then(Value::as_str).unwrap_or("error");
             app.story_push(RenderBlock::system(t));
@@ -640,11 +668,10 @@ pub(crate) fn apply_result(calls: &mut ScrollbackState, exec: &mut ExecStream, e
             set_wire_mode(calls, id, DisplayMode::Expanded);
             calls.set_last_running(true);
             exec.id = Some(id);
-            exec.tag = ev
-                .get("tag")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string();
+            let tag = ev.get("tag").and_then(Value::as_str).unwrap_or("");
+            let empty = Value::Null;
+            let attrs = ev.get("attrs").unwrap_or(&empty);
+            exec.tag = syscall_operation(tag, attrs).to_string();
         }
         "delta" => {
             let text = ev.get("text").and_then(Value::as_str).unwrap_or("");
@@ -656,27 +683,31 @@ pub(crate) fn apply_result(calls: &mut ScrollbackState, exec: &mut ExecStream, e
             exec.flush(calls);
             let text = ev.get("text").and_then(Value::as_str).unwrap_or("");
             let tag = ev.get("tag").and_then(Value::as_str).unwrap_or("?");
+            let empty = Value::Null;
+            let attrs = ev.get("attrs").unwrap_or(&empty);
+            let operation = syscall_operation(tag, attrs);
             if let Some(id) = exec.id.take() {
                 if let Some(entry) = calls.get_by_id_mut(id) {
                     match &mut entry.block {
                         RenderBlock::ToolCall(ToolCallBlock::Execute(block)) => {
-                            if block.output.as_ref().is_none_or(|s| s.is_empty())
-                                && !text.is_empty()
+                            if !text.is_empty() {
+                                let formatted = format_result(text);
+                                if formatted != text
+                                    || block.output.as_ref().is_none_or(|s| s.is_empty())
                             {
-                                block.output = Some(text.to_string());
+                                    block.output = Some(formatted);
                             }
-                            if looks_failed(tag, text) {
+                            }
+                            if looks_failed(operation, text) {
                                 block.set_error(Some(
                                     text.lines().next().unwrap_or("failed").to_string(),
                                 ));
                             }
                             block.finish();
                         }
-                        // Only python/bash are Execute cards. `edit`, `register`,
-                        // `system`, `skill`, `evolve` and every tag grown with
-                        // <register> render as Other, which has no streaming
-                        // output slot — rebuild the card from the done event so
-                        // the wire pane actually shows what the syscall returned.
+                        // Non-execute cards have no shared streaming output
+                        // slot. Rebuild from the done event so Activity shows
+                        // the final diff, media, or structured result.
                         other => *other = result_block(ev),
                     }
                 }
