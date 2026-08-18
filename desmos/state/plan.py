@@ -222,6 +222,11 @@ def create(
             body = text
         if steps is None:
             steps = steps_from_text(text)
+    if steps is None and body:
+        # Same lift `from N` does, for the same reason: a plan written down
+        # ending in a numbered list already says what its steps are, and
+        # re-entering them one syscall at a time is transcription, not work.
+        steps = steps_from_text(body)
     if status not in STATUSES:
         raise ValueError(f"status must be one of {STATUSES}")
     rec = {
@@ -326,7 +331,8 @@ USAGE = (
     "plan ops (first line is the command):\n"
     "  (empty)                list every plan\n"
     "  list [status]          list plans, optionally filtered\n"
-    "  new TITLE              create a draft; remaining lines become the body\n"
+    "  new TITLE              create a draft; remaining lines become the body,\n"
+    "                         and a numbered list in them becomes the steps\n"
     "  from N [| TITLE]       capture transcript message N as the body and\n"
     "                         lift its numbered list into steps\n"
     "  show ID                full render including the body\n"

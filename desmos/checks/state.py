@@ -1380,4 +1380,11 @@ def _check_plan_rail(cwd: Path) -> None:
     assert len(calls) == 1, calls
     shown = plan.render(plan.read(world, rec["plan_id"]))
     assert "blocked: waiting on the user" in shown, shown
+
+    # A written plan already says what its steps are; `new` lifts them the way
+    # `from N` does rather than making the model re-enter each one.
+    lifted = plan.create(world, "lifted", "why this matters\n\n1. first\n2. second")
+    assert [s["title"] for s in lifted["steps"]] == ["first", "second"], lifted
+    prose = plan.create(world, "prose", "no list here, just a paragraph")
+    assert prose["steps"] == [], prose
     print("plan rail check ok")
