@@ -96,6 +96,37 @@ errors twice, should be tombstoned. Otherwise the dialect sludges.
 unless it is in a note, a skill, or a named object the *index* still
 lists.
 
+### Retiring an op (the frozen side)
+
+Refine governs grown tags. The frozen ABI is retired under a stricter rule,
+because its ops are advertised to every request and some of them exist for
+the day they are needed rather than the day they are used.
+
+**Call count is not the criterion.** `rollback`, `judgment`, `resume` and
+`error` are insurance; their whole value is the tail. A workspace can run for
+months without one and still be well served by it. `observe op=usage` names
+the ops nothing has called: that list is a question, never a verdict.
+
+An op may be *proposed* for retirement only when one of these holds, and
+never merely because it is idle:
+
+1. **Subsumed.** Another op does its job, and the record shows the successor
+   used on this op's own case. Retiring without a successor is not
+   simplification, it is a capability gap.
+2. **Unreachable.** No dispatch path can produce it, or its handler has been
+   broken for a whole generation and nothing noticed.
+3. **Misrouting.** Two lines read as the same thing and calls land on the
+   wrong one. Rewrite the description first (`harness op=describe`) -- a doc
+   is cheaper than an ABI change -- and retire only if the confusion survives
+   the rewrite.
+
+Before any of that, ask the discoverability question: did the *situation* the
+op serves ever occur? A regression rolled back by hand while
+`harness op=rollback` sat unused is a routing failure, not a dead op.
+
+Retirement is a tombstone here too. The tag stays in `COMPAT_ALIASES` forever
+so old transcripts and generations still replay; only the advertised line goes.
+
 ## Mechanical contract (this repo)
 
 - Frozen ABI lists the write paths. It does not list fifty tools.

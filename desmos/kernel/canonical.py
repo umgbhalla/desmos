@@ -403,6 +403,13 @@ def _op_rollup(world, persist):
     lines = [f"{count:>5}  {name}" for name, count in rows]
     if idle:
         lines.append("never called: " + ", ".join(idle))
+        # Rarity is not a retirement criterion: rollback and judgment are
+        # insurance, and their value is the tail. docs/self-growth.md,
+        # "Retiring an op", is the rule this list feeds.
+        lines.append(
+            "  (idle is a question, not a verdict -- see docs/self-growth.md,"
+            " retiring an op: subsumed, unreachable or misrouting, never rare)"
+        )
     return "\n".join(lines) or "no calls recorded"
 
 
