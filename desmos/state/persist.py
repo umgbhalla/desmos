@@ -915,16 +915,59 @@ def _save_data(conn: sqlite3.Connection, world: World, data: dict[str, Any]) -> 
                         item["prompt"] + "\n" + item["speech"], str(seq),
                     ),
                 )
+        # The delete pass above refuses to erase a row this world never saw.
+        # The write pass used to erase it anyway: INSERT OR REPLACE with the
+        # value this world happens to hold overwrites whatever a sibling
+        # session wrote since this one loaded, in silence and with no way to
+        # tell afterwards. A row changed after the watermark is theirs -- adopt
+        # it into memory so both sessions converge on what is actually stored,
+        # and say so once rather than losing it quietly.
+        adopted: list[str] = []
+        stored_notes = {
+            str(r["name"]): (str(r["body"] or ""), str(r["updated_at"] or ""))
+            for r in conn.execute(
+                "SELECT name, body, updated_at FROM notes WHERE workspace_id = ?",
+                (workspace,),
+            )
+        }
         for name, body in data["notes"].items():
-            if isinstance(body, str):
-                conn.execute(
-                    "INSERT OR REPLACE INTO"
-                    " notes(workspace_id, name, body, updated_at)"
-                    " VALUES (?, ?, ?, ?)",
-                    (workspace, str(name), body, now),
-                )
+            if not isinstance(body, str):
+                continue
+            have = stored_notes.get(str(name))
+            if have and have[0] == body:
+                continue  # identical; writing it would only churn updated_at
+            if have and have[1] > watermark:
+                world.notes[str(name)] = have[0]
+                adopted.append(str(name))
+                continue
+            conn.execute(
+                "INSERT OR REPLACE INTO"
+                " notes(workspace_id, name, body, updated_at)"
+                " VALUES (?, ?, ?, ?)",
+                (workspace, str(name), body, now),
+            )
+        stored_tools = {
+            str(r["name"]): (str(r["doc"] or ""), r["source"], str(r["updated_at"] or ""))
+            for r in conn.execute(
+                "SELECT name, doc, source, updated_at FROM tools WHERE workspace_id = ?",
+                (workspace,),
+            )
+        }
+
+        def _keep_theirs(name: str, doc: str, source: Any) -> bool:
+            """Same rule as the notes above: a row newer than the view is theirs."""
+            have = stored_tools.get(name)
+            if not have:
+                return False
+            if have[0] == doc and have[1] == source:
+                return True  # identical; writing it would only churn updated_at
+            if have[2] > watermark:
+                adopted.append(name)
+                return True
+            return False
+
         for name, doc in data["docs"].items():
-            if isinstance(doc, str):
+            if isinstance(doc, str) and not _keep_theirs(str(name), doc, None):
                 conn.execute(
                     "INSERT OR REPLACE INTO"
                     " tools(workspace_id, name, doc, source, frozen, updated_at)"
@@ -936,12 +979,23 @@ def _save_data(conn: sqlite3.Connection, world: World, data: dict[str, Any]) -> 
                 continue
             doc, source = spec.get("doc"), spec.get("source")
             if isinstance(doc, str) and (isinstance(source, str) or source is None):
+                if _keep_theirs(str(name), doc, source):
+                    continue
                 conn.execute(
                     "INSERT OR REPLACE INTO"
                     " tools(workspace_id, name, doc, source, frozen, updated_at)"
                     " VALUES (?, ?, ?, ?, 0, ?)",
                     (workspace, str(name), doc, source, now),
                 )
+        if adopted:
+            # Loud, once, naming what changed under this world. Silence here is
+            # what made the old clobber impossible to notice.
+            warnings.warn(
+                "adopted rows a sibling session wrote after this one loaded: "
+                + ", ".join(sorted(set(adopted))),
+                RuntimeWarning,
+                stacklevel=2,
+            )
         world.synced_at = now
         conn.commit()
     except BaseException:

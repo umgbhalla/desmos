@@ -347,6 +347,7 @@ def check() -> None:
         _check_plan_rail(cwd)
         _check_fold_consent(cwd)
         _check_child_run_id()
+        _check_concurrent_notes()
         _check_steer(cwd)
         _check_op_rollup(cwd)
         _check_slice(cwd)
@@ -1495,3 +1496,45 @@ def _check_child_run_id() -> None:
     child = out.stdout.strip()
     assert child and child != mine, (child, mine)
     print("child run id check ok")
+
+
+def _check_concurrent_notes() -> None:
+    """A sibling's note survives a save from a session that never saw it.
+
+    The delete pass already refused to erase rows outside this world's view;
+    the write pass overwrote them anyway. Now that two sessions can share a
+    workspace, that is not a theoretical race -- it is the ordinary case.
+    """
+    import sqlite3
+    import tempfile
+    import warnings
+
+    from desmos.state import persist
+
+    root = Path(tempfile.mkdtemp())
+    first = new_world(root, persist=True)
+    first.notes["shared"] = "from A"
+    persist.save(first)
+    path = persist.state_file(first)
+
+    second = new_world(root, persist=True)
+    assert second.notes.get("shared") == "from A", second.notes
+    second.notes["shared"] = "from B"
+    second.notes["only-b"] = "b wrote this"
+    persist.save(second)
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        persist.save(first)
+
+    conn = sqlite3.connect(path)
+    try:
+        rows = dict(conn.execute("SELECT name, body FROM notes"))
+    finally:
+        conn.close()
+    assert rows.get("shared") == "from B", rows
+    assert rows.get("only-b") == "b wrote this", rows
+    assert first.notes["shared"] == "from B", first.notes
+    assert any("adopted rows" in str(w.message) for w in caught), \
+        [str(w.message) for w in caught]
+    print("concurrent notes check ok")
