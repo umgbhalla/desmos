@@ -461,6 +461,79 @@ def _watch_channel(
             continue
 
 
+def _read_ops(
+    stream: Any,
+    world: Any,
+    inbox: queue.Queue,
+    cancel: threading.Event,
+    pause: threading.Event,
+) -> None:
+    """The stdin op reader. Out-of-band ops -- stop/quit/steer/pause/resume and
+    the interventions -- are answered on this thread; everything else queues on
+    the inbox behind the running step."""
+    for raw in stream:
+        line = raw.strip()
+        if not line:
+            continue
+        try:
+            msg = json.loads(line)
+        except ValueError as exc:
+            _emit({"ev": "error", "text": f"bad json: {exc}"})
+            continue
+        if not isinstance(msg, dict):
+            _emit({"ev": "error", "text": "bad json: not an object"})
+            continue
+        op = msg.get("op")
+        if op == "stop":
+            cancel.set()
+            continue
+        if op == "quit":
+            cancel.set()
+            inbox.put(None)
+            return
+        if op == "steer":
+            # Not a stop and not a step: the text joins world.steers and the
+            # running loop delivers it at its next turn boundary (drain_steers
+            # in kernel/loop.py). The inbox would queue it *behind* the very
+            # step it is meant to redirect, so it must not go there, and cancel
+            # must stay untouched -- steering is not stopping.
+            from desmos.kernel.catalog import steer as _steer
+
+            text = str(msg.get("text") or "").strip()
+            if not text:
+                _emit({"ev": "error", "text": "empty steer"})
+                continue
+            _steer(world, text)
+            _emit({"ev": "notice", "text": "steer queued"})
+            continue
+        if op in ("pause", "resume"):
+            # Freeze, do not orphan. The drive loop's should_stop gate sleeps
+            # while this event is set, so the model loop parks at a turn
+            # boundary while shells, pending tasks and children keep running.
+            pause.set() if op == "pause" else pause.clear()
+            _emit({"ev": "notice", "text": f"session {op}d"})
+            continue
+        if op in ("kill_run", "rerun"):
+            # Same routing as the socket readers: an intervention answered
+            # inline, not queued behind the step it interrupts.
+            _intervene(op, msg)
+            continue
+        inbox.put(msg)
+    inbox.put(None)
+
+
+def _pause_gate(cancel: threading.Event, pause: threading.Event) -> Any:
+    """The should_stop handed to run_turns: blocks while paused instead of
+    stopping, so a pause is a freeze at the turn boundary and never a stop."""
+
+    def gate() -> bool:
+        while pause.is_set() and not cancel.is_set():
+            time.sleep(0.05)
+        return cancel.is_set()
+
+    return gate
+
+
 def serve(cwd: Path) -> int:
     from desmos.state.persist import WorkspaceBusy, claim_workspace
 
@@ -485,6 +558,7 @@ def serve(cwd: Path) -> int:
     S.bind(world)
     S.set_emitter(_emit)
     cancel = threading.Event()
+    pause = threading.Event()
     channel_stop = threading.Event()
     inbox: queue.Queue[dict[str, Any] | None] = queue.Queue()
     # The log first: ready and everything after it must be in the replay file.
@@ -511,33 +585,7 @@ def serve(cwd: Path) -> int:
         threading.Thread(target=acceptor, daemon=True).start()
 
     def reader() -> None:
-        for raw in sys.stdin:
-            line = raw.strip()
-            if not line:
-                continue
-            try:
-                msg = json.loads(line)
-            except ValueError as exc:
-                _emit({"ev": "error", "text": f"bad json: {exc}"})
-                continue
-            if not isinstance(msg, dict):
-                _emit({"ev": "error", "text": "bad json: not an object"})
-                continue
-            op = msg.get("op")
-            if op == "stop":
-                cancel.set()
-                continue
-            if op == "quit":
-                cancel.set()
-                inbox.put(None)
-                return
-            if op in ("kill_run", "rerun"):
-                # Same routing as the socket readers: an intervention answered
-                # inline, not queued behind the step it interrupts.
-                _intervene(op, msg)
-                continue
-            inbox.put(msg)
-        inbox.put(None)
+        _read_ops(sys.stdin, world, inbox, cancel, pause)
 
     threading.Thread(target=reader, daemon=True).start()
     from desmos.transport.settings import picker as _picker
@@ -556,7 +604,7 @@ def serve(cwd: Path) -> int:
         target=_watch_channel, args=(world, inbox, channel_stop), daemon=True
     ).start()
     try:
-        return _drive(world, inbox, cancel)
+        return _drive(world, inbox, cancel, pause)
     finally:
         channel_stop.set()
         if sock_srv is not None:
@@ -568,7 +616,13 @@ def serve(cwd: Path) -> int:
             _LOG_WORLD = None
 
 
-def _drive(world: Any, inbox: queue.Queue, cancel: threading.Event) -> int:
+def _drive(
+    world: Any,
+    inbox: queue.Queue,
+    cancel: threading.Event,
+    pause: threading.Event | None = None,
+) -> int:
+    should_stop = _pause_gate(cancel, pause) if pause is not None else cancel.is_set
     while True:
         msg = inbox.get()
         if msg is None:
@@ -595,7 +649,7 @@ def _drive(world: Any, inbox: queue.Queue, cancel: threading.Event) -> int:
                     text,
                     quiet=True,
                     on_event=_emit,
-                    should_stop=cancel.is_set,
+                    should_stop=should_stop,
                     has_input=lambda: not inbox.empty(),
                     images=images,
                 )

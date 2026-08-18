@@ -864,6 +864,71 @@ def check() -> None:
             proc.stdin.flush()
             proc.wait(timeout=20)
 
+        # --- bridge: steer without stop, and pause that freezes ---
+        # The REAL reader loop (`_read_ops`, the body of the stdin thread) fed
+        # real NDJSON lines. A steer must land in world.steers -- not the inbox,
+        # not cancel -- so the running loop delivers it at its next boundary.
+        import io as _io
+        import queue
+        import threading as _th
+        import time as _time
+
+        import desmos.front.bridge as _B
+        from desmos.kernel.catalog import drain_steers as _drain
+
+        steer_cwd = cwd / "steercwd"
+        steer_cwd.mkdir(exist_ok=True)
+        sworld = _B.new_world(steer_cwd)
+        sinbox: "queue.Queue[dict | None]" = queue.Queue()
+        scancel, spause = _th.Event(), _th.Event()
+        lines = "".join(
+            json.dumps(m) + "\n"
+            for m in (
+                {"op": "steer", "text": "redirect to X"},
+                {"op": "pause"},
+                {"op": "steer", "text": "  "},
+                {"op": "steer", "text": "and then Y"},
+                {"op": "resume"},
+                {"op": "snapshot"},
+            )
+        )
+        wire = _B._WIRE
+        _B._WIRE = _io.StringIO()
+        try:
+            _B._read_ops(_io.StringIO(lines), sworld, sinbox, scancel, spause)
+            emitted = [json.loads(x) for x in _B._WIRE.getvalue().splitlines() if x.strip()]
+        finally:
+            _B._WIRE = wire
+        assert not scancel.is_set(), "a steer must never touch cancel"
+        assert not spause.is_set(), "resume must clear the pause"
+        assert sworld.steers == ["redirect to X", "and then Y"], sworld.steers
+        # Only the ordinary op queues; the out-of-band ones were answered inline.
+        queued = []
+        while not sinbox.empty():
+            queued.append(sinbox.get_nowait())
+        assert queued == [{"op": "snapshot"}, None], queued
+        assert any(e.get("ev") == "error" and "empty steer" in e.get("text", "") for e in emitted), emitted
+        assert [e["text"] for e in emitted if e.get("ev") == "notice"] == [
+            "steer queued", "session paused", "steer queued", "session resumed",
+        ], emitted
+        # The kernel seam: the loop's drain is what delivers them.
+        assert _drain(sworld) == ["redirect to X", "and then Y"]
+        assert sworld.steers == []
+
+        # Pause freezes at the turn boundary: the should_stop gate blocks while
+        # paused and returns False (not a stop) once resumed.
+        gate = _B._pause_gate(scancel, spause)
+        assert gate() is False
+        spause.set()
+        landed: list[bool] = []
+        waiter = _th.Thread(target=lambda: landed.append(gate()), daemon=True)
+        waiter.start()
+        _time.sleep(0.3)
+        assert waiter.is_alive() and not landed, "pause did not block the step"
+        spause.clear()
+        waiter.join(timeout=5)
+        assert landed == [False], landed  # released, and never reported a stop
+
         # vendor/grok-build is committed now, so the DESMOS_ACP branch cannot
         # go missing on a fresh clone. What can still go missing is the branch
         # itself, if a sync overwrites it -- and that is silent, because the

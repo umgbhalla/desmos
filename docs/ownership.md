@@ -330,6 +330,8 @@ is narrated by kernel/loop.py (`pending`/`resumed` above).
 |---|---|---|---|
 | `stop` | — | front/bridge.py:101-103 (reader thread, jumps the queue) | main.rs:2787, 3453 |
 | `quit` | — | front/bridge.py:104-107 | main.rs:2776, 2782; check.py:2051 |
+| `steer` | `text` str | front/bridge.py `_read_ops` — reader thread, appends to `world.steers` (catalog.steer); the running loop delivers it at its next result boundary (`drain_steers`, `ev:steer`). Never queued on the inbox, never touches cancel | checks/front.py (no TUI sender yet) |
+| `pause` / `resume` | — | front/bridge.py `_read_ops` — sets/clears the pause event; `_pause_gate` (the `should_stop` handed to `run_turns`) blocks at the turn boundary while set and returns False, so shells, pending tasks and children keep running | checks/front.py (no TUI sender yet) |
 | `step` | `text` str | front/bridge.py:125-143 | main.rs:3490 |
 | `snapshot` | — | front/bridge.py:144-145 | **nobody** (dead op) |
 | `reset` | — | front/bridge.py:146-148 | main.rs:2812, 3594 |
