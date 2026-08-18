@@ -97,6 +97,10 @@ class Shell:
         # reads it as its own input, which is how `; echo "...$?"` ended up
         # inside a python input() answer.
         self.at_prompt = True
+        # Rolling capture of everything read from the pty, so a peek can show
+        # what a monitored command has said so far without touching the read
+        # loop. Capped: a build log's useful part is its head and tail.
+        self._history = bytearray()
         self.master, slave = pty.openpty()
         # Not $SHELL. The user's shell loads the user's rc, which means the
         # result of a syscall depends on someone's dotfiles -- on this machine
@@ -167,6 +171,9 @@ class Shell:
             if not chunk:
                 break
             out.extend(chunk)
+            self._history.extend(chunk)
+            if len(self._history) > 131072:
+                del self._history[: len(self._history) - 65536]
         return bytes(out)
 
     def _read_chunk(self, window: float) -> bytes:
@@ -362,6 +369,18 @@ class Shell:
         note = "[running; monitored automatically — do not poll this shell]"
         return f"{body}\n{note}".strip()
 
+    def peek(self) -> str:
+        """Status plus the recent pty capture. Read-only: no write, no drain."""
+        state = (
+            "monitoring" if self.monitoring
+            else "at prompt" if self.at_prompt
+            else "busy"
+        )
+        if not self.alive():
+            state = "exited"
+        tail = head_tail(bytes(getattr(self, "_history", b""))).strip()
+        return f"[shell {state}]\n{tail}".strip()
+
     def interrupt(self) -> str:
         """Ctrl-C the foreground job, leaving the persistent shell alive."""
         if not self.alive():
@@ -441,6 +460,9 @@ def run(
     shell = get(world, name)
     if attrs.get("interrupt") in {"1", "true", "yes"}:
         return shell.interrupt()
+    if attrs.get("peek") in {"1", "true", "yes"}:
+        fn = getattr(shell, "peek", None)
+        return fn() if fn is not None else f"shell {name!r} predates peek; restart it"
     text = body.strip("\n")
     if not text.strip():
         return "(empty)"
