@@ -201,6 +201,10 @@ counted rather than believed. The asymmetry is the whole point: an observer
 is useful because it files items nobody asked for, and safe because it cannot
 mark one done. Acceptance stays where G2 and D3 put it.
 
+*Amended (substrate diet):* the observer rail was removed from the substrate
+without ever being used -- no run adopted `DESMOS_ROLE=observer`, so the
+authority split above records a resolved design that is no longer built.
+
 **T5 -- Peer agency versus bounded exchange.** *Resolved, and built.*
 Directed peer messages are drawn against an allowance denominated in human
 asks -- one allotment for the session, one more per ask, recovered from the
@@ -294,8 +298,9 @@ a record that can silently empty itself.
 **Phase 5 -- selection and the shadow observer.**
 - 5.1 Isolation branch runner: mutation, baseline, holdout, publish or discard
   (D4, E1). *Gate:* one real policy change published end to end through it.
-- 5.2 Shadow observer with open-only authority (T4). *Gate:* it files an item
-  nobody asked for that a human accepts.
+- 5.2 Shadow observer with open-only authority (T4). *Withdrawn:* the rail was
+  built, never used, and cut in the substrate diet; the gate was never met and
+  is not being carried forward.
 
 **Phase 6 -- surfaces.**
 - 6.1 Persistent disconnected state (F1, failure 4).

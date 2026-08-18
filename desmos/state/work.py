@@ -2,9 +2,7 @@
 
 A todo is a line. A plan is a body of reasoning with steps. Neither survives
 being worked on by more than one session, and neither can say *why* an item is
-finished. This is the third thing: work as rows, in the harness database, where
-a sibling session can see it, claim it, and be refused if it claims what
-somebody else already holds.
+finished. This is the third thing: work as rows, in the harness database, stored durably in the harness database and protected by atomic leases.
 
 Four tables (persist.SCHEMA_SQL):
 
@@ -23,7 +21,6 @@ A gate is a row, not code: an item with a non-empty ``gate`` cannot reach
 
 from __future__ import annotations
 
-import os
 import sqlite3
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -46,20 +43,6 @@ MAX_BODY = 8000
 #: The event a refused finish leaves behind: gated, and no evidence pointer.
 #: Read back by desmos.state.witness as this workspace's gate-failure count.
 GATE_REFUSED = "gate-refused"
-
-#: The role that may open work and never close it (constitution T4). A shadow
-#: observer is useful exactly because it files items nobody asked for; it is
-#: safe exactly because it cannot mark one done. The two go together.
-OBSERVER = "observer"
-
-#: What an observer's refused close leaves behind. Same reasoning as
-#: GATE_REFUSED: a rule nobody can count is a rule nobody can audit.
-OBSERVER_REFUSED = "observer-refused"
-
-
-def role() -> str:
-    """Which authority this run acts with. Default: a worker, unrestricted."""
-    return (os.environ.get("DESMOS_ROLE", "") or "worker").strip().lower()
 
 
 def _now() -> str:
@@ -249,14 +232,6 @@ def claim(
             row = _fetch(db, workspace, item_id)
             if row["status"] in ("done", "dropped"):
                 raise WorkError(f"work claim: {item_id} is {row['status']}")
-            if role() == OBSERVER:
-                # A lease it can never discharge is worse than no lease: the
-                # item would sit claimed by someone with no authority to close
-                # it. So the refusal is here, not at the end.
-                raise WorkError(
-                    f"work claim: this run is an observer and cannot hold"
-                    f" {item_id}; file an item instead"
-                )
             db.execute(
                 """
                 INSERT INTO work_leases(item_id, run_id, holder, claimed_at,
@@ -334,8 +309,6 @@ def note(
     return {"item": item_id, "detail": detail, "evidence": evidence}
 
 
-TRIGGER_CHANNEL = "work"
-
 
 def _fire_triggers(
     conn: sqlite3.Connection,
@@ -346,10 +319,7 @@ def _fire_triggers(
 ) -> list[str]:
     """A trigger is a row: finishing this item wakes whoever waits on it.
 
-    The wake goes out on the peer channel that already exists, in the same
-    transaction as the finish, so a trigger cannot fire for work that rolled
-    back. Waking a *seat* is the eventual shape; until seats are stored, the
-    workspace channel reaches every live sibling and none of the dead ones.
+    Trigger events remain local to the work graph.
     """
     woken: list[str] = []
     rows = conn.execute(
@@ -361,21 +331,9 @@ def _fire_triggers(
     ).fetchall()
     if not rows:
         return woken
-    session = _session_id(conn, world, workspace)
-    now = _now()
-    run = run_id()
     for row in rows:
         child = str(row["child"])
         _record(conn, child, "triggered", f"{item_id} finished: {title}")
-        conn.execute(
-            "INSERT INTO channel_messages(workspace_id, session_id, channel,"
-            " run_id, author, body, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (
-                workspace, session or "", TRIGGER_CHANNEL, run, "work",
-                f"{item_id} finished ({title}) -- {child} is up: {row['title']}",
-                now,
-            ),
-        )
         woken.append(child)
     return woken
 
@@ -392,14 +350,8 @@ def finish(
             workspace = _scope(db, world)
             row = _fetch(db, workspace, item_id)
             gate = str(row["gate"] or "")
-            watching = role() == OBSERVER
             refused = bool(status == "done" and gate and not evidence.strip())
-            if watching:
-                # An observer's whole authority is to open work. Recorded
-                # before it is raised, for the same reason the gate refusal
-                # below is: the count is the only evidence the rail holds.
-                _record(db, item_id, OBSERVER_REFUSED, status)
-            elif refused:
+            if refused:
                 # Recorded, then raised. A refusal that leaves no trace is a
                 # rule nobody can count, and that count is what tells a later
                 # session whether its gates are gating anything. The event
@@ -419,11 +371,6 @@ def finish(
                         db, world, workspace, item_id, str(row["title"])
                     )
                 return done
-        if watching:
-            raise WorkError(
-                f"work finish: this run is an observer, so {item_id} stays"
-                " open. An observer opens work items and never closes them."
-            )
         raise WorkError(
             f"work finish: {item_id} is gated on {gate!r};"
             " give an evidence pointer"

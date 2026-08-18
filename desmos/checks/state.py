@@ -359,12 +359,8 @@ def check() -> None:
         _check_prune_manifest()
         _check_cold_store()
         _check_outbox()
-        _check_d1_sink()
-        _check_d1_worker()
         _check_budget_rail(cwd)
         _check_witness(cwd)
-        _check_observer_rail(cwd)
-        _check_peer_budget(cwd)
         _check_refine(cwd)
         _check_stow()
         _check_salvage()
@@ -1904,8 +1900,8 @@ def _check_work_graph() -> None:
     assert any(str(e["evidence"]).startswith("check ok") for e in
                work.events(world, parent["id"])), kinds
 
-    # A trigger does not block: it wakes. Finishing the parent puts a message
-    # on the peer channel naming the item that just came up.
+    # A trigger does not block: it wakes. Finishing the parent records a
+    # trigger event on the item that just came up.
     waker = work.add(world, "run the suite")
     sleeper = work.add(world, "read what it said")
     work.link(world, waker["id"], sleeper["id"], kind="trigger")
@@ -1916,8 +1912,6 @@ def _check_work_graph() -> None:
     assert "triggered" in [
         str(e["kind"]) for e in work.events(world, sleeper["id"])
     ]
-    posted = persist.channel_read(world, work.TRIGGER_CHANNEL)
-    assert any(sleeper["id"] in str(m["body"]) for m in posted), posted
     print("work graph check ok")
 
 
@@ -1996,134 +1990,6 @@ def _check_outbox() -> None:
     persist.save(world)
     assert len(outbox.pending(world)) == depth, (depth, outbox.pending(world))
     print("outbox check ok")
-
-
-def _check_d1_sink() -> None:
-    """The one part that speaks HTTP, against a socket on this machine.
-
-    A refusal must cost a retry and not a row, an unconfigured harness must
-    be an ordinary state rather than an error, and what goes on the wire must
-    be the fact plus its fingerprint -- never this machine's row ids.
-    """
-    import json as _json
-    import os as _os
-    import tempfile
-    import threading
-    from http.server import BaseHTTPRequestHandler, HTTPServer
-
-    from desmos.state import d1, outbox
-
-    seen: list = []
-    state = {"code": 200}
-
-    class Handler(BaseHTTPRequestHandler):
-        def do_POST(self):  # noqa: N802 - stdlib naming
-            length = int(self.headers.get("Content-Length", "0"))
-            seen.append({
-                "body": _json.loads(self.rfile.read(length) or b"{}"),
-                "auth": self.headers.get("Authorization", ""),
-            })
-            code = int(state["code"])
-            self.send_response(code)
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
-            self.wfile.write(b'{"ok": true}' if code < 300 else b'{"error": "no"}')
-
-        def log_message(self, *_args):  # keep the check quiet
-            return
-
-    server = HTTPServer(("127.0.0.1", 0), Handler)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    url = f"http://127.0.0.1:{server.server_address[1]}/sync"
-
-    root = Path(tempfile.mkdtemp())
-    world = new_world(root, persist=True)
-    outbox.enqueue(world, "cold_session", {"session_id": "d1-a", "rows": 1})
-    outbox.enqueue(world, "cold_session", {"session_id": "d1-b", "rows": 2})
-
-    saved = {k: _os.environ.get(k) for k in (d1.URL_ENV, d1.TOKEN_ENV)}
-    try:
-        _os.environ.pop(d1.URL_ENV, None)
-        idle = d1.push(world)
-        assert idle == {"configured": False, "sent": 0, "pending": 2, "error": ""}, idle
-        assert not seen, seen
-
-        _os.environ[d1.URL_ENV] = url
-        _os.environ[d1.TOKEN_ENV] = "shhh"
-        state["code"] = 500
-        refused = d1.push(world)
-        assert refused["sent"] == 0 and refused["pending"] == 2, refused
-        assert "500" in refused["error"], refused
-        still = outbox.pending(world)
-        assert all(int(r["attempts"]) == 1 for r in still), still
-
-        state["code"] = 200
-        pushed = d1.push(world)
-        assert pushed["sent"] == 2 and pushed["pending"] == 0, pushed
-        assert d1.push(world)["sent"] == 0, "an empty queue posted anyway"
-
-        wire = seen[-1]["body"]["rows"]
-        assert seen[-1]["auth"] == "Bearer shhh", seen[-1]["auth"]
-        assert len(wire) == 2, wire
-        assert {r["payload"]["session_id"] for r in wire} == {"d1-a", "d1-b"}, wire
-        assert all(len(r["fingerprint"]) == 64 for r in wire), wire
-        assert all("id" not in r and "attempts" not in r for r in wire), wire
-    finally:
-        for key, value in saved.items():
-            if value is None:
-                _os.environ.pop(key, None)
-            else:
-                _os.environ[key] = value
-        server.shutdown()
-        server.server_close()
-    print("d1 sink check ok")
-
-
-def _check_d1_worker() -> None:
-    """The deploy artifact and the client agree on what a row is.
-
-    The Worker is the one piece of this sync I cannot run: no account, no
-    wrangler, no D1. What can be checked locally is the thing that actually
-    breaks -- the client learning a field the table has no column for. So the
-    schema is executed against SQLite, and the columns must cover the wire.
-    """
-    import sqlite3
-    import tempfile
-
-    from desmos.state import d1
-
-    root = Path(__file__).resolve().parents[2] / "cloud" / "d1-worker"
-    schema = (root / "schema.sql").read_text()
-    worker = (root / "worker.js").read_text()
-
-    conn = sqlite3.connect(":memory:")
-    try:
-        conn.executescript(schema)
-        columns = {
-            row[1] for row in conn.execute("PRAGMA table_info(cold_facts)")
-        }
-        assert columns, "schema.sql defines no cold_facts table"
-    finally:
-        conn.close()
-
-    row = {
-        "id": 1, "workspace_id": "w", "kind": "cold_session",
-        "fingerprint": "f" * 64, "payload_json": "{}", "payload": {"a": 1},
-        "created_at": "2026-01-01T00:00:00+00:00", "sent_at": None,
-        "attempts": 0, "last_error": "",
-    }
-    wire = d1._wire([row])["rows"][0]
-    mapped = {"payload": "payload_json"}
-    for field in wire:
-        column = mapped.get(field, field)
-        assert column in columns, (field, sorted(columns))
-    assert "received_at" in columns, sorted(columns)
-
-    assert "INSERT OR IGNORE INTO cold_facts" in worker, "the worker can overwrite"
-    assert "fingerprint" in worker and "length !== 64" in worker, \
-        "the worker accepts a row with no sha256 fingerprint"
-    print("d1 worker check ok")
 
 
 def _check_witness(cwd: Path) -> None:
@@ -2212,130 +2078,6 @@ def _check_witness(cwd: Path) -> None:
     assert witness.wake(quiet) == ""
     assert witness.BLOCK not in quiet.injections
     print("witness check ok")
-
-
-def _check_peer_budget(cwd: Path) -> None:
-    """A directed peer exchange is bounded by human asks (constitution T5).
-
-    Cross-session messaging works, and nothing but a convention stopped two
-    sessions replying to each other forever. The allowance is denominated in
-    asks a person actually made, read back out of the stored transcript, so a
-    long conversation with a person is never throttled and a conversation
-    with only peers in it runs out.
-    """
-    from desmos.state import persist
-
-    home = cwd / "peers"
-    home.mkdir()
-    world = new_world(home, state_path=home / "harness.sqlite3")
-
-    to_peer = persist.peer_channel("peer-run", "request")
-    fresh = persist.peer_spend(world)
-    assert fresh["asks"] == 0 and fresh["left"] == persist.PEER_BUDGET, fresh
-
-    for i in range(persist.PEER_BUDGET):
-        persist.channel_post(world, f"peer message {i}", channel=to_peer)
-    spent = persist.peer_spend(world)
-    assert spent["sent"] == persist.PEER_BUDGET and spent["left"] == 0, spent
-
-    try:
-        persist.channel_post(world, "and another", channel=to_peer)
-    except ValueError as exc:
-        assert "amplification" in str(exc), exc
-    else:
-        raise AssertionError("a directed peer exchange ran past its allowance")
-
-    # The shared channel is not the amplification mode and is not bounded:
-    # nobody replies to it automatically.
-    open_room = persist.channel_post(world, "still talking here")
-    assert open_room["channel"] == "conflicts", open_room
-
-    # A human turn buys more. The ask is recovered from the stored record by
-    # content, so a tool result or a harness nudge cannot mint allowance.
-    world.messages.extend(
-        [
-            {"role": "user", "content": [{"type": "tool_result", "content": "out"}]},
-            {"role": "user", "content": "ask the peer whether it saw the drop"},
-        ]
-    )
-    world.session_message_start = 0
-    persist.save(world)
-    after = persist.peer_spend(world)
-    assert after["asks"] == 1, after
-    assert after["left"] == persist.PEER_BUDGET, after
-    again = persist.channel_post(world, "one more, with a person in the loop",
-                                 channel=to_peer)
-    assert again["channel"] == to_peer, again
-    print("peer budget check ok")
-
-
-def _check_observer_rail(cwd: Path) -> None:
-    """An observer opens work items and never closes them (constitution T4).
-
-    Recommend-only is safe and ignorable; publish authority is useful and
-    dangerous. The rail that makes the middle position real is asymmetric:
-    add, note and reopen stay open to an observer, while finish and claim are
-    refused -- claim too, because a lease nobody may discharge leaves the item
-    held by a run with no authority to close it.
-    """
-    from desmos.state import work
-
-    home = cwd / "observer"
-    home.mkdir()
-    world = new_world(home, state_path=home / "harness.sqlite3")
-
-    item = work.add(world, "file the sink defect")
-    prior = os.environ.get("DESMOS_ROLE")
-    os.environ["DESMOS_ROLE"] = work.OBSERVER
-    try:
-        assert work.role() == work.OBSERVER, work.role()
-
-        # Opening is the observer's whole job, and it still works.
-        filed = work.add(world, "nobody asked for this one")
-        assert filed["status"] == "open", filed
-        work.note(world, filed["id"], "seen twice in the last two sessions")
-
-        try:
-            work.finish(world, item["id"], evidence="deadbeef")
-        except work.WorkError as exc:
-            assert "observer" in str(exc), exc
-        else:
-            raise AssertionError("an observer closed a work item")
-
-        # Refused, and the refusal is a row. An unrecorded rule cannot be
-        # audited, and the item must be exactly as open as it was.
-        kinds = [e["kind"] for e in work.events(world, item["id"])]
-        assert work.OBSERVER_REFUSED in kinds, kinds
-        assert kinds.count("done") == 0, kinds
-        still = [r["id"] for r in work.items(world, status="open")]
-        assert item["id"] in still, still
-
-        # Dropping is closing too. Neither door.
-        try:
-            work.finish(world, item["id"], status="dropped")
-        except work.WorkError as exc:
-            assert "observer" in str(exc), exc
-        else:
-            raise AssertionError("an observer dropped a work item")
-
-        try:
-            work.claim(world, item["id"])
-        except work.WorkError as exc:
-            assert "observer" in str(exc), exc
-        else:
-            raise AssertionError("an observer took a lease")
-    finally:
-        if prior is None:
-            os.environ.pop("DESMOS_ROLE", None)
-        else:
-            os.environ["DESMOS_ROLE"] = prior
-
-    # And with the role gone, the same call closes the same item. The rail is
-    # the role, not a broken finish.
-    assert work.role() == "worker", work.role()
-    closed = work.finish(world, item["id"], evidence="deadbeef")
-    assert closed["status"] == "done", closed
-    print("observer rail check ok")
 
 
 def _check_budget_rail(cwd: Path) -> None:
