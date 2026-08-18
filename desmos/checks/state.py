@@ -1245,6 +1245,14 @@ def _check_cold_store() -> None:
                     " VALUES (?, 0, 'user', ?)",
                     (sid, json.dumps(f"cold conversation {i}")),
                 )
+                # Index them the way save() indexes a real transcript: what a
+                # prune costs is not measured in rows, it is measured in what
+                # recall can still find afterwards.
+                conn.execute(
+                    "INSERT INTO history_fts(workspace_id, session_id, kind,"
+                    " text, source_seq) VALUES (?, ?, 'message:user', ?, 0)",
+                    (workspace, sid, f"cold conversation {i} quokkatelemetry{i:04d}"),
+                )
     finally:
         conn.close()
     persist.save(world)
@@ -1267,6 +1275,24 @@ def _check_cold_store() -> None:
         store.close()
     assert len(rows) == 1, f"{len(rows)} archived messages for {sid}"
     assert "cold conversation" in rows[0][0], rows[0][0]
+
+    # Retention that erases findability is deletion by another name. The live
+    # index rows leave with the session, so recall reads through to the copy
+    # the archive keeps -- and the answer says it came from the cold side.
+    rare = "quokkatelemetry0000"
+    conn = persist._open(path)
+    try:
+        left = conn.execute(
+            "SELECT count(*) FROM history_fts WHERE session_id = ?", ("cold-0000",)
+        ).fetchone()[0]
+    finally:
+        conn.close()
+    assert left == 0, "the live index still holds the pruned session"
+    hits = persist.search_history(world, rare)
+    assert hits, "a pruned session stopped being findable at all"
+    assert all(hit.get("cold") for hit in hits), hits
+    assert hits[0]["session_id"] == "cold-0000", hits
+    assert rare in hits[0]["text"], hits[0]
 
     # The second archive into a store that already holds the tables is where
     # the live schema's bare CREATE TABLE used to raise "table calls already

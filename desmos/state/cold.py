@@ -65,6 +65,75 @@ def _ensure(conn: sqlite3.Connection, cold: sqlite3.Connection, table: str) -> N
             cold.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl or 'TEXT'}")
 
 
+#: The archive keeps its own copy of the search index. history_fts is derived,
+#: so it is not *history* -- but a prune deletes the live index rows along with
+#: the session, and bytes nobody can find again are deleted in every sense that
+#: matters to a running agent. Rebuilt per session on archive, so re-archiving
+#: the same session is idempotent rather than doubling its rows.
+COLD_FTS = (
+    "CREATE VIRTUAL TABLE IF NOT EXISTS cold_fts USING fts5("
+    " workspace_id UNINDEXED, session_id UNINDEXED, kind UNINDEXED,"
+    " text, source_seq UNINDEXED, tokenize = 'porter unicode61')"
+)
+
+
+def _ensure_fts(cold: sqlite3.Connection) -> None:
+    cold.execute(COLD_FTS)
+
+
+def _copy_fts(
+    conn: sqlite3.Connection, cold: sqlite3.Connection, sid: str
+) -> int:
+    """Mirror one session's search rows into the archive's own index."""
+    try:
+        src = conn.execute(
+            "SELECT workspace_id, session_id, kind, text, source_seq"
+            " FROM history_fts WHERE session_id = ?",
+            (sid,),
+        ).fetchall()
+    except sqlite3.DatabaseError:
+        return 0
+    cold.execute("DELETE FROM cold_fts WHERE session_id = ?", (sid,))
+    cold.executemany(
+        "INSERT INTO cold_fts(workspace_id, session_id, kind, text,"
+        " source_seq) VALUES (?, ?, ?, ?, ?)",
+        [tuple(row) for row in src],
+    )
+    return len(src)
+
+
+def search(
+    path: Path, workspace: str, match: str, limit: int = 12
+) -> list[dict[str, Any]]:
+    """Rank archived history. Same query language as the live index.
+
+    Rows come back in the live search's shape with `cold` set, so a caller can
+    say where an answer came from without a second code path.
+    """
+    target = cold_path(path)
+    if not target.is_file():
+        return []
+    conn = sqlite3.connect(target, timeout=5.0)
+    conn.row_factory = sqlite3.Row
+    try:
+        rows = conn.execute(
+            "SELECT session_id, kind, text, source_seq, bm25(cold_fts) AS score"
+            " FROM cold_fts WHERE cold_fts MATCH ? AND workspace_id = ?"
+            " ORDER BY score LIMIT ?",
+            (match, workspace, max(1, min(int(limit), 100))),
+        ).fetchall()
+    except sqlite3.DatabaseError:
+        return []
+    finally:
+        conn.close()
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        item = dict(row)
+        item["cold"] = 1
+        out.append(item)
+    return out
+
+
 def _ensure_manifest(cold: sqlite3.Connection) -> None:
     cold.execute(
         "CREATE TABLE IF NOT EXISTS cold_sessions ("
@@ -119,6 +188,7 @@ def archive(
         for table in tables:
             _ensure(conn, cold, table)
         _ensure_manifest(cold)
+        _ensure_fts(cold)
         at = datetime.now(timezone.utc).isoformat()
         for sid in doomed:
             moved = _copy_session(conn, cold, tables, sid)
@@ -129,6 +199,7 @@ def archive(
                 " rows) VALUES (?, ?, ?)",
                 (sid, at, moved),
             )
+            _copy_fts(conn, cold, sid)
             out["archived"].append(sid)
             out["rows"] += moved
         cold.commit()

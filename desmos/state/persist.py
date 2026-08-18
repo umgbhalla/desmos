@@ -1898,7 +1898,23 @@ def search_history(
                 max(1, min(int(limit), 100)),
             ),
         ).fetchall()
-        return [dict(row) for row in rows]
+        live = [dict(row) for row in rows]
+        # Read through to the archive. A pruned session's rows are gone from
+        # history_fts, so without this the only visible effect of retention is
+        # that history stops existing -- which is the failure this whole cold
+        # path was built to prevent. Live rows win; cold fills what is left.
+        cap = max(1, min(int(limit), 100))
+        if len(live) < cap:
+            seen = {
+                (r["session_id"], r["kind"], r["source_seq"]) for r in live
+            }
+            for row in cold.search(path, workspace, match, cap - len(live)):
+                key = (row["session_id"], row["kind"], row["source_seq"])
+                if key in seen:
+                    continue
+                seen.add(key)
+                live.append(row)
+        return live
     finally:
         conn.close()
 
