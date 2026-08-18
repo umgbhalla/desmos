@@ -358,6 +358,7 @@ def check() -> None:
         _check_cold_store()
         _check_outbox()
         _check_d1_sink()
+        _check_d1_worker()
         _check_stow()
         _check_salvage()
         _check_fold_keeps_transcript()
@@ -1812,3 +1813,49 @@ def _check_d1_sink() -> None:
         server.shutdown()
         server.server_close()
     print("d1 sink check ok")
+
+
+def _check_d1_worker() -> None:
+    """The deploy artifact and the client agree on what a row is.
+
+    The Worker is the one piece of this sync I cannot run: no account, no
+    wrangler, no D1. What can be checked locally is the thing that actually
+    breaks -- the client learning a field the table has no column for. So the
+    schema is executed against SQLite, and the columns must cover the wire.
+    """
+    import sqlite3
+    import tempfile
+
+    from desmos.state import d1
+
+    root = Path(__file__).resolve().parents[2] / "cloud" / "d1-worker"
+    schema = (root / "schema.sql").read_text()
+    worker = (root / "worker.js").read_text()
+
+    conn = sqlite3.connect(":memory:")
+    try:
+        conn.executescript(schema)
+        columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(cold_facts)")
+        }
+        assert columns, "schema.sql defines no cold_facts table"
+    finally:
+        conn.close()
+
+    row = {
+        "id": 1, "workspace_id": "w", "kind": "cold_session",
+        "fingerprint": "f" * 64, "payload_json": "{}", "payload": {"a": 1},
+        "created_at": "2026-01-01T00:00:00+00:00", "sent_at": None,
+        "attempts": 0, "last_error": "",
+    }
+    wire = d1._wire([row])["rows"][0]
+    mapped = {"payload": "payload_json"}
+    for field in wire:
+        column = mapped.get(field, field)
+        assert column in columns, (field, sorted(columns))
+    assert "received_at" in columns, sorted(columns)
+
+    assert "INSERT OR IGNORE INTO cold_facts" in worker, "the worker can overwrite"
+    assert "fingerprint" in worker and "length !== 64" in worker, \
+        "the worker accepts a row with no sha256 fingerprint"
+    print("d1 worker check ok")

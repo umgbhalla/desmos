@@ -1,0 +1,12 @@
+name = "desmos-cold-store"
+main = "worker.js"
+compatibility_date = "2026-01-01"
+
+# wrangler d1 create desmos-cold-store, then paste the id it prints.
+[[d1_databases]]
+binding = "DB"
+database_name = "desmos-cold-store"
+database_id = "UNSET"
+
+# wrangler secret put DESMOS_SYNC_TOKEN
+# The same value goes in DESMOS_D1_TOKEN on the machine that pushes.
