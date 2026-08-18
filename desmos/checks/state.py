@@ -1259,6 +1259,34 @@ def _check_cold_store() -> None:
         store.close()
     assert len(rows) == 1, f"{len(rows)} archived messages for {sid}"
     assert "cold conversation" in rows[0][0], rows[0][0]
+
+    # The second archive into a store that already holds the tables is where
+    # the live schema's bare CREATE TABLE used to raise "table calls already
+    # exists" -- and it took save() with it, so a workspace only ever crashed
+    # after it had pruned once, which no fresh check could see.
+    conn = persist._open(path)
+    try:
+        with conn:
+            for i in range(4):
+                sid = f"cold2-{i:04d}"
+                conn.execute(
+                    "INSERT INTO sessions(id, workspace_id, kind, started_at,"
+                    " last_seen_at, cache_key) VALUES (?, ?, 'attach', ?, ?, ?)",
+                    (sid, workspace, f"2020-01-02T00:00:{i:02d}",
+                     f"2020-01-02T00:00:{i:02d}", sid),
+                )
+                conn.execute(
+                    "INSERT INTO messages(session_id, seq, role, content_json)"
+                    " VALUES (?, 0, 'user', ?)",
+                    (sid, json.dumps(f"second wave {i}")),
+                )
+    finally:
+        conn.close()
+    before = {e["session_id"] for e in persist.pruned(path)}
+    persist.save(world)
+    after = {e["session_id"] for e in persist.pruned(path)}
+    assert after > before, sorted(after)
+    assert after <= {r["session_id"] for r in cold.archived(path)}, sorted(after)
     print("cold store check ok")
 
 

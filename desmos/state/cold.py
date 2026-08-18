@@ -50,7 +50,14 @@ def _ensure(conn: sqlite3.Connection, cold: sqlite3.Connection, table: str) -> N
     ddl = conn.execute(
         "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?", (table,)
     ).fetchone()
-    if ddl and ddl[0]:
+    exists = cold.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (table,)
+    ).fetchone()
+    if ddl and ddl[0] and not exists:
+        # The live DDL is a bare CREATE TABLE. Replaying it into a cold store
+        # that already holds the table raises "table calls already exists" --
+        # which took down save() on the second archive, not the first, so a
+        # fresh workspace never saw it.
         cold.execute(str(ddl[0]))
     have = {name for name, _ in _cols(cold, table)}
     for name, decl in _cols(conn, table):
