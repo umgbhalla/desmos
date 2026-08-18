@@ -38,9 +38,10 @@ def _billing(model: str) -> str:
 
 
 def _snapshot(world: Any) -> dict[str, Any]:
+    from desmos.state.decisions import pending
     from desmos.transport.settings import provider_of
 
-    return {
+    snapshot = {
         "ev": "snapshot",
         "model": world.model,
         "provider": provider_of(world.model),
@@ -51,6 +52,10 @@ def _snapshot(world: Any) -> dict[str, Any]:
         "ns": ns_names(world),
         "tools": advertised_names(world),
     }
+    decisions = pending(world)
+    if decisions:
+        snapshot["decisions"] = decisions
+    return snapshot
 
 
 # The wire handle, bound once at import.

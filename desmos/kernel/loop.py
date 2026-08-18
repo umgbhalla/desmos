@@ -656,6 +656,12 @@ def turn(
             # of the unique match, located at write time). dispatch fills it;
             # the keys land top-level on the done event.
             meta: dict[str, Any] = {}
+            decision_before: dict[str, dict[str, Any]] = {}
+            is_decide = b.tag == "knowledge" and b.attrs.get("op") == "decide"
+            if is_decide:
+                from desmos.state.decisions import pending as _dpending
+
+                decision_before = {r["id"]: r for r in _dpending(world)}
             try:
                 r = dispatch(
                     world,
@@ -672,6 +678,29 @@ def turn(
                 # ambiguous <edit> body did exactly this. A failure is this
                 # tag's result, like every other failure in this system.
                 r = traceback.format_exc()
+            if is_decide:
+                decision_after = {r["id"]: r for r in _dpending(world)}
+                for did, rec in decision_after.items():
+                    if did not in decision_before:
+                        fire({
+                            "ev": "decision",
+                            "id": did,
+                            "prompt": rec["prompt"],
+                            "options": rec["options"],
+                            "status": "open",
+                            "answer": None,
+                        })
+                for did, rec in decision_before.items():
+                    if did not in decision_after:
+                        choice = b.body.strip()[7:].strip().partition(" ")[2]
+                        fire({
+                            "ev": "decision",
+                            "id": did,
+                            "prompt": rec["prompt"],
+                            "options": rec["options"],
+                            "status": "answered",
+                            "answer": choice,
+                        })
             # The commit claim rides the result event, not a TUI HEAD-snapshot
             # race: the kernel ran the command and holds the output that names
             # the sha, so the row downstream never attributes a commit the
@@ -933,11 +962,21 @@ def _run_turns(
     _stripped = prompt.strip()
     if _stripped.startswith("decide:"):
         try:
-            from desmos.state.decisions import answer as _danswer
+            from desmos.state.decisions import answer as _danswer, pending as _dpending
             _head, _, _choice = _stripped.partition(": ")
             _did = _head.split("—")[0].strip()[len("decide:"):]
+            _open = {r["id"]: r for r in _dpending(world)}
             if _did and _choice:
                 _danswer(world, _did, _choice.strip())
+                _rec = _open[_did]
+                emit({
+                    "ev": "decision",
+                    "id": _did,
+                    "prompt": _rec["prompt"],
+                    "options": _rec["options"],
+                    "status": "answered",
+                    "answer": _choice.strip(),
+                })
         except Exception:
             pass
     world.messages.append({"role": "user", "content": header(world) + "\n\n" + prompt})

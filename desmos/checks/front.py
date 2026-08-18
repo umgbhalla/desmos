@@ -589,11 +589,77 @@ def _check_socket() -> None:
     )
 
 
+
+def _check_decision_events(cwd: Path) -> None:
+    """Decision dispatch changes are forwarded and snapshots replay open ones."""
+    import os
+
+    from desmos.front.bridge import _snapshot
+    from desmos.kernel.loop import new_world, turn
+    from desmos.state.decisions import pending
+
+    world = new_world(cwd, state_path=cwd / "decision-harness.json", ns={})
+    world.model = "claude-opus-5"
+    replies = iter([
+        '<knowledge op="decide">ask Deploy now? | yes | no</knowledge>',
+        None,
+    ])
+
+    def complete(model, system, messages, max_tokens):
+        text = next(replies)
+        if text is None:
+            did = pending(world)[0]["id"]
+            text = f'<knowledge op="decide">answer {did} yes</knowledge>'
+        return {
+            "content": [{"type": "text", "text": text}],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 1, "output_tokens": 1},
+        }
+
+    world.complete_fn = complete
+    events: list[dict] = []
+    messages: list[dict] = []
+    old_typed = os.environ.get("DESMOS_TOOL_SYSCALLS")
+    os.environ["DESMOS_TOOL_SYSCALLS"] = "0"
+    try:
+        turn(world, messages, 1024, emit=events.append)
+    finally:
+        if old_typed is None:
+            os.environ.pop("DESMOS_TOOL_SYSCALLS", None)
+        else:
+            os.environ["DESMOS_TOOL_SYSCALLS"] = old_typed
+    opened = [e for e in events if e.get("ev") == "decision"]
+    assert len(opened) == 1 and opened[0] == {
+        "ev": "decision",
+        "id": opened[0]["id"],
+        "prompt": "Deploy now?",
+        "options": ["yes", "no"],
+        "status": "open",
+        "answer": None,
+    }, opened
+    assert _snapshot(world)["decisions"] == pending(world)
+    os.environ["DESMOS_TOOL_SYSCALLS"] = "0"
+    try:
+        turn(world, messages, 1024, n=2, emit=events.append)
+    finally:
+        if old_typed is None:
+            os.environ.pop("DESMOS_TOOL_SYSCALLS", None)
+        else:
+            os.environ["DESMOS_TOOL_SYSCALLS"] = old_typed
+    changed = [e for e in events if e.get("ev") == "decision"]
+    assert changed[-1] == {
+        **opened[0],
+        "status": "answered",
+        "answer": "yes",
+    }, changed
+    assert pending(world) == [], pending(world)
+
 def check() -> None:
     import tempfile
 
     with tempfile.TemporaryDirectory() as tmp:
         cwd = Path(tmp)
+        _check_decision_events(cwd)
         import os
 
         from desmos.front.cli import (
