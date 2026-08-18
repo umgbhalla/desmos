@@ -926,6 +926,9 @@ def _run_turns(
             emit({"ev": "attached", "text": note})
     last = ""
     n = 0
+    # Consecutive stops answered by the plan rail. Reset by any turn that ran
+    # a syscall, because that is what progress looks like from here.
+    plan_nudges = 0
     while max_turns is None or n < max_turns:
         n += 1
         if stopped():
@@ -978,6 +981,7 @@ def _run_turns(
         # marker that they had been executed.
         call = syscall_call(assistant)
         if results or call:
+            plan_nudges = 0
             world.messages.append(
                 {"role": "user", "content": result_content(results, assistant, world.cwd)}
             )
@@ -1028,6 +1032,20 @@ def _run_turns(
                     pending.commit(world, landed)
                     emit_pending()
                     emit({"ev": "resumed", "n": n, "text": text})
+                    continue
+            # A stop is not a decision when a plan is still open. The rail
+            # answers it with the next step instead of ending the step, and
+            # yields after plan.nudge_limit() consecutive reminders so a wedged
+            # plan cannot hold the turn hostage. Blocking the plan with a
+            # reason is the deliberate way out.
+            from desmos.state import plan as _plan
+
+            if plan_nudges < _plan.nudge_limit():
+                reminder = _plan.nudge(world)
+                if reminder:
+                    plan_nudges += 1
+                    deliver(world, reminder)
+                    emit({"ev": "guidance", "n": n, "text": reminder})
                     continue
             emit_pending()
             _commit_step(world, prompt, speech)

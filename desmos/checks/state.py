@@ -344,6 +344,7 @@ def check() -> None:
         _check_single_writer(cwd)
         _check_injections(cwd)
         _check_handoff_rail(cwd)
+        _check_plan_rail(cwd)
         _check_steer(cwd)
         _check_op_rollup(cwd)
         _check_slice(cwd)
@@ -1334,3 +1335,49 @@ def _check_handoff_rail(cwd: Path) -> None:
     assert "Context is at" in sent[-1], sent[-1][-400:]
     assert handoff.BLOCK not in world.injections, world.injections
     print("handoff rail check ok")
+
+
+def _check_plan_rail(cwd: Path) -> None:
+    """A stop with an open plan is answered by the plan; a block ends it.
+
+    Driven through run_turns because the defect worth catching is a reminder
+    nothing sends. The cap is exercised too: a rail that never yields is a
+    hang, not a feature.
+    """
+    import os as _os
+    from desmos.kernel.loop import run_turns
+    from desmos.state import plan
+
+    home = cwd / "planrail"
+    home.mkdir()
+    world = new_world(home, state_path=home / "harness.sqlite3", persist=False)
+    world.model = "claude-opus-5"
+    rec = plan.create(
+        world, "ship the rail", steps=["write it", "verify it"], status="active"
+    )
+    calls: list[int] = []
+
+    def fake(_model, _system, messages, _max_tokens):
+        calls.append(len(messages))
+        return {"content": [{"type": "text", "text": "narrating, not working"}],
+                "usage": {}}
+
+    world.complete_fn = fake
+    _os.environ["DESMOS_PLAN_NUDGES"] = "2"
+    try:
+        run_turns(world, "go", quiet=True)
+    finally:
+        _os.environ.pop("DESMOS_PLAN_NUDGES", None)
+    assert len(calls) == 3, calls
+    sent = [m for m in world.messages
+            if m.get("role") == "user" and "still active" in str(m.get("content"))]
+    assert len(sent) == 2, sent
+    assert "next step 1: write it" in str(sent[0]["content"]), sent[0]
+
+    plan.block(world, rec["plan_id"], "waiting on the user")
+    calls.clear()
+    run_turns(world, "again", quiet=True)
+    assert len(calls) == 1, calls
+    shown = plan.render(plan.read(world, rec["plan_id"]))
+    assert "blocked: waiting on the user" in shown, shown
+    print("plan rail check ok")

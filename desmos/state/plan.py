@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import time
 from datetime import datetime, timezone
@@ -31,7 +32,7 @@ from desmos.kernel.types import World
 
 PLANS_SUBDIR = "plans"
 PLANS_FILENAME = "plans.jsonl"
-STATUSES = ("draft", "active", "done", "dropped")
+STATUSES = ("draft", "active", "blocked", "done", "dropped")
 STEP_STATUSES = ("todo", "doing", "done", "dropped")
 STEP_MARKS = {"todo": " ", "doing": ">", "done": "x", "dropped": "-"}
 MAX_BODY = 20000
@@ -240,7 +241,7 @@ def create(
     return _append(world, rec)
 
 
-_MUTABLE = ("title", "status", "body", "steps", "source")
+_MUTABLE = ("title", "status", "body", "steps", "source", "blocked")
 
 
 def revise(world: World, plan_id: str, **fields: Any) -> dict[str, Any]:
@@ -290,6 +291,8 @@ def render(rec: dict[str, Any], full: bool = False) -> str:
         f"[{done}/{len(steps)}]  {rec['title']}"
     )
     lines = [head]
+    if rec.get("blocked"):
+        lines.append(f"  blocked: {rec['blocked']}")
     src = rec.get("source")
     if src:
         lines.append(
@@ -331,7 +334,9 @@ USAGE = (
     "  step ID x N [note]     mark step N done\n"
     "  step ID > N [note]     mark step N in progress\n"
     "  step ID - N [note]     drop step N\n"
-    "  status ID STATUS       draft | active | done | dropped\n"
+    "  status ID STATUS       draft | active | blocked | done | dropped\n"
+    "  block ID REASON        pause the plan and stop the stop-reminders\n"
+    "  unblock ID             clear the block and go back to active\n"
     "  verify ID              is the source message still what was captured\n"
     "  history ID             every revision of this plan"
 )
@@ -397,6 +402,19 @@ def handle_plan(world: World, body: str = "", **attrs: Any) -> str:
             for r in recs
         )
 
+    if cmd == "block":
+        pid, _, reason = arg.partition(" ")
+        try:
+            return render(block(world, pid.strip(), reason.strip() or rest))
+        except (KeyError, ValueError) as exc:
+            return str(exc)
+
+    if cmd == "unblock":
+        try:
+            return render(unblock(world, arg.strip()))
+        except (KeyError, ValueError) as exc:
+            return str(exc)
+
     if cmd == "status":
         pid, _, value = arg.partition(" ")
         try:
@@ -422,3 +440,82 @@ def handle_plan(world: World, body: str = "", **attrs: Any) -> str:
         return f"unknown step verb {verb!r}; try + x > - o"
 
     return f"unknown plan command {cmd!r}\n\n{USAGE}"
+
+
+# ------------------------------------------------------------------- rail
+
+#: How many consecutive reminders one stopped step may take before the turn
+#: goes back to the user anyway. A rail that never yields is a hang.
+NUDGE_LIMIT = 4
+
+
+def nudge_limit() -> int:
+    """The cap, overridable per run without touching the code."""
+    raw = os.environ.get("DESMOS_PLAN_NUDGES")
+    try:
+        value = int(raw) if raw else NUDGE_LIMIT
+    except ValueError:
+        return NUDGE_LIMIT
+    return max(0, value)
+
+
+def active(world: World) -> dict[str, Any] | None:
+    """The plan the reminders speak for: the newest one marked active."""
+    recs = [r for r in latest(world).values() if r.get("status") == "active"]
+    if not recs:
+        return None
+    recs.sort(key=lambda r: (r.get("at", ""), r.get("rev", 0)))
+    return recs[-1]
+
+
+def current_step(rec: dict[str, Any]) -> dict[str, Any] | None:
+    """What to work on: whatever is in progress, else the first open step."""
+    steps = rec.get("steps") or []
+    for wanted in ("doing", "todo"):
+        for step in steps:
+            if step.get("status") == wanted:
+                return step
+    return None
+
+
+def nudge(world: World) -> str | None:
+    """What to say to a step that stopped while a plan is still open.
+
+    A stop is not a decision. The loop ends a step the moment the model writes
+    no syscall, which is right when the work is done and wrong when the model
+    merely narrated. So when a plan is active with open steps, the stop is
+    answered with the plan instead of with the turn, and the only ways out are
+    finishing the steps or blocking the plan with a reason someone can read.
+    """
+    try:
+        rec = active(world)
+    except Exception:  # noqa: BLE001 -- a broken plan file cannot end a step
+        return None
+    if not rec:
+        return None
+    step = current_step(rec)
+    if step is None:
+        return None
+    steps = rec.get("steps") or []
+    left = sum(1 for s in steps if s.get("status") in ("todo", "doing"))
+    return (
+        f"[plan {rec['plan_id']} is still active: {rec['title']}]\n"
+        f"next step {step['step_id']}: {step['title']}  "
+        f"({left} of {len(steps)} open)\n"
+        "Carry on with that step now. If it truly cannot proceed, block the "
+        f"plan with the reason -- knowledge op=plan, body: block {rec['plan_id']} "
+        "<why> -- which stops these reminders and hands the turn back."
+    )
+
+
+def block(world: World, plan_id: str, reason: str) -> dict[str, Any]:
+    """Pause a plan with a reason. The reason is the whole point."""
+    text = _clean(str(reason or "").strip(), 300)
+    if not text:
+        raise ValueError("block needs a reason")
+    return revise(world, plan_id, status="blocked", blocked=text)
+
+
+def unblock(world: World, plan_id: str) -> dict[str, Any]:
+    """Clear the block and go back to active."""
+    return revise(world, plan_id, status="active", blocked="")
