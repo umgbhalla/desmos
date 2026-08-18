@@ -33,8 +33,11 @@ from desmos.kernel.types import World
 PLANS_SUBDIR = "plans"
 PLANS_FILENAME = "plans.jsonl"
 STATUSES = ("draft", "active", "blocked", "done", "dropped")
-STEP_STATUSES = ("todo", "doing", "done", "dropped")
-STEP_MARKS = {"todo": " ", "doing": ">", "done": "x", "dropped": "-"}
+# A step waiting on someone else is neither open nor finished: the rail must
+# not point at it, and dropping it would lose a real item. `waiting` is that
+# state, and current_step skips it by only ever looking for doing and todo.
+STEP_STATUSES = ("todo", "doing", "waiting", "done", "dropped")
+STEP_MARKS = {"todo": " ", "doing": ">", "waiting": "?", "done": "x", "dropped": "-"}
 MAX_BODY = 20000
 MAX_RENDER = 4000
 TITLE_LIMIT = 140
@@ -339,6 +342,7 @@ USAGE = (
     "  step ID + TITLE        append a step\n"
     "  step ID x N [note]     mark step N done\n"
     "  step ID > N [note]     mark step N in progress\n"
+    "  step ID ? N [note]     step N waits on someone else; the rail skips it\n"
     "  step ID - N [note]     drop step N\n"
     "  status ID STATUS       draft | active | blocked | done | dropped\n"
     "  block ID REASON        pause the plan and stop the stop-reminders\n"
@@ -435,7 +439,8 @@ def handle_plan(world: World, body: str = "", **attrs: Any) -> str:
         try:
             if verb == "+":
                 return render(add_steps(world, pid.strip(), [payload]))
-            marks = {"x": "done", ">": "doing", "-": "dropped", "o": "todo"}
+            marks = {"x": "done", ">": "doing", "-": "dropped", "o": "todo",
+                     "?": "waiting"}
             if verb in marks:
                 num, _, note = payload.partition(" ")
                 return render(

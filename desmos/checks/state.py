@@ -1388,6 +1388,13 @@ def _check_plan_rail(cwd: Path) -> None:
     assert [s["title"] for s in lifted["steps"]] == ["first", "second"], lifted
     prose = plan.create(world, "prose", "no list here, just a paragraph")
     assert prose["steps"] == [], prose
+
+    # A step that waits on someone else is not work the rail may demand. It
+    # stays in the plan, marked, and the reminder falls silent instead of
+    # pointing at something this session cannot do.
+    idle = plan.create(world, "waits on the user", steps=["they decide"], status="active")
+    plan.set_step(world, idle["plan_id"], 1, "waiting", "the user decides")
+    assert plan.nudge(world) is None, plan.render(plan.read(world, idle["plan_id"]))
     print("plan rail check ok")
 
 
