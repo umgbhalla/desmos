@@ -711,6 +711,9 @@ pub(crate) fn handle_key(
             app.prompt.move_line_end(width);
             false
         }
+        KeyCode::Enter if key.modifiers.contains(KeyModifiers::ALT) => {
+            return submit_prompt_forced_step(bridge, app);
+        }
         KeyCode::Enter if is_mod_enter(&key) => {
             app.prompt.insert_char('\n');
             true

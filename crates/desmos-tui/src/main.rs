@@ -1432,7 +1432,19 @@ fn start_step(
     Ok(())
 }
 
-fn submit_prompt(mut bridge: Option<&mut Bridge>, app: &mut App) -> io::Result<bool> {
+fn submit_prompt(bridge: Option<&mut Bridge>, app: &mut App) -> io::Result<bool> {
+    submit_prompt_inner(bridge, app, false)
+}
+
+fn submit_prompt_forced_step(bridge: Option<&mut Bridge>, app: &mut App) -> io::Result<bool> {
+    submit_prompt_inner(bridge, app, true)
+}
+
+fn submit_prompt_inner(
+    mut bridge: Option<&mut Bridge>,
+    app: &mut App,
+    force_step: bool,
+) -> io::Result<bool> {
     let images = app.prompt.images();
     // An image with no words is a real prompt -- "look at this" is the whole
     // message. The bridge rejects an empty one, so name what was attached
@@ -1555,28 +1567,15 @@ fn submit_prompt(mut bridge: Option<&mut Bridge>, app: &mut App) -> io::Result<b
     }
         return Ok(false);
     }
-    if app.running {
-        let pos = match slot {
-            Some(idx) => {
-                app.queue.insert_at_with(idx, line, images);
-                idx + 1
-            }
-            None => {
-                app.queue.push_with(line, images);
-                app.queue.len()
-            }
-        };
-        // Tell the loop something was typed. A queued follow-up outranks
-        // background work, but run_turns can only see it through the bridge's
-        // inbox -- the queue lives here, not there. With nothing sent,
-        // pending.wait_next blocked until every task landed, so any turn that
-        // left a shell monitor running parked the composer in "queued" and the
-        // follow-up never fired. The op itself does nothing; being in the
-        // inbox is the whole signal.
-        if let Some(b) = bridge.as_mut() {
-            b.send(&json!({"op": "typed"}))?;
+    if app.running && !force_step {
+        if let Some(idx) = slot {
+            app.queue.insert_at_with(idx, line, images);
+            app.notify(format!("queued #{}", idx + 1));
+        } else if let Some(b) = bridge.as_mut() {
+            b.send(&json!({"op": "steer", "text": line}))?;
+        } else {
+            app.notify("bridge is gone");
         }
-        app.notify(format!("queued #{pos}"));
         return Ok(false);
     }
     start_step(bridge, app, line, images)?;
@@ -3345,11 +3344,12 @@ fn draw_input(f: &mut Frame, area: Rect, app: &mut App) {
     let focused = app.focus == Focus::Input;
     let signal = input_signal(app);
     let (signal_label, signal_color) = match signal {
-        Some(InputSignal::Inference) => (Some("Inference".to_string()), theme.accent_assistant),
+        Some(InputSignal::Inference) => (Some("steer".to_string()), theme.accent_assistant),
         // No count here. The queue pane above already titles itself "Queue N"
         // and lists every item; repeating the number on the composer border put
         // "Queue 1" and "Queued 1" one row apart.
         Some(InputSignal::Queued) => (Some("Queued".to_string()), theme.accent_user),
+        Some(InputSignal::Tool) if app.running => (Some("steer".to_string()), theme.accent_tool),
         Some(InputSignal::Tool) => (Some("Tool".to_string()), theme.accent_tool),
         None => (
             None,
@@ -5515,28 +5515,39 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::BrokenPipe);
     }
 
-    /// A follow-up typed while a step runs must reach the bridge, not just the
-    /// local queue. `run_turns` parks on `pending.wait_next` while background
-    /// tasks are outstanding and only releases when its inbox is non-empty, so
-    /// a queue-only push left the composer stuck in "queued" until every
-    /// monitor landed. Drives the real key path and reads the wire back.
     #[test]
-    fn queued_followup_pokes_the_bridge() {
-        let mut app = App::new();
+    fn composer_submission_selects_steer_step_and_forced_step_ops() {
         let mut bridge = match Bridge::loopback() {
             Ok(b) => b,
             Err(_) => return, // no `cat` on this box; nothing to assert
         };
-        app.running = true;
-        app.prompt.insert_str("and then push it");
-        submit_prompt(Some(&mut bridge), &mut app).unwrap();
 
-        assert_eq!(app.queue.len(), 1, "follow-up did not queue");
-        let sent = bridge
-            .rx
-            .recv_timeout(std::time::Duration::from_secs(5))
-            .expect("nothing reached the bridge -- the loop cannot see the queue");
-        assert_eq!(sent["op"], "typed", "wrong op on the wire: {sent}");
+        let mut running = App::new();
+        running.running = true;
+        running.prompt.insert_str("adjust course");
+        submit_prompt(Some(&mut bridge), &mut running).unwrap();
+        let steer = bridge.rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(steer, json!({"op": "steer", "text": "adjust course"}));
+
+        let mut idle = App::new();
+        idle.prompt.insert_str("begin");
+        submit_prompt(Some(&mut bridge), &mut idle).unwrap();
+        let step = bridge.rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(step["op"], "step");
+        assert_eq!(step["text"], "begin");
+
+        let mut forced = App::new();
+        forced.running = true;
+        forced.prompt.insert_str("next full turn");
+        handle_key(
+            Some(&mut bridge),
+            &mut forced,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT),
+        )
+        .unwrap();
+        let forced_step = bridge.rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(forced_step["op"], "step");
+        assert_eq!(forced_step["text"], "next full turn");
     }
 
     #[test]
@@ -6761,10 +6772,10 @@ mod tests {
     }
 
     #[test]
-    fn enter_while_running_stacks_follow_up() {
+    fn enter_while_running_steers_without_queueing() {
         let mut app = App::new();
         app.running = true;
-        app.prompt.insert_str("do this next");
+        app.prompt.insert_str("do this now");
         let quit = handle_key(
             None,
             &mut app,
@@ -6772,13 +6783,9 @@ mod tests {
         )
         .unwrap();
         assert!(!quit);
-        assert_eq!(app.queue.len(), 1);
+        assert!(app.queue.is_empty());
         assert!(app.prompt.to_send().is_empty());
-        assert_eq!(
-            app.sess.story.len(),
-            0,
-            "queued follow-up must not hit story yet"
-        );
+        assert_eq!(app.sess.story.len(), 0, "steer must not start another turn");
     }
 
     #[test]
@@ -8297,7 +8304,7 @@ mod tests {
         );
 
         let waiting = paint(&mut app, 120, 34);
-        assert!(rows_of(&waiting, app.input_area).contains("Inference"));
+        assert!(rows_of(&waiting, app.input_area).contains("steer"));
         assert!(!rows_of(&waiting, app.call_area).contains("Thinking"));
 
         handle_event(
@@ -8857,7 +8864,7 @@ mod tests {
         let painted = paint(&mut app, 120, 28);
         let input = rows_of(&painted, app.input_area);
         let meta = rows_of(&painted, app.cache.area);
-        assert!(input.contains("Tool"), "{input}");
+        assert!(input.contains("steer"), "{input}");
         for leak in ["secret", "sk-live", "curl", "Authorization", "example.com"] {
             assert!(!input.contains(leak), "composer leaked {leak}: {input}");
             assert!(!meta.contains(leak), "Meta leaked {leak}: {meta}");
@@ -9389,7 +9396,7 @@ mod tests {
         inference.turn_started = Some(Instant::now());
         start_thinking(&mut inference.sess.calls, &mut inference.sess.stream);
         let (first, inference_color, first_mod) = paint_input_state(&mut inference, 140, 30);
-        assert!(rows_of(&first, inference.input_area).contains("Inference"));
+        assert!(rows_of(&first, inference.input_area).contains("steer"));
         let meta = rows_of(&first, inference.cache.area);
         assert!(
             !meta.contains("idle") && !meta.contains("thinking"),
@@ -9432,7 +9439,7 @@ mod tests {
         let (busy_text, _, _) = paint_input_state(&mut busy, 140, 30);
         let busy_rows = rows_of(&busy_text, busy.input_area);
         assert!(
-            busy_rows.contains("Inference") && !busy_rows.contains("Queued"),
+            busy_rows.contains("steer") && !busy_rows.contains("Queued"),
             "{busy_rows}"
         );
 
@@ -9444,7 +9451,7 @@ mod tests {
             json!({"ev":"result","phase":"start","tag":"bash","attrs":{},"body":"echo hi"}),
         );
         let (tool_text, tool_color, _) = paint_input_state(&mut tool, 140, 30);
-        assert!(rows_of(&tool_text, tool.input_area).contains("Tool"));
+        assert!(rows_of(&tool_text, tool.input_area).contains("steer"));
         assert_ne!(inference_color, queued_color);
         assert_ne!(queued_color, tool_color);
         assert_ne!(inference_color, tool_color);
