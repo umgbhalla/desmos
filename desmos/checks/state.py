@@ -348,6 +348,7 @@ def check() -> None:
         _check_fold_consent(cwd)
         _check_child_run_id()
         _check_concurrent_notes()
+        _check_work_graph()
         _check_steer(cwd)
         _check_op_rollup(cwd)
         _check_slice(cwd)
@@ -1538,3 +1539,93 @@ def _check_concurrent_notes() -> None:
     assert any("adopted rows" in str(w.message) for w in caught), \
         [str(w.message) for w in caught]
     print("concurrent notes check ok")
+
+
+def _check_work_graph() -> None:
+    """Two claimants, one lease; a blocked child is not ready; a gate holds.
+
+    The claim is a single-statement CAS, so the interesting failure is not a
+    crash -- it is two sessions both believing they hold the same item and
+    doing the work twice. Two threads race one item here and exactly one may
+    come back holding it.
+    """
+    import tempfile
+    import threading
+
+    from desmos.state import persist, work
+
+    root = Path(tempfile.mkdtemp())
+    world = new_world(root, persist=True)
+
+    parent = work.add(world, "cut verification time", gate="a green suite")
+    child = work.add(world, "measure the slow checks", parent=parent["id"])
+    ids = [str(r["id"]) for r in work.ready(world)]
+    assert ids == [parent["id"]], (ids, parent["id"], child["id"])
+
+    real = work.run_id
+    names = {}
+
+    def fake_run_id() -> str:
+        return names.get(threading.current_thread().name, real())
+
+    work.run_id = fake_run_id
+    try:
+        gate = threading.Barrier(2)
+        held: list[dict] = []
+        lock = threading.Lock()
+
+        def race() -> None:
+            names[threading.current_thread().name] = threading.current_thread().name
+            gate.wait()
+            got = work.claim(world, parent["id"])
+            with lock:
+                held.append(got)
+
+        threads = [threading.Thread(target=race, name=n) for n in ("run-a", "run-b")]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        winners = [h for h in held if h["held"]]
+        assert len(held) == 2, held
+        assert len(winners) == 1, held
+        owner = winners[0]["run_id"]
+        assert all(h["run_id"] == owner for h in held), held
+
+        # The loser cannot release what it does not hold.
+        loser = "run-a" if owner == "run-b" else "run-b"
+        names[threading.current_thread().name] = loser
+        assert work.release(world, parent["id"])["released"] is False
+
+        # An expired lease is free again, without anybody deleting a row.
+        conn = persist._open(persist.state_file(world))
+        try:
+            with conn:
+                conn.execute(
+                    "UPDATE work_leases SET expires_at = '2000-01-01T00:00:00+00:00'"
+                    " WHERE item_id = ?",
+                    (parent["id"],),
+                )
+        finally:
+            conn.close()
+        again = work.claim(world, parent["id"])
+        assert again["held"] and again["run_id"] == loser, again
+    finally:
+        work.run_id = real
+
+    try:
+        work.finish(world, parent["id"])
+    except work.WorkError as exc:
+        assert "gated" in str(exc), exc
+    else:  # pragma: no cover - the gate is the point
+        raise AssertionError("a gated item closed with no evidence")
+
+    work.finish(world, parent["id"], evidence="check ok at abc1234")
+    ready_now = [str(r["id"]) for r in work.ready(world)]
+    assert ready_now == [child["id"]], ready_now
+
+    kinds = [str(e["kind"]) for e in work.events(world, parent["id"])]
+    assert kinds[0] == "done" and "claimed" in kinds, kinds
+    assert any(str(e["evidence"]).startswith("check ok") for e in
+               work.events(world, parent["id"])), kinds
+    print("work graph check ok")

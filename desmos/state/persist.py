@@ -26,7 +26,7 @@ from desmos.kernel.types import Tool, World
 _UMASK = os.umask(0)
 os.umask(_UMASK)
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 #: Oldest build that can still read this schema. Additive changes leave it
 #: alone; anything an older reader would misread raises it.
 MIN_READER_VERSION = 9
@@ -560,6 +560,48 @@ CREATE TABLE IF NOT EXISTS channel_cursors (
     last_seen INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (run_id, channel)
 );
+CREATE TABLE IF NOT EXISTS work_items (
+    id TEXT PRIMARY KEY,
+    workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+    session_id TEXT NOT NULL DEFAULT '',
+    title TEXT NOT NULL,
+    body TEXT NOT NULL DEFAULT '',
+    kind TEXT NOT NULL DEFAULT 'task',
+    gate TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'open'
+        CHECK (status IN ('open', 'claimed', 'blocked', 'done', 'dropped')),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS work_edges (
+    parent_id TEXT NOT NULL REFERENCES work_items(id) ON DELETE CASCADE,
+    child_id TEXT NOT NULL REFERENCES work_items(id) ON DELETE CASCADE,
+    kind TEXT NOT NULL DEFAULT 'blocks',
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (parent_id, child_id, kind)
+);
+CREATE TABLE IF NOT EXISTS work_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    item_id TEXT NOT NULL REFERENCES work_items(id) ON DELETE CASCADE,
+    ts TEXT NOT NULL,
+    run_id TEXT NOT NULL DEFAULT '',
+    kind TEXT NOT NULL,
+    detail TEXT NOT NULL DEFAULT '',
+    evidence TEXT NOT NULL DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS work_leases (
+    item_id TEXT PRIMARY KEY REFERENCES work_items(id) ON DELETE CASCADE,
+    run_id TEXT NOT NULL,
+    holder TEXT NOT NULL DEFAULT '',
+    claimed_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_work_items_workspace
+    ON work_items(workspace_id, status, created_at);
+CREATE INDEX IF NOT EXISTS idx_work_edges_child
+    ON work_edges(child_id, kind);
+CREATE INDEX IF NOT EXISTS idx_work_events_item
+    ON work_events(item_id, id);
 CREATE INDEX IF NOT EXISTS idx_messages_session
     ON messages(session_id, seq);
 CREATE INDEX IF NOT EXISTS idx_calls_session
