@@ -26,7 +26,7 @@ from desmos.kernel.types import Tool, World
 _UMASK = os.umask(0)
 os.umask(_UMASK)
 
-SCHEMA_VERSION = 11
+SCHEMA_VERSION = 12
 #: Oldest build that can still read this schema. Additive changes leave it
 #: alone; anything an older reader would misread raises it.
 MIN_READER_VERSION = 9
@@ -512,6 +512,7 @@ CREATE TABLE IF NOT EXISTS calls (
     cache_creation_input_tokens INTEGER NOT NULL DEFAULT 0,
     output_tokens INTEGER NOT NULL DEFAULT 0,
     cost_usd REAL NOT NULL DEFAULT 0,
+    account TEXT NOT NULL DEFAULT '',
     PRIMARY KEY (session_id, seq)
 );
 CREATE TABLE IF NOT EXISTS events (
@@ -716,6 +717,9 @@ def _migrate(conn: sqlite3.Connection) -> None:
         _drop_seat_scaffold(conn)
         for shared in ("notes", "tools"):
             _add_column(conn, shared, "updated_at", "TEXT NOT NULL DEFAULT ''")
+        # Which purse paid for a call. Older rows keep '' and are counted
+        # against whatever account asks, because they predate the question.
+        _add_column(conn, "calls", "account", "TEXT NOT NULL DEFAULT ''")
         _add_column(
             conn, "schema_migrations", "min_reader", "INTEGER NOT NULL DEFAULT 0"
         )
@@ -1482,6 +1486,29 @@ def channel_notice(world: World, channel: str = "conflicts") -> str:
     )
 
 
+#: One complaint per process per failure text. The ledger is the only record
+#: of what a run cost, and it used to fail in perfect silence -- a budget built
+#: on a ledger that quietly stops writing is not a budget.
+_LEDGER_WARNED: set[str] = set()
+
+
+def _ledger_failed(world: World, exc: BaseException) -> None:
+    summary = f"call ledger write failed ({type(exc).__name__}: {exc})"
+    if summary in _LEDGER_WARNED:
+        return
+    _LEDGER_WARNED.add(summary)
+    try:
+        record_event(
+            world,
+            {"ev": "notice", "text": summary},
+            ts_ms=int(time.time() * 1000),
+            mono_ns=time.monotonic_ns(),
+        )
+    except Exception:  # noqa: BLE001
+        pass
+    warnings.warn(summary, RuntimeWarning, stacklevel=3)
+
+
 def record_call(world: World, entry: dict[str, Any]) -> None:
     """Append one priced model round to the current session."""
     if not world.persist or not entry:
@@ -1490,9 +1517,16 @@ def record_call(world: World, entry: dict[str, Any]) -> None:
     if not any(usage.get(key) for key in prices.USAGE_KEYS):
         return
     model = str(world.model or "")
+    # Late import: budget reads this module's tables, so importing it at module
+    # scope would close a cycle. Which purse paid is part of the row, not a
+    # question asked later of a model name that may since have changed.
+    from desmos.state import budget as _budget
+
+    purse = _budget.account(world)
     try:
         conn = _open(state_file(world))
-    except Exception:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001
+        _ledger_failed(world, exc)
         return
     try:
         with conn:
@@ -1509,8 +1543,8 @@ def record_call(world: World, entry: dict[str, Any]) -> None:
                 INSERT INTO calls(
                     session_id, seq, ts, model, input_tokens,
                     cache_read_input_tokens, cache_creation_input_tokens,
-                    output_tokens, cost_usd)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    output_tokens, cost_usd, account)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     session,
@@ -1522,10 +1556,11 @@ def record_call(world: World, entry: dict[str, Any]) -> None:
                     int(usage.get("cache_creation_input_tokens") or 0),
                     int(usage.get("output_tokens") or 0),
                     float(prices.cost(usage, model)),
+                    purse,
                 ),
             )
-    except Exception:  # noqa: BLE001
-        pass
+    except Exception as exc:  # noqa: BLE001
+        _ledger_failed(world, exc)
     finally:
         conn.close()
 

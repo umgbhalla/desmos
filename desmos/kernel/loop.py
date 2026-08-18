@@ -437,6 +437,11 @@ def turn(
     # carries the handoff rail. Injections ride in the uncached tail, so asking
     # here costs nothing cached and warns before the fold rather than after.
     handoff.watch(world)
+    # Same seam, different ceiling: the spend block rides the uncached tail too,
+    # and the price of the call that just landed is already in the ledger.
+    from desmos.state import budget as _budget
+
+    _budget.watch(world)
     if len(world.log) > 1:
         # Only the newest entry's wire bodies are ever read -- by the complete
         # event three lines below, and by nothing else in the process. Keeping
@@ -894,6 +899,19 @@ def _run_turns(
         if max_total_tokens is not None and not hit:
             if _spent_tokens(world, spent_from) >= max_total_tokens:
                 hit.append(f"token budget of {max_total_tokens} reached")
+        if not hit:
+            # The money ceiling, unlike the token one, is not per-step: it is a
+            # rolling window over every session in this workspace. A sibling
+            # that spent the account dry stops this loop too.
+            from desmos.state import budget as _budget
+
+            if _budget.over(world):
+                st = _budget.status(world)
+                hit.append(
+                    f"usd budget of ${st['limit']:.2f} reached "
+                    f"(${st['usd']:.2f} on {st['account']} in the last "
+                    f"{st['hours']:.0f}h)"
+                )
         return bool(hit) or (should_stop is not None and should_stop())
 
     def stop_note(n: int) -> str:

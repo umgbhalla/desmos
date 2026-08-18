@@ -359,6 +359,7 @@ def check() -> None:
         _check_outbox()
         _check_d1_sink()
         _check_d1_worker()
+        _check_budget_rail(cwd)
         _check_stow()
         _check_salvage()
         _check_fold_keeps_transcript()
@@ -1859,3 +1860,85 @@ def _check_d1_worker() -> None:
     assert "fingerprint" in worker and "length !== 64" in worker, \
         "the worker accepts a row with no sha256 fingerprint"
     print("d1 worker check ok")
+
+
+def _check_budget_rail(cwd: Path) -> None:
+    """Money is a ceiling, counted across the workspace, and it ends the step.
+
+    Driven through run_turns because the defect worth catching is a limit
+    nothing consults: the ledger has priced every call for months and no
+    running loop had ever read it back. Revert the branch in `stopped()` and
+    the fixture keeps buying turns it cannot afford.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    from desmos.kernel.loop import run_turns
+    from desmos.state import budget, persist
+
+    home = cwd / "budget"
+    home.mkdir()
+    world = new_world(home, state_path=home / "harness.sqlite3")
+    world.model = "claude-opus-5"
+    now = datetime.now(timezone.utc)
+    fresh, stale = now.isoformat(), (now - timedelta(hours=72)).isoformat()
+
+    persist.record_call(world, {"ts": fresh, "usage": FIXTURE_USAGE})
+    persist.record_call(world, {"ts": fresh, "usage": FIXTURE_USAGE})
+    # Outside the window: spent, but no longer bounding the rate.
+    persist.record_call(world, {"ts": stale, "usage": FIXTURE_USAGE})
+
+    spent = budget.spend(world, hours=24)
+    assert spent["account"] == "anthropic", spent
+    assert spent["calls"] == 2, spent
+    assert abs(spent["usd"] - 2 * FIXTURE_COST_OPUS) < 1e-12, spent
+
+    # A second purse in the same workspace is a separate ceiling.
+    world.model = "gpt-5.6-sol"
+    persist.record_call(world, {"ts": fresh, "usage": FIXTURE_USAGE})
+    assert budget.account(world) == "openai"
+    assert budget.spend(world, hours=24)["calls"] == 1, "purses are pooled"
+    world.model = "claude-opus-5"
+
+    # Another World over the same file is a sibling front, and it spends from
+    # the same card. Per-session budgets are a limit that doubles per front.
+    sibling = new_world(home, state_path=home / "harness.sqlite3")
+    sibling.model = "claude-opus-5"
+    persist.record_call(sibling, {"ts": fresh, "usage": FIXTURE_USAGE})
+    assert budget.spend(world, hours=24)["calls"] == 3, "the window is per-session"
+
+    ceiling = 3.5 * FIXTURE_COST_OPUS
+    os.environ["DESMOS_BUDGET_USD"] = f"{ceiling:.12f}"
+    os.environ["DESMOS_BUDGET_WINDOW_HOURS"] = "24"
+    budget._SEEN.clear()
+    calls: list[int] = []
+
+    def fake(_model, _system, messages, _max_tokens):
+        calls.append(len(messages))
+        return {"content": [{"type": "text", "text": "spending"}],
+                "usage": FIXTURE_USAGE}
+
+    world.complete_fn = fake
+    try:
+        state = budget.status(world)
+        assert not state["over"] and state["soft"], state
+        # Warned before the ceiling, not after: the block rides the uncached
+        # tail, so it can appear and vanish without costing the prefix.
+        budget.watch(world)
+        assert "Budget: $" in system_prompt(world), "no warning under the ceiling"
+        assert budget.over(world) is False
+
+        run_turns(world, "go", quiet=True)
+    finally:
+        os.environ.pop("DESMOS_BUDGET_USD", None)
+        os.environ.pop("DESMOS_BUDGET_WINDOW_HOURS", None)
+        budget._SEEN.clear()
+
+    assert len(calls) == 1, calls
+    note = str(world.messages[-1].get("content"))
+    assert "usd budget of $" in note, note
+
+    # No ceiling is the default, and it must not stop anything.
+    budget.watch(world)
+    assert "Budget: $" not in system_prompt(world), "the block outlived its limit"
+    assert budget.over(world) is False
+    print("budget rail check ok")
