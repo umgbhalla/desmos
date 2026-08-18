@@ -1101,18 +1101,28 @@ def _caller_world() -> Any:
     return _UNRESOLVED
 
 
-def wait(*ids: str, timeout: float = 600.0, poll: float = 0.5) -> list[dict[str, Any]]:
-    """Block until the named runs settle (all of them if none named)."""
+def wait(*ids: str, timeout: float = 600.0, poll: float = 0.0) -> list[dict[str, Any]]:
+    """Block until the named runs settle (all of them if none named).
+
+    `poll=0`, the default, backs off from 10ms to 250ms instead of ticking at a
+    flat half second. The flat tick charged up to 0.5s of doing nothing to
+    every wait *after* the child had already finished -- five seconds of the
+    check floor, and the same delay on every real fanout. Pass a number to pin
+    it; the contract checks do, because they assert on timing.
+    """
     with _LOCK:
         # spawn() inserts under _LOCK; iterating RUNS unlocked raised
         # "dictionary changed size during iteration" mid-fanout.
         targets = list(ids) or list(RUNS)
     deadline = time.time() + timeout
+    tick = poll or 0.01
     while time.time() < deadline:
         pending = [i for i in targets if i in RUNS and RUNS[i].state in ("pending", "running")]
         if not pending:
             break
-        time.sleep(poll)
+        time.sleep(tick)
+        if not poll:
+            tick = min(tick * 1.6, 0.25)
     out = []
     for i in targets:
         run = RUNS.get(i)

@@ -796,15 +796,19 @@ def check() -> None:
 
         from desmos.exec import run_bash as _bash
 
+        # The timeouts are one second and the grandchildren sleep twenty and
+        # thirty: the regression this encodes is a twentyfold overrun, so it
+        # does not need a wide window to be unmissable, and the four seconds
+        # these two lines used to cost bought nothing.
         started = _time.monotonic()
-        out = _bash("sleep 20 & echo started", cwd, timeout=3)
+        out = _bash("sleep 20 & echo started", cwd, timeout=1)
         took = _time.monotonic() - started
-        assert took < 8, f"a backgrounded grandchild held the harness for {took:.1f}s"
+        assert took < 5, f"a backgrounded grandchild held the harness for {took:.1f}s"
         assert "started" in out, out
         # And a timeout takes the whole group with it, not just /bin/sh.
         started = _time.monotonic()
-        out = _bash("sh -c 'sleep 30 & wait'", cwd, timeout=2)
-        assert _time.monotonic() - started < 6, out
+        out = _bash("sh -c 'sleep 30 & wait'", cwd, timeout=1)
+        assert _time.monotonic() - started < 4, out
         assert "timeout after" in out, out
 
         # A reply the endpoint cut off is not a reply that finished. scan drops
@@ -995,6 +999,22 @@ def check() -> None:
 
         assert _fg_window <= 1.0, "the first look is snappy, not a task estimate"
 
+        # Every dispatch below waits PROMPT_IDLE of silence after the prompt
+        # before it answers, and there are twenty of them: half of this group's
+        # wall clock was that one constant, found with `desmos check --profile`.
+        # The product defaults are asserted here and then pinned small for the
+        # state-carrying assertions, which prove what a shell remembers rather
+        # than how long it listens. The timing repros further down are
+        # untouched: they turn on INITIAL_WINDOW, which is left alone.
+        from desmos.kernel import shell as _shell_mod
+
+        assert (_shell_mod.PROMPT_IDLE, _shell_mod.QUIET) == (0.3, 0.20), (
+            _shell_mod.PROMPT_IDLE,
+            _shell_mod.QUIET,
+        )
+        _idle_was, _quiet_was = _shell_mod.PROMPT_IDLE, _shell_mod.QUIET
+        _shell_mod.PROMPT_IDLE, _shell_mod.QUIET = 0.05, 0.05
+
         w_sh = new_world(cwd, state_path=None, persist=False, ns={})
         try:
             def sh(body: str, **attrs: str) -> str:
@@ -1050,6 +1070,7 @@ def check() -> None:
             assert w_sh.shells, "sessions live on the world"
         finally:
             _close_shells(w_sh)
+            _shell_mod.PROMPT_IDLE, _shell_mod.QUIET = _idle_was, _quiet_was
         assert not w_sh.shells
 
         # A body that contains its own closing tag used to be cut there, and the
@@ -1164,6 +1185,8 @@ def check() -> None:
         )
         assert rec_file.read_bytes() == rec_before, "rollback rewrote memory records"
 
+        _check_profiler()
+
         try:
             from IPython.core.interactiveshell import InteractiveShell
         except ImportError:
@@ -1179,3 +1202,71 @@ def check() -> None:
         assert callable(shell.user_ns.get("reset"))
         assert "doc" in ns_names(w4)
         assert dispatch(w4, Block("python", "len(doc)", {})) == "11"
+
+
+def _check_profiler() -> None:
+    """`check --profile` blames the check line that spends the seconds.
+
+    Driven through runner.run, because what broke twice was the wiring, never
+    the arithmetic: a version that wrapped select/sleep reported nothing at
+    all for a 14.7s group, and a version that kept its tallies in module
+    globals had them emptied by the SDK reload this very group performs.
+
+    So: a synthetic group that spends a known 0.3s at a known line inside
+    desmos/checks/ (compile() sets co_filename, which is what _blame reads),
+    run through the real entry point, and the report must name that line.
+    Then a reload of the profiler mid-sample, which must not lose the count.
+    """
+    import contextlib
+    import importlib
+    import io
+    import sys as _sys
+    import time
+    import types as _types
+
+    from desmos.checks import profile as prof_mod
+    from desmos.checks import runner
+
+    probe_path = str(Path(prof_mod.__file__).resolve().parent / "_probe.py")
+    probe_src = "import time\n\n\ndef check():\n    time.sleep(0.3)\n"
+    probe = _types.ModuleType("desmos.checks._probe")
+    probe.__file__ = probe_path
+    exec(compile(probe_src, probe_path, "exec"), probe.__dict__)
+
+    old_groups = runner.GROUPS
+    _sys.modules["desmos.checks._probe"] = probe
+    runner.GROUPS = old_groups + ("_probe",)
+    buf = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(buf):
+            code = runner.run(only="_probe", profile=True)
+    finally:
+        runner.GROUPS = old_groups
+        _sys.modules.pop("desmos.checks._probe", None)
+    out = buf.getvalue()
+    assert code == 0, out
+    assert "[profile]" in out, "check --profile printed no report:\n" + out
+    rows = [ln for ln in out.splitlines() if ln.startswith("  ") and "s  " in ln]
+    assert rows, "profile report has no attributed lines:\n" + out
+    assert "_probe.py:5" in rows[0], (
+        "the 0.3s sleep was blamed on " + rows[0].strip() + ", not the probe "
+        "line that spent it:\n" + out
+    )
+
+    # The tallies live on the sampler object precisely so that a reload of the
+    # profiler partway through a run cannot rebind them to empty dicts.
+    with prof_mod.profiling(interval=0.004) as sampler:
+        time.sleep(0.08)
+        before = sum(sampler.samples.values())
+        # Counted off the sampler, not off the module: a global tally is not
+        # empty after a reload, it is a *fresh* one, so "did anything get
+        # counted" passes while every sample before the reload is gone.
+        assert before >= 5, "the tallies are not on the sampler object: " + repr(before)
+        importlib.reload(prof_mod)
+        time.sleep(0.08)
+    after = sum(sampler.samples.values())
+    assert after >= before + 5, (
+        "a mid-run reload of the profiler lost its earlier tallies: "
+        + repr((before, after))
+    )
+    assert sampler.sites() and sampler.wall >= 0.14, (sampler.wall, sampler.sites()[:2])

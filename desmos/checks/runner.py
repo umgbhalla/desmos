@@ -15,10 +15,17 @@ GROUPS = ("layering", "kernel", "transport", "state", "find_check", "recall_chec
 
 # The seconds tier: the scan/dispatch/persist/edit repros, with no localhost
 # SSE or auth-callback servers (transport), no subagent waits (agents), no
-# bridge subprocess (front). Measured 2026-08-16 (M-series laptop): layering
-# 0.0s + kernel 13.0s + state 0.0s ~= 13s; transport 0.1s, agents 0.9s,
-# front 1.2s; whole floor 15.4s. Kernel dominates because its timeout repros
-# really sleep -- if it grows past the 30s ceiling, split it, do not skip it.
+# bridge subprocess (front). Measured 2026-08-18 (M-series laptop): layering
+# 0.2s + kernel 10.4s + state 1.0s ~= 12s; transport 0.2s, find_check 0.3s,
+# recall_check 0.6s, agents 2.0s, front 6.6s, conformance 0.2s; whole floor
+# 21s, down from 33s.
+#
+# Do not guess where a new second went -- `--profile` attributes it to the
+# check line that holds it. Today: 5.1s in the kernel shell dispatch helper
+# (~20 state-carrying dispatches, already at a 0.05s prompt-idle floor), 4.3s
+# in the front bridge flood poll, 2.0s in the two bash timeout repros, which
+# really sleep. If the floor grows past the 30s ceiling, split a group, do
+# not skip it.
 FAST = ("layering", "kernel", "state")
 
 PINNED_MODEL = "claude-opus-5"
@@ -104,7 +111,7 @@ def _pinned(names: tuple[str, ...]) -> int:
                 mod.DEFAULT_MODEL = was
 
 
-def run(only: str | None = None, fast: bool = False) -> int:
+def run(only: str | None = None, fast: bool = False, profile: bool = False) -> int:
     if only is not None:
         if only not in GROUPS:
             print(f"unknown check group {only!r}; groups: {', '.join(GROUPS)}")
@@ -114,7 +121,18 @@ def run(only: str | None = None, fast: bool = False) -> int:
         names = FAST
     else:
         names = GROUPS
-    return _pinned(names)
+    if not profile:
+        return _pinned(names)
+    # Measure before optimising, and measure the line rather than the group: a
+    # group timing says kernel is half the floor and cannot say which repro.
+    from desmos.checks import profile as _profile
+
+    # `prof` is a local: the kernel group reloads the SDK mid-run, and a tally
+    # kept in that module's globals is silently rebound to empty when it does.
+    with _profile.profiling() as prof:
+        code = _pinned(names)
+    print(prof.report())
+    return code
 
 
 def self_check() -> None:

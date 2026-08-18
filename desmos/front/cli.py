@@ -61,7 +61,7 @@ def cmd_check(args: argparse.Namespace) -> int:
     _on_path()
     from desmos.check import run
 
-    return run(only=args.only, fast=args.fast)
+    return run(only=args.only, fast=args.fast, profile=bool(getattr(args, "profile", False)))
 
 
 def cmd_run(args: argparse.Namespace) -> int:
@@ -412,6 +412,11 @@ def main() -> int:
     ch = sub.add_parser("check", help="run harness self-check")
     ch.add_argument("--only", metavar="GROUP", default=None, help="run one check group")
     ch.add_argument("--fast", action="store_true", help="run only the seconds-tier groups")
+    ch.add_argument(
+        "--profile",
+        action="store_true",
+        help="report which check lines spend the wall clock",
+    )
     ch.set_defaults(func=cmd_check)
 
     r = sub.add_parser("run", help="one-shot task, no IPython")

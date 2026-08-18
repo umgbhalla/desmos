@@ -42,11 +42,27 @@ def _check_path_deps_tracked() -> None:
 
     collect(tomllib.loads(manifest.read_text()))
     missing = []
+    present: list[tuple[str, Path]] = []
     for rel in sorted(deps):
         target = (root / rel / "Cargo.toml").resolve()
         if not target.exists():
             missing.append(f"{rel}/Cargo.toml does not exist")
-            continue
+        else:
+            present.append((rel, target))
+
+    # One git call for the whole set. `--error-unmatch` fails the batch if any
+    # path is untracked, so the per-path loop below only runs when something is
+    # actually wrong -- which is the case that can afford to be slow.
+    suspect: list[tuple[str, Path]] = []
+    if present:
+        batch = subprocess.run(
+            ["git", "-C", str(root), "ls-files", "--error-unmatch",
+             *[str(path) for _, path in present]],
+            capture_output=True, check=False,
+        )
+        if batch.returncode != 0:
+            suspect = present
+    for rel, target in suspect:
         tracked = subprocess.run(
             ["git", "-C", str(root), "ls-files", "--error-unmatch", str(target)],
             capture_output=True, check=False,
