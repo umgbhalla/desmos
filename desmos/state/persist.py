@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from desmos.kernel import prices
+from desmos.state import cold
 from desmos.kernel.const import FROZEN, PRIOR_KEEP
 from desmos.kernel.exec import callable_from_source
 from desmos.kernel.types import Tool, World
@@ -1569,15 +1570,26 @@ def _prune_sessions(
         for row in rows[max(1, int(keep)):]
         if str(row["id"]) != current and str(row["id"]) not in live
     ]
+    if path is None:
+        # Nothing is ever deleted, so with nowhere to copy to there is
+        # nothing to prune either.
+        return 0
     if doomed:
         # Census first: after the delete there is nothing left to describe.
-        census = _prune_census(conn, doomed) if path is not None else []
+        census = _prune_census(conn, doomed)
+        moved = cold.archive(path, conn, doomed)
+        safe = set(moved["archived"])
+        doomed = [sid for sid in doomed if sid in safe]
+        census = [
+            dict(entry, archived_to=moved["path"])
+            for entry in census
+            if entry["session_id"] in safe
+        ]
         conn.executemany(
             "DELETE FROM history_fts WHERE session_id = ?", [(sid,) for sid in doomed]
         )
         conn.executemany("DELETE FROM sessions WHERE id = ?", [(sid,) for sid in doomed])
-        if path is not None:
-            _record_prune(path, census)
+        _record_prune(path, census)
     return len(doomed)
 
 

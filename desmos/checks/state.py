@@ -349,6 +349,7 @@ def check() -> None:
         _check_schema_tolerance()
         _check_quarantine_manifest()
         _check_prune_manifest()
+        _check_cold_store()
         _check_salvage()
         _check_fold_keeps_transcript()
         _check_session_asks()
@@ -1194,3 +1195,64 @@ def _check_schema_tolerance() -> None:
     assert persist.quarantines(path) == before, "compatibility quarantined"
     assert _recorded() == (top + 2, top + 2), _recorded()
     print("schema tolerance check ok")
+
+
+def _check_cold_store() -> None:
+    """Pruning is a move, not a delete.
+
+    Bounding the live database used to destroy its oldest sessions outright.
+    A session may now leave harness.sqlite3 only after a verified copy lands
+    in the cold store: the census names where each one went, and the archive
+    can still answer for the messages.
+    """
+    import sqlite3
+    import tempfile
+
+    from desmos.state import cold, persist
+
+    root = Path(tempfile.mkdtemp())
+    world = new_world(root, persist=True)
+    world.messages.append({"role": "user", "content": "the surviving session"})
+    persist.save(world)
+    path = persist.state_file(world)
+
+    conn = persist._open(path)
+    try:
+        workspace = conn.execute("SELECT id FROM workspaces").fetchone()[0]
+        with conn:
+            for i in range(persist.SESSION_KEEP + 3):
+                sid = f"cold-{i:04d}"
+                conn.execute(
+                    "INSERT INTO sessions(id, workspace_id, kind, started_at,"
+                    " last_seen_at, cache_key) VALUES (?, ?, 'attach', ?, ?, ?)",
+                    (sid, workspace, f"2020-01-01T00:00:{i:02d}",
+                     f"2020-01-01T00:00:{i:02d}", sid),
+                )
+                conn.execute(
+                    "INSERT INTO messages(session_id, seq, role, content_json)"
+                    " VALUES (?, 0, 'user', ?)",
+                    (sid, json.dumps(f"cold conversation {i}")),
+                )
+    finally:
+        conn.close()
+    persist.save(world)
+
+    entries = [e for e in persist.pruned(path) if e["session_id"].startswith("cold-")]
+    assert entries, "nothing was pruned"
+    for entry in entries:
+        assert entry["archived_to"], entry
+    moved = {e["session_id"] for e in entries}
+    held = {r["session_id"] for r in cold.archived(path)}
+    assert moved <= held, sorted(moved - held)
+
+    store = sqlite3.connect(cold.cold_path(path))
+    try:
+        sid = sorted(moved)[0]
+        rows = store.execute(
+            "SELECT content_json FROM messages WHERE session_id = ?", (sid,)
+        ).fetchall()
+    finally:
+        store.close()
+    assert len(rows) == 1, f"{len(rows)} archived messages for {sid}"
+    assert "cold conversation" in rows[0][0], rows[0][0]
+    print("cold store check ok")
