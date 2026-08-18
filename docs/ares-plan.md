@@ -50,6 +50,19 @@ scout reports (2026-08-17). Every decision below is the user's unless marked
 
 Each phase names the gate that proves it. Cheapest and most decision-free
 first.
+### Phase 0 — make a schema bump survivable (ARES 10; blocks C and D)
+- `_migrate()` raises on any newer db (persist.py:629-632) and `_open()`'s
+  recovery catches only `sqlite3.DatabaseError` (persist.py:652-666), so the
+  RuntimeError escapes and the front dies rather than degrading.
+- Tolerate a newer *additive* schema; add `min_reader_version` to the schema
+  metadata (persist.py:437-441) and reject only genuinely incompatible readers.
+  Never route a compatibility failure through corruption quarantine.
+- Replace the single `SELECT *` (peers, persist.py:1106) with named columns —
+  it is the only real compatibility boundary in the file.
+- *Gate:* an old reader opens a db written by a newer additive writer and keeps
+  working. **This ships before any bump, or the tolerance never reaches the
+  fronts that need it.**
+
 ### Phase A — the record stops deleting (decision-free)
 - A1 pruning becomes archival: rows move to a cold store, never vanish.
   *Gate:* prune a session in a temp workspace, then read its messages back.
@@ -88,13 +101,27 @@ first.
 - D2 append-only model bindings per seat, written on switch. Settles T2 in
   schema rather than prose.
 - D3 `birth`: minting a seat needs the user; resolving an existing one is free.
-- D4 a sibling session gets its own state path, `persist=True`, its own session
-  row with `kind='child'` and a real `parent_id`, and its own session id —
-  today's children are `state_path=None, persist=False`
-  (subagent.py:386-400). **Blocked on the single-writer lock** shipped for todo
-  18: a sibling needs a home of its own, or the lock needs scoping.
-- D5 standing seats need a headless runner. The peer rail can wake a seat, but
-  only through a live bridge. Without this there are no unattended agents.
+- D4 a sibling is a plain session — no seat, not user-facing. Its own process,
+  its own `DESMOS_SESSION_ID`, run headless through `desmos run`
+  (loop.py:1413-1433), which never claims the workspace lock: that lock is
+  interactive-front-only and headless runs deliberately skip it
+  (persist.py:1059-1067). The lock does not change, and a sibling needs no home
+  of its own.
+- D4a identity lives in the process environment: `run_id()` reads and writes
+  `DESMOS_SESSION_ID` in `os.environ` (persist.py:953-960), so two sessions in
+  one process collide. Separate processes, always. ACP shares one World across
+  sessions with no per-session id — a latent instance of the same bug
+  (front/acp.py:124-138).
+- D4b the real blocker: three `INSERT OR REPLACE` upserts and the `workspaces`
+  UPDATE still let a stale snapshot overwrite a concurrent session's newer row
+  (persist.py:784-787, 878-903). The notes/tools *deletes* were fixed with a
+  watermark; the upserts were not. Same fix. *Gate:* two sessions save
+  concurrently and neither loses a note, a tool, or the generation counter.
+- D5 a standing sibling needs a watcher that is not the TUI bridge. Only a live
+  bridge runs `_watch_channel` (front/bridge.py:376-455), so a session with no
+  front is never woken and `session post` reports it inactive. That daemon —
+  supervision, durable control input, event emission — is the whole of
+  "unattended".
 
 ### Phase E — cloud and money (ARES 6/7)
 - E1 transactional outbox, fingerprint `sha256(canonical_json(...))`, push-only
@@ -116,12 +143,12 @@ Measure before optimising: publish per-group check timings, then cut the
 dominant group. The green gate holds until then.
 
 ## Open, needing the user
-- **When to bump SCHEMA_VERSION.** Phase C and D both need it, and it kills
-  every live front on this workspace, including the other session writing here
-  now. One bump for both, deliberately scheduled.
-- **Does a sibling seat get a home of its own** — its own workspace dir and
-  worktree — or does the single-writer lock get scoped instead? *My
-  recommendation: a home of its own, with the work graph as the meeting point.*
+- **The schema question is withdrawn.** Phase 0 makes a bump survivable, so
+  when to bump is no longer a decision you have to make.
+- **Siblings need no home of their own.** Separate processes sharing one
+  workspace are safe once the upserts carry a watermark.
+- Still yours: whether `reset()` survives at all (B3), and whether a standing
+  sibling may run unattended overnight — decision 10 said not yet.
 
 ## Next action
 Phase A1. Decision-free, and it unblocks the salvage.
