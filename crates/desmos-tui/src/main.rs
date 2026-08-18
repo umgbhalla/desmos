@@ -2104,6 +2104,8 @@ fn draw(f: &mut Frame, app: &mut App) {
         0
     };
     let float_rows = input_float_rows(app);
+    let decision_h =
+        app.decisions.len().min(3) as u16 + u16::from(app.decisions.len() > 3);
     // Grow with what is typed, up to half the column. The old ceiling of ten
     // rows existed to leave a legend band matching it opposite; there is no
     // legend now, and a long prompt is worth more rows than a short story is.
@@ -2113,7 +2115,7 @@ fn draw(f: &mut Frame, app: &mut App) {
     let input_h = (2 + float_rows + prompt_rows)
         .min(work_area.height.saturating_sub(8 + queue_h))
         .max(2 + float_rows + default_rows);
-    let bottom_h = queue_h + input_h;
+    let bottom_h = queue_h + decision_h + input_h;
     let post_h = app
         .layout
         .post_h
@@ -2124,6 +2126,7 @@ fn draw(f: &mut Frame, app: &mut App) {
             Constraint::Min(3),
             Constraint::Length(post_h),
             Constraint::Length(queue_h),
+            Constraint::Length(decision_h),
             Constraint::Length(input_h),
         ])
         .split(body[0]);
@@ -2177,7 +2180,8 @@ fn draw(f: &mut Frame, app: &mut App) {
     } else {
         left[2]
     };
-    app.input_area = left[3];
+    let decision_area = left[3];
+    app.input_area = left[4];
 
     let viewing = app.viewing.clone();
     let child_ok = viewing
@@ -2309,6 +2313,7 @@ fn draw(f: &mut Frame, app: &mut App) {
     draw_git(f, app.git_area, app);
     draw_files(f, app.files_area, app);
     draw_queue(f, app.queue_area, app);
+    draw_decisions(f, decision_area, app);
     draw_input(f, app.input_area, app);
     if app.file_picker.is_open() {
         draw_file_picker(f, app);
@@ -2342,6 +2347,42 @@ fn draw(f: &mut Frame, app: &mut App) {
     {
         app.media.frame.clear();
     }
+}
+
+fn draw_decisions(f: &mut Frame, area: Rect, app: &App) {
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
+    let theme = Theme::current();
+    let mut lines = app
+        .decisions
+        .iter()
+        .take(3)
+        .map(|decision| {
+            let short_id = decision.id.chars().take(8).collect::<String>();
+            let mut text = format!("◐ decide:{short_id} {}", decision.prompt);
+            for (index, option) in decision.options.iter().take(9).enumerate() {
+                text.push_str(&format!(" [{}] {}", index + 1, option));
+            }
+            Line::from(Span::styled(
+                text,
+                Style::default()
+                    .fg(theme.warning)
+                    .bg(theme.bg_base)
+                    .add_modifier(Modifier::BOLD),
+            ))
+        })
+        .collect::<Vec<_>>();
+    if app.decisions.len() > 3 {
+        lines.push(Line::from(Span::styled(
+            format!("  +{} more", app.decisions.len() - 3),
+            Style::default().fg(theme.accent_tool).bg(theme.bg_base),
+        )));
+    }
+    f.render_widget(
+        Paragraph::new(lines).style(Style::default().bg(theme.bg_base)),
+        area,
+    );
 }
 
 fn draw_json_tree(
@@ -5496,6 +5537,102 @@ mod tests {
             .recv_timeout(std::time::Duration::from_secs(5))
             .expect("nothing reached the bridge -- the loop cannot see the queue");
         assert_eq!(sent["op"], "typed", "wrong op on the wire: {sent}");
+    }
+
+    #[test]
+    fn bridge_decision_digit_submits_exact_answer_and_answered_closes_it() {
+        let mut app = App::new();
+        handle_event(
+            &mut app,
+            json!({
+                "ev": "decision",
+                "id": "decision-123456",
+                "prompt": "Deploy now?",
+                "options": ["wait", "ship"],
+                "status": "open"
+            }),
+        );
+        assert_eq!(
+            app.decisions,
+            vec![Decision {
+                id: "decision-123456".into(),
+                prompt: "Deploy now?".into(),
+                options: vec!["wait".into(), "ship".into()],
+                status: DecisionStatus::Open,
+            }]
+        );
+
+        let backend = TestBackend::new(160, 28);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert!(
+            buffer_text(&term).contains("◐ decide:decision Deploy now? [1] wait [2] ship"),
+            "open decision strip was not rendered"
+        );
+
+        let mut bridge = match Bridge::loopback() {
+            Ok(bridge) => bridge,
+            Err(_) => return,
+        };
+        handle_key(
+            Some(&mut bridge),
+            &mut app,
+            KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE),
+        )
+        .unwrap();
+        let sent = bridge
+            .rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("decision answer did not reach the bridge");
+        assert_eq!(sent["op"], "step");
+        assert_eq!(
+            sent["text"],
+            "decide:decision-123456 — Deploy now?: ship"
+        );
+        assert!(app.prompt.to_send().is_empty());
+
+        handle_event(
+            &mut app,
+            json!({
+                "ev": "decision",
+                "id": "decision-123456",
+                "prompt": "Deploy now?",
+                "options": ["wait", "ship"],
+                "status": "answered",
+                "answer": "ship"
+            }),
+        );
+        assert!(app.decisions.is_empty());
+
+        app.prompt.insert_str("version ");
+        handle_key(
+            None,
+            &mut app,
+            KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert_eq!(app.prompt.to_send(), "version 2");
+    }
+
+    #[test]
+    fn snapshot_replaces_open_decisions_and_omission_clears_them() {
+        let mut app = App::new();
+        handle_event(
+            &mut app,
+            json!({
+                "ev": "snapshot",
+                "decisions": [{
+                    "id": "snap",
+                    "prompt": "Snapshot choice",
+                    "options": ["one"],
+                    "status": "open"
+                }]
+            }),
+        );
+        assert_eq!(app.decisions.len(), 1);
+        assert_eq!(app.decisions[0].id, "snap");
+        handle_event(&mut app, json!({"ev": "snapshot"}));
+        assert!(app.decisions.is_empty());
     }
 
     /// User prompts go through the real Story renderer with their own semantic

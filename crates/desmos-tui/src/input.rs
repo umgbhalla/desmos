@@ -650,6 +650,22 @@ pub(crate) fn handle_key(
     }
 
     let width = app.input_inner.width.max(20);
+    // The newest open decision owns bare digits only while the composer is
+    // empty. Once typing has begun, digits remain ordinary text.
+    if app.prompt.to_send().is_empty()
+        && app.prompt.images().is_empty()
+        && let KeyCode::Char(digit @ '1'..='9') = key.code
+        && is_text_key(&key)
+        && let Some(decision) = app.decisions.last()
+        && let Some(option) = decision.options.get(digit as usize - '1' as usize)
+    {
+        let line = format!(
+            "decide:{} — {}: {}",
+            decision.id, decision.prompt, option
+        );
+        app.prompt.insert_str(&line);
+        return submit_prompt(bridge, app);
+    }
     let edited = match key.code {
         KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             app.prompt.move_line_home(width);

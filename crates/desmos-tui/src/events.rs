@@ -361,6 +361,40 @@ pub(crate) fn handle_child(app: &mut App, ev: &Value) {
     }
 }
 
+fn decision_from_value(value: &Value) -> Option<crate::Decision> {
+    let status = match value.get("status").and_then(Value::as_str)? {
+        "open" => crate::DecisionStatus::Open,
+        "answered" => crate::DecisionStatus::Answered,
+        _ => return None,
+    };
+    Some(crate::Decision {
+        id: value.get("id")?.as_str()?.to_string(),
+        prompt: value.get("prompt")?.as_str()?.to_string(),
+        options: value
+            .get("options")?
+            .as_array()?
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::to_string)
+            .collect(),
+        status,
+    })
+}
+
+fn apply_decision(app: &mut App, value: &Value) {
+    let Some(id) = value.get("id").and_then(Value::as_str) else {
+        return;
+    };
+    // Any non-open update closes this id. That includes answered and
+    // forward-compatible statuses this client does not yet understand.
+    app.decisions.retain(|item| item.id != id);
+    if let Some(decision) = decision_from_value(value)
+        && decision.status == crate::DecisionStatus::Open
+    {
+        app.decisions.push(decision);
+    }
+}
+
 pub(crate) fn handle_event(app: &mut App, ev: Value) {
     let kind = ev.get("ev").and_then(Value::as_str).unwrap_or("");
     // The work row's repo tail, taken here because this is where the git pane
@@ -368,6 +402,7 @@ pub(crate) fn handle_event(app: &mut App, ev: Value) {
     // fork git itself, on this thread, once per result and per thought.
     app.sess.stream.run.note_repo(&app.git);
     match kind {
+        "decision" => apply_decision(app, &ev),
         "picker" => app.picker.observe(&ev),
         "login" => {
             let text = ev.get("text").and_then(Value::as_str).unwrap_or("");
@@ -377,6 +412,12 @@ pub(crate) fn handle_event(app: &mut App, ev: Value) {
         }
         "ready" | "snapshot" => {
             app.picker.observe(&ev);
+            app.decisions.clear();
+            if let Some(decisions) = ev.get("decisions").and_then(Value::as_array) {
+                for decision in decisions {
+                    apply_decision(app, decision);
+                }
+            }
             if let Some(b) = ev.get("billing").and_then(Value::as_str) {
                 app.cache.plan = b == "plan";
             }

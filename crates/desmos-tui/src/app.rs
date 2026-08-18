@@ -406,6 +406,20 @@ impl TextSel {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum DecisionStatus {
+    Open,
+    Answered,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Decision {
+    pub(crate) id: String,
+    pub(crate) prompt: String,
+    pub(crate) options: Vec<String>,
+    pub(crate) status: DecisionStatus,
+}
+
 pub(crate) struct App {
     pub(crate) prompt: PromptBuf,
     pub(crate) model: String,
@@ -419,6 +433,8 @@ pub(crate) struct App {
     /// sleeper, any submitted task. Non-empty means the session will resume
     /// itself when one lands, which is the one thing polling gets wrong.
     pub(crate) background: Vec<String>,
+    /// Bridge-owned decisions waiting for a one-key human answer, oldest first.
+    pub(crate) decisions: Vec<Decision>,
     /// Slash completion for the composer. Recomputed on every keystroke that
     /// changes the line, so it never has to be dismissed explicitly.
     pub(crate) slash: slash::Slash,
@@ -534,6 +550,7 @@ impl App {
             thinking: String::new(),
             model_pending: None,
             background: Vec::new(),
+            decisions: Vec::new(),
             slash: slash::Slash::default(),
             slash_paste_guard: false,
             theme_preview_origin: None,
