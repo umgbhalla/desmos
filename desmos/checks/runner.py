@@ -15,7 +15,7 @@ import time
 import traceback
 from pathlib import Path
 
-GROUPS = ("layering", "kernel", "transport", "state", "find_check", "recall_check", "agents", "front", "conformance")
+GROUPS = ("layering", "kernel", "transport", "state", "find_check", "recall_check", "agents", "front", "herdr_check", "conformance")
 
 # The seconds tier: the scan/dispatch/persist/edit repros, with no localhost
 # SSE or auth-callback servers (transport), no subagent waits (agents), no

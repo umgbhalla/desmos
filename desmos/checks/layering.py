@@ -63,6 +63,7 @@ ALLOWED_FN_EDGES = {
     ("desmos.kernel.loop", "desmos.state.decisions"),  # decide: answer ingestion seam
     ("desmos.kernel.canonical", "desmos.transport.complete"),
     ("desmos.kernel.exec", "desmos.state.persist"),
+    ("desmos.state.persist", "desmos.front.herdr"),  # Herdr pane sidebar seam
     ("desmos.kernel.loop", "desmos.agents.pending"),  # resume seam
     ("desmos.kernel.loop", "desmos.state.plan"),  # plan rail answers a stop
     ("desmos.kernel.loop", "desmos.state.budget"),  # money ceiling answers a stop
