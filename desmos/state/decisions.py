@@ -10,8 +10,10 @@ urgency ("normal"|"high"), status ("open"|"answered"), answer (str|None), ts.
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
+import os
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -40,7 +42,13 @@ def _append(world: World, rec: dict[str, Any]) -> None:
     path = _decisions_path(world)
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as fh:
-        fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+        try:
+            fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+        finally:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
 
 
 def _all_records(world: World) -> list[dict[str, Any]]:

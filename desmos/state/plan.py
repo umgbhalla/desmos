@@ -18,6 +18,7 @@ where append-only was enforced only by everyone agreeing to behave.
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import os
@@ -104,7 +105,13 @@ def _append(world: World, rec: dict[str, Any]) -> dict[str, Any]:
     path = plans_path(world)
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as fh:
-        fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+        try:
+            fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+        finally:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
     return rec
 
 
