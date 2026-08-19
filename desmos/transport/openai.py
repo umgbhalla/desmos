@@ -625,6 +625,14 @@ def unsupported_field(detail: str) -> str | None:
     return None
 
 
+# Fields the server infers from something we did send. The Codex backend 400s
+# with param=prompt_cache_retention, a field never in the body -- it is
+# derived server-side from prompt_cache_key -- so _drop_field finds nothing
+# and the whole call used to raise. Map the phantom name to the sent field
+# that provokes it; anything unmapped keeps the current raise.
+INFERRED_FIELDS = {"prompt_cache_retention": "prompt_cache_key"}
+
+
 def _drop_field(body: dict[str, Any], path: str) -> bool:
     """Remove what the 400 named, most precisely first. True if anything went.
 
@@ -721,6 +729,10 @@ def complete(
             # `tools` is a prefix test so a complaint about "tools.0.name"
             # cannot amputate the syscall tool and leave the model unable to act.
             field = unsupported_field(detail)
+            if field in INFERRED_FIELDS and field not in body:
+                # The 400 names a field the server inferred, not one we sent;
+                # drop the sent field that provokes it instead.
+                field = INFERRED_FIELDS[field]
             if e.code == 400 and field and not field.startswith("tools") and _drop_field(body, field):
                 dropped.append(field)
                 log_payload(body, [])

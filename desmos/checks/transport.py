@@ -840,6 +840,60 @@ def check() -> None:
         assert _oai.effort_of("medium") == "medium"
         assert "gpt-5.6-sol" in _oai.MODELS and "gpt-5.6-luna" in _oai.MODELS
 
+        # --- 400 retry: a phantom inferred field maps onto the sent field ---
+        # Regression: the Codex backend 400s naming prompt_cache_retention, a
+        # field never in the body (inferred server-side from prompt_cache_key),
+        # so _drop_field found nothing and the whole call raised. The loop must
+        # drop prompt_cache_key and retry instead.
+        import io as _io
+        import urllib.error as _uerr
+
+        def _http400(param):
+            detail = json.dumps({"error": {"message": f"Unsupported parameter: '{param}'"}})
+            return _uerr.HTTPError(
+                "https://api.openai.com/v1/responses", 400, "Bad Request", {},
+                _io.BytesIO(detail.encode()),
+            )
+
+        class _FakeResp:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        sent_bodies = []
+        fails = [_http400("max_output_tokens"), _http400("prompt_cache_retention")]
+
+        def _fake_open(req, **_kw):
+            sent_bodies.append(json.loads(req.data))
+            if fails:
+                raise fails.pop(0)
+            return _FakeResp()
+
+        real_open, real_read = _oai._open_with_retry, _oai.read_sse
+        real_cred, real_log = _oai.auth.credential, _oai.log_payload
+        _oai._open_with_retry = _fake_open
+        _oai.read_sse = lambda *_a, **_k: {"content": [{"type": "text", "text": "ok"}], "usage": {}}
+        _oai.auth.credential = lambda *_a, **_k: _auth.Credential(provider="openai", kind="env", token="sk-x")
+        _oai.log_payload = lambda *_a, **_k: ""
+        try:
+            out_retry = _oai.complete(
+                "gpt-5.6-sol", "system", [{"role": "user", "content": "hi"}], 100,
+                cache_key="ck-regress",
+            )
+        finally:
+            _oai._open_with_retry, _oai.read_sse = real_open, real_read
+            _oai.auth.credential, _oai.log_payload = real_cred, real_log
+        assert len(sent_bodies) == 3, f"expected 3 attempts, saw {len(sent_bodies)}"
+        assert sent_bodies[0]["prompt_cache_key"] == "ck-regress"
+        assert "max_output_tokens" not in sent_bodies[1], "first 400 must drop max_output_tokens"
+        assert "prompt_cache_retention" not in sent_bodies[1], "never sent, never appears"
+        assert "prompt_cache_key" not in sent_bodies[2], (
+            "400 naming inferred prompt_cache_retention must drop prompt_cache_key"
+        )
+        assert text_of(out_retry) == "ok", out_retry
+
         reasoning_item = {
             "id": "rs_1",
             "type": "reasoning",
