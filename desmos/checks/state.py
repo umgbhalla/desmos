@@ -123,6 +123,18 @@ def check() -> None:
         import sqlite3 as _sqlite3
 
         with _sqlite3.connect(cwd / "harness.sqlite3") as _db:
+            # No transcript was saved, so no session row exists yet: a session
+            # becomes a row on its first real record, not on process start.
+            assert _db.execute("SELECT COUNT(*) FROM sessions").fetchone()[0] == 0
+            assert _db.execute("PRAGMA foreign_key_check").fetchall() == []
+        world2.messages = [
+            {"role": "user", "content": "session row check"},
+            {"role": "assistant", "content": "minted on first record"},
+        ]
+        from desmos.state.persist import save as _save
+
+        _save(world2)
+        with _sqlite3.connect(cwd / "harness.sqlite3") as _db:
             assert _db.execute("SELECT COUNT(*) FROM sessions").fetchone()[0] == 1
             assert _db.execute("PRAGMA foreign_key_check").fetchall() == []
 

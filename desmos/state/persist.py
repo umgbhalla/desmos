@@ -870,6 +870,19 @@ def _workspace_id(
     return workspace
 
 
+def _resume_parent(conn: sqlite3.Connection, workspace: str) -> str | None:
+    """The session this attach would descend from, if any."""
+    fresh = str(os.environ.get(NEW_SESSION_ENV, "")).strip().lower()
+    if fresh in {"1", "true", "yes", "on"}:
+        return None
+    row = conn.execute(
+        "SELECT id FROM sessions WHERE workspace_id = ?"
+        " ORDER BY started_at DESC, id DESC LIMIT 1",
+        (workspace,),
+    ).fetchone()
+    return str(row["id"]) if row else None
+
+
 def _session_id(
     conn: sqlite3.Connection, world: World, workspace: str, *, create: bool = True
 ) -> str | None:
@@ -888,15 +901,7 @@ def _session_id(
         return current
     if not create:
         return None
-    fresh = str(os.environ.get(NEW_SESSION_ENV, "")).strip().lower()
-    parent = None
-    if fresh not in {"1", "true", "yes", "on"}:
-        parent = conn.execute(
-            "SELECT id FROM sessions WHERE workspace_id = ?"
-            " ORDER BY started_at DESC, id DESC LIMIT 1",
-            (workspace,),
-        ).fetchone()
-    parent_id = str(parent["id"]) if parent else None
+    parent_id = _resume_parent(conn, workspace)
     conn.execute(
         "INSERT INTO sessions(id, workspace_id, parent_id, kind, started_at,"
         " last_seen_at, model, thinking, cache_key)"
@@ -938,8 +943,12 @@ def _save_data(conn: sqlite3.Connection, world: World, data: dict[str, Any]) -> 
     try:
         workspace = _workspace_id(conn, world)
         assert workspace is not None
-        session = _session_id(conn, world, workspace)
-        assert session is not None
+        # A session becomes a row only once it has something to record: a
+        # bare resume that saves nothing must leave no incarnation behind.
+        session = _session_id(
+            conn, world, workspace,
+            create=bool(data["messages"] or data["prior"]),
+        )
         conn.execute(
             "UPDATE workspaces SET generation = ?, gen_reason = ?, updated_at = ?"
             " WHERE id = ?",
@@ -1216,8 +1225,11 @@ def announce(world: World, conn: sqlite3.Connection | None = None) -> None:
         with db:
             workspace = _workspace_id(db, world)
             assert workspace is not None
-            session = _session_id(db, world, workspace)
-            assert session is not None
+            session = _session_id(db, world, workspace, create=False)
+            if session is None:
+                # No record yet, so no sessions row to reference: presence
+                # stays on the lease file until something real is written.
+                return
             db.execute(
                 """
                 INSERT INTO active_runs(
@@ -2135,9 +2147,10 @@ def save(world: World) -> None:
         with conn:
             workspace = _workspace_id(conn, world)
             assert workspace is not None
-            session = _session_id(conn, world, workspace)
-            assert session is not None
-            _prune_sessions(conn, workspace, session, path=state_file(world))
+            session = _session_id(conn, world, workspace, create=False)
+            # Pruning is bounded by the workspace, not by whether this attach
+            # has minted its own row yet; an unminted run id excludes nothing.
+            _prune_sessions(conn, workspace, session or run_id(), path=state_file(world))
     finally:
         conn.close()
     try:
@@ -2225,17 +2238,21 @@ def _read_data(
     workspace = _workspace_id(conn, world, create=False)
     if workspace is None:
         return None
-    current = _session_id(conn, world, workspace)
-    assert current is not None
+    current = _session_id(conn, world, workspace, create=False)
     workspace_row = conn.execute(
         "SELECT generation, gen_reason FROM workspaces WHERE id = ?",
         (workspace,),
     ).fetchone()
-    current_row = conn.execute(
-        "SELECT thinking FROM sessions WHERE id = ?", (current,)
-    ).fetchone()
+    current_row = None
+    if current is not None:
+        current_row = conn.execute(
+            "SELECT thinking FROM sessions WHERE id = ?", (current,)
+        ).fetchone()
 
-    lineage = _lineage(conn, current)
+    # With no row of its own yet, this attach reads the line of descent it
+    # would join on its first write, so a bare resume still sees history.
+    head = current or _resume_parent(conn, workspace)
+    lineage = _lineage(conn, head) if head else []
     slots = ",".join("?" * len(lineage))
     message_rows = conn.execute(
         f"""
@@ -2246,7 +2263,7 @@ def _read_data(
         ORDER BY sessions.started_at, sessions.id, messages.seq
         """,
         lineage,
-    ).fetchall()
+    ).fetchall() if lineage else []
     messages = [
         {"role": row["role"], "content": json.loads(row["content_json"])}
         for row in message_rows
@@ -2264,7 +2281,7 @@ def _read_data(
         ORDER BY sessions.started_at, sessions.id, prior_turns.seq
         """,
         lineage,
-    ).fetchall()
+    ).fetchall() if lineage else []
     kept_prior = prior_rows[-PRIOR_KEEP:]
     prior = [
         {"prompt": row["prompt"], "speech": row["speech"]}
@@ -2296,7 +2313,7 @@ def _read_data(
     return {
         "generation": int(workspace_row["generation"]),
         "gen_reason": str(workspace_row["gen_reason"]),
-        "thinking": str(current_row["thinking"]),
+        "thinking": str(current_row["thinking"]) if current_row else str(world.thinking),
         "messages": messages,
         "prior": prior,
         "notes": notes,
@@ -2323,8 +2340,7 @@ def load(world: World) -> None:
         conn.execute("BEGIN IMMEDIATE")
         workspace = _workspace_id(conn, world)
         assert workspace is not None
-        session = _session_id(conn, world, workspace)
-        assert session is not None
+        _session_id(conn, world, workspace, create=False)
         data = _read_data(conn, world)
         conn.commit()
         if data is not None:
@@ -2361,7 +2377,12 @@ def op_rollup(world: World) -> list[tuple[str, int]]:
         workspace = _workspace_id(db, world, create=False)
         if workspace is None:
             return []
-        chain = _lineage(db, _session_id(db, world, workspace))
+        head = _session_id(db, world, workspace, create=False) or _resume_parent(
+            db, workspace
+        )
+        if head is None:
+            return []
+        chain = _lineage(db, head)
         slots = ",".join("?" for _ in chain)
         rows = db.execute(
             "SELECT payload_json FROM events WHERE kind = 'result'"
@@ -2395,7 +2416,9 @@ def _lineage_chain(conn, world):
     workspace = _workspace_id(conn, world, create=False)
     if workspace is None:
         return []
-    session = _session_id(conn, world, workspace, create=False)
+    session = _session_id(conn, world, workspace, create=False) or _resume_parent(
+        conn, workspace
+    )
     return _lineage(conn, session) if session else []
 
 
