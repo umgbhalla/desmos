@@ -26,6 +26,7 @@ def check() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         sock_path = str(Path(tmp) / "herdr.sock")
         frames: list[dict] = []
+        rejected: list[dict] = []
         srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         srv.bind(sock_path)
         srv.listen(8)
@@ -45,9 +46,22 @@ def check() -> None:
                             break
                         data += chunk
                     if data:
-                        frames.append(json.loads(data))
+                        frame = json.loads(data)
+                        # Mirror the real herdr server: a JSON-RPC id must
+                        # be a string; anything else is rejected.
+                        if isinstance(frame.get("id"), str):
+                            frames.append(frame)
+                            reply = b'{"result":{"type":"ok"}}\n'
+                        else:
+                            rejected.append(frame)
+                            reply = (
+                                b'{"error":{"code":"invalid_request",'
+                                b'"message":"invalid type: expected a string"}}\n'
+                            )
+                    else:
+                        reply = b"{}\n"
                     try:
-                        conn.sendall(b"{}\n")
+                        conn.sendall(reply)
                     except OSError:
                         pass
 
@@ -91,7 +105,8 @@ def check() -> None:
             assert states == ["working", "blocked", "idle"], states
             first = frames[0]
             assert first["method"] == "pane.report_agent", first
-            assert isinstance(first["id"], int)
+            assert isinstance(first["id"], str) and first["id"], first
+            assert rejected == [], f"server rejected non-string ids: {rejected}"
             p = first["params"]
             assert p["pane_id"] == "pane-7", p
             assert p["source"] == "herdr:desmos", p

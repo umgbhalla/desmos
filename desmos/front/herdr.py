@@ -71,7 +71,7 @@ def observe(event: dict[str, Any]) -> None:
         if isinstance(text, str) and text:
             params["message"] = text[:120]
         frame = {
-            "id": next(_uniq),
+            "id": f"herdr:desmos:{next(_uniq)}",
             "method": "pane.report_agent",
             "params": params,
         }
