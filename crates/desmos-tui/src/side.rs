@@ -231,6 +231,12 @@ impl GitPane {
         }
     }
 
+    /// True while a read is in flight — the event loop keeps its short poll
+    /// so the result is drained promptly.
+    pub fn busy(&self) -> bool {
+        self.pending.is_some()
+    }
+
     /// The generation of the read `snap` came from. Zero until one lands.
     pub fn snap_gen(&self) -> u64 {
         self.snap_at

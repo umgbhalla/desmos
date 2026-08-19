@@ -1072,10 +1072,14 @@ fn run(
     // when a running entry is in view. `tick_running()` only invalidates
     // caches — it does not advance the frame.
     const DRAIN: usize = 32;
-    const ANIM: Duration = Duration::from_millis(33);
     let mut dirty = true;
     let mut last_anim = Instant::now();
     let mut last_cache = Instant::now();
+    // Last user key / bridge event. A reply to an op the user just sent
+    // (session list, model change) arrives on the bridge channel, which
+    // event::poll cannot see — so keep the short poll for a couple of seconds
+    // after any activity, then fall back to the long idle block.
+    let mut last_activity = Instant::now();
     loop {
         let mut more = false;
         let mut died = false;
@@ -1086,6 +1090,7 @@ fn run(
                     Ok(ev) => {
                         handle_event(app, ev);
                         dirty = true;
+                        last_activity = Instant::now();
                         n += 1;
                         if n >= DRAIN {
                             more = true;
@@ -1125,7 +1130,7 @@ fn run(
             dirty = true;
         }
 
-        let live = streaming(app) || app.running || app.sess.story.has_running_entries();
+        let live = animating(app);
         if live && last_anim.elapsed() >= ANIM {
             if tick_scrollbacks(app) || app.running {
                 dirty = true;
@@ -1172,12 +1177,11 @@ fn run(
 
         let wait = if more {
             Duration::ZERO
-        } else if live {
-            ANIM
         } else {
-            Duration::from_millis(80)
+            poll_wait(app, last_activity.elapsed() < ACTIVITY_GRACE)
         };
         if event::poll(wait)? {
+            last_activity = Instant::now();
             let mut evs = vec![event::read()?];
             while event::poll(Duration::ZERO)? {
                 evs.push(event::read()?);
@@ -2014,6 +2018,38 @@ fn exec_activity_title(app: &App) -> String {
     } else {
         format!("<{}>", app.sess.exec.tag)
     }
+}
+
+/// Frame period while something on screen is actually moving (~30fps).
+const ANIM: Duration = Duration::from_millis(33);
+/// The short poll: responsive to bridge replies, worker results, and notice
+/// expiry without a busy loop.
+const SHORT_WAIT: Duration = Duration::from_millis(80);
+/// The idle block. Nothing animating, nothing pending: `event::poll` sleeps
+/// until a key arrives or a second passes (the git REFRESH timer and the
+/// cache-TTL bar only need a once-a-second look).
+const IDLE_WAIT: Duration = Duration::from_secs(1);
+/// How long after a key or bridge event the short poll is kept, so a reply
+/// riding the bridge channel (which `event::poll` cannot see) lands promptly.
+const ACTIVITY_GRACE: Duration = Duration::from_secs(2);
+
+/// True while something visibly animates: a streaming reply, a running turn,
+/// or a spinner on a running story entry. Only then does the loop tick at
+/// ANIM; idle, it blocks and paints nothing.
+fn animating(app: &App) -> bool {
+    streaming(app) || app.running || app.sess.story.has_running_entries()
+}
+
+/// How long the event loop may block before it must wake on its own.
+fn poll_wait(app: &App, recent_activity: bool) -> Duration {
+    if animating(app) {
+        return ANIM;
+    }
+    let short = recent_activity
+        || app.notice.is_some()          // lapse on time, not up to 1s late
+        || app.file_picker.is_open()     // scan results stream in
+        || app.git.busy();               // a read is in flight
+    if short { SHORT_WAIT } else { IDLE_WAIT }
 }
 
 fn streaming(app: &App) -> bool {
@@ -4231,6 +4267,38 @@ fn format_usage(
 
 #[cfg(test)]
 mod tests {
+
+    /// Idle must not tick: with nothing pending the loop blocks for
+    /// IDLE_WAIT (no 33ms animation frame, so no repaint per tick) and only
+    /// wakes fast while something is actually live.
+    #[test]
+    fn idle_loop_blocks_long_and_skips_animation() {
+        let mut app = App::new();
+        assert!(!animating(&app), "fresh app has nothing to animate");
+        assert_eq!(poll_wait(&app, false), IDLE_WAIT, "idle blocks long");
+        assert_eq!(
+            poll_wait(&app, true),
+            SHORT_WAIT,
+            "recent input keeps the short poll for the bridge reply"
+        );
+        app.notify("hello");
+        assert_eq!(
+            poll_wait(&app, false),
+            SHORT_WAIT,
+            "a notice must lapse on time"
+        );
+        app.notice = None;
+        app.running = true;
+        assert!(animating(&app), "a running turn animates");
+        assert_eq!(poll_wait(&app, false), ANIM);
+        app.running = false;
+        app.sess.stream.speech = Some(wire_push(
+            &mut app.sess.story,
+            RenderBlock::system("streaming"),
+        ));
+        assert!(animating(&app), "a streaming reply animates");
+        assert_eq!(poll_wait(&app, false), ANIM);
+    }
 
     #[test]
     fn a_chatgpt_plan_does_not_print_a_bill() {
