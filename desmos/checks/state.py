@@ -356,6 +356,7 @@ def check() -> None:
         _check_slice(cwd)
         _check_schema_tolerance()
         _check_quarantine_manifest()
+        _check_quarantine_gate()
         _check_prune_manifest()
         _check_cold_store()
         _check_outbox()
@@ -446,6 +447,102 @@ def _check_quarantine_manifest() -> None:
         warnings.simplefilter("ignore")
         persist.load(fresh)
     assert len(persist.read_events(fresh, limit=500)) == before, "quarantine notice repeated"
+
+
+def _check_quarantine_gate() -> None:
+    """Only confirmed corruption gets renamed; transient errors never do.
+
+    `_open` used to quarantine on every `sqlite3.DatabaseError`, so a lock or
+    an interrupted read cost the whole database. Now a `PRAGMA quick_check`
+    gates the rename: a healthy file hit by a transient error is retried once
+    and then re-raised, never renamed; a truly corrupt file still quarantines
+    -- exactly once, even when two openers race.
+    """
+    import glob
+    import sqlite3
+    import tempfile
+    import threading
+    import warnings
+
+    from desmos.state import persist
+
+    # Transient DatabaseError on a healthy database: never renamed.
+    root = Path(tempfile.mkdtemp())
+    world = new_world(root, persist=True)
+    world.messages.append({"role": "user", "content": "survives the transient"})
+    persist.save(world)
+    path = persist.state_file(world)
+    assert path.is_file(), path
+    quarantines_before = persist.quarantines(path)
+
+    calls = {"n": 0}
+    orig_migrate = persist._migrate
+
+    def always_transient(conn):
+        calls["n"] += 1
+        raise sqlite3.OperationalError("database is locked")
+
+    persist._migrate = always_transient
+    try:
+        raised = False
+        try:
+            persist._open(path).close()
+        except sqlite3.OperationalError:
+            raised = True
+    finally:
+        persist._migrate = orig_migrate
+    assert raised, "transient error was swallowed"
+    assert calls["n"] == 2, f"expected one retry, saw {calls['n']} attempts"
+    assert path.is_file(), "healthy database vanished"
+    assert not glob.glob(str(path) + "*.corrupt*"), "healthy database quarantined"
+    assert persist.quarantines(path) == quarantines_before, "transient recorded as corruption"
+
+    # A transient that clears on the retry succeeds without any rename.
+    flaky = {"n": 0}
+
+    def transient_once(conn):
+        flaky["n"] += 1
+        if flaky["n"] == 1:
+            raise sqlite3.OperationalError("database is locked")
+        return orig_migrate(conn)
+
+    persist._migrate = transient_once
+    try:
+        persist._open(path).close()
+    finally:
+        persist._migrate = orig_migrate
+    assert flaky["n"] == 2, flaky
+    assert not glob.glob(str(path) + "*.corrupt*"), "retry path quarantined"
+
+    # Truly corrupt file: quarantined exactly once under concurrent opens.
+    raw = bytearray(path.read_bytes())
+    raw[0:16] = b"not-a-database\x00\x00"
+    path.write_bytes(bytes(raw))
+    persist._QUARANTINE_REPORTED.discard(str(path))
+
+    errors: list[BaseException] = []
+
+    def opener() -> None:
+        try:
+            persist._open(path).close()
+        except BaseException as exc:  # noqa: BLE001 -- collected for the assert
+            errors.append(exc)
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        threads = [threading.Thread(target=opener) for _ in range(2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+    assert not errors, errors
+    corpses = glob.glob(str(path) + ".corrupt*")
+    assert len(corpses) == 1, f"main db renamed {len(corpses)} times: {corpses}"
+    entries = persist.quarantines(path)
+    assert len(entries) == len(quarantines_before) + 1, entries
+    assert path.is_file(), "no fresh database after quarantine"
+    conn = persist._open(path)
+    conn.close()
 
 
 def _check_prune_manifest() -> None:

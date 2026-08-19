@@ -745,6 +745,50 @@ def _migrate(conn: sqlite3.Connection) -> None:
         raise
 
 
+def _quick_check_verdict(path: Path) -> bool | None:
+    """Is the file on disk actually corrupt?
+
+    True: PRAGMA quick_check passes. False: confirmed corruption ("file is
+    not a database", "disk image is malformed"). None: inconclusive -- the
+    file is missing, locked, or unreadable right now. Only False is ever
+    grounds for quarantine; a lock or an I/O hiccup on a healthy database
+    must never cost its state.
+    """
+    if not path.exists():
+        return None
+    try:
+        probe = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5.0)
+    except sqlite3.Error:
+        return None
+    try:
+        rows = probe.execute("PRAGMA quick_check").fetchall()
+    except sqlite3.OperationalError:
+        # Locks and open failures are transient, not proof of corruption.
+        return None
+    except sqlite3.DatabaseError:
+        return False
+    finally:
+        probe.close()
+    return len(rows) == 1 and str(rows[0][0]).lower() == "ok"
+
+
+def _quarantine(path: Path, exc: BaseException) -> list[Path]:
+    """Rename a confirmed-corrupt database -- exactly once across openers.
+
+    The flock serializes concurrent openers; whoever waits re-checks the
+    verdict under the lock, because the winner has already renamed the dead
+    file and created a fresh one, and renaming *that* would lose it.
+    """
+    lock_path = path.with_name(path.name + ".quarantine.lock")
+    with open(lock_path, "w", encoding="utf-8") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if _quick_check_verdict(path) is not False:
+            return []
+        moved = _move_sqlite_files(path, "corrupt")
+        _record_quarantine(path, exc, moved)
+        return moved
+
+
 def _open(path: Path) -> sqlite3.Connection:
     path.parent.mkdir(parents=True, exist_ok=True)
     conn: sqlite3.Connection | None = None
@@ -755,15 +799,28 @@ def _open(path: Path) -> sqlite3.Connection:
     except sqlite3.DatabaseError as exc:
         if conn is not None:
             conn.close()
-        moved = _move_sqlite_files(path, "corrupt")
-        _record_quarantine(path, exc, moved)
-        warnings.warn(
-            f"backed up corrupt harness database ({exc}); fresh state will be created"
-            + (f" at {moved[0]}" if moved else "")
-            + f"; accounted in {quarantine_log_path(path)}",
-            RuntimeWarning,
-            stacklevel=2,
-        )
+        if _quick_check_verdict(path) is not False:
+            # The file itself is healthy (or cannot be judged): the error was
+            # transient -- a lock, a race, an interrupted read. Retry once,
+            # then surface it. Quarantining a healthy database loses state.
+            conn = None
+            try:
+                conn = _connect(path)
+                _migrate(conn)
+                return conn
+            except sqlite3.DatabaseError:
+                if conn is not None:
+                    conn.close()
+                raise
+        moved = _quarantine(path, exc)
+        if moved:
+            warnings.warn(
+                f"backed up corrupt harness database ({exc}); fresh state will be created"
+                + f" at {moved[0]}"
+                + f"; accounted in {quarantine_log_path(path)}",
+                RuntimeWarning,
+                stacklevel=2,
+            )
         conn = _connect(path)
         _migrate(conn)
         return conn
