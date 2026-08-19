@@ -1153,7 +1153,7 @@ def _check_injections(cwd: Path) -> None:
 
 
 def _check_steer(cwd: Path) -> None:
-    """A steer rides in the carrier that answers the call already in flight."""
+    """A steer arrives as its own labelled user turn, never inside a result."""
     from desmos.kernel.catalog import steer
     from desmos.kernel.loop import run_turns
 
@@ -1175,15 +1175,15 @@ def _check_steer(cwd: Path) -> None:
     world.complete_fn = fake
     run_turns(world, "go", quiet=True, on_continue=lambda n: "guidance: keep going")
 
-    roles = [m["role"] for m in world.messages]
-    pairs = list(zip(roles, roles[1:]))
-    assert ("user", "user") not in pairs, roles
     carrier = world.messages[2]
     assert carrier["role"] == "user", carrier
     kinds = [b.get("type") for b in carrier["content"]]
-    assert kinds == ["tool_result", "text", "text"], kinds
-    assert carrier["content"][1]["text"] == "switch to the smaller file"
-    assert carrier["content"][2]["text"] == "guidance: keep going"
+    # The steer never rides in the carrier: gluing it onto an already-sent
+    # result block read out of order in the transcript.
+    assert kinds == ["tool_result"], kinds
+    steer_msg = world.messages[3]
+    assert steer_msg["role"] == "user", steer_msg
+    assert steer_msg["content"] == "[steer] switch to the smaller file", steer_msg
     assert world.steers == [], world.steers
     print("steer check ok")
 

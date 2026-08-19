@@ -222,6 +222,17 @@ def deliver(world, text: str) -> None:
     msgs.append({"role": "user", "content": text})
 
 
+def deliver_steer(world, text: str) -> None:
+    """A steered line gets its own labelled user turn, never a merge.
+
+    deliver() folds text into the previous user message; for a steer that
+    glued fresh input onto an already-sent result block, which reads out of
+    order. A steer is the user speaking mid-step, so it arrives as its own
+    user turn, labelled so the model knows it is a redirect.
+    """
+    world.messages.append({"role": "user", "content": f"[steer] {text}"})
+
+
 _BUILTIN_DOCS = (
     ("python", "exec Python in the persistent kernel"),
     ("bash", "isolated one-shot command in cwd — no state kept; use only when reset is useful"),
@@ -1068,9 +1079,11 @@ def _run_turns(
             )
         # A syscall in this batch may have handed work to a monitor. Say so now,
         # while the turn is still running, rather than at the park.
+        steered = False
         for line in drain_steers(world):
-            deliver(world, line)
+            deliver_steer(world, line)
             emit({"ev": "steer", "n": n, "text": line})
+            steered = True
         emit_pending()
         # After the results, never before: the note explains what did not run,
         # and reads as nonsense ahead of the output of what did.
@@ -1079,6 +1092,12 @@ def _run_turns(
             emit({"ev": "error", "n": n, "text": cut_note})
             if not quiet:
                 print(cut_note)
+        if steered and not stopped():
+            # `done` was decided before the steer was drained: the model
+            # finished a turn it had never seen the steer in. Ending the step
+            # here would leave the line sitting in the transcript unread until
+            # something else woke the loop -- run another turn instead.
+            continue
         if done or stopped():
             if stopped():
                 # A stop left no trace in the transcript, so the next step read
@@ -1100,7 +1119,19 @@ def _run_turns(
 
             if pending.count(world):
                 emit_pending()
-                landed = pending.wait_next(world, stop=stopped, interrupt=has_input)
+                def _steer_or_input() -> bool:
+                    # A queued steer breaks the park the same way user input
+                    # does: the user is redirecting now, not after the task.
+                    if world.steers:
+                        return True
+                    return bool(has_input()) if has_input is not None else False
+
+                landed = pending.wait_next(world, stop=stopped, interrupt=_steer_or_input)
+                if not landed and world.steers:
+                    for line in drain_steers(world):
+                        deliver_steer(world, line)
+                        emit({"ev": "steer", "n": n, "text": line})
+                    continue
                 if landed:
                     text = pending.notice(landed)
                     deliver(world, text)

@@ -471,6 +471,62 @@ def check() -> None:
         assert "post" in seen
         assert seen.index("post") < seen.index("complete")
 
+        # --- steer wakes the step ---
+        # `done` is decided before the steers drain, so a steer landing on the
+        # turn the model finished used to sit in the transcript unread while
+        # the step returned. It must buy another turn, and it must arrive as
+        # its own labelled user message, never glued into a sent result.
+        from desmos.kernel.catalog import steer as _steer
+
+        w_steer = new_world(cwd, state_path=cwd / "harness-steer.json", ns={})
+        _steer_calls: list[int] = []
+
+        def fake_done(_model, _system, messages, _max_tokens):
+            _steer_calls.append(len(messages))
+            return {"content": [{"type": "text", "text": f"reply {len(_steer_calls)}"}], "usage": {}}
+
+        w_steer.complete_fn = fake_done
+        _steer(w_steer, "redirect to Z")
+        steer_events: list[dict] = []
+        _run(w_steer, "go", quiet=True, on_event=steer_events.append)
+        steer_turns = [e for e in steer_events if e.get("ev") == "turn"]
+        assert len(steer_turns) == 2, f"a steer on a done turn must buy another turn: {steer_events}"
+        assert [
+            m for m in w_steer.messages
+            if m.get("role") == "user" and m.get("content") == "[steer] redirect to Z"
+        ], w_steer.messages
+        for m in w_steer.messages:
+            content = m.get("content")
+            if isinstance(content, list):
+                assert not any("redirect to Z" in str(b) for b in content), m
+
+        # A steer queued while the loop is parked in pending.wait_next breaks
+        # the park the way user input does -- before the task lands, not after.
+        from desmos.agents import pending as _pending
+
+        w_park = new_world(cwd, state_path=cwd / "harness-park.json", ns={})
+        _release = _threading.Event()
+
+        def fake_park(_model, _system, messages, _max_tokens):
+            if not any(m.get("role") == "assistant" for m in messages):
+                _pending.submit(w_park, "slowtask", lambda: _release.wait(timeout=10) and "landed")
+            return {"content": [{"type": "text", "text": "ok"}], "usage": {}}
+
+        w_park.complete_fn = fake_park
+        park_events: list[dict] = []
+        _threading.Timer(0.15, lambda: _steer(w_park, "wake up")).start()
+        _threading.Timer(0.6, _release.set).start()
+        _run(w_park, "start", quiet=True, on_event=park_events.append)
+        park_names = [e.get("ev") for e in park_events]
+        assert "steer" in park_names and "resumed" in park_names, park_names
+        assert park_names.index("steer") < park_names.index("resumed"), (
+            f"a steer must break the park before the task lands: {park_names}"
+        )
+        assert any(
+            m.get("role") == "user" and m.get("content") == "[steer] wake up"
+            for m in w_park.messages
+        ), w_park.messages
+
         # A syscall that raises is that syscall's result. It used to unwind the
         # whole dispatch loop and take the syscalls before it with it: the
         # <bash> had already run, its output was thrown away, and the model's
