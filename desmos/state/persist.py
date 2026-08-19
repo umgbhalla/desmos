@@ -46,6 +46,13 @@ RUN_ID_ENV = SESSION_ID_ENV  # compatibility name for the public run_id() API
 DB_FILENAME = "harness.sqlite3"
 KEEP_MESSAGES = 80
 SESSION_KEEP = 24
+#: Launch announcements describe a process starting, not anything it did.
+#: Alone they must never mint a sessions row (see 4050814): with no row yet
+#: they wait in _PENDING_LAUNCH and land only when a real record mints one.
+LAUNCH_EVENT_KINDS = frozenset({"session", "ready"})
+#: Launch events buffered per run id until that run's row exists, so a bare
+#: launch that records nothing leaves no trace and the events FK stays whole.
+_PENDING_LAUNCH: dict[str, list[tuple[str, str, int, str, int, int]]] = {}
 _PRESENCE_LEASES: dict[str, Any] = {}
 
 
@@ -918,6 +925,20 @@ def _session_id(
             f"desmos-{current[:16]}",
         ),
     )
+    for kind, payload, nbytes, digest, ts_ms, mono_ns in _PENDING_LAUNCH.pop(
+        current, []
+    ):
+        seq_row = conn.execute(
+            "SELECT COALESCE(MAX(seq), 0) FROM events WHERE session_id = ?",
+            (current,),
+        ).fetchone()
+        conn.execute(
+            "INSERT INTO events(session_id, seq, ts_ms, mono_ns, kind,"
+            " payload_json, payload_bytes, payload_sha256)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (current, int(seq_row[0]) + 1, ts_ms, mono_ns, kind,
+             payload, nbytes, digest),
+        )
     return current
 
 
@@ -2065,7 +2086,19 @@ def record_event(
         with conn:
             workspace = _workspace_id(conn, world)
             assert workspace is not None
-            session = _session_id(conn, world, workspace)
+            if kind in LAUNCH_EVENT_KINDS:
+                # A bare launch mints no row. Until a real record mints one,
+                # the announcement waits in memory; _session_id flushes it as
+                # the row's first events, so replay still opens on 'session'.
+                session = _session_id(conn, world, workspace, create=False)
+                if session is None:
+                    _PENDING_LAUNCH.setdefault(run_id(), []).append(
+                        (kind, payload, len(raw.encode("utf-8")), digest,
+                         int(ts_ms), int(mono_ns))
+                    )
+                    return 0
+            else:
+                session = _session_id(conn, world, workspace)
             assert session is not None
             row = conn.execute(
                 "SELECT COALESCE(MAX(seq), 0) FROM events WHERE session_id = ?",

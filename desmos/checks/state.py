@@ -122,6 +122,12 @@ def check() -> None:
         assert (cwd / "harness.sqlite3").read_bytes().startswith(b"SQLite format 3")
         import sqlite3 as _sqlite3
 
+        from desmos.state.persist import record_event as _record_event
+
+        # A launch announcement alone -- the bridge's 'session' plus the TUI's
+        # 'ready' -- is not a record and must not mint a sessions row either.
+        assert _record_event(world2, {"ev": "session"}, ts_ms=0, mono_ns=0) == 0
+        assert _record_event(world2, {"ev": "ready"}, ts_ms=1, mono_ns=1) == 0
         with _sqlite3.connect(cwd / "harness.sqlite3") as _db:
             # No transcript was saved, so no session row exists yet: a session
             # becomes a row on its first real record, not on process start.
