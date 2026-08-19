@@ -1,6 +1,6 @@
 //! Follow-up query stack — grok's pending_prompts, local to desmos.
 //!
-//! Enter while a step is running appends a row. After the step settles the
+//! Tab while a step is running appends a row. After the step settles the
 //! front runs. Empty Enter mid-step is send-now: stop the current step and
 //! fire the front immediately.
 
@@ -148,14 +148,6 @@ impl QueryQueue {
         self.items.len().saturating_sub(MAX_VISIBLE)
     }
 
-    pub fn display_height(&self) -> u16 {
-        if self.items.is_empty() {
-            0
-        } else {
-            (self.items.len().min(MAX_VISIBLE) as u16).saturating_add(2)
-        }
-    }
-
     pub fn lines(&self, width: u16, focused: bool) -> Vec<Line<'static>> {
         let theme = Theme::current();
         let w = width.max(8) as usize;
@@ -225,7 +217,7 @@ impl QueryQueue {
     }
 }
 
-fn truncate_width(s: &str, max: usize) -> String {
+pub(crate) fn truncate_width(s: &str, max: usize) -> String {
     if UnicodeWidthStr::width(s) <= max {
         return s.to_string();
     }

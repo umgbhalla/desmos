@@ -1,7 +1,7 @@
 //! The App: parent session state, child sessions, focus, and pane layout.
 //! Moved verbatim out of main.rs.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -484,6 +484,9 @@ pub(crate) struct App {
     /// turn's reply, and saying so beats blanking it under a new number.
     pub(crate) post_out_n: u64,
     pub(crate) queue: QueryQueue,
+    /// Steers submitted to the bridge but not yet acknowledged by the kernel's
+    /// `ev:steer`. They stay visible until the running turn consumes them.
+    pub(crate) pending_steers: VecDeque<String>,
     pub(crate) send_now: bool,
     /// Cheatsheet for the focused pane's keys, open until the next key.
     pub(crate) help: bool,
@@ -575,6 +578,7 @@ impl App {
             post_n: 0,
             post_out_n: 0,
             queue: QueryQueue::default(),
+            pending_steers: VecDeque::new(),
             send_now: false,
             help: false,
             queue_edit: None,

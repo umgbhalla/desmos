@@ -1437,17 +1437,22 @@ fn start_step(
 }
 
 fn submit_prompt(bridge: Option<&mut Bridge>, app: &mut App) -> io::Result<bool> {
-    submit_prompt_inner(bridge, app, false)
+    submit_prompt_inner(bridge, app, false, false)
 }
 
 fn submit_prompt_forced_step(bridge: Option<&mut Bridge>, app: &mut App) -> io::Result<bool> {
-    submit_prompt_inner(bridge, app, true)
+    submit_prompt_inner(bridge, app, true, false)
+}
+
+fn queue_prompt(bridge: Option<&mut Bridge>, app: &mut App) -> io::Result<bool> {
+    submit_prompt_inner(bridge, app, false, true)
 }
 
 fn submit_prompt_inner(
     mut bridge: Option<&mut Bridge>,
     app: &mut App,
     force_step: bool,
+    force_queue: bool,
 ) -> io::Result<bool> {
     let images = app.prompt.images();
     // An image with no words is a real prompt -- "look at this" is the whole
@@ -1560,6 +1565,7 @@ fn submit_prompt_inner(
         app.post_n = 0;
         app.post_out_n = 0;
         app.queue.clear();
+        app.pending_steers.clear();
         app.queue_edit = None;
         app.send_now = false;
         app.notify("transcript cleared");
@@ -1575,8 +1581,13 @@ fn submit_prompt_inner(
         if let Some(idx) = slot {
             app.queue.insert_at_with(idx, line, images);
             app.notify(format!("queued #{}", idx + 1));
+        } else if force_queue {
+            let idx = app.queue.len();
+            app.queue.push_with(line, images);
+            app.notify(format!("queued #{}", idx + 1));
         } else if let Some(b) = bridge.as_mut() {
             b.send(&json!({"op": "steer", "text": line}))?;
+            app.pending_steers.push_back(line);
         } else {
             app.notify("bridge is gone");
         }
@@ -2123,7 +2134,7 @@ fn draw(f: &mut Frame, app: &mut App) {
     // The composer frame shares the Story column edges; only its own border is
     // removed when measuring wrapped text.
     let inner_w = body[0].width.saturating_sub(2);
-    let queue_h = app.queue.display_height();
+    let queue_h = pending_input_height(app);
     // The composer floats over the column while POST is open: a blank row above
     // it, so it reads as a card rather than one more stacked pane. Once POST is
     // fully collapsed that row is only dead
@@ -3221,7 +3232,7 @@ fn money(v: f64) -> String {
 }
 
 fn draw_queue(f: &mut Frame, area: Rect, app: &App) {
-    if area.height == 0 || app.queue.is_empty() {
+    if area.height == 0 || pending_input_rows(app) == 0 {
         return;
     }
     let theme = Theme::current();
@@ -3231,7 +3242,11 @@ fn draw_queue(f: &mut Frame, area: Rect, app: &App) {
     } else {
         theme.bg_base
     };
-    let title = format!(" Queue  {} ", app.queue.len());
+    let title = match (app.pending_steers.len(), app.queue.len()) {
+        (0, queued) => format!(" Queue  {queued} "),
+        (steers, 0) => format!(" Steer pending  {steers} "),
+        (steers, queued) => format!(" Steer {steers} · Queue {queued} "),
+    };
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(border))
@@ -3250,7 +3265,33 @@ fn draw_queue(f: &mut Frame, area: Rect, app: &App) {
     // The band is drawn where `selected` and the scroll offset are both in
     // scope. Reapplying it here indexed the visible slice with an absolute
     // row number, which lands on the wrong row the moment the queue scrolls.
-    f.render_widget(Paragraph::new(app.queue.lines(inner.width, focused)), inner);
+    let steer_rows = pending_steer_rows(app);
+    let mut lines: Vec<Line<'static>> = app
+        .pending_steers
+        .iter()
+        .skip(app.pending_steers.len().saturating_sub(steer_rows))
+        .map(|text| {
+            let first = text
+                .lines()
+                .map(str::trim)
+                .find(|line| !line.is_empty())
+                .unwrap_or("");
+            Line::from(vec![
+                Span::styled("↪ ", Style::default().fg(theme.gray)),
+                Span::styled(
+                    queue::truncate_width(first, inner.width.saturating_sub(2) as usize),
+                    Style::default().fg(theme.accent_assistant),
+                ),
+            ])
+        })
+        .collect();
+    let room = PENDING_INPUT_MAX_ROWS.saturating_sub(lines.len());
+    let mut queued = app.queue.lines(inner.width, focused);
+    if queued.len() > room {
+        queued.drain(..queued.len() - room);
+    }
+    lines.extend(queued);
+    f.render_widget(Paragraph::new(lines), inner);
 }
 
 fn less_saturated(color: Color) -> Color {
@@ -3360,8 +3401,29 @@ fn focus_name(focus: Focus) -> &'static str {
 
 /// The blank spacer row the composer floats on: one while POST is open, none
 /// when it is collapsed or when an open queue is carrying that row instead.
+const PENDING_INPUT_MAX_ROWS: usize = 6;
+
+fn pending_steer_rows(app: &App) -> usize {
+    let limit = if app.queue.is_empty() {
+        PENDING_INPUT_MAX_ROWS
+    } else {
+        PENDING_INPUT_MAX_ROWS - 1
+    };
+    app.pending_steers.len().min(limit)
+}
+
+fn pending_input_rows(app: &App) -> usize {
+    let steers = pending_steer_rows(app);
+    steers + app.queue.len().min(PENDING_INPUT_MAX_ROWS - steers)
+}
+
+fn pending_input_height(app: &App) -> u16 {
+    let rows = pending_input_rows(app);
+    if rows == 0 { 0 } else { rows as u16 + 2 }
+}
+
 fn input_float_rows(app: &App) -> u16 {
-    u16::from(app.queue.is_empty() && app.layout.post_h > 0)
+    u16::from(pending_input_rows(app) == 0 && app.layout.post_h > 0)
 }
 
 fn draw_input(f: &mut Frame, area: Rect, app: &mut App) {
@@ -3380,12 +3442,18 @@ fn draw_input(f: &mut Frame, area: Rect, app: &mut App) {
     let focused = app.focus == Focus::Input;
     let signal = input_signal(app);
     let (signal_label, signal_color) = match signal {
-        Some(InputSignal::Inference) => (Some("steer".to_string()), theme.accent_assistant),
+        Some(InputSignal::Inference) => (
+            Some("enter steer · tab queue".to_string()),
+            theme.accent_assistant,
+        ),
         // No count here. The queue pane above already titles itself "Queue N"
         // and lists every item; repeating the number on the composer border put
         // "Queue 1" and "Queued 1" one row apart.
         Some(InputSignal::Queued) => (Some("Queued".to_string()), theme.accent_user),
-        Some(InputSignal::Tool) if app.running => (Some("steer".to_string()), theme.accent_tool),
+        Some(InputSignal::Tool) if app.running => (
+            Some("enter steer · tab queue".to_string()),
+            theme.accent_tool,
+        ),
         Some(InputSignal::Tool) => (Some("Tool".to_string()), theme.accent_tool),
         None => (
             None,
@@ -3600,7 +3668,14 @@ fn pane_keys(focus: Focus) -> (&'static str, &'static [(&'static str, &'static s
                 ("i", "back to the composer"),
             ],
         ),
-        Focus::Input => ("composer", &[]),
+        Focus::Input => (
+            "composer",
+            &[
+                ("enter", "send now; while running, steer this turn"),
+                ("tab", "while running, queue for the next turn"),
+                ("alt-enter", "start a separate full turn"),
+            ],
+        ),
     }
 }
 
@@ -5596,6 +5671,28 @@ mod tests {
         submit_prompt(Some(&mut bridge), &mut running).unwrap();
         let steer = bridge.rx.recv_timeout(Duration::from_secs(5)).unwrap();
         assert_eq!(steer, json!({"op": "steer", "text": "adjust course"}));
+        assert_eq!(
+            running.pending_steers.iter().cloned().collect::<Vec<_>>(),
+            vec!["adjust course"]
+        );
+        let pending = paint(&mut running, 120, 34);
+        assert!(pending.contains("Steer pending  1"), "{pending}");
+        assert!(pending.contains("adjust course"), "{pending}");
+
+        handle_event(
+            &mut running,
+            json!({"ev": "notice", "text": "steer queued"}),
+        );
+        assert_eq!(running.sess.story.len(), 0, "queue ack is not a Story turn");
+        handle_event(
+            &mut running,
+            json!({"ev": "steer", "text": "adjust course"}),
+        );
+        assert!(running.pending_steers.is_empty());
+        assert!(matches!(
+            running.sess.story.entry(0).map(|entry| &entry.block),
+            Some(RenderBlock::UserPrompt(_))
+        ));
 
         let mut idle = App::new();
         idle.prompt.insert_str("begin");
@@ -6854,6 +6951,30 @@ mod tests {
         assert!(app.queue.is_empty());
         assert!(app.prompt.to_send().is_empty());
         assert_eq!(app.sess.story.len(), 0, "steer must not start another turn");
+    }
+
+    #[test]
+    fn tab_while_running_queues_the_draft_instead_of_changing_focus() {
+        let mut app = App::new();
+        app.running = true;
+        app.prompt.insert_str("do this after");
+        handle_key(
+            None,
+            &mut app,
+            KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
+        )
+        .unwrap();
+
+        assert_eq!(app.focus, Focus::Input);
+        assert_eq!(app.prompt.to_send(), "");
+        assert_eq!(app.queue.len(), 1);
+        assert_eq!(app.queue.iter().next().unwrap().text, "do this after");
+        assert!(app.pending_steers.is_empty());
+
+        let screen = paint(&mut app, 120, 34);
+        assert!(screen.contains("Queue  1"), "{screen}");
+        assert!(screen.contains("do this after"), "{screen}");
+        assert!(screen.contains("tab queue"), "{screen}");
     }
 
     #[test]

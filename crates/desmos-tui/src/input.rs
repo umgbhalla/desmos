@@ -299,6 +299,16 @@ pub(crate) fn handle_key(
         }
         return Ok(false);
     }
+    // Match Codex: Enter steers the running turn; Tab keeps this draft as a
+    // visible follow-up for the next turn. Empty Tab still cycles panes.
+    if key.code == KeyCode::Tab
+        && key.modifiers == KeyModifiers::NONE
+        && app.focus == Focus::Input
+        && app.running
+        && (!app.prompt.to_send().trim().is_empty() || !app.prompt.images().is_empty())
+    {
+        return queue_prompt(bridge.as_deref_mut(), app);
+    }
     match key.code {
         KeyCode::Tab if key.modifiers.contains(KeyModifiers::SHIFT) => {
             app.set_focus(app.focus.prev_open(&pane_open(app)));

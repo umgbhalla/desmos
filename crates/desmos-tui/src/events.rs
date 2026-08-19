@@ -580,6 +580,17 @@ pub(crate) fn handle_event(app: &mut App, ev: Value) {
                 .stream
                 .finish(&mut app.sess.story, &mut app.sess.calls);
         }
+        "steer" => {
+            let text = ev.get("text").and_then(Value::as_str).unwrap_or("");
+            if let Some(idx) = app.pending_steers.iter().position(|item| item == text) {
+                app.pending_steers.remove(idx);
+            }
+            if !text.is_empty() {
+                app.story_push(RenderBlock::user_prompt(&format!("[steer] {text}")));
+                app.sess.story.follow_new_turn(None, false);
+                app.notify("steer delivered");
+            }
+        }
         // Outstanding background work, re-sent whenever the set changes. Meta
         // is the only reader: this is state, not an event worth a card.
         "pending" => {
@@ -627,7 +638,9 @@ pub(crate) fn handle_event(app: &mut App, ev: Value) {
         // an error, so it must not touch running state.
         "notice" => {
             let t = ev.get("text").and_then(Value::as_str).unwrap_or("");
-            if !t.is_empty() {
+            if t == "steer queued" {
+                app.notify(t);
+            } else if !t.is_empty() {
                 app.story_push(RenderBlock::system(t));
             }
         }
