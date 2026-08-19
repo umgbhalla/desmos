@@ -1031,6 +1031,7 @@ pub(crate) fn handle_mouse(app: &mut App, m: MouseEvent) {
     let on_story = hit(app.traj_area, m.column, m.row);
     let on_post_in = hit(app.post_in_area, m.column, m.row);
     let on_post_out = hit(app.post_out_area, m.column, m.row);
+    let on_rail = hit(app.rail_area, m.column, m.row);
     let on_queue = hit(app.queue_area, m.column, m.row) && !app.queue.is_empty();
     let on_input = hit(app.input_area, m.column, m.row);
     let on_git = hit(app.git_area, m.column, m.row);
@@ -1078,6 +1079,16 @@ pub(crate) fn handle_mouse(app: &mut App, m: MouseEvent) {
             }
         }
         MouseEventKind::Down(MouseButton::Left) => {
+            if on_rail {
+                app.set_focus(Focus::Rail);
+                if let Some(row) = pane_row(app.rail_area, m.row) {
+                    if row < rail::rows(app).len() {
+                        app.rail_sel = row;
+                        rail::activate(app);
+                    }
+                }
+                return;
+            }
             if on_queue {
                 app.set_focus(Focus::Queue);
                 if app.queue_area.height > 2 {

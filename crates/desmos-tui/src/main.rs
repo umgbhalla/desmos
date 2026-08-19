@@ -9884,6 +9884,65 @@ mod tests {
         assert_eq!(app.files.sel, fixed, "border clicks must not move a cursor");
     }
 
+    #[test]
+    fn click_on_the_rail_selects_and_activates_a_row() {
+        let mut app = App::new();
+        app.ensure_child("c1", "");
+        app.ensure_child("c2", "");
+        let _ = paint(&mut app, 140, 30);
+        let rail = app.rail_area;
+        assert!(rail.width > 0, "the rail is not on screen");
+
+        // Row 0 is the root, so row 1 is the first child.
+        handle_mouse(
+            &mut app,
+            click(
+                MouseEventKind::Down(MouseButton::Left),
+                rail.x + 2,
+                rail.y + 2,
+            ),
+        );
+        assert_eq!(app.rail_sel, 1);
+        assert_eq!(app.viewing.as_deref(), Some("c1"));
+
+        handle_mouse(
+            &mut app,
+            click(
+                MouseEventKind::Down(MouseButton::Left),
+                rail.x + 2,
+                rail.y + 3,
+            ),
+        );
+        assert_eq!(app.rail_sel, 2);
+        assert_eq!(app.viewing.as_deref(), Some("c2"));
+
+        // The root row puts the story pane back on the root session.
+        handle_mouse(
+            &mut app,
+            click(
+                MouseEventKind::Down(MouseButton::Left),
+                rail.x + 2,
+                rail.y + 1,
+            ),
+        );
+        assert_eq!(app.rail_sel, 0);
+        assert_eq!(app.viewing, None);
+
+        // A click below the last row only focuses the rail.
+        app.set_focus(Focus::Story);
+        handle_mouse(
+            &mut app,
+            click(
+                MouseEventKind::Down(MouseButton::Left),
+                rail.x + 2,
+                rail.y + 8,
+            ),
+        );
+        assert_eq!(app.focus, Focus::Rail);
+        assert_eq!(app.rail_sel, 0);
+        assert_eq!(app.viewing, None);
+    }
+
     /// `error` is not a terminator. loop.py fires it for a reply the endpoint
     /// cut short and keeps looping, and the reader thread synthesises one for
     /// any unparseable NDJSON line — run_turns still emits exactly one
