@@ -38,6 +38,41 @@ CLEAR = _share("DESMOS_HANDOFF_CLEAR", SOFT - 0.05)
 #: Injection name. Idempotent by name -- re-injecting refreshes the number.
 BLOCK = "handoff"
 
+#: Note key for agent-authored anchors: facts that must survive a fold. The
+#: note rides the volatile system tail (catalog.VOLATILE_NOTES), which is
+#: recomposed every request from world.notes -- a fold rewrites messages, not
+#: notes, so anchors cross it verbatim.
+ANCHORS = "anchors"
+
+#: Injection name for the one-shot "write your anchors" nudge at SOFT.
+NUDGE = "anchor-nudge"
+
+#: Bounds. Anchors are a handoff, not a transcript: a few lines, each short.
+MAX_ANCHORS = 8
+ANCHOR_CHARS = 200
+
+
+def set_anchors(world: World, body: str) -> str:
+    """Replace the anchor set with the lines of body, bounded; empty clears.
+
+    Whole-set replacement, not append: the agent re-states what still matters
+    each time, which is exactly the discipline a fold demands.
+    """
+    lines = [line.strip()[:ANCHOR_CHARS] for line in str(body).splitlines() if line.strip()]
+    dropped = max(0, len(lines) - MAX_ANCHORS)
+    lines = lines[:MAX_ANCHORS]
+    if lines:
+        world.notes[ANCHORS] = "\n".join(lines)
+    else:
+        world.notes.pop(ANCHORS, None)
+    if not lines:
+        return "anchors cleared"
+    tail = f" ({dropped} over the cap of {MAX_ANCHORS} dropped)" if dropped else ""
+    return (
+        f"anchors: {len(lines)} line(s) pinned{tail}; they ride the volatile "
+        "system block every turn and survive a fold verbatim"
+    )
+
 
 def prompt_tokens(usage: dict[str, Any] | None) -> int:
     """How large the prompt actually was: fresh input plus both cache tiers.
@@ -89,9 +124,26 @@ def watch(world: World) -> bool:
     share = fill(world)
     if share >= SOFT:
         catalog.inject(world, BLOCK, text(share), turns=0)
+        # One nudge per climb, not one per turn: turns=1 makes it fall out
+        # after a single render, and the flag stops re-arming until the fill
+        # drops back under CLEAR.
+        if not getattr(world, "anchor_nudged", False):
+            world.anchor_nudged = True
+            catalog.inject(
+                world,
+                NUDGE,
+                (
+                    f"Context is at {share * 100:.0f}%: write or refresh your anchors NOW "
+                    f'(<knowledge op="anchor">one fact per line</knowledge>, max {MAX_ANCHORS} '
+                    f"lines x {ANCHOR_CHARS} chars) -- they ride the system tail and survive "
+                    "the coming fold verbatim."
+                ),
+                turns=1,
+            )
         return True
     if share < CLEAR:
         catalog.retire(world, BLOCK)
+        world.anchor_nudged = False
         return False
     return BLOCK in getattr(world, "injections", {})
 

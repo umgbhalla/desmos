@@ -1254,6 +1254,8 @@ def check() -> None:
         )
         assert rec_file.read_bytes() == rec_before, "rollback rewrote memory records"
 
+        _check_anchors()
+
         _check_profiler()
 
         try:
@@ -1271,6 +1273,55 @@ def check() -> None:
         assert callable(shell.user_ns.get("reset"))
         assert "doc" in ns_names(w4)
         assert dispatch(w4, Block("python", "len(doc)", {})) == "11"
+
+
+def _check_anchors() -> None:
+    """Anchors survive a simulated fold; the 75% anchor nudge fires once per climb."""
+    import tempfile
+
+    from desmos.kernel import catalog, handoff, prices
+    from desmos.loop import new_world
+
+    with tempfile.TemporaryDirectory() as tmp:
+        w = new_world(Path(tmp), state_path=None, persist=False, ns={})
+
+        out = dispatch(w, Block("knowledge", "fact one\nfact two", {"op": "anchor"}))
+        assert "2 line(s)" in out, out
+        assert "fact one" in catalog.volatile(w), "anchors missing from the volatile block"
+
+        # Bounds: line count and per-line length are both capped.
+        many = "\n".join(f"line {i} " + "x" * 500 for i in range(20))
+        out = dispatch(w, Block("knowledge", many, {"op": "anchor"}))
+        rows = w.notes[handoff.ANCHORS].splitlines()
+        assert len(rows) == handoff.MAX_ANCHORS, out
+        assert all(len(r) <= handoff.ANCHOR_CHARS for r in rows), "anchor line over cap"
+
+        # Simulated fold: the transcript is replaced by a summary someone else
+        # wrote; anchors live in notes, so the recomposed tail still carries
+        # them verbatim.
+        dispatch(w, Block("knowledge", "objective: ship the rail", {"op": "anchor"}))
+        w.messages[:] = [{"role": "user", "content": "[server-written summary]"}]
+        handoff.after_fold(w, len(w.messages), "summary")
+        assert "objective: ship the rail" in catalog.volatile(w), (
+            "anchors did not survive the fold"
+        )
+
+        # The nudge fires once at SOFT, not every turn above it.
+        win = prices.window(w.model)
+        w.log.append({"usage": {"input_tokens": int(win * 0.8)}})
+        assert handoff.watch(w), "watch did not arm above SOFT"
+        assert handoff.NUDGE in w.injections, "anchor nudge missing at SOFT"
+        catalog.expire(w)  # the turn that carried it renders; turns=1 falls out
+        assert handoff.NUDGE not in w.injections
+        handoff.watch(w)
+        assert handoff.NUDGE not in w.injections, "anchor nudge re-fired while still above SOFT"
+
+        # Dropping under CLEAR re-arms it for the next climb.
+        w.log.append({"usage": {"input_tokens": int(win * 0.3)}})
+        assert not handoff.watch(w), "watch stayed armed under CLEAR"
+        w.log.append({"usage": {"input_tokens": int(win * 0.8)}})
+        handoff.watch(w)
+        assert handoff.NUDGE in w.injections, "anchor nudge did not re-arm after a clear"
 
 
 def _check_profiler() -> None:

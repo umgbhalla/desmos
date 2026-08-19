@@ -31,7 +31,7 @@ DIRECT_TARGETS = {
 
 DIRECT_OPS = {
     "workspace": ("read", "see", "commit"),
-    "knowledge": ("todo", "plan", "decide"),
+    "knowledge": ("todo", "plan", "decide", "anchor"),
     "observe": ("usage", "slice", "trajectory", "error", "symbol", "threads"),
     "agents": (
         "spawn", "fanout", "resume", "lineage",
@@ -228,6 +228,13 @@ def _knowledge(world, op, body, attrs):
         return handle_plan(world, body, **attrs)
     if op == "decide":
         return _decide(world, body)
+    if op == "anchor":
+        from desmos.kernel import handoff
+        from desmos.state.persist import save
+
+        result = handoff.set_anchors(world, body)
+        save(world)
+        return result
     existing = _legacy(world, "todo", body, attrs)
     if existing is not None:
         return existing

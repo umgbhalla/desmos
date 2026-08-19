@@ -56,7 +56,7 @@ def ns_index(world: World) -> str:
 # prompt, after every cache breakpoint, because a byte changed anywhere in the
 # cached system blocks re-writes the whole prefix behind it -- measured at
 # ~$0.85 per todo tick at 130k tokens of context.
-VOLATILE_NOTES = ("todo",)
+VOLATILE_NOTES = ("todo", "anchors")
 VOLATILE_MARKER = "# now"
 
 
