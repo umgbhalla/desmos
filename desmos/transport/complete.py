@@ -15,6 +15,14 @@ INTERLEAVED_BETA = "interleaved-thinking-2025-05-14"
 COMPACT_BETA = "compact-2026-01-12"
 COMPACT_STRATEGY = "compact_20260112"
 COMPACT_BLOCK = "compaction"
+# Opt-in 1h TTL on the *stable* cache breakpoints (ABI + catalog; tools ride
+# under the same prefix). 1h writes cost 2x base input vs 1.25x for 5m; reads
+# are 0.1x either way, so this pays off when gaps between turns exceed 5
+# minutes. Default off: the payload stays byte-identical to today. The moving
+# tail breakpoint always keeps the 5m default -- a 2x write on a segment that
+# is rewritten every turn is pure loss.
+CACHE_TTL_1H = False
+CACHE_TTL_BETA = "extended-cache-ttl-2025-04-11"
 ADAPTIVE_MARKERS = (
     "opus-5",
     "opus-4-6",
@@ -341,10 +349,11 @@ def cached_payload(
     from desmos.skills import filter_skill_dialects
 
     cache = {"type": "ephemeral"}
+    stable = {"type": "ephemeral", "ttl": "1h"} if CACHE_TTL_1H else cache
     abi, catalog_text, volatile_text = split_system(system)
-    sys_blocks: list[dict[str, Any]] = [{"type": "text", "text": abi, "cache_control": cache}]
+    sys_blocks: list[dict[str, Any]] = [{"type": "text", "text": abi, "cache_control": dict(stable)}]
     if catalog_text.strip():
-        sys_blocks.append({"type": "text", "text": catalog_text, "cache_control": cache})
+        sys_blocks.append({"type": "text", "text": catalog_text, "cache_control": dict(stable)})
     # A tool_result whose tool_use is gone is a hard 400, and so is a tool_use
     # nothing answered. Both happen for real: a fold cuts the head off the
     # transcript, or the harness raises between appending the assistant turn
@@ -455,6 +464,8 @@ def cached_payload(
         payload["tools"] = [dict(SYSCALL_TOOL)]
         payload["tool_choice"] = {"type": "auto", "disable_parallel_tool_use": True}
     payload["_betas"] = apply_thinking(payload, model, thinking) + apply_compaction(payload, model)
+    if CACHE_TTL_1H:
+        payload["_betas"] = payload["_betas"] + [CACHE_TTL_BETA]
     return payload
 
 

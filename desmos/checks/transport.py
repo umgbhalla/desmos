@@ -138,6 +138,32 @@ def check() -> None:
         ]
         assert marked == [("user", "second")], marked
 
+        # Opt-in 1h TTL: on, the stable prefix blocks (ABI + catalog) carry the
+        # 1h ttl and the moving tail keeps the 5m default; off (the default),
+        # the payload is byte-identical to today -- no ttl anywhere, no beta.
+        import json as _json
+        import desmos.transport.complete as _tc
+
+        _ttl_args = ("claude-opus-5", ABI + "\n\n# tools\nx", [{"role": "user", "content": "hi"}], 8192)
+        off = cached_payload(*_ttl_args, thinking="low")
+        assert "ttl" not in _json.dumps(off), "ttl leaked into the default payload"
+        assert _tc.CACHE_TTL_BETA not in off["_betas"], off["_betas"]
+        try:
+            _tc.CACHE_TTL_1H = True
+            on = cached_payload(*_ttl_args, thinking="low")
+        finally:
+            _tc.CACHE_TTL_1H = False
+        assert all(
+            b["cache_control"] == {"type": "ephemeral", "ttl": "1h"} for b in on["system"]
+        ), on["system"]
+        tail_cc = on["messages"][-1]["content"][-1]["cache_control"]
+        assert tail_cc == {"type": "ephemeral"}, tail_cc
+        assert _tc.CACHE_TTL_BETA in on["_betas"], on["_betas"]
+        on["system"], on["_betas"] = off["system"], off["_betas"]
+        assert _json.dumps(on, sort_keys=True) == _json.dumps(off, sort_keys=True), (
+            "the 1h option changed something beyond the stable blocks and beta"
+        )
+
         # A todo tick must not move the cached prefix. Volatile notes ride
         # behind every breakpoint, so mutating one rewrites a single trailing
         # block instead of the whole 130k-token prefix in front of it -- the
