@@ -632,6 +632,10 @@ def unsupported_field(detail: str) -> str | None:
 # that provokes it; anything unmapped keeps the current raise.
 INFERRED_FIELDS = {"prompt_cache_retention": "prompt_cache_key"}
 
+# Seam for the checks: backoff between phantom-field 400 retries without a
+# real wait in tests.
+_sleep = time.sleep
+
 
 def _drop_field(body: dict[str, Any], path: str) -> bool:
     """Remove what the 400 named, most precisely first. True if anything went.
@@ -703,7 +707,8 @@ def complete(
     )
     log_payload(body, [])
     dropped: list[str] = []
-    for _ in range(6):
+    phantom_retries = 0
+    for _ in range(9):
         # The body the drop loop below may still edit, frozen per attempt. The
         # kernel used to re-read the complete.LAST global after this returned,
         # which a subagent POST from the thread pool could overwrite in between,
@@ -733,22 +738,45 @@ def complete(
                 # The 400 names a field the server inferred, not one we sent;
                 # drop the sent field that provokes it instead.
                 field = INFERRED_FIELDS[field]
-            if e.code == 400 and field and not field.startswith("tools") and _drop_field(body, field):
-                dropped.append(field)
-                log_payload(body, [])
-                # Dropping a field is a silent downgrade otherwise: a 400 naming
-                # reasoning.summary used to leave the session with no thinking
-                # while the meta pane still reported the configured effort.
-                if on_event is not None:
-                    on_event(
-                        {
-                            "kind": "retry",
-                            "attempt": len(dropped),
-                            "delay": 0.0,
-                            "reason": f"OpenAI 400: dropped {field}",
-                        }
-                    )
-                continue
+            if e.code == 400 and field and not field.startswith("tools"):
+                if _drop_field(body, field):
+                    dropped.append(field)
+                    log_payload(body, [])
+                    # Dropping a field is a silent downgrade otherwise: a 400 naming
+                    # reasoning.summary used to leave the session with no thinking
+                    # while the meta pane still reported the configured effort.
+                    if on_event is not None:
+                        on_event(
+                            {
+                                "kind": "retry",
+                                "attempt": len(dropped),
+                                "delay": 0.0,
+                                "reason": f"OpenAI 400: dropped {field}",
+                            }
+                        )
+                    continue
+                # The 400 names a field absent from the body even after the
+                # INFERRED_FIELDS remap found nothing to drop. Live evidence:
+                # the Codex backend intermittently 400s
+                # param=prompt_cache_retention on bodies with no cache field
+                # at all, and replaying the identical body minutes later
+                # returns 200. That is transient server-side confusion, not a
+                # payload bug: retry the SAME body a few times with a short
+                # backoff before giving up with the detail.
+                if phantom_retries < 3:
+                    phantom_retries += 1
+                    delay = 0.5 * phantom_retries
+                    if on_event is not None:
+                        on_event(
+                            {
+                                "kind": "retry",
+                                "attempt": phantom_retries,
+                                "delay": delay,
+                                "reason": f"OpenAI 400 names absent field {field}; retrying same body",
+                            }
+                        )
+                    _sleep(delay)
+                    continue
             note = f" (dropped {', '.join(dropped)})" if dropped else ""
             raise RuntimeError(f"OpenAI HTTP {e.code}{note}: {detail[:2000]}") from e
     raise RuntimeError(f"OpenAI kept rejecting fields: dropped {', '.join(dropped)}")

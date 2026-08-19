@@ -894,6 +894,71 @@ def check() -> None:
         )
         assert text_of(out_retry) == "ok", out_retry
 
+        # --- 400 retry: an absent-field 400 is transient; same body retried ---
+        # Regression: the Codex backend intermittently 400s
+        # param=prompt_cache_retention on bodies with no cache field at all
+        # (no cache_key here, so the INFERRED_FIELDS remap also finds nothing
+        # to drop); replaying the identical body later returns 200. Two such
+        # 400s then a 200 must succeed with the body unchanged.
+        sent_bodies2: list = []
+        fails2 = [_http400("prompt_cache_retention"), _http400("prompt_cache_retention")]
+
+        def _fake_open2(req, **_kw):
+            sent_bodies2.append(json.loads(req.data))
+            if fails2:
+                raise fails2.pop(0)
+            return _FakeResp()
+
+        slept: list = []
+        real_sleep = _oai._sleep
+        _oai._open_with_retry = _fake_open2
+        _oai.read_sse = lambda *_a, **_k: {"content": [{"type": "text", "text": "ok"}], "usage": {}}
+        _oai.auth.credential = lambda *_a, **_k: _auth.Credential(provider="openai", kind="env", token="sk-x")
+        _oai.log_payload = lambda *_a, **_k: ""
+        _oai._sleep = lambda s: slept.append(s)
+        try:
+            out_phantom = _oai.complete(
+                "gpt-5.6-sol", "system", [{"role": "user", "content": "hi"}], 100,
+            )
+        finally:
+            _oai._open_with_retry, _oai.read_sse = real_open, real_read
+            _oai.auth.credential, _oai.log_payload = real_cred, real_log
+            _oai._sleep = real_sleep
+        assert len(sent_bodies2) == 3, f"expected 3 attempts, saw {len(sent_bodies2)}"
+        assert "prompt_cache_key" not in sent_bodies2[0], "no cache field was ever sent"
+        assert sent_bodies2[0] == sent_bodies2[1] == sent_bodies2[2], (
+            "a phantom-field 400 must retry the SAME body, not mutate it"
+        )
+        assert len(slept) == 2 and all(s > 0 for s in slept), slept
+        assert text_of(out_phantom) == "ok", out_phantom
+
+        # A persisting absent-field 400 must still raise with the detail.
+        sent_bodies3: list = []
+
+        def _fake_open3(req, **_kw):
+            sent_bodies3.append(json.loads(req.data))
+            raise _http400("prompt_cache_retention")
+
+        _oai._open_with_retry = _fake_open3
+        _oai.read_sse = lambda *_a, **_k: {"content": [], "usage": {}}
+        _oai.auth.credential = lambda *_a, **_k: _auth.Credential(provider="openai", kind="env", token="sk-x")
+        _oai.log_payload = lambda *_a, **_k: ""
+        _oai._sleep = lambda s: None
+        try:
+            try:
+                _oai.complete("gpt-5.6-sol", "system", [{"role": "user", "content": "hi"}], 100)
+                raise AssertionError("expected RuntimeError on a persisting phantom-field 400")
+            except RuntimeError as e:
+                assert "OpenAI HTTP 400" in str(e), e
+                assert "prompt_cache_retention" in str(e), e
+        finally:
+            _oai._open_with_retry, _oai.read_sse = real_open, real_read
+            _oai.auth.credential, _oai.log_payload = real_cred, real_log
+            _oai._sleep = real_sleep
+        assert len(sent_bodies3) == 4, (
+            f"1 attempt + 3 same-body retries, saw {len(sent_bodies3)}"
+        )
+
         reasoning_item = {
             "id": "rs_1",
             "type": "reasoning",
