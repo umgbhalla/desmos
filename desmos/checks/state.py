@@ -781,8 +781,14 @@ def _check_salvage() -> None:
 
     root = Path(tempfile.mkdtemp())
     rare = "peregrine telemetry cadence"
-    previous = os.environ.get(persist.SESSION_ID_ENV)
+    # Same hermeticity as the lineage check: run_id() only honours the id when
+    # the pid var names this process, and overwrites both vars otherwise.
+    saved = {
+        var: os.environ.get(var)
+        for var in (persist.SESSION_ID_ENV, persist.SESSION_PID_ENV, persist.NEW_SESSION_ENV)
+    }
     try:
+        os.environ.pop(persist.NEW_SESSION_ENV, None)
         lost = new_world(root, persist=True)
         lost.messages.append({"role": "user", "content": f"about {rare} and nothing else"})
         lost.messages.append({"role": "assistant", "content": "noted"})
@@ -796,6 +802,7 @@ def _check_salvage() -> None:
         assert moved, "nothing was moved aside"
 
         # A different attach, on the empty replacement.
+        os.environ[persist.SESSION_PID_ENV] = str(os.getpid())
         os.environ[persist.SESSION_ID_ENV] = "01a0salvage000000000000000000000"
         live = new_world(root, persist=True)
         live.messages.append({"role": "user", "content": "an unrelated later question"})
@@ -825,10 +832,11 @@ def _check_salvage() -> None:
         again = salvage.salvage(live, apply=True)
         assert again["sessions"] == 0, f"salvage is not idempotent: {again}"
     finally:
-        if previous is None:
-            os.environ.pop(persist.SESSION_ID_ENV, None)
-        else:
-            os.environ[persist.SESSION_ID_ENV] = previous
+        for var, value in saved.items():
+            if value is None:
+                os.environ.pop(var, None)
+            else:
+                os.environ[var] = value
 
 
 def _check_prices() -> None:
@@ -868,16 +876,25 @@ def _check_session_lineage(cwd: Path) -> None:
     from desmos.state import persist
 
     path = cwd / "lineage.sqlite3"
-    prior_env = os.environ.get(persist.SESSION_ID_ENV)
+    # Own the whole session environment: run_id() only honours the id when the
+    # pid var names this process, and DESMOS_SESSION_NEW severs the very
+    # lineage this check asserts. A live desmos exports all three.
+    saved = {
+        var: os.environ.get(var)
+        for var in (persist.SESSION_ID_ENV, persist.SESSION_PID_ENV, persist.NEW_SESSION_ENV)
+    }
     try:
         first_id = "019100000000aaaaaaaaaaaaaaaaaaaa"
         second_id = "019200000000bbbbbbbbbbbbbbbbbbbb"
+        os.environ.pop(persist.NEW_SESSION_ENV, None)
+        os.environ[persist.SESSION_PID_ENV] = str(os.getpid())
         os.environ[persist.SESSION_ID_ENV] = first_id
         first = new_world(cwd, state_path=path)
         first.messages.append({"role": "user", "content": "from first"})
         first.prior.append({"prompt": "p1", "speech": "s1"})
         persist.save(first)
 
+        os.environ[persist.SESSION_PID_ENV] = str(os.getpid())
         os.environ[persist.SESSION_ID_ENV] = second_id
         second = new_world(cwd, state_path=path)
         assert second.messages == [{"role": "user", "content": "from first"}]
@@ -922,10 +939,11 @@ def _check_session_lineage(cwd: Path) -> None:
         assert secret not in str(events), events[0]
         assert events[0]["payload_bytes"] > 100_000, events[0]
     finally:
-        if prior_env is None:
-            os.environ.pop(persist.SESSION_ID_ENV, None)
-        else:
-            os.environ[persist.SESSION_ID_ENV] = prior_env
+        for var, value in saved.items():
+            if value is None:
+                os.environ.pop(var, None)
+            else:
+                os.environ[var] = value
 
 
 def _check_call_ledger(cwd: Path) -> None:
