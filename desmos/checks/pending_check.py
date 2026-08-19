@@ -76,6 +76,74 @@ def self_check() -> None:
         assert elapsed >= 0.2, elapsed
         assert pending.count(world) == 0, pending.outstanding(world)
 
+    # A steer that lands while the step is parked on background work is
+    # delivered through the park's own drain, not the live turn loop -- and
+    # the TUI badge only clears when the kernel echoes {"ev":"steer"}. The
+    # echo is owned by delivery itself (deliver_steer), so this path must
+    # emit it exactly once with the delivered text.
+    with tempfile.TemporaryDirectory() as tmp:
+        import threading
+
+        from desmos.kernel.catalog import steer as queue_steer
+
+        world = new_world(Path(tmp), state_path=None, persist=False, ns={})
+        world.model = "claude-opus-5"
+        pending.clear(world)
+
+        def sleeper2(body: str, **_a: str) -> str:
+            pending.submit(world, "sleep", lambda: (time.sleep(1.0), "slept")[1])
+            return "scheduled"
+
+        world.tools["sleeper"] = type(world.tools["python"])(
+            name="sleeper", doc="sleep in the background", handler=sleeper2
+        )
+        turns = [
+            response(f"{LT}sleeper>1.0{LT}/sleeper>"),
+            response("nothing to wait for"),
+            response("answering the steer"),
+            response("task landed, done"),
+            response("spare"),
+        ]
+        world.complete_fn = lambda _m, _s, _msgs, _x: turns.pop(0)
+        events = []
+        threading.Timer(0.3, lambda: queue_steer(world, "go left")).start()
+        run_turns(world, "schedule it", quiet=True, on_event=events.append)
+        steer_evs = [e for e in events if e.get("ev") == "steer"]
+        assert len(steer_evs) == 1, steer_evs
+        assert steer_evs[0]["text"] == "go left", steer_evs
+        assert isinstance(steer_evs[0]["n"], int) and steer_evs[0]["n"] >= 1, steer_evs
+        delivered = [
+            m for m in world.messages
+            if m.get("role") == "user" and m.get("content") == "[steer] go left"
+        ]
+        assert len(delivered) == 1, delivered
+        pending.clear(world)
+
+    # The live-turn path still echoes exactly once per steer: the emit moved
+    # into deliver_steer, so the loop's drain must not double-echo.
+    with tempfile.TemporaryDirectory() as tmp:
+        from desmos.kernel.catalog import steer as queue_steer
+
+        world = new_world(Path(tmp), state_path=None, persist=False, ns={})
+        world.model = "claude-opus-5"
+        pending.clear(world)
+        turns = [
+            response("first answer"),
+            response("answered the steer"),
+        ]
+
+        def complete_live(_m: str, _s: str, _msgs: list[dict[str, Any]], _x: int) -> dict[str, Any]:
+            if len(turns) == 2:
+                queue_steer(world, "turn left")
+            return turns.pop(0)
+
+        world.complete_fn = complete_live
+        events = []
+        out = run_turns(world, "say something", quiet=True, on_event=events.append)
+        steer_evs = [e for e in events if e.get("ev") == "steer"]
+        assert steer_evs == [{"ev": "steer", "n": 1, "text": "turn left"}], steer_evs
+        assert out == "answered the steer", out
+
     # A queued follow-up outranks background work: the wait gives the turn back.
     with tempfile.TemporaryDirectory() as tmp:
         world = new_world(Path(tmp), state_path=None, persist=False, ns={})

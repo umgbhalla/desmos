@@ -222,15 +222,23 @@ def deliver(world, text: str) -> None:
     msgs.append({"role": "user", "content": text})
 
 
-def deliver_steer(world, text: str) -> None:
+def deliver_steer(world, text: str, *, n: int = 0, emit=None) -> None:
     """A steered line gets its own labelled user turn, never a merge.
 
     deliver() folds text into the previous user message; for a steer that
     glued fresh input onto an already-sent result block, which reads out of
     order. A steer is the user speaking mid-step, so it arrives as its own
     user turn, labelled so the model knows it is a redirect.
+
+    The {"ev":"steer"} echo lives here, on delivery itself: the TUI keeps a
+    "Steer pending" badge alive until it sees that echo, and a delivery route
+    that forgets to emit leaves the badge stuck forever. Callers must not
+    echo again -- the TUI clears one badge entry per matching event, so a
+    duplicate would eat two entries for one steer.
     """
     world.messages.append({"role": "user", "content": f"[steer] {text}"})
+    if emit is not None:
+        emit({"ev": "steer", "n": n, "text": text})
 
 
 _BUILTIN_DOCS = (
@@ -1081,8 +1089,7 @@ def _run_turns(
         # while the turn is still running, rather than at the park.
         steered = False
         for line in drain_steers(world):
-            deliver_steer(world, line)
-            emit({"ev": "steer", "n": n, "text": line})
+            deliver_steer(world, line, n=n, emit=emit)
             steered = True
         emit_pending()
         # After the results, never before: the note explains what did not run,
@@ -1129,8 +1136,7 @@ def _run_turns(
                 landed = pending.wait_next(world, stop=stopped, interrupt=_steer_or_input)
                 if not landed and world.steers:
                     for line in drain_steers(world):
-                        deliver_steer(world, line)
-                        emit({"ev": "steer", "n": n, "text": line})
+                        deliver_steer(world, line, n=n, emit=emit)
                     continue
                 if landed:
                     text = pending.notice(landed)
