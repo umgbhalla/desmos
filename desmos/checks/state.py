@@ -1852,7 +1852,8 @@ def _check_fold_consent(cwd: Path) -> None:
             return {
                 "content": [
                     {"type": COMPACT_BLOCK, "summary": "the work so far, folded"},
-                    {"type": "text", "text": lt + "python>1" + lt + "/python>"},
+                    {"type": "tool_use", "id": "toolu_fold", "name": "syscall",
+                     "input": {"input": lt + "python>1" + lt + "/python>"}},
                 ],
                 "usage": {},
             }
