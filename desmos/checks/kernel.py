@@ -901,6 +901,26 @@ def check() -> None:
         assert any("cut short" in str(m.get("content")) for m in w_cut.messages), w_cut.messages
         assert any(e.get("ev") == "error" and "cut short" in e.get("text", "") for e in cut_evs)
 
+        # A refusal is a terminal provider answer, not a truncated generation
+        # to repost. Reposting the same prompt cannot recover it and used to
+        # spend every remaining turn on the same empty refusal.
+        w_refused = new_world(cwd, state_path=None, persist=False, ns={})
+        refused_calls = {"n": 0}
+
+        def refused(_m, _s, _msgs, _mt):
+            refused_calls["n"] += 1
+            return {"content": [], "stop_reason": "refusal", "usage": {}}
+
+        w_refused.complete_fn = refused
+        refused_evs: list[dict] = []
+        refused_speech = _run(
+            w_refused, "refuse this", quiet=True, max_turns=8, on_event=refused_evs.append
+        )
+        assert refused_calls["n"] == 1, refused_calls
+        assert refused_speech.strip(), "an empty refusal must remain visible"
+        assert [m["role"] for m in w_refused.messages] == ["user", "assistant"]
+        assert not any(e.get("ev") == "error" for e in refused_evs), refused_evs
+
         # The two reasons this harness cuts a reply itself look identical to
         # the endpoint's: an empty, apparently-finished turn. They were not in
         # the set, so a generation guillotined the instant it started forging a

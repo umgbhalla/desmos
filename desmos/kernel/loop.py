@@ -416,6 +416,11 @@ def turn(
         req = dict(sent)
     speech = text_of(resp)
     assistant = assistant_content(resp)
+    refused = resp.get("stop_reason") == "refusal"
+    if refused and not speech:
+        speech = "[provider refused this reply]"
+        assistant = [b for b in assistant if b.get("type") != "text" or b.get("text")]
+        assistant.append({"type": "text", "text": speech})
     world.log.append(
         {
             "ts": datetime.now(timezone.utc).isoformat(),
@@ -553,7 +558,9 @@ def turn(
     results: list[tuple[Block, str]] = []
     recoverable = False
     call = syscall_call(assistant)
-    if call:
+    if refused:
+        blocks = []
+    elif call:
         raw, shape_error = normalize_syscall_input(syscall_body(call) or "")
         # The next Responses request replays the provider item verbatim. Keep
         # that replay schema-valid even when this client exposed input as an
@@ -756,13 +763,12 @@ def turn(
     return speech, results, (not blocks and note is None and not recoverable), assistant, note
 
 
-# Why a reply ended early, and what to tell the model about it. The first two
-# were cut by the endpoint and should be resumed from where they stopped. The
-# last two were cut by this harness precisely because the text was going
+# Why a reply ended early, and what to tell the model about it. The first was
+# cut by the endpoint and should be resumed from where it stopped. The last
+# two were cut by this harness precisely because the text was going
 # wrong, so "continue" is the one instruction that must not be given.
 CUT_REASONS = {
     "max_tokens": "reply was cut short: max_tokens — continue from where it stopped",
-    "refusal": "reply was cut short: refusal — nothing was dispatched",
     "stop_sequence": (
         "generation was stopped: you began writing a result block or a user turn. "
         "Those are the harness speaking, never you. Emit the syscall and stop — the "
