@@ -260,7 +260,46 @@ def _intervene(op: str, msg: dict[str, Any]) -> None:
     _emit({"ev": "notice", "text": result})
 
 
-def _serve_client(conn: socket.socket, inbox: queue.Queue, cancel: threading.Event) -> None:
+def _handle_oob(
+    msg: dict[str, Any],
+    world: Any,
+    inbox: queue.Queue,
+    cancel: threading.Event,
+    pause: threading.Event,
+) -> bool:
+    """Handle an op that must not wait behind the running step."""
+    op = msg.get("op")
+    if op == "stop":
+        cancel.set()
+    elif op == "quit":
+        cancel.set()
+        inbox.put(None)
+    elif op == "steer":
+        from desmos.kernel.catalog import steer as _steer
+
+        text = str(msg.get("text") or "").strip()
+        if not text:
+            _emit({"ev": "error", "text": "empty steer"})
+        else:
+            _steer(world, text)
+            _emit({"ev": "notice", "text": "steer queued"})
+    elif op in ("pause", "resume"):
+        pause.set() if op == "pause" else pause.clear()
+        _emit({"ev": "notice", "text": f"session {op}d"})
+    elif op in ("kill_run", "rerun"):
+        _intervene(op, msg)
+    else:
+        return False
+    return True
+
+
+def _serve_client(
+    conn: socket.socket,
+    world: Any,
+    inbox: queue.Queue,
+    cancel: threading.Event,
+    pause: threading.Event,
+) -> None:
     """One accepted unix-socket client: reads ops into the shared inbox (the
     queue is the serialization -- two clients cannot double-drive the world),
     writes the live stream back. A client that wants history sends
@@ -326,17 +365,11 @@ def _serve_client(conn: socket.socket, inbox: queue.Queue, cancel: threading.Eve
                     return
                 registered = True
                 continue
-            if op == "quit":
-                # A socket client's quit detaches that client. Only stdio --
-                # the owner -- may end the bridge.
-                return
             with _WIRE_LOCK:
                 register_locked()
-            if op == "stop":
-                cancel.set()
-                continue
-            if op in ("kill_run", "rerun"):
-                _intervene(op, msg)
+            if _handle_oob(msg, world, inbox, cancel, pause):
+                if op == "quit":
+                    return
                 continue
             inbox.put(msg)
     except OSError:
@@ -488,40 +521,9 @@ def _read_ops(
         if not isinstance(msg, dict):
             _emit({"ev": "error", "text": "bad json: not an object"})
             continue
-        op = msg.get("op")
-        if op == "stop":
-            cancel.set()
-            continue
-        if op == "quit":
-            cancel.set()
-            inbox.put(None)
-            return
-        if op == "steer":
-            # Not a stop and not a step: the text joins world.steers and the
-            # running loop delivers it at its next turn boundary (drain_steers
-            # in kernel/loop.py). The inbox would queue it *behind* the very
-            # step it is meant to redirect, so it must not go there, and cancel
-            # must stay untouched -- steering is not stopping.
-            from desmos.kernel.catalog import steer as _steer
-
-            text = str(msg.get("text") or "").strip()
-            if not text:
-                _emit({"ev": "error", "text": "empty steer"})
-                continue
-            _steer(world, text)
-            _emit({"ev": "notice", "text": "steer queued"})
-            continue
-        if op in ("pause", "resume"):
-            # Freeze, do not orphan. The drive loop's should_stop gate sleeps
-            # while this event is set, so the model loop parks at a turn
-            # boundary while shells, pending tasks and children keep running.
-            pause.set() if op == "pause" else pause.clear()
-            _emit({"ev": "notice", "text": f"session {op}d"})
-            continue
-        if op in ("kill_run", "rerun"):
-            # Same routing as the socket readers: an intervention answered
-            # inline, not queued behind the step it interrupts.
-            _intervene(op, msg)
+        if _handle_oob(msg, world, inbox, cancel, pause):
+            if msg.get("op") == "quit":
+                return
             continue
         inbox.put(msg)
     inbox.put(None)
@@ -583,7 +585,9 @@ def serve(cwd: Path) -> int:
             except OSError:
                 return  # closed on exit
             threading.Thread(
-                target=_serve_client, args=(conn, inbox, cancel), daemon=True
+                target=_serve_client,
+                args=(conn, world, inbox, cancel, pause),
+                daemon=True,
             ).start()
 
     if sock_srv is not None:
