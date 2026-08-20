@@ -261,6 +261,13 @@ impl Bridge {
     /// The first bytes down the wire are the attach op: `since=0` for a
     /// fresh TUI (full replay), the last seen seq on reconnect (bridge.py's
     /// attach replays events with seq>N from the SQL log, gaplessly).
+    /// True when this bridge attached to a live kernel over its socket
+    /// rather than spawning a child: the session there is already running,
+    /// so startup must not offer the session picker.
+    fn is_connected(&self) -> bool {
+        self.child.is_none()
+    }
+
     fn connect(sock_path: &Path, since: u64) -> io::Result<Self> {
         let (writer, rx, sock) = Self::open_socket(sock_path, since)?;
         Ok(Self {
@@ -1069,7 +1076,11 @@ fn main() -> io::Result<()> {
         }
     };
     let mut app = App::new();
-    if !demo {
+    // An attaching TUI joins a kernel whose session is already live: the
+    // picker would only fire session ops at it. Offer it solely when we
+    // spawned the bridge ourselves.
+    let attached = bridge.as_ref().is_some_and(Bridge::is_connected);
+    if !demo && !attached {
         app.session_picker = session::SessionPicker::discover(&PathBuf::from(&cwd));
     }
     if demo {
@@ -4468,8 +4479,42 @@ mod tests {
         let ev = bridge.rx.recv_timeout(Duration::from_secs(5)).unwrap();
         assert_eq!(ev.get("seq").and_then(Value::as_u64), Some(7));
         assert!(bridge.child.is_none(), "a connected bridge must own no child");
+        assert!(
+            bridge.is_connected(),
+            "a connected bridge must report is_connected"
+        );
         server.join().unwrap();
         let _ = std::fs::remove_file(&sock);
+    }
+
+    /// The startup seam: an attached bridge reports connected, so the
+    /// session picker stays closed -- it would only fire session ops at a
+    /// kernel whose session is already live. A spawned bridge reports the
+    /// opposite and keeps the picker path open.
+    #[test]
+    fn attach_mode_keeps_session_picker_closed() {
+        use std::os::unix::net::UnixListener;
+        let sock = std::env::temp_dir().join(format!("desmos-pick-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&sock);
+        let listener = UnixListener::bind(&sock).unwrap();
+        let accepted = std::thread::spawn(move || listener.accept().unwrap().0);
+        let bridge = Bridge::connect(&sock, 0).unwrap();
+        let _stream = accepted.join().unwrap();
+        assert!(bridge.is_connected());
+
+        // Mirror main(): on attach the discover call is skipped entirely.
+        let mut app = App::new();
+        let attached = bridge.is_connected();
+        if !attached {
+            app.session_picker = session::SessionPicker::discover(&std::env::temp_dir());
+        }
+        assert!(!app.session_picker.open, "picker must stay closed on attach");
+        drop(bridge);
+        let _ = std::fs::remove_file(&sock);
+
+        if let Ok(spawned) = Bridge::loopback() {
+            assert!(!spawned.is_connected(), "a spawned bridge is not attached");
+        }
     }
 
     /// Drop only kills what we spawned. A connected bridge's server side
