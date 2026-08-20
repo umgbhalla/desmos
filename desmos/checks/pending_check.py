@@ -144,6 +144,31 @@ def self_check() -> None:
         assert steer_evs == [{"ev": "steer", "n": 1, "text": "turn left"}], steer_evs
         assert out == "answered the steer", out
 
+    # A steer queued while the kernel is idle is delivered before turn one.
+    with tempfile.TemporaryDirectory() as tmp:
+        from desmos.kernel.catalog import steer as queue_steer
+
+        world = new_world(Path(tmp), state_path=None, persist=False, ns={})
+        world.model = "claude-opus-5"
+        pending.clear(world)
+        queue_steer(world, "idle steer")
+        world.complete_fn = lambda _m, _s, _msgs, _x: response("one turn")
+        events = []
+        run_turns(
+            world,
+            "start the next step",
+            max_turns=1,
+            quiet=True,
+            on_event=events.append,
+        )
+        steer_evs = [e for e in events if e.get("ev") == "steer"]
+        assert steer_evs == [{"ev": "steer", "n": 0, "text": "idle steer"}], steer_evs
+        delivered = [
+            m for m in world.messages
+            if m.get("role") == "user" and m.get("content") == "[steer] idle steer"
+        ]
+        assert len(delivered) == 1, delivered
+
     # A queued follow-up outranks background work: the wait gives the turn back.
     with tempfile.TemporaryDirectory() as tmp:
         world = new_world(Path(tmp), state_path=None, persist=False, ns={})

@@ -1024,6 +1024,13 @@ def _run_turns(
             emit({"ev": "error", "text": note})
         else:
             emit({"ev": "attached", "text": note})
+    # A steer can arrive while no step owns the live drain. Deliver that backlog
+    # before the first completion so this step's first model call can see it.
+    start_steered = False
+    for line in drain_steers(world):
+        deliver_steer(world, line, n=0, emit=emit)
+        start_steered = True
+
     last = ""
     n = 0
     # Consecutive stops answered by the plan rail. Reset by any turn that ran
@@ -1087,7 +1094,7 @@ def _run_turns(
             )
         # A syscall in this batch may have handed work to a monitor. Say so now,
         # while the turn is still running, rather than at the park.
-        steered = False
+        steered = start_steered and n == 1
         for line in drain_steers(world):
             deliver_steer(world, line, n=n, emit=emit)
             steered = True
