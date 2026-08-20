@@ -73,8 +73,9 @@ fn theme_lock() -> std::sync::MutexGuard<'static, ()> {
 }
 
 use std::io::{self, BufRead, BufReader, Write};
-use std::path::PathBuf;
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::os::unix::net::UnixStream;
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, TryRecvError};
 use std::time::{Duration, Instant};
 
@@ -196,9 +197,38 @@ fn pretty_json(v: &Value) -> String {
 }
 
 struct Bridge {
-    child: Child,
-    stdin: ChildStdin,
+    /// Present only when this TUI spawned the process. A connected bridge
+    /// has no child: it belongs to whoever started it and outlives us.
+    child: Option<Child>,
+    writer: Box<dyn Write + Send>,
     rx: Receiver<Value>,
+    /// The unix socket we attached to, kept for the single reconnect.
+    sock_path: Option<PathBuf>,
+    /// The live socket itself: Drop shuts it down so every clone (the reader
+    /// thread's included) closes and the bridge sees a clean detach.
+    sock: Option<UnixStream>,
+    /// The one reconnect has been spent.
+    retried: bool,
+}
+
+/// Reader half shared by every transport: one JSON object per line onto the
+/// same `Receiver<Value>` the rest of the TUI drains, whether the bytes come
+/// from a child's stdout or a live bridge's unix socket.
+fn line_reader<R: io::Read + Send + 'static>(reader: R) -> Receiver<Value> {
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        for line in BufReader::new(reader).lines().map_while(Result::ok) {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let v = serde_json::from_str(&line)
+                .unwrap_or_else(|e| json!({"ev":"error","text": e.to_string()}));
+            if tx.send(v).is_err() {
+                break;
+            }
+        }
+    });
+    rx
 }
 
 impl Bridge {
@@ -217,20 +247,68 @@ impl Bridge {
             .stdout
             .take()
             .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "bridge stdout"))?;
-        let (tx, rx) = mpsc::channel();
-        std::thread::spawn(move || {
-            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-                if line.trim().is_empty() {
-                    continue;
+        Ok(Self {
+            child: Some(child),
+            writer: Box::new(stdin),
+            rx: line_reader(stdout),
+            sock_path: None,
+            sock: None,
+            retried: false,
+        })
+    }
+
+    /// Attach to a live bridge over its unix socket instead of spawning one.
+    /// The first bytes down the wire are the attach op: `since=0` for a
+    /// fresh TUI (full replay), the last seen seq on reconnect (bridge.py's
+    /// attach replays events with seq>N from the SQL log, gaplessly).
+    fn connect(sock_path: &Path, since: u64) -> io::Result<Self> {
+        let (writer, rx, sock) = Self::open_socket(sock_path, since)?;
+        Ok(Self {
+            child: None,
+            writer,
+            rx,
+            sock_path: Some(sock_path.to_path_buf()),
+            sock: Some(sock),
+            retried: false,
+        })
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn open_socket(
+        path: &Path,
+        since: u64,
+    ) -> io::Result<(Box<dyn Write + Send>, Receiver<Value>, UnixStream)> {
+        let stream = UnixStream::connect(path)?;
+        let rx = line_reader(stream.try_clone()?);
+        let handle = stream.try_clone()?;
+        let mut writer: Box<dyn Write + Send> = Box::new(stream);
+        writeln!(writer, "{}", json!({"op": "attach", "since": since}))?;
+        writer.flush()?;
+        Ok((writer, rx, handle))
+    }
+
+    /// One reattach after the channel dies, and only for a connected bridge:
+    /// a spawned child that exited is gone for good. Returns whether a new
+    /// stream, attached at `since`, is live.
+    fn reconnect(&mut self, since: u64) -> bool {
+        let Some(path) = self.sock_path.clone() else {
+            return false;
+        };
+        if self.retried {
+            return false;
+        }
+        self.retried = true;
+        match Self::open_socket(&path, since) {
+            Ok((writer, rx, sock)) => {
+                if let Some(old) = self.sock.replace(sock) {
+                    let _ = old.shutdown(std::net::Shutdown::Both);
                 }
-                let v = serde_json::from_str(&line)
-                    .unwrap_or_else(|e| json!({"ev":"error","text": e.to_string()}));
-                if tx.send(v).is_err() {
-                    break;
-                }
+                self.writer = writer;
+                self.rx = rx;
+                true
             }
-        });
-        Ok(Self { child, stdin, rx })
+            Err(_) => false,
+        }
     }
 
     /// A bridge whose child echoes whatever it is sent, so a test can read
@@ -251,32 +329,36 @@ impl Bridge {
             .stdout
             .take()
             .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "loopback stdout"))?;
-        let (tx, rx) = mpsc::channel();
-        std::thread::spawn(move || {
-            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-                if line.trim().is_empty() {
-                    continue;
-                }
-                let v = serde_json::from_str(&line)
-                    .unwrap_or_else(|e| json!({"ev":"error","text": e.to_string()}));
-                if tx.send(v).is_err() {
-                    break;
-                }
-            }
-        });
-        Ok(Self { child, stdin, rx })
+        Ok(Self {
+            child: Some(child),
+            writer: Box::new(stdin),
+            rx: line_reader(stdout),
+            sock_path: None,
+            sock: None,
+            retried: false,
+        })
     }
 
     fn send(&mut self, msg: &Value) -> io::Result<()> {
-        writeln!(self.stdin, "{msg}")?;
-        self.stdin.flush()
+        writeln!(self.writer, "{msg}")?;
+        self.writer.flush()
     }
 }
 
 impl Drop for Bridge {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        // Only a child we spawned dies with the TUI. A connected bridge is
+        // left running: its side treats a client quit as a detach, never a
+        // shutdown (bridge.py: socket client quit only detaches).
+        if let Some(child) = self.child.as_mut() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        // Shut the socket down explicitly so the reader thread's clone closes
+        // too and the bridge's reader sees EOF -- a detach, nothing more.
+        if let Some(sock) = self.sock.take() {
+            let _ = sock.shutdown(std::net::Shutdown::Both);
+        }
     }
 }
 
@@ -977,7 +1059,14 @@ fn main() -> io::Result<()> {
     let mut bridge = if demo {
         None
     } else {
-        Some(Bridge::spawn(&python, &cwd)?)
+        // A live bridge already owns this cwd's socket: reattach to it with a
+        // full replay. Anything else -- no file, or a stale file that refuses
+        // the connection -- means spawn a child as before.
+        let sock = PathBuf::from(&cwd).join(".desmos").join("bridge.sock");
+        match Bridge::connect(&sock, 0) {
+            Ok(b) => Some(b),
+            Err(_) => Some(Bridge::spawn(&python, &cwd)?),
+        }
     };
     let mut app = App::new();
     if !demo {
@@ -1099,6 +1188,16 @@ fn run(
                     }
                     Err(TryRecvError::Empty) => break,
                     Err(TryRecvError::Disconnected) => {
+                        // A connected bridge gets exactly one reattach at the
+                        // last seq seen; bridge.py replays seq>last_seq from
+                        // the SQL log, so the resume is gapless. A spawned
+                        // child, or a second death, falls through to gone.
+                        if b.reconnect(app.last_seq) {
+                            app.notify("bridge reattached");
+                            dirty = true;
+                            last_activity = Instant::now();
+                            break;
+                        }
                         // try_recv on a closed, drained channel returns
                         // Disconnected forever. Without this break the drain
                         // loop spun at 100% and never reached draw or
@@ -4343,6 +4442,71 @@ fn format_usage(
 #[cfg(test)]
 mod tests {
 
+    /// Bridge::connect against a fake in-test unix server: the attach op is
+    /// the first bytes down the wire, and lines the server writes arrive on
+    /// the same Receiver<Value> the spawn path feeds.
+    #[test]
+    fn connect_attaches_first_and_streams_events() {
+        use std::os::unix::net::UnixListener;
+        let sock = std::env::temp_dir().join(format!("desmos-conn-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&sock);
+        let listener = UnixListener::bind(&sock).unwrap();
+        let (tx, first_line) = mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut lines = BufReader::new(stream.try_clone().unwrap()).lines();
+            tx.send(lines.next().unwrap().unwrap()).unwrap();
+            let mut w = stream;
+            writeln!(w, "{}", json!({"ev": "notice", "text": "hi", "seq": 7})).unwrap();
+            w.flush().unwrap();
+        });
+        let bridge = Bridge::connect(&sock, 0).unwrap();
+        let attach: Value =
+            serde_json::from_str(&first_line.recv_timeout(Duration::from_secs(5)).unwrap())
+                .unwrap();
+        assert_eq!(attach, json!({"op": "attach", "since": 0}));
+        let ev = bridge.rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(ev.get("seq").and_then(Value::as_u64), Some(7));
+        assert!(bridge.child.is_none(), "a connected bridge must own no child");
+        server.join().unwrap();
+        let _ = std::fs::remove_file(&sock);
+    }
+
+    /// Drop only kills what we spawned. A connected bridge's server side
+    /// sees a plain EOF -- a detach -- while a loopback child is dead after.
+    #[test]
+    fn drop_leaves_connected_bridges_running_and_kills_spawned_ones() {
+        use std::os::unix::net::UnixListener;
+        let sock = std::env::temp_dir().join(format!("desmos-drop-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&sock);
+        let listener = UnixListener::bind(&sock).unwrap();
+        let accepted = std::thread::spawn(move || listener.accept().unwrap().0);
+        let bridge = Bridge::connect(&sock, 3).unwrap();
+        let stream = accepted.join().unwrap();
+        assert!(bridge.child.is_none());
+        drop(bridge);
+        let mut r = BufReader::new(stream);
+        let mut line = String::new();
+        r.read_line(&mut line).unwrap(); // the attach op
+        assert!(line.contains("attach"), "{line}");
+        line.clear();
+        let n = r.read_line(&mut line).unwrap();
+        assert_eq!(n, 0, "drop must only close the stream, never kill the peer");
+        let _ = std::fs::remove_file(&sock);
+
+        let Ok(bridge) = Bridge::loopback() else {
+            return; // no `cat` on this box; nothing to assert
+        };
+        let pid = bridge.child.as_ref().unwrap().id();
+        drop(bridge);
+        let alive = Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .status()
+            .unwrap()
+            .success();
+        assert!(!alive, "spawned child {pid} survived Drop");
+    }
+
     /// Idle must not tick: with nothing pending the loop blocks for
     /// IDLE_WAIT (no 33ms animation frame, so no repaint per tick) and only
     /// wakes fast while something is actually live.
@@ -5651,8 +5815,8 @@ mod tests {
             Ok(b) => b,
             Err(_) => return,
         };
-        bridge.child.kill().unwrap();
-        bridge.child.wait().unwrap();
+        bridge.child.as_mut().expect("loopback spawns").kill().unwrap();
+        bridge.child.as_mut().expect("loopback spawns").wait().unwrap();
 
         let err = wait_ready(Some(&mut bridge), &mut app).expect_err("dead bridge launched TUI");
         assert_eq!(err.kind(), io::ErrorKind::BrokenPipe);

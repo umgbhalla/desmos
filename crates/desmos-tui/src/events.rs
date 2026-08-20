@@ -396,6 +396,10 @@ fn apply_decision(app: &mut App, value: &Value) {
 }
 
 pub(crate) fn handle_event(app: &mut App, ev: Value) {
+    // Every envelope carries seq; the max seen is the reattach cursor.
+    if let Some(seq) = ev.get("seq").and_then(Value::as_u64) {
+        app.last_seq = app.last_seq.max(seq);
+    }
     let kind = ev.get("ev").and_then(Value::as_str).unwrap_or("");
     // The work row's repo tail, taken here because this is where the git pane
     // is reachable. sync() is called from inside the stream cursor and used to

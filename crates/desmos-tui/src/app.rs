@@ -542,6 +542,9 @@ pub(crate) struct App {
     /// bridge at all: --demo and the pane tests run without one on purpose,
     /// and telling them the harness is gone is a lie they cannot act on.
     pub(crate) bridge_gone: bool,
+    /// Highest seq seen on any event envelope. A reconnect attaches with
+    /// `since=last_seq` so the bridge replays only what this TUI missed.
+    pub(crate) last_seq: u64,
 }
 
 impl App {
@@ -614,6 +617,7 @@ impl App {
             layout: PaneLayout::load(),
             demo: false,
             bridge_gone: false,
+            last_seq: 0,
         };
         app.apply_grok_settings();
         app
