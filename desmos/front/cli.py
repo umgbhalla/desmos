@@ -73,9 +73,14 @@ def cmd_run(args: argparse.Namespace) -> int:
 
 def cmd_bridge(args: argparse.Namespace) -> int:
     _on_path()
+    cwd = Path(args.cwd).resolve()
+    if getattr(args, "daemon", False):
+        from desmos.front.bridge import daemonize
+
+        return daemonize(cwd)
     from desmos.front.bridge import serve
 
-    return serve(Path(args.cwd).resolve())
+    return serve(cwd)
 
 
 def cmd_acp(args: argparse.Namespace) -> int:
@@ -436,6 +441,11 @@ def main() -> int:
 
     b = sub.add_parser("bridge", help="JSONL stdio bridge (used by desmos-tui)")
     b.add_argument("--cwd", default=".")
+    b.add_argument(
+        "--daemon",
+        action="store_true",
+        help="detach and serve the unix socket only (no TUI on stdio)",
+    )
     b.set_defaults(func=cmd_bridge)
 
     co = sub.add_parser("comet", help="launch Comet with Desmos as an ACP agent")

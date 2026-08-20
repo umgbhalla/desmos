@@ -654,6 +654,82 @@ def _check_decision_events(cwd: Path) -> None:
     }, changed
     assert pending(world) == [], pending(world)
 
+def _check_daemon() -> None:
+    """--daemon: detach with a pid file, serve socket-only, clean SIGTERM.
+
+    Driven through the real entry point (`python -m desmos bridge --daemon`),
+    never the internal functions.
+    """
+    import os
+    import signal
+    import subprocess
+    import sys
+    import tempfile
+    import time
+
+    root = Path(__file__).resolve().parents[2]
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        cwd = tmp / "w"
+        cwd.mkdir()
+        env = dict(os.environ)
+        env["DESMOS_SETTINGS"] = str(tmp / "settings.json")
+        env["PYTHONPATH"] = str(root)
+        env["OPENAI_API_KEY"] = "check-only"
+        env["DESMOS_TOOL_SYSCALLS"] = "0"
+        argv = [sys.executable, "-m", "desmos", "bridge", "--cwd", str(cwd), "--daemon"]
+        first = subprocess.run(
+            argv, capture_output=True, text=True, timeout=60, env=env, cwd=str(cwd)
+        )
+        assert first.returncode == 0, (first.returncode, first.stdout, first.stderr)
+        pid = int(first.stdout.strip())
+        dot = cwd / ".desmos"
+        pid_file = dot / "bridge.pid"
+        assert pid_file.is_file(), "parent exited 0 but bridge.pid is missing"
+        assert int(pid_file.read_text(encoding="utf-8")) == pid
+
+        def log_tail() -> str:
+            log = dot / "bridge.log"
+            return log.read_text(encoding="utf-8")[-2000:] if log.is_file() else "<no log>"
+
+        # The parent returns before the daemon binds; poll, bounded.
+        sock_path = dot / "bridge.sock"
+        deadline = time.time() + 30
+        while not sock_path.exists():
+            assert time.time() < deadline, f"daemon never bound the socket; log: {log_tail()}"
+            time.sleep(0.05)
+        try:
+            client = _SockClient(sock_path)
+            try:
+                client.send({"op": "attach", "since": 0})
+                ready = client.until(lambda e: e.get("ev") == "ready")
+                # macOS tempdirs live behind the /var -> /private/var symlink.
+                assert Path(ready["cwd"]).resolve() == cwd.resolve(), ready
+            finally:
+                client.close()
+
+            # A second --daemon in the same cwd must refuse, loudly.
+            second = subprocess.run(
+                argv, capture_output=True, text=True, timeout=60, env=env, cwd=str(cwd)
+            )
+            assert second.returncode == 1, (second.returncode, second.stdout, second.stderr)
+            resolved = cwd.resolve() / ".desmos" / "bridge.sock"
+            assert f"bridge already serving {resolved}" in second.stderr, second.stderr
+            assert pid_file.is_file(), "the refused second daemon clobbered bridge.pid"
+        finally:
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+        deadline = time.time() + 30
+        while pid_file.exists() or sock_path.exists():
+            assert time.time() < deadline, (
+                f"SIGTERM cleanup incomplete: pid_file={pid_file.exists()} "
+                f"sock={sock_path.exists()}; log: {log_tail()}"
+            )
+            time.sleep(0.05)
+
+
 def check() -> None:
     import tempfile
 
@@ -1003,3 +1079,4 @@ def check() -> None:
         _check_vendor_patch()
         _check_release_tui_launcher()
     _check_socket()
+    _check_daemon()

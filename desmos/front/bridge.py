@@ -422,6 +422,94 @@ def _bind_socket(cwd: Path) -> tuple[socket.socket | None, bool]:
     return srv, False
 
 
+def daemonize(cwd: Path) -> int:
+    """--daemon: detach and serve the socket only, no TUI on stdio.
+
+    The parent prints the daemon's pid and exits 0. The detached child rebinds
+    fd 0 to /dev/null -- its stdin reader hits EOF at once and serve() takes
+    the existing socket-only downgrade -- and fds 1/2 to .desmos/bridge.log
+    (append), so a lost stdout can never kill it. SIGTERM is the clean
+    shutdown: serve()'s own finally unlinks the socket it owns (socket_owned
+    stays respected), and the pid file goes with it.
+    """
+    import signal
+
+    dot = cwd / ".desmos"
+    dot.mkdir(parents=True, exist_ok=True)
+    sock_path = dot / "bridge.sock"
+    if sock_path.exists():
+        probe = socket.socket(socket.AF_UNIX)
+        probe.settimeout(0.5)
+        try:
+            probe.connect(str(sock_path))
+        except OSError:
+            pass  # stale path: serve()'s _bind_socket unlinks and takes over
+        else:
+            print(f"bridge already serving {sock_path}", file=sys.stderr)
+            return 1
+        finally:
+            probe.close()
+
+    rd, wr = os.pipe()
+    pid = os.fork()
+    if pid:
+        # The launcher: wait for the daemon to report its pid, relay it.
+        os.close(wr)
+        data = b""
+        while True:
+            chunk = os.read(rd, 64)
+            if not chunk:
+                break
+            data += chunk
+        os.close(rd)
+        os.waitpid(pid, 0)
+        if not data:
+            print("bridge daemon failed to detach", file=sys.stderr)
+            return 1
+        print(int(data))
+        return 0
+
+    # First child: a fresh session, then fork again so the daemon can never
+    # reacquire a controlling terminal.
+    os.close(rd)
+    os.setsid()
+    if os.fork():
+        os._exit(0)
+
+    # The daemon.
+    devnull = os.open(os.devnull, os.O_RDONLY)
+    os.dup2(devnull, 0)
+    os.close(devnull)
+    log_fd = os.open(
+        str(dot / "bridge.log"), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600
+    )
+    os.dup2(log_fd, 1)
+    os.dup2(log_fd, 2)
+    os.close(log_fd)
+
+    def _term(signum: int, frame: Any) -> None:
+        # Raised in the main thread, which sits in the inbox get(); it
+        # propagates through _drive so serve()'s finally runs the same
+        # cleanup a quit op would.
+        raise SystemExit(0)
+
+    signal.signal(signal.SIGTERM, _term)
+    pid_file = dot / "bridge.pid"
+    pid_file.write_text(str(os.getpid()), encoding="utf-8")
+    os.write(wr, str(os.getpid()).encode("ascii"))
+    os.close(wr)
+    code = 1
+    try:
+        code = serve(cwd)
+    except SystemExit as exc:
+        code = int(exc.code or 0)
+    except BaseException:  # noqa: BLE001 -- the daemon must still drop its pid file
+        code = 1
+    finally:
+        pid_file.unlink(missing_ok=True)
+    os._exit(code)
+
+
 def _watch_channel(
     world: Any, inbox: queue.Queue, stop: threading.Event
 ) -> None:
