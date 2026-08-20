@@ -29,6 +29,24 @@ def _seq(value: Any) -> tuple[str, ...]:
     return tuple(str(item) for item in value)
 
 
+def _components(path: str) -> tuple[str, ...]:
+    """Normalized path components: posix separators, no empty or '.' parts."""
+    normalized = path.replace("\\", "/")
+    return tuple(part for part in normalized.split("/") if part and part != ".")
+
+
+def _in_scope(changed: str, scopes: tuple[str, ...]) -> bool:
+    """True when `changed` equals a scope entry or sits under one treated as a
+    directory. Comparison is by path component, never bare str.startswith --
+    `src-evil/x` must not match a `src` scope."""
+    parts = _components(changed)
+    for scope in scopes:
+        scope_parts = _components(scope)
+        if parts[: len(scope_parts)] == scope_parts:
+            return True
+    return False
+
+
 @dataclass(frozen=True)
 class TaskContract:
     objective: str
@@ -62,7 +80,9 @@ class TaskContract:
             raise ValueError("deliverable_schema is required")
         if self.write_paths and not self.allowed_paths:
             raise ValueError("write_paths require allowed_paths")
-        outside = [path for path in self.write_paths if path not in self.allowed_paths]
+        outside = [
+            path for path in self.write_paths if not _in_scope(path, self.allowed_paths)
+        ]
         if outside:
             raise ValueError(f"write paths are outside allowed_paths: {outside}")
         # judge() matches these against the `kind` field of every EvidenceRef the
@@ -377,7 +397,7 @@ def judge(
         if not contract.write_paths:
             reasons.append("result reports changed paths for a read-only contract")
         for changed in result.changed_paths:
-            if changed not in contract.write_paths:
+            if not _in_scope(changed, contract.write_paths):
                 reasons.append(f"changed path is outside write scope: {changed}")
     if result.failures:
         reasons.extend(f"reported failure: {failure}" for failure in result.failures)

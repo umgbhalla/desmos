@@ -17,7 +17,7 @@ class SimpleSubagentContractTests(unittest.TestCase):
             checks=("request path is traced",),
             tools=("bash",),
             depends=("prior123",),
-            evidence=("file_line",),
+            evidence=("file",),
         )
         self.assertTrue(contract.compact)
         self.assertEqual(contract.allowed_paths, ("desmos/complete.py",))
@@ -25,11 +25,58 @@ class SimpleSubagentContractTests(unittest.TestCase):
         self.assertEqual(contract.acceptance_checks, ("request path is traced",))
         self.assertEqual(contract.allowed_tools, ("bash",))
         self.assertEqual(contract.dependencies, ("prior123",))
-        self.assertEqual(contract.required_evidence, ("file_line",))
+        self.assertEqual(contract.required_evidence, ("file",))
 
     def test_write_scope_still_must_be_inside_read_scope(self):
         with self.assertRaisesRegex(ValueError, "outside allowed_paths"):
             TaskContract.simple("edit", paths=("a.py",), write=("b.py",))
+
+    def test_write_paths_under_an_allowed_directory_pass_post_init(self):
+        contract = TaskContract(
+            objective="edit",
+            allowed_paths=("crates/desmos-tui",),
+            write_paths=("crates/desmos-tui/src",),
+        )
+        self.assertEqual(contract.write_paths, ("crates/desmos-tui/src",))
+
+    def _judge_scope(self, write_paths, changed):
+        from desmos.subagent_contracts import RunResult, judge
+
+        contract = TaskContract(
+            objective="edit",
+            allowed_paths=("crates",),
+            write_paths=write_paths,
+            require_tool_use=False,
+        )
+        result = RunResult(
+            terminal_state="done",
+            stop_reason="completed",
+            summary="edited",
+            changed_paths=(changed,),
+        )
+        return judge(contract, result)
+
+    def test_judge_directory_write_scope_accepts_nested_file(self):
+        judgment = self._judge_scope(("crates/desmos-tui/src",),
+                                     "crates/desmos-tui/src/main.rs")
+        self.assertNotIn(
+            "changed path is outside write scope: crates/desmos-tui/src/main.rs",
+            judgment.reasons,
+        )
+
+    def test_judge_rejects_sibling_dir_with_shared_string_prefix(self):
+        judgment = self._judge_scope(("crates/src",), "crates/src-evil/main.rs")
+        self.assertIn(
+            "changed path is outside write scope: crates/src-evil/main.rs",
+            judgment.reasons,
+        )
+
+    def test_judge_exact_file_write_entry_still_works(self):
+        judgment = self._judge_scope(("crates/lib.rs",), "crates/lib.rs")
+        self.assertNotIn(
+            "changed path is outside write scope: crates/lib.rs",
+            judgment.reasons,
+        )
 
     def test_compact_prompt_is_materially_smaller(self):
         full = TaskContract(
@@ -37,14 +84,14 @@ class SimpleSubagentContractTests(unittest.TestCase):
             allowed_paths=("desmos",),
             acceptance_checks=("one",),
             allowed_tools=("bash",),
-            required_evidence=("file_line",),
+            required_evidence=("file",),
         ).prompt()
         compact = TaskContract.simple(
             "audit",
             paths=("desmos",),
             checks=("one",),
             tools=("bash",),
-            evidence=("file_line",),
+            evidence=("file",),
         ).prompt()
         self.assertLess(len(compact), len(full) * 0.6)
 
