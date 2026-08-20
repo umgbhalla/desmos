@@ -796,6 +796,52 @@ def _quarantine(path: Path, exc: BaseException) -> list[Path]:
         return moved
 
 
+def _is_lock_error(exc: BaseException) -> bool:
+    return isinstance(exc, sqlite3.OperationalError) and "locked" in str(exc).lower()
+
+
+def _quarantine_settled(path: Path) -> bool:
+    """Was another opener inside the quarantine window? Wait it out if so.
+
+    Returns False immediately when the quarantine lock is free (or was never
+    taken): a plain transient error on a healthy database keeps its one-retry
+    semantics. Returns True only after blocking until the concurrent
+    quarantine's rename has settled, so a retry sees the rebuilt file.
+    """
+    lock_path = path.with_name(path.name + ".quarantine.lock")
+    if not lock_path.exists():
+        return False
+    with open(lock_path, "w", encoding="utf-8") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            fcntl.flock(lock, fcntl.LOCK_EX)  # block until the winner is done
+            return True
+        return False
+
+
+def _reopen_after_quarantine(path: Path) -> sqlite3.Connection:
+    """Bounded reopen: the quarantine winner may still hold write locks
+    while it rebuilds the fresh database, so a losing opener retries lock
+    errors briefly instead of surfacing them raw."""
+    last: sqlite3.OperationalError | None = None
+    for _ in range(20):
+        conn: sqlite3.Connection | None = None
+        try:
+            conn = _connect(path)
+            _migrate(conn)
+            return conn
+        except sqlite3.OperationalError as exc:
+            if conn is not None:
+                conn.close()
+            if not _is_lock_error(exc):
+                raise
+            last = exc
+            time.sleep(0.05)
+    assert last is not None
+    raise last
+
+
 def _open(path: Path) -> sqlite3.Connection:
     path.parent.mkdir(parents=True, exist_ok=True)
     conn: sqlite3.Connection | None = None
@@ -810,14 +856,20 @@ def _open(path: Path) -> sqlite3.Connection:
             # The file itself is healthy (or cannot be judged): the error was
             # transient -- a lock, a race, an interrupted read. Retry once,
             # then surface it. Quarantining a healthy database loses state.
+            # If a concurrent opener held the quarantine window, wait for its
+            # rename to settle first, and treat a lingering lock as part of
+            # that window rather than a raw failure.
+            settled = _quarantine_settled(path)
             conn = None
             try:
                 conn = _connect(path)
                 _migrate(conn)
                 return conn
-            except sqlite3.DatabaseError:
+            except sqlite3.DatabaseError as retry_exc:
                 if conn is not None:
                     conn.close()
+                if settled and _is_lock_error(retry_exc):
+                    return _reopen_after_quarantine(path)
                 raise
         moved = _quarantine(path, exc)
         if moved:
@@ -828,9 +880,7 @@ def _open(path: Path) -> sqlite3.Connection:
                 RuntimeWarning,
                 stacklevel=2,
             )
-        conn = _connect(path)
-        _migrate(conn)
-        return conn
+        return _reopen_after_quarantine(path)
 
 
 def _uuid7() -> str:
