@@ -1696,8 +1696,11 @@ fn submit_prompt_inner(
             app.queue.push_with(line, images);
             app.notify(format!("queued #{}", idx + 1));
         } else if let Some(b) = bridge.as_mut() {
-            b.send(&json!({"op": "steer", "text": line}))?;
-            app.pending_steers.push_back(line);
+            let line = line.trim();
+            if !line.is_empty() {
+                b.send(&json!({"op": "steer", "text": line}))?;
+                app.pending_steers.push_back(line.into());
+            }
         } else {
             app.notify("bridge is gone");
         }
@@ -5876,17 +5879,17 @@ mod tests {
 
         let mut running = App::new();
         running.running = true;
-        running.prompt.insert_str("adjust course");
+        running.prompt.insert_str("go left  ");
         submit_prompt(Some(&mut bridge), &mut running).unwrap();
         let steer = bridge.rx.recv_timeout(Duration::from_secs(5)).unwrap();
-        assert_eq!(steer, json!({"op": "steer", "text": "adjust course"}));
+        assert_eq!(steer, json!({"op": "steer", "text": "go left"}));
         assert_eq!(
             running.pending_steers.iter().cloned().collect::<Vec<_>>(),
-            vec!["adjust course"]
+            vec!["go left"]
         );
         let pending = paint(&mut running, 120, 34);
         assert!(pending.contains("Steer pending  1"), "{pending}");
-        assert!(pending.contains("adjust course"), "{pending}");
+        assert!(pending.contains("go left"), "{pending}");
 
         handle_event(
             &mut running,
@@ -5895,9 +5898,11 @@ mod tests {
         assert_eq!(running.sess.story.len(), 0, "queue ack is not a Story turn");
         handle_event(
             &mut running,
-            json!({"ev": "steer", "text": "adjust course"}),
+            json!({"ev": "steer", "text": "go left"}),
         );
         assert!(running.pending_steers.is_empty());
+        let delivered = paint(&mut running, 120, 34);
+        assert!(!delivered.contains("Steer pending"), "{delivered}");
         assert!(matches!(
             running.sess.story.entry(0).map(|entry| &entry.block),
             Some(RenderBlock::UserPrompt(_))

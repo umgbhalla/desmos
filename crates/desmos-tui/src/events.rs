@@ -586,7 +586,11 @@ pub(crate) fn handle_event(app: &mut App, ev: Value) {
         }
         "steer" => {
             let text = ev.get("text").and_then(Value::as_str).unwrap_or("");
-            if let Some(idx) = app.pending_steers.iter().position(|item| item == text) {
+            if let Some(idx) = app
+                .pending_steers
+                .iter()
+                .position(|item| item.trim() == text)
+            {
                 app.pending_steers.remove(idx);
             }
             if !text.is_empty() {
