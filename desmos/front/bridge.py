@@ -67,6 +67,10 @@ def _snapshot(world: Any) -> dict[str, Any]:
 # wedges the bridge on any <python> that prints. Write to the real handle.
 _WIRE = sys.stdout
 
+# Set once the stdout pipe dies (the TUI was killed). The wire write is then
+# skipped permanently; _log and the socket fan-out keep going.
+_WIRE_DEAD = False
+
 # One NDJSON line per event, and a line only means anything whole. Subagents
 # run on their own threads and every one of them reaches this function through
 # child_event, so the main loop and up to a poolful of children write here at
@@ -188,12 +192,19 @@ def _log(ev: dict[str, Any]) -> None:
 
 
 def _emit(ev: dict[str, Any]) -> None:
+    global _WIRE_DEAD
     line = json.dumps(ev, default=str) + "\n"
     data = line.encode("utf-8")
     with _WIRE_LOCK:
         _log(ev)
-        _WIRE.write(line)
-        _WIRE.flush()
+        if not _WIRE_DEAD:
+            try:
+                _WIRE.write(line)
+                _WIRE.flush()
+            except (OSError, ValueError):
+                # Dead stdout (TUI SIGKILLed): disable the stdout wire for
+                # good, keep the log and socket clients alive. Never raise.
+                _WIRE_DEAD = True
         for client in _CLIENTS[:]:
             try:
                 client.push(data)
@@ -505,6 +516,7 @@ def _read_ops(
     inbox: queue.Queue,
     cancel: threading.Event,
     pause: threading.Event,
+    socket_up: bool = False,
 ) -> None:
     """The stdin op reader. Out-of-band ops -- stop/quit/steer/pause/resume and
     the interventions -- are answered on this thread; everything else queues on
@@ -526,6 +538,11 @@ def _read_ops(
                 return
             continue
         inbox.put(msg)
+    # stdin EOF: the TUI is gone. With a live socket the bridge keeps serving
+    # so a new TUI can attach; with no transport at all, shut down as before.
+    if socket_up:
+        _emit({"ev": "notice", "text": "stdio client gone; serving socket only"})
+        return
     inbox.put(None)
 
 
@@ -594,7 +611,7 @@ def serve(cwd: Path) -> int:
         threading.Thread(target=acceptor, daemon=True).start()
 
     def reader() -> None:
-        _read_ops(sys.stdin, world, inbox, cancel, pause)
+        _read_ops(sys.stdin, world, inbox, cancel, pause, socket_up=sock_srv is not None)
 
     threading.Thread(target=reader, daemon=True).start()
     from desmos.transport.settings import picker as _picker
