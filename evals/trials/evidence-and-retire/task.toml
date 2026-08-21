@@ -1,0 +1,9 @@
+version = "1.0"
+
+[metadata]
+name = "evidence-and-retire"
+capability = "self-improvement: usage evidence in census, tombstone, epitaph"
+
+[verifier]
+entrypoint = "verifier/verify.py"
+timeout_sec = 60

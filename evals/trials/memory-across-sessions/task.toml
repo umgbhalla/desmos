@@ -1,0 +1,9 @@
+version = "1.0"
+
+[metadata]
+name = "memory-across-sessions"
+capability = "self-improvement: durable memory found by ranked multi-word search"
+
+[verifier]
+entrypoint = "verifier/verify.py"
+timeout_sec = 60

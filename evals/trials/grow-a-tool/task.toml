@@ -1,0 +1,9 @@
+version = "1.0"
+
+[metadata]
+name = "grow-a-tool"
+capability = "self-improvement: grow a dispatchable tool between turns"
+
+[verifier]
+entrypoint = "verifier/verify.py"
+timeout_sec = 60
