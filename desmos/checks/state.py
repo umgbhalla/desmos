@@ -85,6 +85,55 @@ def check() -> None:
         assert "user.umang.identity" not in gone, gone
         dispatch(memory_world2, _memory( "consolidate", {}))
 
+        # BM25 search: multi-word relevance beats substring noise, forgotten
+        # records never surface, the derived FTS index rebuilds itself after
+        # deletion, and FTS-hostile queries fall back instead of raising.
+        from desmos.state import memory as memory_mod
+
+        for rid, content in (
+            # Dense hit: the query terms dominate the record.
+            ("repo.rank.dense", "rust compiler pipeline: the rust compiler stages"),
+            # Noise: both terms appear once, buried in a long record, and its
+            # id sorts before the dense hit so the old priority order would
+            # have listed it first.
+            (
+                "repo.rank.a-noise",
+                "notes on many things "
+                + "filler word soup " * 40
+                + "one rust remark and a compiler aside",
+            ),
+        ):
+            dispatch(
+                memory_world2,
+                _memory(content, {"id": rid, "scope": "repo", "kind": "note"}),
+            )
+        ranked = dispatch(memory_world2, _memory("search rust compiler", {}))
+        assert ranked.index("repo.rank.dense") < ranked.index("repo.rank.a-noise"), ranked
+        assert "user.umang.identity" not in ranked, ranked
+
+        dispatch(memory_world2, _memory("forget repo.rank.a-noise", {}))
+        after_forget = dispatch(memory_world2, _memory("search rust compiler", {}))
+        assert "repo.rank.a-noise" not in after_forget, after_forget
+        assert "repo.rank.dense" in after_forget, after_forget
+
+        # The index is derived and disposable: delete it and search rebuilds.
+        index_file = memory_mod._index_path(memory_mod.memory_root(memory_world2))
+        assert index_file.is_file(), index_file
+        index_file.unlink()
+        rebuilt = dispatch(memory_world2, _memory("search rust compiler", {}))
+        assert "repo.rank.dense" in rebuilt, rebuilt
+        assert index_file.is_file(), "search did not rebuild the derived index"
+
+        # A malformed record id: the forgotten record's terms via substring
+        # only (FTS returns zero rows for an empty phrase) still answer
+        # through the scan fallback instead of "no match" surprises.
+        assert memory_mod.search(memory_world2, "ompiler") != "no match"
+
+        # An FTS-hostile query (embedded NUL breaks the MATCH string) must
+        # fall back to the substring scan, not raise to the caller.
+        hostile = memory_mod.search(memory_world2, "rust \x00", mode="any")
+        assert "repo.rank.dense" in hostile, hostile
+
         ping = cwd / ".desmos" / "skills" / "ping"
         ping.mkdir(parents=True)
         (ping / "SKILL.md").write_text(

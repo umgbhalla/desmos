@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import sqlite3
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -12,6 +13,7 @@ from desmos.kernel.types import World
 
 RECORDS_SUBDIR = "memories"
 RECORDS_FILENAME = "records.jsonl"
+INDEX_FILENAME = "search_index.sqlite3"
 SUMMARY_FILENAME = "memory_summary.md"
 HANDBOOK_FILENAME = "MEMORY.md"
 LEGACY_FILENAME = "legacy_MEMORY.md"
@@ -298,11 +300,76 @@ def remember(
     return f"{action} {target['id']} ({len([r for r in records if r.get('status') == 'active'])} active)"
 
 
-def search(world: World, query: str, *, max_results: int = MAX_SEARCH_RESULTS, mode: str = "all") -> str:
-    _, records = _ensure_records(world)
-    terms = [term.lower() for term in query.split() if term]
-    if not terms:
-        return "memory search failed: query required"
+def _index_path(root: Path) -> Path:
+    return root / RECORDS_SUBDIR / INDEX_FILENAME
+
+
+def _records_stamp(root: Path) -> str:
+    try:
+        stat = records_path(root).stat()
+    except OSError:
+        return "missing"
+    return f"{stat.st_mtime_ns}:{stat.st_size}"
+
+
+def _fts_hits(root: Path, records: list[dict[str, Any]], terms: list[str], mode: str) -> list[str] | None:
+    """BM25-ranked ids for the query, or None when FTS5 cannot answer.
+
+    records.jsonl stays the source of truth (append-only, A1); this index is
+    derived and disposable. It is rebuilt whenever it is missing or stale
+    (records.jsonl stamp or active-row count mismatch), so deleting the file
+    is always safe. Any sqlite error -- FTS5 unavailable, corrupt index,
+    FTS-hostile query -- returns None and the caller falls back to the
+    substring scan instead of raising.
+    """
+    active = [r for r in records if r.get("status", "active") == "active"]
+    match = (" OR " if mode == "any" else " AND ").join(
+        '"' + term.replace('"', '""') + '"' for term in terms
+    )
+    try:
+        _index_path(root).parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(_index_path(root))
+    except (sqlite3.Error, OSError):
+        return None
+    try:
+        conn.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)")
+        conn.execute(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5("
+            "id, scope, kind, content, tokenize = 'porter unicode61')"
+        )
+        stamp = _records_stamp(root)
+        row = conn.execute("SELECT value FROM meta WHERE key = 'stamp'").fetchone()
+        count = conn.execute("SELECT count(*) FROM memory_fts").fetchone()[0]
+        if row is None or row[0] != stamp or count != len(active):
+            conn.execute("DELETE FROM memory_fts")
+            conn.executemany(
+                "INSERT INTO memory_fts (id, scope, kind, content) VALUES (?, ?, ?, ?)",
+                [
+                    (
+                        str(r.get("id", "")),
+                        str(r.get("scope", "")),
+                        str(r.get("kind", "")),
+                        str(r.get("content", "")),
+                    )
+                    for r in active
+                ],
+            )
+            conn.execute(
+                "INSERT OR REPLACE INTO meta (key, value) VALUES ('stamp', ?)", (stamp,)
+            )
+            conn.commit()
+        rows = conn.execute(
+            "SELECT id FROM memory_fts WHERE memory_fts MATCH ? ORDER BY bm25(memory_fts)",
+            (match,),
+        ).fetchall()
+        return [r[0] for r in rows]
+    except sqlite3.Error:
+        return None
+    finally:
+        conn.close()
+
+
+def _scan_hits(records: list[dict[str, Any]], terms: list[str], mode: str) -> list[dict[str, Any]]:
     hits = []
     for record in records:
         if record.get("status", "active") != "active":
@@ -313,10 +380,27 @@ def search(world: World, query: str, *, max_results: int = MAX_SEARCH_RESULTS, m
         matched = all(term in blob for term in terms) if mode != "any" else any(term in blob for term in terms)
         if matched:
             hits.append(record)
+    return sorted(hits, key=_priority)
+
+
+def search(world: World, query: str, *, max_results: int = MAX_SEARCH_RESULTS, mode: str = "all") -> str:
+    root, records = _ensure_records(world)
+    terms = [term for term in query.split() if term]
+    if not terms:
+        return "memory search failed: query required"
+    by_id = {
+        str(r.get("id")): r for r in records if r.get("status", "active") == "active"
+    }
+    ranked = _fts_hits(root, records, terms, mode)
+    hits = [by_id[rid] for rid in ranked if rid in by_id] if ranked else []
+    if not hits:
+        # FTS5 unavailable, FTS-hostile query, or tokenization missed a raw
+        # substring match: the linear scan keeps the old recall guarantees.
+        hits = _scan_hits(records, [t.lower() for t in terms], mode)
     if not hits:
         return "no match"
     lines = []
-    for record in sorted(hits, key=_priority)[: max(1, min(max_results, MAX_SEARCH_RESULTS))]:
+    for record in hits[: max(1, min(max_results, MAX_SEARCH_RESULTS))]:
         content = _clean(str(record["content"]))
         if len(content) > 320:
             content = content[:317].rstrip() + "..."
