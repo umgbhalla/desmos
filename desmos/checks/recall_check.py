@@ -1,4 +1,4 @@
-"""Checks for the recall lane: the ~/.desmos/registry append and the <recall>
+"""Checks for the recall lane: the ~/.desmos/registry append and the knowledge op=recall
 syscall. All state is temp (temp root + temp HOME); nothing touches the real
 registry. The seeded round-trip silent-skips unless a memex-desmos fork is on
 PATH — the common case is no fork, and then only the refusal path is live.

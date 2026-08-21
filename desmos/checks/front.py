@@ -183,7 +183,7 @@ def scripted(model, system, messages, max_tokens):
         # spilled keeping the head -- a tail marker never reaches the blob.
         if "FLOODED" not in blob:
             body = 'print("FLOODED")\\nfor i in range(6000):\\n    print(i)'
-            return say("flooding\\n<python>\\n" + body + "\\n</python>")
+            return say('flooding\\n<exec op="python">\\n' + body + "\\n</exec>")
         return say("flood finished")
     if "kill test" in blob:
         if "<result" not in blob:
@@ -193,10 +193,10 @@ def scripted(model, system, messages, max_tokens):
                 "wait(rid, timeout=60)",
                 'print("child settled")',
             ])
-            return say("spawning\\n<python>\\n" + body + "\\n</python>")
+            return say('spawning\\n<exec op="python">\\n' + body + "\\n</exec>")
         return say("kill test finished")
     if "loop forever" in blob:
-        return say("looping\\n<bash>sleep 0.3</bash>")
+        return say('looping\\n<exec op="bash">sleep 0.3</exec>')
     return say("pong")
 
 
@@ -949,7 +949,7 @@ def check() -> None:
             return {
                 "content": [
                     {"type": "thinking", "thinking": "hmm", "signature": "sig"},
-                    {"type": "text", "text": "<python>1+1</python>"},
+                    {"type": "text", "text": '<exec op="python">1+1</exec>'},
                 ],
                 "usage": {},
             }
@@ -979,7 +979,7 @@ def check() -> None:
         assert "tool_call_update" in kinds
         assert all(n["params"].get("_meta", {}).get("promptId") == "p-check" for n in notes if n.get("method") == "session/update")
         tool = next(n["params"]["update"] for n in notes if n.get("method") == "session/update" and n["params"]["update"]["sessionUpdate"] == "tool_call")
-        assert tool["title"] == "python" and tool["kind"] == "execute"
+        assert tool["title"] == "exec" and tool["kind"] == "execute"
 
         # The pager opens a second session on the same cwd for every new
         # thread. Sessions on one workspace share the World -- persist keys its

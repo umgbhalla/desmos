@@ -10,7 +10,7 @@ brainstem, and evidence.
 In the hunger-games runs, Opus 5:
 
 - found the answer and left it in stdout
-- registered `<grep>` / `<read>` only when the chat still felt like a session
+- registered ad-hoc grep/read tools only when the chat still felt like a session
 - never wrote `SURVIVAL`
 - after a wipe, re-oriented instead of using heap objects it already had
 
@@ -59,7 +59,7 @@ do work
 2. `<tool name doc>` — rewrite a description so future-you routes better.
 3. `SKILL.md` under `.desmos/skills/<name>/` — instructions, progressive.
 4. Python skill `handle` / `run` — real code in the kernel. Medium-high.
-5. `<register>` XML tag — new dialect. Entropy risk. Prefer a skill.
+5. `harness op=register` — new dialect. Entropy risk. Prefer a skill.
 6. Extension `load(api)` — hooks on dispatch. Highest user-code risk.
 
 ### What may not grow

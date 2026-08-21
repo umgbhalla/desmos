@@ -253,10 +253,10 @@ def check() -> None:
         interrupted = []
         for i in range(31):
             interrupted.append({"role": "user", "content": f"prompt {i}"})
-            interrupted.append({"role": "assistant", "content": f"<bash>echo {i}</bash>"})
-            interrupted.append({"role": "user", "content": f'<result tag="bash">{i}</result>'})
+            interrupted.append({"role": "assistant", "content": f'<exec op="bash">echo {i}</exec>'})
+            interrupted.append({"role": "user", "content": f'<result tag="exec">{i}</result>'})
             interrupted.append({"role": "assistant", "content": f"ran {i}"})
-        interrupted.append({"role": "user", "content": '<result tag="bash">last</result>'})
+        interrupted.append({"role": "user", "content": '<result tag="exec">last</result>'})
         interrupted.append({"role": "user", "content": "[stopped by the user after turn 1]"})
         for shape in (interrupted, interrupted[:-1], interrupted[:-2], interrupted[2:]):
             aligned = turn_aligned(shape)
@@ -296,7 +296,7 @@ def check() -> None:
                 "content": [
                     {"type": "text", "text": "first"},
                     {"type": "tool_use", "id": "toolu_ok", "name": "syscall",
-                     "input": {"input": "<bash>true</bash>"}},
+                     "input": {"input": '<exec op="bash">true</exec>'}},
                 ],
             },
             {
@@ -308,7 +308,7 @@ def check() -> None:
                 "content": [
                     {"type": "text", "text": "now the slow one"},
                     {"type": "tool_use", "id": "toolu_dangling", "name": "syscall",
-                     "input": {"input": "<bash>sleep 999</bash>"}},
+                     "input": {"input": '<exec op="bash">sleep 999</exec>'}},
                 ],
             },
             {"role": "user", "content": "a later prompt the crash never answered"},
@@ -359,7 +359,7 @@ def check() -> None:
                 "role": "assistant",
                 "content": [
                     {"type": "custom_tool_call", "call_id": "call_9", "name": "syscall",
-                     "input": "<bash>sleep 999</bash>"},
+                     "input": '<exec op="bash">sleep 999</exec>'},
                 ],
             },
         ]
@@ -378,13 +378,13 @@ def check() -> None:
         prose_world = new_world(cwd, state_path=prose_path)
         prose_world.messages = [
             {"role": "user", "content": "run it"},
-            {"role": "assistant", "content": "on it\n<bash>echo hi</bash>"},
+            {"role": "assistant", "content": 'on it\n<exec op="bash">echo hi</exec>'},
         ]
         _save_world(prose_world)
         healed_prose = new_world(cwd, state_path=prose_path)
         assert len(healed_prose.messages) == 3, healed_prose.messages
         assert healed_prose.messages[2]["role"] == "user"
-        assert '<result tag="bash">' in healed_prose.messages[2]["content"]
+        assert '<result tag="exec">' in healed_prose.messages[2]["content"]
         assert "interrupted" in healed_prose.messages[2]["content"]
         prose_world2 = new_world(cwd, state_path=cwd / "orphan-prose-done.sqlite3")
         prose_world2.messages = [

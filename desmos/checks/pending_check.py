@@ -9,6 +9,7 @@ from typing import Any
 
 from desmos import pending
 from desmos.loop import new_world, run_turns
+from desmos.types import Tool
 
 LT = chr(60)
 
@@ -27,18 +28,18 @@ def self_check() -> None:
         world.model = "claude-opus-5"
         pending.clear(world)
 
-        def sleeper(body: str, **_a: str) -> str:
+        def pending_task(body: str, **_a: str) -> str:
             secs = float(body.strip() or "0.2")
             pending.submit(world, "sleep", lambda: (time.sleep(secs), "slept and woke up")[1])
             return f"scheduled; not waiting {secs}s"
 
-        world.tools["sleeper"] = type(world.tools["python"])(
-            name="sleeper", doc="sleep in the background", handler=sleeper
+        world.tools["pending-task"] = Tool(
+            name="pending-task", doc="schedule pending background work", handler=pending_task
         )
 
         seen: list[str] = []
         turns = [
-            response(f"{LT}sleeper>0.2{LT}/sleeper>"),
+            response(f"{LT}pending-task>0.2{LT}/pending-task>"),
             response("scheduled it; nothing to wait for"),
             response("the task landed, so here is the outcome"),
         ]
@@ -90,15 +91,15 @@ def self_check() -> None:
         world.model = "claude-opus-5"
         pending.clear(world)
 
-        def sleeper2(body: str, **_a: str) -> str:
+        def pending_task2(body: str, **_a: str) -> str:
             pending.submit(world, "sleep", lambda: (time.sleep(1.0), "slept")[1])
             return "scheduled"
 
-        world.tools["sleeper"] = type(world.tools["python"])(
-            name="sleeper", doc="sleep in the background", handler=sleeper2
+        world.tools["pending-task"] = Tool(
+            name="pending-task", doc="schedule pending background work", handler=pending_task2
         )
         turns = [
-            response(f"{LT}sleeper>1.0{LT}/sleeper>"),
+            response(f"{LT}pending-task>1.0{LT}/pending-task>"),
             response("nothing to wait for"),
             response("answering the steer"),
             response("task landed, done"),

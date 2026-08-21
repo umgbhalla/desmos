@@ -1,4 +1,4 @@
-"""find checks: the <find> syscall driven through real dispatch over a real
+"""find checks: the workspace op=find syscall driven through real dispatch over a real
 fff engine.
 
 The whole file silent-skips when the fff extension module is not built (it is
@@ -6,7 +6,7 @@ built out-of-band by the orchestrator). Each check drives the real dispatch
 path in a fresh temp tree and tears the engine down after, so no check holds a
 handle on a deleted tempdir.
 
-(a) typo round-trip: <find>mian.py</find> ranks src/main.py first.
+(a) typo round-trip: <workspace op="find">mian.py</workspace> ranks src/main.py first.
 (b) watcher liveness: a file created after the scan settles is findable within
     5s (proves watch=True).
 (c) absent-module refusal names the build script.
@@ -33,7 +33,7 @@ def _find(world, query: str, **attrs) -> str:
     from desmos.dispatch import dispatch
     from desmos.types import Block
 
-    return dispatch(world, Block("find", query, {k: str(v) for k, v in attrs.items()}))
+    return dispatch(world, Block("workspace", query, {**{k: str(v) for k, v in attrs.items()}, "op": "find"}))
 
 
 def _first_path(out: str) -> str:
@@ -117,7 +117,7 @@ def _frecency_ordering() -> None:
         (root / "alpha_two.py").write_text("v0\n")
         world = _world(root)
         try:
-            # Each successful <edit> on alpha_two feeds frecency via the dispatch
+            # Each successful workspace op=edit on alpha_two feeds frecency via the dispatch
             # edit choke point (touch -> track_access) before any engine exists.
             # A single access does not clear fff's boost threshold; a short chain
             # of real edits does — and every one of them is a genuine touch, so
@@ -126,7 +126,7 @@ def _frecency_ordering() -> None:
             for i in range(6):
                 msg = dispatch(
                     world,
-                    Block("edit", f"v{i}\n---\nv{i + 1}", {"path": "alpha_two.py"}),
+                    Block("workspace", f"v{i}\n---\nv{i + 1}", {"op": "edit", "path": "alpha_two.py"}),
                 )
                 assert f"v{i + 1}" in (root / "alpha_two.py").read_text(), f"edit {i} did not apply: {msg}"
             out = _find(world, "alpha")

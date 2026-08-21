@@ -23,7 +23,7 @@ def check_shell_peek_history(cwd: Path) -> None:
     world = new_world(cwd, state_path=None, persist=False, ns={})
 
     def sh(body: str = "", **attrs: str) -> str:
-        return dispatch(world, Block("shell", body, attrs))
+        return dispatch(world, Block("exec", body, {**attrs, "op": "shell"}))
 
     try:
         sentinel = b"pty-history-sentinel"
@@ -227,17 +227,17 @@ def check() -> None:
         assert "reload" in world.tools and world.tools["reload"].frozen
         assert "reload_sdk" in world.tools and world.tools["reload_sdk"].frozen
         assert any(s.name == "skill-creator" for s in world.skills)
-        assert "skill-creator" in dispatch(world, Block("skill", "", {"name": "skill-creator"}))
+        assert "skill-creator" in dispatch(world, Block("harness", "", {"op": "skill", "name": "skill-creator"}))
         assert any(s.name == "edit" for s in world.skills) or "edit" in world.tools
 
         sample = cwd / "sample.txt"
         sample.write_text("alpha beta alpha\n", encoding="utf-8")
         # Two matches is ambiguous, and a refusal that still wrote would
         # corrupt the file while reporting the refusal.
-        dispatch(world, Block("edit", "alpha\n---\nALPHA", {"path": str(sample)}))
+        dispatch(world, Block("workspace", "alpha\n---\nALPHA", {"op": "edit", "path": str(sample)}))
         assert sample.read_text(encoding="utf-8") == "alpha beta alpha\n", "ambiguous edit wrote anyway"
         sample.write_text("alpha beta\n", encoding="utf-8")
-        dispatch(world, Block("edit", "alpha\n---\nALPHA", {"path": str(sample)}))
+        dispatch(world, Block("workspace", "alpha\n---\nALPHA", {"op": "edit", "path": str(sample)}))
         assert sample.read_text(encoding="utf-8") == "ALPHA beta\n"
 
         blocks = scan('<python>x = 1+1</python>\n<bash>echo hi</bash>')
@@ -321,9 +321,9 @@ def check() -> None:
         assert lone[0].body == ""
         assert lone[3].attrs == {"n": "1"}
         assert lone[4].attrs == {"name": "ping"}
-        assert dispatch(world, blocks[0]) == "ok"
+        assert dispatch(world, blocks[0]) == "ok"  # step-5: legacy tag dispatch proof
         assert world.ns["x"] == 2
-        assert dispatch(world, blocks[1]).strip() == "hi"
+        assert dispatch(world, blocks[1]).strip() == "hi"  # step-5: legacy tag dispatch proof
 
         # The advertised surface is seven capability families. Compatibility
         # aliases still execute, but they do not compete in the tool catalog.
@@ -344,7 +344,7 @@ def check() -> None:
             assert marker + alias + ">" not in tool_block, alias
 
         assert dispatch(canonical, Block("exec", "20 + 22", {"op": "python"})) == "42"
-        assert dispatch(canonical, Block("python", "20 + 22", {})) == "42"
+        assert dispatch(canonical, Block("python", "20 + 22", {})) == "42"  # step-5: legacy alias dispatch proof; remove with the compat routes
         read_back = dispatch(
             canonical,
             Block("workspace", "", {"op": "read", "path": "canonical.txt", "lines": "2-3"}),
@@ -415,14 +415,14 @@ def check() -> None:
             from desmos.kernel.diagnostics import exception_snapshot
 
             assert len(_json.dumps(exception_snapshot(oversized, max_chars=512))) <= 512
-        queried = dispatch(world, Block("python", "diag.error()['frames'][-1]['function']", {}))
+        queried = dispatch(world, Block("exec", "diag.error()['frames'][-1]['function']", {"op": "python"}))
         assert queried == "'diag_outer'", queried
 
         symbol = diag.symbol(diag.threads, source=True, max_chars=1200)
         assert symbol["name"] == "threads" and symbol["file"].endswith("diagnostics.py"), symbol
         assert isinstance(symbol["line"], int) and len(_json.dumps(symbol)) <= 1200, symbol
         assert len(_json.dumps(diag.symbol(type(diag).threads, source=True, max_chars=512))) <= 512
-        assert dispatch(world, Block("python", "diag.symbol(diag.threads)['name']", {})) == "'threads'"
+        assert dispatch(world, Block("exec", "diag.symbol(diag.threads)['name']", {"op": "python"})) == "'threads'"
 
         ready = _threading.Event()
         release = _threading.Event()
@@ -450,11 +450,11 @@ def check() -> None:
 
         out = dispatch(
             world,
-            Block("register", "def handle(body, **a):\n    return body.upper()\n", {"name": "echo", "doc": "uppercase"}),
+            Block("harness", "def handle(body, **a):\n    return body.upper()\n", {"op": "register", "name": "echo", "doc": "uppercase"}),
         )
         assert dispatch(world, Block("echo", "hi", {})) == "HI"
 
-        dispatch(world, Block("system", "prefer tests", {"name": "style"}))
+        dispatch(world, Block("knowledge", "prefer tests", {"op": "system", "name": "style"}))
         assert "prefer tests" in system_prompt(world)
 
         def fake_complete(model, system, messages, max_tokens):
@@ -462,7 +462,7 @@ def check() -> None:
             assert "hello world" not in blob
             if any("<result" in (m.get("content") or "") for m in messages):
                 return {"content": [{"type": "text", "text": "11"}], "usage": {}}
-            return {"content": [{"type": "text", "text": "<python>len(doc)</python>"}], "usage": {}}
+            return {"content": [{"type": "text", "text": '<exec op="python">len(doc)</exec>'}], "usage": {}}
 
         ns = {"doc": "hello world"}
         w3 = new_world(cwd, state_path=cwd / "harness2.json", ns=ns)
@@ -480,7 +480,7 @@ def check() -> None:
         w_usage = new_world(cwd, state_path=cwd / "harness-usage.json", ns={})
         dispatch(
             w_usage,
-            Block("register", "def handle(body, **a):\n    return 'tokens:0'\n", {"name": "usage", "doc": "stats"}),
+            Block("harness", "def handle(body, **a):\n    return 'tokens:0'\n", {"op": "register", "name": "usage", "doc": "stats"}),
         )
         w_usage.complete_fn = fake_usage
         bind_step(w_usage)
@@ -763,14 +763,14 @@ def check() -> None:
         assert len(whole) > len(big), "the spill file is no bigger than the result"
         # The gate below it must reuse that file, not write a second copy of
         # the head it was handed.
-        msg = _fmt([(Block("bash", "seq", {}), big)], cwd)
+        msg = _fmt([(Block("exec", "seq", {"op": "bash"}), big)], cwd)
         assert _mark in msg, msg[:200]
         assert len(sorted(out_dir.glob("*.txt"))) == 1, "the same output spilled twice"
         assert len(msg) < _clip2 + 400, len(msg)
         # A result that reached the gate without passing an exec cap -- a
         # handler's return, a shell drain -- has to spill there instead.
         raw = "x" * (_clip2 + 500)
-        msg2 = _fmt([(Block("shell", "", {}), raw)], cwd)
+        msg2 = _fmt([(Block("exec", "", {"op": "shell"}), raw)], cwd)
         assert _mark in msg2, msg2[:200]
         after = sorted(out_dir.glob("*.txt"))
         assert len(after) == 2, after
@@ -803,7 +803,7 @@ def check() -> None:
         def wire_complete(_model, _system, messages, _max_tokens):
             if any("<result" in (m.get("content") or "") for m in messages):
                 return {"content": [{"type": "text", "text": "11"}], "usage": {}}
-            return {"content": [{"type": "text", "text": "<python>len(doc)</python>"}], "usage": {}}
+            return {"content": [{"type": "text", "text": '<exec op="python">len(doc)</exec>'}], "usage": {}}
 
         w_wire.complete_fn = wire_complete
         _run(w_wire, "how long is doc?", quiet=True, on_event=lambda e: evs_wire.append(e))
@@ -812,7 +812,7 @@ def check() -> None:
             for e in evs_wire
             if e.get("ev") == "result" and e.get("phase") in {None, "done"}
         )
-        assert res.get("tag") == "python"
+        assert res.get("tag") == "exec"
         assert "len(doc)" in (res.get("body") or "")
         assert "11" in (res.get("text") or "")
         assert any(e.get("ev") == "result" and e.get("phase") == "start" for e in evs_wire)
@@ -1189,7 +1189,7 @@ def check() -> None:
         w_sh = new_world(cwd, state_path=None, persist=False, ns={})
         try:
             def sh(body: str, **attrs: str) -> str:
-                return dispatch(w_sh, Block("shell", body, attrs))
+                return dispatch(w_sh, Block("exec", body, {**attrs, "op": "shell"}))
 
             assert sh("cd /etc && pwd").strip() == "/etc"
             assert sh("pwd").strip() == "/etc", "a persistent shell keeps its cwd"
@@ -1282,7 +1282,7 @@ def check() -> None:
         assert "chatter" in _clip(noisy, 600), "the head is still right for ordinary output"
         assert len(_clip(noisy, 600, keep="tail")) <= 600 + 40
         assert _clip("short", 600, keep="tail") == "short"
-        boom = dispatch(world, Block("python", "print('x' * 9000)\n1/0", {}))
+        boom = dispatch(world, Block("exec", "print('x' * 9000)\n1/0", {"op": "python"}))
         assert "ZeroDivisionError" in boom, boom[:200]
 
         # A warning raised while parsing the body must land in the result, not
@@ -1296,7 +1296,7 @@ def check() -> None:
         leak = _sio.StringIO()
         with _warn.catch_warnings(), _ctx.redirect_stderr(leak):
             _warn.simplefilter("always")
-            warned = dispatch(world, Block("python", "x = '\\|'\n'done'", {}))
+            warned = dispatch(world, Block("exec", "x = '\\|'\n'done'", {"op": "python"}))
         assert "SyntaxWarning" in warned, warned[:200]
         assert leak.getvalue() == "", f"a parse warning escaped to the terminal: {leak.getvalue()!r}"
 
@@ -1305,7 +1305,7 @@ def check() -> None:
 
         py = cwd / "broke.py"
         py.write_text("x = 1\n")
-        bad = dispatch(world, Block("edit", "x = 1\n---\nx =\n", {"path": str(py)}))
+        bad = dispatch(world, Block("workspace", "x = 1\n---\nx =\n", {"op": "edit", "path": str(py)}))
         assert "SyntaxError" in bad, bad
         assert py.read_text() == "x = 1\n", "a file that would not compile was written anyway"
         assert py.read_text(encoding="utf-8") == "x = 1\n"
@@ -1315,10 +1315,10 @@ def check() -> None:
         # threshold crossing, with a cooldown. Zero extra API calls.
         w_fr = new_world(cwd, state_path=None, persist=False, ns={})
         same = "40 + 2"
-        fr1 = dispatch(w_fr, Block("python", same, {}))
-        fr2 = dispatch(w_fr, Block("python", same, {}))
-        fr3 = dispatch(w_fr, Block("python", same, {}))
-        fr4 = dispatch(w_fr, Block("python", same, {}))
+        fr1 = dispatch(w_fr, Block("exec", same, {"op": "python"}))
+        fr2 = dispatch(w_fr, Block("exec", same, {"op": "python"}))
+        fr3 = dispatch(w_fr, Block("exec", same, {"op": "python"}))
+        fr4 = dispatch(w_fr, Block("exec", same, {"op": "python"}))
         assert fr1 == "42" and fr2 == "42", (fr1, fr2)
         assert "growing a tool" in fr3, fr3
         assert fr3.splitlines()[0] == "42", fr3
@@ -1326,9 +1326,9 @@ def check() -> None:
 
         # Two consecutive tracebacks on one tag nudge exactly once.
         w_ff = new_world(cwd, state_path=None, persist=False, ns={})
-        ff1 = dispatch(w_ff, Block("python", "raise RuntimeError('fr one')", {}))
-        ff2 = dispatch(w_ff, Block("python", "raise RuntimeError('fr two')", {}))
-        ff3 = dispatch(w_ff, Block("python", "raise RuntimeError('fr three')", {}))
+        ff1 = dispatch(w_ff, Block("exec", "raise RuntimeError('fr one')", {"op": "python"}))
+        ff2 = dispatch(w_ff, Block("exec", "raise RuntimeError('fr two')", {"op": "python"}))
+        ff3 = dispatch(w_ff, Block("exec", "raise RuntimeError('fr three')", {"op": "python"}))
         assert "[friction]" not in ff1, ff1
         assert "failed 2x in a row" in ff2, ff2
         assert "[friction]" not in ff3, "a failure nudge repeated inside its cooldown"
@@ -1336,7 +1336,7 @@ def check() -> None:
         # A clean run never nudges.
         w_fc = new_world(cwd, state_path=None, persist=False, ns={})
         for clean_body in ("1 + 1", "2 + 2", "3 + 3"):
-            clean_out = dispatch(w_fc, Block("python", clean_body, {}))
+            clean_out = dispatch(w_fc, Block("exec", clean_body, {"op": "python"}))
             assert "[friction]" not in clean_out, clean_out
 
         # docs/identity.md, driven: the in-memory row survives <reload_sdk/>
@@ -1354,7 +1354,7 @@ def check() -> None:
         w_id.ns["keepsake"] = 42
         w_id.messages.append({"role": "user", "content": "kept line"})
         w_id.messages.append({"role": "assistant", "content": "kept reply"})
-        dispatch(w_id, Block("system", "identity doctrine", {"name": "identity-note"}))
+        dispatch(w_id, Block("knowledge", "identity doctrine", {"op": "system", "name": "identity-note"}))
         _remember(w_id, "the sky is mauve")
         rec_file = _rec_path(_mem_root(w_id))
         rec_before = rec_file.read_bytes()
@@ -1405,7 +1405,7 @@ def check() -> None:
         assert callable(shell.user_ns.get("reload_sdk"))
         assert callable(shell.user_ns.get("reset"))
         assert "doc" in ns_names(w4)
-        assert dispatch(w4, Block("python", "len(doc)", {})) == "11"
+        assert dispatch(w4, Block("exec", "len(doc)", {"op": "python"})) == "11"
 
 
 def _check_ambient_reload() -> None:

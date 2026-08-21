@@ -88,11 +88,11 @@ def _check_dialect() -> None:
 
 
 def _check_call_extraction() -> None:
-    call = _call("<python>1</python>")
+    call = _call('<exec op="python">1</exec>')
     assert syscall_call([call]) is call
-    assert syscall_body(call) == "<python>1</python>"
-    set_syscall_body(call, "<python>2</python>")
-    assert call["input"] == {"input": "<python>2</python>"}
+    assert syscall_body(call) == '<exec op="python">1</exec>'
+    set_syscall_body(call, '<exec op="python">2</exec>')
+    assert call["input"] == {"input": '<exec op="python">2</exec>'}
     # A tool_use for something that is not the syscall tool is not a syscall.
     assert syscall_call([{"type": "tool_use", "id": "x", "name": "other", "input": {}}]) is None
     # Missing id is fatal: the wire cannot pair a result to it.
@@ -105,18 +105,18 @@ def _check_call_extraction() -> None:
 
 
 def _check_result_pairing() -> None:
-    call = _call("<python>1</python>")
-    out = result_content([(Block("python", "1", {}), "1")], [call], Path("."))
+    call = _call('<exec op="python">1</exec>')
+    out = result_content([(Block("exec", "1", {"op": "python"}), "1")], [call], Path("."))
     assert isinstance(out, list) and out[0]["type"] == "tool_result", out
     assert out[0]["tool_use_id"] == "toolu_1", out
     assert "<result" in out[0]["content"], out
     # No call in the turn: the result is plain text, as it always was.
-    plain = result_content([(Block("python", "1", {}), "1")], [], Path("."))
+    plain = result_content([(Block("exec", "1", {"op": "python"}), "1")], [], Path("."))
     assert isinstance(plain, str), plain
 
 
 def _check_replay() -> None:
-    call = _call("<python>1</python>")
+    call = _call('<exec op="python">1</exec>')
     kept = assistant_content({"content": [call, {"type": "text", "text": "ok"}]})
     assert [b["type"] for b in kept] == ["tool_use", "text"], kept
     wire = wire_content(kept)
@@ -124,7 +124,7 @@ def _check_replay() -> None:
 
 
 def _check_orphans() -> None:
-    call = _call("<python>1</python>")
+    call = _call('<exec op="python">1</exec>')
     answer = {"type": "tool_result", "tool_use_id": "toolu_1", "content": "<result/>"}
     with _flag("1"):
         paired = cached_payload(
@@ -190,7 +190,7 @@ def _check_stream() -> None:
             "content_block": {"type": "tool_use", "id": "toolu_9", "name": "syscall", "input": {}},
         },
     )
-    body = json.dumps({"input": "<python>1</python>"})
+    body = json.dumps({"input": '<exec op="python">1</exec>'})
     for chunk in (body[:7], body[7:]):
         apply_stream_event(
             state,
@@ -203,9 +203,9 @@ def _check_stream() -> None:
     apply_stream_event(state, {"type": "content_block_stop", "index": 0})
     message = assemble_message(state)
     block = message["content"][0]
-    assert block["input"] == {"input": "<python>1</python>"}, block
+    assert block["input"] == {"input": '<exec op="python">1</exec>'}, block
     assert "_partial_json" not in block, block
-    assert syscall_body(syscall_call(assistant_content(message))) == "<python>1</python>"
+    assert syscall_body(syscall_call(assistant_content(message))) == '<exec op="python">1</exec>'
 
     # Malformed JSON leaves input empty rather than raising: loop.turn answers
     # the call with the rejection note and asks for a corrected one.
@@ -251,7 +251,7 @@ def _check_loop() -> None:
             )
             if answered:
                 return {"content": [{"type": "text", "text": "11"}], "usage": {}}
-            return {"content": [_call("<python>len(doc)</python>")], "usage": {}}
+            return {"content": [_call('<exec op="python">len(doc)</exec>')], "usage": {}}
 
         world.complete_fn = replies
         spoken = run_turns(world, "how long is doc?", quiet=True)
@@ -266,7 +266,7 @@ def _check_loop() -> None:
         prose = new_world(cwd, state_path=None, persist=False, ns={"doc": "x"})
         prose.model = MODEL
         prose.complete_fn = lambda *_: {
-            "content": [{"type": "text", "text": "<python>1</python>"}],
+            "content": [{"type": "text", "text": '<exec op="python">1</exec>'}],
             "usage": {},
         }
         run_turns(prose, "go", quiet=True)

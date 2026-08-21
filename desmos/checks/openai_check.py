@@ -9,8 +9,8 @@ from typing import Any
 
 from desmos.openai import to_input
 
-PY_CLOSE = "</python>"
-SH_CLOSE = "</bash>"
+PY_CLOSE = "</" + "exec>"
+SH_CLOSE = "</" + "exec>"
 
 
 def _call(call_id: str, body: str) -> dict[str, Any]:
@@ -45,8 +45,8 @@ def _kinds(items: list[dict[str, Any]]) -> list[str]:
 
 
 def self_check() -> None:
-    py_call = "<python>1" + PY_CLOSE
-    sh_call = "<bash>true" + SH_CLOSE
+    py_call = '<exec op="python">1' + PY_CLOSE
+    sh_call = '<exec op="bash">true' + SH_CLOSE
 
     paired = to_input([_call("call_a", py_call), _output("call_a", "one")])
     ids = [i["call_id"] for i in paired if i.get("type") == "custom_tool_call_output"]
@@ -130,8 +130,8 @@ def self_check() -> None:
     # Validation remains all-or-nothing after normalization.
     from desmos.loop import run_turns
 
-    command_a = "<python>array_a = 1</python>"
-    command_b = "<python>array_b = 2</python>"
+    command_a = '<exec op="python">array_a = 1</exec>'
+    command_b = '<exec op="python">array_b = 2</exec>'
     accepted_inputs: list[Any] = [
         [command_a, command_b],
         json.dumps([command_a, command_b]),
@@ -193,7 +193,7 @@ def self_check() -> None:
         world = new_world(cwd, state_path=cwd / "recover.sqlite3", ns={"live_marker": [1, 2]})
         world.model = "gpt-5.6-sol"
         attempts = 0
-        bad_input = "<python>live_marker.append(3)</python> stray prose"
+        bad_input = '<exec op="python">live_marker.append(3)</exec> stray prose'
 
         def complete_recover(
             _model: str, _system: str, messages: list[dict[str, Any]], _max: int

@@ -222,6 +222,8 @@ def self_check() -> None:
     if bad:
         raise AssertionError("layering violations:\n  " + "\n  ".join(bad))
 
+    _check_canonical_emissions()
+
     n_fac = sum(1 for c in classes.values() if c == "facade")
     print(
         f"layering check ok ({len(mods)} modules, {n_fac} facades, "
@@ -229,6 +231,34 @@ def self_check() -> None:
     )
     for src, tgt in sorted(ALLOWED_FN_EDGES):
         print(f"  acknowledged: {src} -> {tgt}")
+
+
+def _check_canonical_emissions() -> None:
+    """Canonical cut step 4: no check constructs a Block with a legacy tag.
+
+    Compatibility assertions that must survive until step 5 (legacy dispatch
+    removal) carry a `step-5` comment on the same line and are exempt; every
+    other first-party emission spells the canonical family.
+    """
+    import re
+
+    from desmos.kernel.const import COMPAT_ALIASES
+
+    names = "|".join(sorted(COMPAT_ALIASES))
+    pattern = re.compile(r"Block\(\s*['\"](" + names + r")['\"]")
+    offenders: list[str] = []
+    for path in sorted(Path(__file__).parent.glob("*.py")):
+        for lineno, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+            if "step-5" in line:
+                continue
+            if pattern.search(line):
+                offenders.append(f"{path.name}:{lineno}: {line.strip()}")
+    assert not offenders, (
+        "legacy Block emissions in checks (mark deliberate compat proofs "
+        "with a step-5 comment):\n  " + "\n  ".join(offenders)
+    )
+    print(f"canonical emission sweep ok ({len(sorted(Path(__file__).parent.glob('*.py')))} check files)")
+
 
 
 if __name__ == "__main__":

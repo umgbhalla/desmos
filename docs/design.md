@@ -157,7 +157,7 @@ exists so a session that cannot issue a call has a way back in.
 ignores tags inside fenced blocks, indented blocks, inline code spans and
 unterminated strings, because the model writes about tags as often as it calls
 them. A body ends at the first matching closer, which is why `end="TOKEN"`
-exists: `<python end="X">` runs to `</python:X>` and a bare closer inside is
+exists: `<exec op="python" end="X">` runs to `</exec:X>` and a bare closer inside is
 ordinary text.
 
 `dispatch()` then walks a fixed order:

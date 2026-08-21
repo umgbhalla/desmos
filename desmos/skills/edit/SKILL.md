@@ -5,14 +5,14 @@ description: Replace exactly one unique string in an existing file. Use for targ
 
 # Edit
 
-Prefer the frozen tag:
+Prefer the canonical workspace family:
 
 ```
-<edit path="pkg/file.py">
+<workspace op="edit" path="pkg/file.py">
 old unique snippet
 ---
 new snippet
-</edit>
+</workspace>
 ```
 
 Or from Python in the kernel:

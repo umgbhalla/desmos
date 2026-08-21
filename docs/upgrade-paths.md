@@ -28,7 +28,7 @@ to events (executed in Phase 3, documented now):
 - syscall span classification: kernel emits authoritative spans on the
   turn-end/result event; the TUI keeps only a conservative mid-stream hold
   and reconciles.
-- `<edit>` card start line: the edit result event carries `line`.
+- `workspace op=edit` card start line: the edit result event carries `line`.
 - work-row commit attribution: the kernel knows which syscall was a
   `git commit` from its own result; the git *pane* stays a Rust-side
   environment viewer.
@@ -217,7 +217,7 @@ Track 1.3 preconditions → 6.5→6.6→6.7 (memex); 6.8 last.
   module is the sqlite3 case, NOT the scanner tripwire (unchanged) — and the
   accepted risk is named: an abort in fff-core's unsafe SIMD/mmap kills the
   kernel; PanicException is handled, aborts are not.
-- 6.2 `<find>` syscall: body = fff-query-parser query, with `mode=` selecting
+- 6.2 `workspace op=find` syscall: body = fff-query-parser query, with `mode=` selecting
   typo-resistant path search, glob, SIMD plain/regex/fuzzy grep,
   definition-first symbol search, or Aho–Corasick multi-pattern grep. `limit=`,
   `context=`, `match=`, and multi-pattern `constraints=` expose the bounded
@@ -227,10 +227,10 @@ Track 1.3 preconditions → 6.5→6.6→6.7 (memex); 6.8 last.
   changes; first query waits for the scan and SAYS SO if still scanning.
   The Python binding enables fff-core's `definitions` feature. Absent module:
   loud refusal naming the build script. CAPS: read+edit.
-- 6.3 Frecency fed by the kernel's own `<edit>` results at the dispatch
+- 6.3 Frecency fed by the kernel's own `workspace op=edit` results at the dispatch
   choke point — one call site, children covered by construction. touch()
   opens the frecency DB alone when no engine is live; full hydration stays
-  lazy on first `<find>`. Check: edit alpha_two, then `<find>alpha</find>`
+  lazy on first `workspace op=find`. Check: edit alpha_two, then `<workspace op="find">alpha</workspace>`
   ranks it first — this is also the tripwire for the vendor patch.
 - 6.4 fff in the TUI: the files pane KEEPS read_dir (correct owner of
   "list this directory"); the new surface is a ctrl-key fuzzy picker on a
@@ -256,7 +256,7 @@ Track 1.3 preconditions → 6.5→6.6→6.7 (memex); 6.8 last.
   (deduped, atomic, children never write it; lazy-prune dead roots); fork
   resume template `cd {cwd_shell} && python -m desmos tui`, gains
   `--resume {session_id}` when Track 1.3 session ids become resumable.
-- 6.7 `<recall>` syscall: shells `memex search <q> --json-array` per call,
+- 6.7 `knowledge op=recall` syscall: shells `memex search <q> --json-array` per call,
   no kernel-owned daemon; warm calls are ms-scale BM25, freshness is
   memex's own TTL+flock lease. Results are spill-capped user-role results —
   on the record, no secret channel. SECURITY: recall output passes the same

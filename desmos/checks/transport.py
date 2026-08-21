@@ -81,7 +81,7 @@ def check() -> None:
 
         payload = cached_payload(
             "claude-opus-5",
-            ABI + "\n\n# tools\n<python> exec",
+            ABI + "\n\n# tools\n<exec> run code",
             [{"role": "user", "content": "hi"}],
             8192,
             thinking="low",
@@ -113,7 +113,7 @@ def check() -> None:
         assert _cached(payload["system"]) == [0, 1], payload["system"]
         abi_block, cat_block = payload["system"]
         assert abi_block["text"] == ABI, "the first cached system block is not the ABI"
-        assert "<python> exec" in cat_block["text"], "the catalog is not its own cached block"
+        assert "<exec> run code" in cat_block["text"], "the catalog is not its own cached block"
         assert _cached(payload["messages"][0]["content"]) == [0]
 
         # A transcript that ends on the assistant: the breakpoint has to walk
@@ -198,7 +198,8 @@ def check() -> None:
             "a fully ticked todo still appended a block"
         )
 
-        # A mid-run <register>, <tool>, <system> or <evolve> must not move the
+        # A mid-run harness op=register/describe, knowledge op=system or harness
+        # op=evolve must not move the
         # cached catalog block either. It is frozen at first use and the
         # difference ships in the same trailing block the todo uses.
         from desmos.types import Tool as _Tool
@@ -408,7 +409,7 @@ def check() -> None:
                     "",
                     'data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}',
                     "",
-                    'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"half a <bash>ls"}}',
+                    'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"half a <exec>ls"}}',
                     "",
                 ]
             )
@@ -1196,11 +1197,11 @@ def check() -> None:
         # now reports what it left outside the calls.
         from desmos.scan import trailing_residue as _residue
 
-        sol_tail = "<bash>rg -n data .</" + "bash> \n lousy? token. \n"
+        sol_tail = '<exec op="bash">rg -n data .</' + "exec> \n lousy? token. \n"
         assert _residue(sol_tail) == "lousy? token.", _residue(sol_tail)
-        assert [b.tag for b in scan(sol_tail)] == ["bash"], "the call still dispatches"
-        assert _residue("<usage/>") == "" and _residue("just prose") == ""
-        assert _residue("prose before <usage/>") == "", "only what follows the last call counts"
+        assert [b.tag for b in scan(sol_tail)] == ["exec"], "the call still dispatches"
+        assert _residue('<observe op="usage"/>') == "" and _residue("just prose") == ""
+        assert _residue('prose before <observe op="usage"/>') == "", "only what follows the last call counts"
 
         # An attached screenshot has to survive the crossing. Anthropic's block
         # shape goes in, Responses' flat data-URL input_image comes out -- the
@@ -1273,7 +1274,7 @@ def check() -> None:
             if len(seen) == 1:
                 return {
                     "content": [
-                        {"type": "text", "text": '<python>switch("claude-sonnet-4-6")</python>'}
+                        {"type": "text", "text": '<exec op="python">switch("claude-sonnet-4-6")</exec>'}
                     ],
                     "usage": {},
                 }

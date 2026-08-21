@@ -24,7 +24,7 @@ def check() -> None:
 
         reload_subagent.bind(world)
         reload_subagent.set_emitter(reload_emit)
-        dispatch(world, Block("reload_sdk", "", {}))
+        dispatch(world, Block("harness", "", {"op": "reload-sdk"}))
         assert "reload_sdk" in world.tools
         assert reload_subagent.PARENT is world, "SDK reload orphaned later subagent spawns"
         assert reload_subagent._EMIT is reload_emit, "SDK reload dropped child event routing"
@@ -35,7 +35,7 @@ def check() -> None:
         parent = new_world(cwd, state_path=cwd / "harness-iso.json")
         dispatch(
             parent,
-            Block("register", "def handle(body, **a):\n    return 'SECRET'\n", {"name": "secret", "doc": "parent only"}),
+            Block("harness", "def handle(body, **a):\n    return 'SECRET'\n", {"op": "register", "name": "secret", "doc": "parent only"}),
         )
         child = _child_world(resolve("explore"), parent)
         assert child.persist is False
@@ -48,7 +48,7 @@ def check() -> None:
         # the containment was false. Assert the file, not the table.
         scoped_file = cwd / "scoped.txt"
         scoped_file.write_text("alpha\n", encoding="utf-8")
-        denied = dispatch(child, Block("edit", "alpha\n---\nBETA", {"path": str(scoped_file)}))
+        denied = dispatch(child, Block("workspace", "alpha\n---\nBETA", {"op": "edit", "path": str(scoped_file)}))
         assert scoped_file.read_text(encoding="utf-8") == "alpha\n", (
             f"a read-capability child edited a file on disk: {denied!r}"
         )
@@ -63,21 +63,23 @@ def check() -> None:
         # went through.
         bind_step(child)
         assert child.ns.get("world") is child
-        assert dispatch(child, Block("python", "world.allowed_tags = None", {})) == "ok"
+        assert dispatch(child, Block("exec", "world.allowed_tags = None", {"op": "python"})) == "ok"
         assert "edit" not in (scope_of(child) or ()), scope_of(child)
-        disarmed = dispatch(child, Block("edit", "alpha\n---\nBETA", {"path": str(scoped_file)}))
+        disarmed = dispatch(child, Block("workspace", "alpha\n---\nBETA", {"op": "edit", "path": str(scoped_file)}))
         assert scoped_file.read_text(encoding="utf-8") == "alpha\n", (
             f"a child disarmed its own scope from <python>: {disarmed!r}"
         )
         # Same gate, harness-level tags: a note written here would outlive the
         # child in the prompt the parent's own turn reads back.
-        dispatch(child, Block("system", "pwn", {"name": "pwn-note"}))
+        dispatch(child, Block("knowledge", "pwn", {"op": "system", "name": "pwn-note"}))
         assert "pwn-note" not in child.notes
-        for tag in ("evolve", "rollback", "register", "reload_sdk"):
-            assert "outside this agent's scope" in dispatch(child, Block(tag, "x", {})), tag
+        for op in ("evolve", "rollback", "register", "reload-sdk"):
+            assert "outside this agent's scope" in dispatch(
+                child, Block("harness", "x", {"op": op})
+            ), op
         # And the capability it does have still works, or the "scope" is just
         # a broken child.
-        assert dispatch(child, Block("bash", "echo alive", {})).strip() == "alive"
+        assert dispatch(child, Block("exec", "echo alive", {"op": "bash"})).strip() == "alive"
 
         child.notes["pwn"] = "from-child"
         save_world(child)
@@ -96,9 +98,9 @@ def check() -> None:
 
         _seed(quiet)
         _install(quiet)
-        dispatch(quiet, Block("evolve", "probe", {}))
-        dispatch(quiet, Block("memory", "remember user.pwn.identity leaked", {}))
-        dispatch(quiet, Block("system", "in-memory only", {"name": "n"}))
+        dispatch(quiet, Block("harness", "probe", {"op": "evolve"}))
+        dispatch(quiet, Block("knowledge", "remember user.pwn.identity leaked", {"op": "memory"}))
+        dispatch(quiet, Block("knowledge", "in-memory only", {"op": "system", "name": "n"}))
         # The durable pending handoff is the root world's alone: a child's
         # background task must stay in memory, or its notice file would be
         # replayed into a session that no longer exists. The rglob below
@@ -276,14 +278,14 @@ def check() -> None:
         import time
 
         nest = (
-            "<python>\n"
+            '<exec op="python">\n'
             "import desmos.agents.subagent as S\n"
             'print(S.spawn({task!r}, agent="explore", model="claude-opus-5", '
             "_register_pending=False))\n"
-            "</python>"
+            "</exec>"
         )
         overfork = (
-            "<python>\n"
+            '<exec op="python">\n'
             "import threading\n"
             "import desmos.agents.subagent as S\n"
             'print(S.spawn("level-d overflow", agent="explore", _register_pending=False))\n'
@@ -292,7 +294,7 @@ def check() -> None:
             'agent="explore", _register_pending=False)))\n'
             "t.start(); t.join()\n"
             "print(out[0])\n"
-            "</python>"
+            "</exec>"
         )
 
         def tree_complete(_model, _system, messages, _max_tokens):
@@ -379,11 +381,11 @@ def check() -> None:
             # flag each run's own loop reads, so the terminal subagent event
             # reaches the wire with phase "stopped".
             kill_nest = (
-                "<python>\n"
+                '<exec op="python">\n'
                 "import desmos.agents.subagent as S\n"
                 'print(S.spawn("kill-b spin", agent="explore", model="claude-opus-5", '
                 "_register_pending=False))\n"
-                "</python>"
+                "</exec>"
             )
 
             def kill_complete(_model, _system, messages, _max_tokens):
@@ -391,7 +393,7 @@ def check() -> None:
                 if first and "kill-a" in json.dumps(messages):
                     text = "forking\n" + kill_nest
                 else:
-                    text = "<bash>sleep 0.1</bash>"  # spins until killed
+                    text = '<exec op="bash">sleep 0.1</exec>'  # spins until killed
                 return {"content": [{"type": "text", "text": text}], "usage": {}}
 
             kill_root = new_world(cwd, state_path=None, persist=False)
@@ -735,15 +737,15 @@ def check() -> None:
             "scan_path = Path(scan_mod.__file__)\n"
             "orig = scan_path.read_bytes()\n"
             "scan_path.write_bytes(orig + b'\\n\\ndef scan(text):\\n    return []\\n')\n"
-            "refused = dispatch(world, Block('reload_sdk', '', {}))\n"
+            "refused = dispatch(world, Block('harness', '', {'op': 'reload-sdk'}))\n"
             "assert not refused.startswith('sdk reloaded'), refused\n"
             "assert 'AssertionError' in refused, refused\n"
             "# No partial reload: the live scanner is the old, working one.\n"
-            "assert [b.tag for b in scan_mod.scan('<bash>ls</bash>')] == ['bash'], (\n"
+            'assert [b.tag for b in scan_mod.scan(\'<exec op="bash">ls</exec>\')] == [\'exec\'], (\n'
             "    'the gate reloaded a broken scanner into the live process'\n"
             ")\n"
             "scan_path.write_bytes(orig)\n"
-            "healed = dispatch(world, Block('reload_sdk', '', {}))\n"
+            "healed = dispatch(world, Block('harness', '', {'op': 'reload-sdk'}))\n"
             "assert healed.startswith('sdk reloaded'), healed\n"
         )
         gate_env = dict(os.environ)

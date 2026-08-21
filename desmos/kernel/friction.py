@@ -64,7 +64,13 @@ def observe(world: Any, block: Any, result: str) -> str:
     st = _state(world)
     st["turn"] += 1
     turn = st["turn"]
+    # Canonical spellings (exec op=python, workspace op=edit, ...) count on
+    # the same counters as the legacy tags they route to (canonical cut
+    # step 4): friction watches the operation, not the spelling.
     tag = block.tag
+    _op = (block.attrs.get("op") or "").lower()
+    if tag in ("exec", "workspace", "knowledge", "harness") and _op:
+        tag = "reload_sdk" if _op == "reload-sdk" else _op
     nudge: str | None = None
 
     # 1) Consecutive failures on one tag: the second traceback in a row says
