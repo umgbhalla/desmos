@@ -373,6 +373,7 @@ def check() -> None:
         _check_op_rollup(cwd)
         _check_slice(cwd)
         _check_schema_tolerance()
+        _check_seats()
         _check_quarantine_manifest()
         _check_quarantine_gate()
         _check_prune_manifest()
@@ -398,6 +399,172 @@ FIXTURE_USAGE = {
     "output_tokens": 50,
 }
 FIXTURE_COST_OPUS = 0.0023125
+
+
+def _check_seats() -> None:
+    """Seats: operator birth gate, single wake binding, tombstone retirement.
+
+    Falsifiers per docs/seats.md section 5: worker roles and child worlds
+    cannot birth; the agent tool surface has no seat tag; a restart in a
+    seated workspace binds and wakes with charter+role; a second concurrent
+    binding is refused with a recorded event; rollback leaves the seat row
+    byte-identical; retirement tombstones without deleting and refuses new
+    bindings; an unreadable newer schema degrades instead of binding.
+    """
+    import tempfile
+    import warnings
+    from argparse import Namespace
+
+    from desmos.front import cli as front_cli
+    from desmos.state import persist
+    from desmos.transport.complete import split_system
+
+    saved = {
+        k: os.environ.get(k)
+        for k in (persist.SESSION_ID_ENV, persist.SESSION_PID_ENV)
+    }
+
+    def fresh_run() -> str:
+        rid = persist._uuid7()
+        os.environ[persist.SESSION_ID_ENV] = rid
+        os.environ[persist.SESSION_PID_ENV] = str(os.getpid())
+        return rid
+
+    def seat_rows(path):
+        conn = persist._connect(path)
+        rows = [tuple(r) for r in conn.execute("SELECT * FROM seats ORDER BY id")]
+        conn.close()
+        return rows
+
+    def session_seat(path, sid):
+        conn = persist._connect(path)
+        row = conn.execute("SELECT seat_id FROM sessions WHERE id = ?", (sid,)).fetchone()
+        conn.close()
+        return None if row is None else str(row["seat_id"])
+
+    def event_kinds(path, sid=None):
+        conn = persist._connect(path)
+        if sid is None:
+            rows = conn.execute("SELECT kind FROM events").fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT kind FROM events WHERE session_id = ?", (sid,)
+            ).fetchall()
+        conn.close()
+        return [str(r["kind"]) for r in rows]
+
+    root = Path(tempfile.mkdtemp())
+    try:
+        rid_a = fresh_run()
+        # Birth gate: a child world (persist=False) never creates and never binds.
+        child = new_world(root, persist=False)
+        try:
+            persist.create_seat(child, role="navigator", charter="steer", operator=True)
+            raise AssertionError("a child world birthed a seat")
+        except persist.SeatError:
+            pass
+        assert persist.seat_binding(child) is None, "a child world bound a seat"
+
+        parent = new_world(root)
+        path = persist.state_file(parent)
+        # The running agent's tool surface grows no seat-creation tag.
+        assert not any("seat" in name for name in parent.tools), sorted(parent.tools)
+        # Worker roles are refused: seats are for user-facing agents only.
+        try:
+            persist.create_seat(parent, role="worker", charter="fork work", operator=True)
+            raise AssertionError("a worker role was seated")
+        except persist.SeatError:
+            pass
+        # Non-operator callers are refused even with a valid role.
+        try:
+            persist.create_seat(parent, role="navigator", charter="c", operator=False)
+            raise AssertionError("a non-operator surface birthed a seat")
+        except persist.SeatError:
+            pass
+        # The operator CLI path succeeds.
+        rc = front_cli.cmd_seat(Namespace(
+            action="new", role="navigator",
+            charter="keep the constitution honest", cwd=str(root),
+        ))
+        assert rc == 0, "operator seat birth failed"
+        born = seat_rows(path)
+        assert len(born) == 1, born
+        assert "seat_birth" in event_kinds(path), "birth event missing"
+        seat_id = born[0][0]
+
+        # Wake binding: simulate a restart by releasing this run's lease.
+        lease_key = str(persist._presence_path(parent, rid_a).resolve())
+        lease = persist._PRESENCE_LEASES.pop(lease_key, None)
+        if lease is not None:
+            lease.close()
+        rid_b = fresh_run()
+        wake = new_world(root)
+        _, _, tail = split_system(system_prompt(wake))
+        assert "keep the constitution honest" in tail, tail[-400:]
+        assert "navigator" in tail, tail[-400:]
+        persist.record_event(wake, {"ev": "notice", "content": "bound"}, ts_ms=1, mono_ns=1)
+        assert session_seat(path, rid_b) == seat_id, "restart did not bind"
+
+        # Second concurrent binding is refused loudly with a recorded event.
+        rid_c = fresh_run()
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            second = new_world(root)
+            persist.record_event(second, {"ev": "notice", "content": "hi"}, ts_ms=2, mono_ns=2)
+        assert session_seat(path, rid_c) == "", "second concurrent bind was accepted"
+        assert "seat_bind_refused" in event_kinds(path, rid_c), "refusal not recorded"
+        assert any("seatless" in str(w.message) for w in caught), \
+            [str(w.message) for w in caught]
+
+        # Rollback narrowness: the seat row is byte-identical across a rollback.
+        before = seat_rows(path)
+        evolve(wake, "seat rollback probe")
+        rollback(wake, 1)
+        assert seat_rows(path) == before, "rollback touched the seat row"
+
+        # Retire: tombstone set, event appended, nothing deleted.
+        rc = front_cli.cmd_seat(Namespace(action="retire", reason="phase over", cwd=str(root)))
+        assert rc == 0, "operator retire failed"
+        after = seat_rows(path)
+        assert len(after) == 1, "retirement deleted the seat row"
+        assert after[0][6] and after[0][7] == "phase over", after
+        kinds = event_kinds(path)
+        assert "seat_retired" in kinds and "seat_birth" in kinds, kinds
+        # A retired seat refuses new bindings -- and quietly: no active seat
+        # is today's behaviour, not a refusal event.
+        rid_d = fresh_run()
+        idle = new_world(root)
+        persist.record_event(idle, {"ev": "notice", "content": "x"}, ts_ms=3, mono_ns=3)
+        assert session_seat(path, rid_d) == "", "a retired seat accepted a binding"
+        assert persist.seat_binding(idle) is None
+        assert "seat_bind_refused" not in event_kinds(path, rid_d)
+
+        # Schema tolerance: an older reader without seats support degrades.
+        conn = persist._connect(path)
+        conn.execute("DELETE FROM schema_migrations")
+        conn.execute(
+            "INSERT INTO schema_migrations(version, applied_at, min_reader)"
+            " VALUES (?, ?, ?)",
+            (persist.SCHEMA_VERSION + 2, "2026-01-01T00:00:00+00:00",
+             persist.SCHEMA_VERSION + 2),
+        )
+        conn.commit()
+        conn.close()
+        fresh_run()
+        old_reader = new_world(root, persist=False)
+        old_reader.persist = True
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            persist.load(old_reader)
+        assert not old_reader.persist, "an unreadable schema kept persistence on"
+        assert persist.seat_binding(old_reader) is None, "a degraded reader bound a seat"
+    finally:
+        for key, value in saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+    print("seats check ok")
 
 
 def _check_quarantine_manifest() -> None:

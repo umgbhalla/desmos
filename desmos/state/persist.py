@@ -26,7 +26,7 @@ from desmos.kernel.types import Tool, World
 _UMASK = os.umask(0)
 os.umask(_UMASK)
 
-SCHEMA_VERSION = 13
+SCHEMA_VERSION = 14  # 14: seats + sessions.seat_id (docs/seats.md; B2 satisfied)
 #: Oldest build that can still read this schema. Additive changes leave it
 #: alone; anything an older reader would misread raises it.
 MIN_READER_VERSION = 9
@@ -479,6 +479,18 @@ CREATE TABLE IF NOT EXISTS sessions (
     cache_key TEXT NOT NULL,
     title TEXT NOT NULL DEFAULT ''
 );
+CREATE TABLE IF NOT EXISTS seats (
+    id TEXT PRIMARY KEY,
+    workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+    charter TEXT NOT NULL,
+    role TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    created_generation INTEGER NOT NULL DEFAULT 0,
+    retired_at TEXT NOT NULL DEFAULT '',
+    retire_reason TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_seats_workspace
+    ON seats(workspace_id, created_at);
 CREATE TABLE IF NOT EXISTS messages (
     session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
     seq INTEGER NOT NULL,
@@ -665,21 +677,6 @@ def _add_column(
     return True
 
 
-def _drop_seat_scaffold(conn: sqlite3.Connection) -> None:
-    """Retire a seat schema that landed before the seat was declared.
-
-    The constitution (B2) forbids seat storage before the seat's fields,
-    lifecycle and reset behaviour are written down and reviewed. The plural
-    `seats` table and `sessions.seat_id` arrived on a shared file with none of
-    that, no CRUD anywhere, and no rows. They go back out until the design is.
-    """
-    columns = {row[1] for row in conn.execute("PRAGMA table_info(sessions)")}
-    if "seat_id" in columns:
-        conn.execute("ALTER TABLE sessions DROP COLUMN seat_id")
-    conn.execute("DROP INDEX IF EXISTS idx_seats_workspace")
-    conn.execute("DROP TABLE IF EXISTS seats")
-
-
 def _version_rows(conn: sqlite3.Connection) -> list[sqlite3.Row]:
     """Recorded versions, tolerating a file written before min_reader."""
     cols = {r[1] for r in conn.execute("PRAGMA table_info(schema_migrations)")}
@@ -721,7 +718,10 @@ def _migrate(conn: sqlite3.Connection) -> None:
             conn.commit()
             return
         _execute_schema(conn)
-        _drop_seat_scaffold(conn)
+        # Seats landed for real in v14: docs/seats.md is reviewed, so the B2
+        # gate is satisfied. The old _drop_seat_scaffold that retired the
+        # premature schema is gone; nothing may drop the declared table again.
+        _add_column(conn, "sessions", "seat_id", "TEXT NOT NULL DEFAULT ''")
         for shared in ("notes", "tools"):
             _add_column(conn, shared, "updated_at", "TEXT NOT NULL DEFAULT ''")
         # Which purse paid for a call. Older rows keep '' and are counted
@@ -959,10 +959,11 @@ def _session_id(
     if not create:
         return None
     parent_id = _resume_parent(conn, workspace)
+    seat_id, refused = _seat_for_new_session(conn, world, workspace, current)
     conn.execute(
         "INSERT INTO sessions(id, workspace_id, parent_id, kind, started_at,"
-        " last_seen_at, model, thinking, cache_key)"
-        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        " last_seen_at, model, thinking, cache_key, seat_id)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             current,
             workspace,
@@ -973,8 +974,11 @@ def _session_id(
             str(world.model),
             str(world.thinking),
             f"desmos-{current[:16]}",
+            seat_id,
         ),
     )
+    if refused is not None:
+        _record_seat_refusal(conn, current, refused)
     for kind, payload, nbytes, digest, ts_ms, mono_ns in _PENDING_LAUNCH.pop(
         current, []
     ):
@@ -990,6 +994,250 @@ def _session_id(
              payload, nbytes, digest),
         )
     return current
+
+
+# --- Seats (docs/seats.md; constitution B1-B3, C3, A1) ----------------------
+#
+# A seat is the enduring party that works in a workspace; sessions are days,
+# seats are people. Birth is operator-gated, binding happens at the single
+# choke point that mints session rows, and retirement is a tombstone.
+
+#: Roles that describe forks and helpers, never a user-facing party (B3).
+WORKER_SEAT_ROLES = frozenset({"worker", "sibling", "child", "subagent", "fork"})
+
+
+class SeatError(RuntimeError):
+    """A seat operation the birth or binding gate refuses."""
+
+
+def _active_seats(
+    conn: sqlite3.Connection, workspace: str
+) -> list[sqlite3.Row]:
+    return conn.execute(
+        "SELECT id, workspace_id, charter, role, created_at,"
+        " created_generation, retired_at, retire_reason FROM seats"
+        " WHERE workspace_id = ? AND retired_at = ''"
+        " ORDER BY created_at, id",
+        (workspace,),
+    ).fetchall()
+
+
+def _live_seat_holder(
+    world: World, conn: sqlite3.Connection, seat: str, current: str
+) -> str | None:
+    """The other live session bound to this seat, if one exists.
+
+    Liveness is the presence lease, same as peers(): a session row with no
+    recorded end whose lock is still held. A dead process releases its lock,
+    so a restart binds; a live one keeps it, so a second attach refuses.
+    """
+    rows = conn.execute(
+        "SELECT id FROM sessions WHERE seat_id = ? AND id != ?"
+        " AND ended_at IS NULL",
+        (seat, current),
+    ).fetchall()
+    for row in rows:
+        path = _presence_path(world, str(row["id"]))
+        if not path.exists():
+            continue
+        probe = path.open("a+")
+        try:
+            fcntl.flock(probe.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return str(row["id"])
+        else:
+            fcntl.flock(probe.fileno(), fcntl.LOCK_UN)
+        finally:
+            probe.close()
+    return None
+
+
+def _seat_for_new_session(
+    conn: sqlite3.Connection, world: World, workspace: str, current: str
+) -> tuple[str, dict[str, str] | None]:
+    """(seat_id, refusal) for a session row about to be minted.
+
+    Exactly one active seat binds (C3). A seat already held by a live session
+    refuses loudly; the caller records the refusal event. No active seat, or
+    an ambiguous number of them, is today's behaviour: no binding.
+    """
+    seats = _active_seats(conn, workspace)
+    if len(seats) != 1:
+        return "", None
+    seat = str(seats[0]["id"])
+    holder = _live_seat_holder(world, conn, seat, current)
+    if holder is None:
+        return seat, None
+    return "", {"seat": seat, "held_by": holder}
+
+
+def _record_seat_refusal(
+    conn: sqlite3.Connection, session: str, refused: dict[str, str]
+) -> None:
+    """One committed event: the refusal is loud, never a silent queue."""
+    import hashlib
+
+    payload = json.dumps(
+        {"ev": "seat_bind_refused", **refused}, separators=(",", ":")
+    )
+    row = conn.execute(
+        "SELECT COALESCE(MAX(seq), 0) FROM events WHERE session_id = ?",
+        (session,),
+    ).fetchone()
+    conn.execute(
+        "INSERT INTO events(session_id, seq, ts_ms, mono_ns, kind,"
+        " payload_json, payload_bytes, payload_sha256)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            session, int(row[0]) + 1, int(time.time() * 1000),
+            time.monotonic_ns(), "seat_bind_refused", payload,
+            len(payload.encode("utf-8")),
+            hashlib.sha256(payload.encode("utf-8")).hexdigest(),
+        ),
+    )
+    warnings.warn(
+        "seat {} is bound by live session {}; this session runs"
+        " seatless".format(refused["seat"][:8], refused["held_by"][:8]),
+        RuntimeWarning,
+        stacklevel=2,
+    )
+
+
+def create_seat(
+    world: World, *, role: str, charter: str, operator: bool = False
+) -> dict[str, str]:
+    """Operator-gated seat birth (docs/seats.md section 2).
+
+    Only the operator surface (`python -m desmos seat new`) passes
+    operator=True; the running agent's tool surface has no seat tag at all.
+    Worker roles and child worlds are refused: seats are for user-facing
+    agents only, and a fork loads no seat and cannot mint one (B3).
+    """
+    if not operator:
+        raise SeatError(
+            "seat birth is operator-gated; a running agent cannot create one"
+        )
+    if not world.persist:
+        raise SeatError(
+            "child worlds are seatless (B3); no seat birth from a"
+            " non-persistent world"
+        )
+    role = str(role).strip()
+    charter = str(charter).strip()
+    if not role or not charter:
+        raise SeatError("a seat needs both a role and a charter")
+    if role.lower() in WORKER_SEAT_ROLES:
+        raise SeatError(
+            f"worker role {role!r} cannot hold a seat; seats are for"
+            " user-facing agents only"
+        )
+    now = datetime.now(timezone.utc).isoformat()
+    seat = _uuid7()
+    conn = _open(state_file(world))
+    try:
+        with conn:
+            workspace = _workspace_id(conn, world)
+            assert workspace is not None
+            conn.execute(
+                "INSERT INTO seats(id, workspace_id, charter, role,"
+                " created_at, created_generation, retired_at, retire_reason)"
+                " VALUES (?, ?, ?, ?, ?, ?, '', '')",
+                (seat, workspace, charter, role, now, int(world.generation)),
+            )
+    finally:
+        conn.close()
+    record_event(
+        world,
+        {"ev": "seat_birth", "seat": seat, "role": role, "charter": charter,
+         "operator": True},
+        ts_ms=int(time.time() * 1000),
+        mono_ns=time.monotonic_ns(),
+    )
+    return {"id": seat, "role": role, "charter": charter, "created_at": now}
+
+
+def retire_seat(
+    world: World, *, reason: str, operator: bool = False
+) -> dict[str, Any]:
+    """Tombstone the workspace's active seat (A1: never delete).
+
+    Sets retired_at plus the reason, appends a retirement event, and leaves
+    every accumulated record exactly where it is. A retired seat refuses new
+    bindings because _active_seats filters on the tombstone.
+    """
+    if not operator:
+        raise SeatError("seat retirement is operator-gated")
+    if not world.persist:
+        raise SeatError("child worlds are seatless (B3); nothing to retire")
+    reason = str(reason).strip()
+    if not reason:
+        raise SeatError("retirement records a reason")
+    conn = _open(state_file(world))
+    try:
+        with conn:
+            workspace = _workspace_id(conn, world, create=False)
+            if workspace is None:
+                raise SeatError("no workspace here; nothing to retire")
+            seats = _active_seats(conn, workspace)
+            if not seats:
+                raise SeatError("no active seat to retire")
+            if len(seats) > 1:
+                raise SeatError("more than one active seat; retire is ambiguous")
+            seat = dict(seats[0])
+            now = datetime.now(timezone.utc).isoformat()
+            conn.execute(
+                "UPDATE seats SET retired_at = ?, retire_reason = ?"
+                " WHERE id = ? AND retired_at = ''",
+                (now, reason, seat["id"]),
+            )
+    finally:
+        conn.close()
+    record_event(
+        world,
+        {"ev": "seat_retired", "seat": seat["id"], "reason": reason},
+        ts_ms=int(time.time() * 1000),
+        mono_ns=time.monotonic_ns(),
+    )
+    seat["retired_at"] = now
+    seat["retire_reason"] = reason
+    return seat
+
+
+def seat_binding(world: World) -> dict[str, Any] | None:
+    """The seat this attach is bound to, or would bind on its first write."""
+    if not world.persist:
+        return None
+    conn = _open(state_file(world))
+    try:
+        workspace = _workspace_id(conn, world, create=False)
+        if workspace is None:
+            return None
+        current = run_id()
+        row = conn.execute(
+            "SELECT seat_id FROM sessions WHERE id = ?", (current,)
+        ).fetchone()
+        if row is not None:
+            if not row["seat_id"]:
+                return None
+            found = conn.execute(
+                "SELECT id, workspace_id, charter, role, created_at,"
+                " created_generation, retired_at, retire_reason"
+                " FROM seats WHERE id = ?",
+                (row["seat_id"],),
+            ).fetchone()
+            return dict(found) if found is not None else None
+        seat, refused = _seat_for_new_session(conn, world, workspace, current)
+        if seat and refused is None:
+            found = conn.execute(
+                "SELECT id, workspace_id, charter, role, created_at,"
+                " created_generation, retired_at, retire_reason"
+                " FROM seats WHERE id = ?",
+                (seat,),
+            ).fetchone()
+            return dict(found) if found is not None else None
+        return None
+    finally:
+        conn.close()
 
 
 def _content_text(content: Any) -> str:
@@ -2452,6 +2700,22 @@ def load(world: World) -> None:
         _witness.wake(world)
     except Exception as exc:  # noqa: BLE001
         warnings.warn(f"witness at wake failed: {exc}", RuntimeWarning)
+    # C3: a wake in a seated workspace carries the seat's charter and role.
+    try:
+        seat = seat_binding(world)
+        if seat is not None:
+            from desmos.kernel import catalog as _catalog
+
+            _catalog.inject(
+                world,
+                "seat",
+                "Seat {}: role {} -- charter: {}".format(
+                    str(seat["id"])[:8], seat["role"], seat["charter"]
+                ),
+                turns=1,
+            )
+    except Exception as exc:  # noqa: BLE001
+        warnings.warn(f"seat binding at wake failed: {exc}", RuntimeWarning)
 
 
 def op_rollup(world: World) -> list[tuple[str, int]]:

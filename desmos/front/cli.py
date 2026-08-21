@@ -57,6 +57,37 @@ def cmd_kernel(_args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_seat(args: argparse.Namespace) -> int:
+    """Operator surface for seat birth and retirement (docs/seats.md).
+
+    This subcommand is the only path that passes operator=True; the running
+    agent's tool surface has no seat tag, so a seat row whose birth event is
+    not an operator action cannot exist.
+    """
+    _on_path()
+    from desmos.kernel.loop import new_world
+    from desmos.state import persist
+
+    world = new_world(Path(args.cwd).resolve())
+    try:
+        if args.action == "new":
+            seat = persist.create_seat(
+                world, role=args.role, charter=args.charter, operator=True
+            )
+            print(
+                "seat {} born: role {}; charter: {}".format(
+                    seat["id"], seat["role"], seat["charter"]
+                )
+            )
+        else:
+            seat = persist.retire_seat(world, reason=args.reason, operator=True)
+            print("seat {} retired: {}".format(seat["id"], args.reason))
+    except persist.SeatError as exc:
+        print(f"refused: {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
 def cmd_check(args: argparse.Namespace) -> int:
     _on_path()
     from desmos.check import run
@@ -469,6 +500,18 @@ def main() -> int:
     a = sub.add_parser("acp", help="ACP stdio server for external frontends")
     a.add_argument("--cwd", default="", help="default cwd before session/new selects one")
     a.set_defaults(func=cmd_acp)
+
+    se = sub.add_parser("seat", help="operator-gated seat lifecycle (docs/seats.md)")
+    seat_sub = se.add_subparsers(dest="action", required=True)
+    sn = seat_sub.add_parser("new", help="birth a user-facing seat in this workspace")
+    sn.add_argument("--role", required=True, help="user-facing role; worker roles are refused")
+    sn.add_argument("--charter", required=True, help="what this seat is for, in prose")
+    sn.add_argument("--cwd", default=".")
+    sn.set_defaults(func=cmd_seat)
+    sr = seat_sub.add_parser("retire", help="tombstone the workspace seat; never deletes")
+    sr.add_argument("--reason", required=True)
+    sr.add_argument("--cwd", default=".")
+    sr.set_defaults(func=cmd_seat)
 
     args = p.parse_args()
     if args.cmd == "run" and not args.out:
