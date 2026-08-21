@@ -181,7 +181,10 @@ def _check_log_forms(binary: Path, tmp: Path, stream: str, replay: str) -> None:
     assert log_text, "SQL event stream is empty"
 
     for what, text in (("the SQL event stream", log_text), ("the attach replay", replay)):
-        _validate(binary, text, what, log=True)
+        # Replayed lines carry the R3 "sid" stamp like live ones; the typed
+        # LogLine vocabulary does not know it yet (reader half pending), so
+        # bodies are validated without it, same as the live stream above.
+        _validate(binary, _desid(text), what, log=True)
         head = json.loads(text.splitlines()[0])
         assert head.get("ev") == "session", f"{what} does not open with the header: {head}"
         assert head.get("session_id") == session_id, head
@@ -193,7 +196,7 @@ def _check_log_forms(binary: Path, tmp: Path, stream: str, replay: str) -> None:
         for event in wire:
             assert event.pop("sid", None) == session_id, event
         stamp_keys = {
-            "seq", "ts", "mono_ns", "payload_bytes", "payload_sha256"
+            "seq", "ts", "mono_ns", "payload_bytes", "payload_sha256", "sid"
         }
         bodies = [
             {key: value for key, value in event.items() if key not in stamp_keys}

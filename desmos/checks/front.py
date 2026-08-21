@@ -875,6 +875,98 @@ def _check_emit_sid() -> None:
     assert all("sid" not in row for row in logged[1:])
 
 
+def _check_replay_sid() -> None:
+    """R3 replay half: the REAL _replay path stamps every replayed line with
+    the same "sid" live lines carry -- persist events, attach with since=0
+    through _replay/_Client, and compare against a live _emit line."""
+    import io
+    import json
+    import os
+    import socket
+    import time as _time
+
+    import desmos.front.bridge as B
+    import desmos.state.persist as P
+
+    logged: list[dict] = []
+
+    def fake_record(world, ev, **kw):
+        logged.append(dict(ev))
+        return len(logged)
+
+    def fake_read(world, since=0, limit=4096, session=None):
+        out = []
+        for i, ev in enumerate(logged, start=1):
+            if i <= int(since) or len(out) >= limit:
+                continue
+            row = dict(ev)
+            row.update({
+                "seq": i,
+                "ts": 1,
+                "mono_ns": 1,
+                "payload_bytes": 0,
+                "payload_sha256": "x",
+            })
+            out.append(row)
+        return out
+
+    buf = io.StringIO()
+    old_wire, old_dead = B._WIRE, B._WIRE_DEAD
+    old_record, old_read = P.record_event, P.read_events
+    old_sid = os.environ.get("DESMOS_SESSION_ID")
+    a, b = socket.socketpair()
+    client = None
+    try:
+        os.environ["DESMOS_SESSION_ID"] = "sid-replay-5678"
+        B._WIRE, B._WIRE_DEAD = buf, False
+        P.record_event = fake_record
+        P.read_events = fake_read
+        B._open_log(type("W", (), {"cwd": Path("/tmp")})())
+        B._emit({"ev": "notice", "text": "one"})
+        B._emit({"ev": "agent", "id": "c1", "parent": "root", "depth": 1})
+        client = B._Client(a)
+        B._replay(client, 0)  # the real attach replay path
+        assert client in B._CLIENTS  # joined live fan-out gaplessly
+        B._emit({"ev": "notice", "text": "live-after-attach"})
+        b.settimeout(5.0)
+        raw = b""
+        deadline = _time.time() + 5.0
+        while raw.count(b"\n") < 4 and _time.time() < deadline:
+            chunk = b.recv(65536)
+            if not chunk:
+                break
+            raw += chunk
+        lines = raw.decode("utf-8").splitlines()
+        assert len(lines) == 4, lines  # session header + 2 events + 1 live
+        live = json.loads(buf.getvalue().splitlines()[-1])
+        assert live["ev"] == "notice" and live["sid"] == "sid-replay-5678"
+        header = json.loads(lines[0])
+        assert header["ev"] == "session", header
+        assert header["session_id"] == live["sid"] and "sid" not in header
+        for line in lines[1:]:
+            ev = json.loads(line)
+            assert ev["sid"] == live["sid"], ev
+            assert line.count('"sid"') == 1, line
+        for line in lines:
+            ev = json.loads(line)
+            assert "payload_bytes" not in ev and "payload_sha256" not in ev
+        # Persisted rows themselves stay unstamped.
+        assert all("sid" not in row for row in logged)
+    finally:
+        B._WIRE, B._WIRE_DEAD = old_wire, old_dead
+        B._LOG_WORLD = None
+        P.record_event, P.read_events = old_record, old_read
+        if client is not None and client in B._CLIENTS:
+            B._CLIENTS.remove(client)
+        if client is not None:
+            client.close()
+        b.close()
+        if old_sid is None:
+            os.environ.pop("DESMOS_SESSION_ID", None)
+        else:
+            os.environ["DESMOS_SESSION_ID"] = old_sid
+
+
 def check() -> None:
     import tempfile
 
@@ -1224,6 +1316,7 @@ def check() -> None:
         _check_vendor_patch()
         _check_release_tui_launcher()
     _check_emit_sid()
+    _check_replay_sid()
     _check_socket()
     _check_daemon()
     _check_daemon_shutdown()

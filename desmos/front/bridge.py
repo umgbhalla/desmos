@@ -231,6 +231,10 @@ def _replay(wire: "_Client", since: int) -> None:
     """Replay compact SQL events, then join the live fan-out gaplessly."""
     from desmos.state.persist import read_events
 
+    # Replayed lines carry the same session stamp as live ones (R3): the
+    # rows read here belong to this bridge's session by construction, so
+    # the same env-var source the _emit/header path uses is correct here.
+    sid = os.environ.get("DESMOS_SESSION_ID", "")
     last = int(since)
     while True:
         with _WIRE_LOCK:
@@ -256,8 +260,13 @@ def _replay(wire: "_Client", since: int) -> None:
             wire_event.pop("payload_bytes", None)
             wire_event.pop("payload_sha256", None)
             if wire_event.get("ev") == "session":
+                # The header names its session as session_id already and the
+                # typed LogLine form (crates/desmos-events) admits no sid on
+                # it; every other replayed line gets the live-wire stamp.
                 wire_event.pop("seq", None)
                 wire_event.pop("mono_ns", None)
+            else:
+                wire_event["sid"] = sid
             wire.push_wait(
                 (json.dumps(wire_event, default=str) + "\n").encode("utf-8"),
                 _REPLAY_STALL,
