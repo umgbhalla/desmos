@@ -320,6 +320,45 @@ def _handle_oob(
     return True
 
 
+
+def _peer_entries(world: Any) -> list[dict[str, Any]]:
+    """R5 bridge half: live workspace sessions shaped for a rail row.
+
+    peers() already prunes released presence leases; kind/parent_id/seat_id
+    live on the sessions table -- nothing new is persisted here, this only
+    joins what is already stored.
+    """
+    from desmos.state.persist import _open, peers, state_file
+
+    rows = peers(world)
+    meta: dict[str, dict[str, Any]] = {}
+    ids = [r["session_id"] for r in rows if r.get("session_id")]
+    if ids:
+        db = _open(state_file(world))
+        try:
+            marks = ",".join("?" for _ in ids)
+            for row in db.execute(
+                "SELECT id, kind, parent_id, seat_id FROM sessions"
+                f" WHERE id IN ({marks})",
+                ids,
+            ).fetchall():
+                meta[row["id"]] = dict(row)
+        finally:
+            db.close()
+    out: list[dict[str, Any]] = []
+    for r in rows:
+        m = meta.get(r.get("session_id"), {})
+        out.append({
+            "session_id": r.get("session_id"),
+            "run_id": r.get("run_id"),
+            "kind": m.get("kind"),
+            "parent_id": m.get("parent_id"),
+            "seat_id": m.get("seat_id") or None,
+            "seen_at": r.get("seen_at"),
+            "self": r.get("self"),
+        })
+    return out
+
 def _serve_client(
     conn: socket.socket,
     world: Any,
@@ -394,6 +433,23 @@ def _serve_client(
                 continue
             with _WIRE_LOCK:
                 register_locked()
+            if op == "peers":
+                # R5 rail-over-siblings seam: answer only the asking client
+                # (like attach's replay), never the fan-out. Same push path
+                # as every other socket line, so it carries "sid" too.
+                try:
+                    entries = _peer_entries(world)
+                except Exception as exc:  # noqa: BLE001 -- name it, don't die
+                    reply = {"ev": "error", "text": f"peers failed: {exc}"}
+                else:
+                    reply = {"ev": "peers", "peers": entries}
+                reply["sid"] = os.environ.get("DESMOS_SESSION_ID", "")
+                line = json.dumps(reply, default=str) + "\n"
+                try:
+                    wire.push(line.encode("utf-8"))
+                except OSError:
+                    return
+                continue
             if op == "quit":
                 # A socket quit detaches this client only; the bridge (and
                 # any other attached client) keeps running. Taking the whole

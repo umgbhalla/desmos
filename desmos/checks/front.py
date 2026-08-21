@@ -595,6 +595,135 @@ def _check_socket() -> None:
 
 
 
+
+def _check_socket_peers() -> None:
+    """R5 bridge half: {"op":"peers"} on the REAL socket answers the asking
+    client (and only it) with one {"ev":"peers"} line listing the live
+    workspace sessions -- session_id, kind, parent_id, seat_id, seen_at --
+    backed by persist.peers()/active_runs with lease-held fake sessions."""
+    import fcntl
+    import json
+    import os
+    import sqlite3
+    import subprocess
+    import sys
+    import tempfile
+    from datetime import datetime, timezone
+
+    root = Path(__file__).resolve().parents[2]
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        cwd = tmp / "w"
+        cwd.mkdir()
+        boot = tmp / "boot.py"
+        boot.write_text(_BOOT, encoding="utf-8")
+        env = dict(os.environ)
+        env["DESMOS_SETTINGS"] = str(tmp / "settings.json")
+        env["PYTHONPATH"] = str(root)
+        env["DESMOS_TOOL_SYSCALLS"] = "0"
+        proc = subprocess.Popen(
+            [sys.executable, str(boot), str(cwd)],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, env=env, cwd=str(cwd),
+        )
+        a = b = None
+        leases = []
+        try:
+            ready = json.loads(proc.stdout.readline())
+            assert ready["ev"] == "ready", ready
+            import threading
+
+            threading.Thread(
+                target=lambda: [None for _ in proc.stdout], daemon=True
+            ).start()
+
+            sock_path = cwd / ".desmos" / "bridge.sock"
+            assert sock_path.exists(), "bridge bound no socket"
+
+            # Client A drives one turn so the bridge's own session row and
+            # the workspace row exist before the fakes reference them.
+            a = _SockClient(sock_path)
+            a.send({"op": "snapshot"})
+            a.until(lambda e: e.get("ev") == "snapshot")
+
+            db_path = cwd / ".desmos" / "harness.sqlite3"
+            now = datetime.now(timezone.utc).isoformat()
+            with sqlite3.connect(db_path) as db:
+                workspace, owner = db.execute(
+                    "SELECT workspace_id, id FROM sessions"
+                    " ORDER BY started_at DESC LIMIT 1"
+                ).fetchone()
+                fakes = [
+                    ("run-peer-1", "sess-peer-1", "fork", owner, "seat-9"),
+                    ("run-peer-2", "sess-peer-2", "child", owner, ""),
+                ]
+                for run, sess, kind, parent, seat in fakes:
+                    db.execute(
+                        "INSERT INTO sessions(id, workspace_id, parent_id,"
+                        " kind, started_at, last_seen_at, model, thinking,"
+                        " cache_key, seat_id)"
+                        " VALUES (?, ?, ?, ?, ?, ?, '', '', ?, ?)",
+                        (sess, workspace, parent, kind, now, now, sess, seat),
+                    )
+                    db.execute(
+                        "INSERT INTO active_runs(run_id, workspace_id,"
+                        " session_id, pid, cwd, generation, model,"
+                        " started_at, seen_at)"
+                        " VALUES (?, ?, ?, 0, ?, 0, 'fake', ?, ?)",
+                        (run, workspace, sess, str(cwd), now, now),
+                    )
+            # Hold the presence leases from THIS process: peers() probes the
+            # flock and prunes any row whose lease is free, so an unheld fake
+            # would vanish instead of proving the wire shape.
+            presence = cwd / ".desmos" / "presence"
+            presence.mkdir(parents=True, exist_ok=True)
+            for run, *_ in fakes:
+                fh = (presence / f"{run}.lock").open("a+")
+                fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                leases.append(fh)
+
+            # Client B joins the fan-out first; the peers answer must miss it.
+            b = _SockClient(sock_path)
+            b.send({"op": "snapshot"})
+            b.until(lambda e: e.get("ev") == "snapshot")
+
+            a.send({"op": "peers"})
+            reply = a.until(lambda e: e.get("ev") == "peers")
+            assert "sid" in reply, f"peers line missing sid: {reply}"
+            by_sess = {p["session_id"]: p for p in reply["peers"]}
+            assert "sess-peer-1" in by_sess and "sess-peer-2" in by_sess, by_sess
+            p1, p2 = by_sess["sess-peer-1"], by_sess["sess-peer-2"]
+            for p in (p1, p2):
+                for field in ("session_id", "run_id", "kind", "parent_id",
+                              "seat_id", "seen_at", "self"):
+                    assert field in p, f"peer entry missing {field}: {p}"
+            assert p1["kind"] == "fork" and p1["parent_id"] == owner, p1
+            assert p1["seat_id"] == "seat-9" and p1["self"] is False, p1
+            assert p2["kind"] == "child" and p2["seat_id"] is None, p2
+            assert p1["run_id"] == "run-peer-1" and p1["seen_at"], p1
+            assert owner in by_sess and by_sess[owner]["self"] is True, by_sess
+
+            # Isolation: B sees the fan-out either side of the reply but
+            # never the peers line itself.
+            b_events: list[dict] = []
+            b.send({"op": "snapshot"})
+            b.until(lambda e: e.get("ev") == "snapshot", seen=b_events)
+            leaked = [e for e in b_events if e.get("ev") == "peers"]
+            assert not leaked, f"peers answer leaked to the fan-out: {leaked}"
+        finally:
+            for fh in leases:
+                fh.close()
+            for c in (a, b):
+                if c is not None:
+                    c.close()
+            proc.terminate()
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+
+
 def _check_decision_events(cwd: Path) -> None:
     """Decision dispatch changes are forwarded and snapshots replay open ones."""
     import os
@@ -1318,5 +1447,6 @@ def check() -> None:
     _check_emit_sid()
     _check_replay_sid()
     _check_socket()
+    _check_socket_peers()
     _check_daemon()
     _check_daemon_shutdown()
