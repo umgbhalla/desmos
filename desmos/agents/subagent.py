@@ -36,7 +36,7 @@ PERSONAS: dict[str, str] = {
     ),
 }
 
-# capability modes: which tags the child may use
+# capability modes: which op-level dispatch targets the child may use
 CAPS: dict[str, tuple[str, ...]] = {
     "read": ("python", "bash", "skill", "todo", "find", "recall"),
     "edit": ("python", "bash", "edit", "skill", "reload", "todo", "find", "recall"),
@@ -366,10 +366,11 @@ def _expand_grants(names) -> set[str]:
     """The one translation seam for capability grants (canonical cut step 3).
 
     Grants may be written as canonical family names (exec, workspace, ...) or
-    as the legacy tag names CAPS still uses; both scope identically. A family
-    name expands to the family tag plus every dispatch target its ops route
-    to; a legacy target keeps its op-level grant and carries its family tag so
-    the child's prompt and evidence counting see the canonical spelling.
+    as op-level dispatch targets (see TARGET_FAMILY in kernel/canonical.py),
+    which is what CAPS and contract allowed_tools use; both scope identically.
+    A family name expands to the family tag plus every dispatch target its
+    ops route to; a target keeps its op-level grant and carries its owning
+    family tag so the child's prompt and evidence counting see the family.
     """
     from desmos.kernel.canonical import TARGET_FAMILY, family_targets
     from desmos.kernel.const import CANONICAL
