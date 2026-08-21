@@ -363,6 +363,32 @@ def check() -> None:
         dispatch(canonical, Block("exec", "printf canonical", {"op": "bash"}))
         assert observed_tags == ["bash"], observed_tags
 
+        # Canonical cut step 2 wiring proof: the canonical families own their
+        # implementations. One call per family must still succeed after every
+        # same-named legacy tool (LEGACY_FROZEN + COMPAT_ALIASES) is deleted
+        # from world.tools -- canonical no longer depends on legacy registration.
+        from desmos.kernel.const import COMPAT_ALIASES
+
+        wired = new_world(cwd, state_path=None, persist=False)
+        for name in COMPAT_ALIASES:
+            wired.tools.pop(name, None)
+        assert dispatch(wired, Block("exec", "20 + 22", {"op": "python"})) == "42"
+        wired_read = dispatch(
+            wired, Block("workspace", "", {"op": "read", "path": "canonical.txt"})
+        )
+        assert "three" in wired_read, wired_read
+        assert "wrote note" in dispatch(
+            wired,
+            Block("knowledge", "canonical owns system", {"op": "system", "name": "cut2"}),
+        )
+        assert "updated" in dispatch(
+            wired, Block("harness", "", {"op": "describe", "name": "exec", "doc": "exec ops"})
+        )
+        assert "calls" in dispatch(wired, Block("observe", "", {"op": "usage"}))
+        wired_agents = dispatch(wired, Block("agents", "", {"op": "status"}))
+        assert wired_agents.startswith(("{", "[")), wired_agents
+        assert '"generation":' in dispatch(wired, Block("session", "", {"op": "status"}))
+
         # `diag` is a real persistent-kernel primitive, not a helper exercised
         # out of band. An uncaught Python call records bounded plain data, and a
         # later call can query it without reconstructing inspect/traceback code.

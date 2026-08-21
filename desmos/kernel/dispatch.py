@@ -193,91 +193,23 @@ def _dispatch(
     if canonical_direct is not None:
         from desmos.kernel.canonical import direct
 
-        return direct(world, canonical_direct)
-    if block.tag == "python":
-        return run_python(block.body, world, on_chunk=on_chunk)
-    if block.tag == "bash":
-        return run_bash(
-            block.body,
-            world.cwd,
-            on_chunk=on_chunk,
-            should_stop=should_stop,
+        return direct(
+            world, canonical_direct,
+            on_chunk=on_chunk, should_stop=should_stop, meta=meta,
         )
-    if block.tag == "shell":
-        from desmos.kernel.shell import run as run_shell
+    from desmos.kernel.canonical import LEGACY_TO_CANONICAL, run_op
 
-        return run_shell(world, block.body, block.attrs, on_chunk=on_chunk)
-    if block.tag == "edit":
-        old, new = parse_edit_body(block.body, block.attrs)
-        msg, line = apply_edit_line(block.attrs.get("path", ""), old, new, cwd=world.cwd)
-        # meta is the caller's out-channel for facts only the syscall can know
-        # at run time; the loop lifts them onto the result done event. A failed
-        # edit has no edit site, so it sets nothing.
-        if meta is not None and line is not None:
-            meta["line"] = line
-        # Feed the <find> frecency index at the one edit choke point every
-        # world (root and child) routes through. A successful edit has an edit
-        # site (line is not None); a failed one does not, so this never fires
-        # on a refusal. touch() is silent on a missing/broken engine -- the
-        # model called <edit>, not <find>.
-        if line is not None:
-            from desmos.state.find import touch
-
-            touch(world, block.attrs.get("path", ""))
-        return msg
-    if block.tag == "find":
-        from desmos.state.find import find
-
-        return find(world, block.body, **block.attrs)
-    if block.tag == "recall":
-        from desmos.state.recall import handle_recall
-
-        return handle_recall(world, block.body, block.attrs)
-    if block.tag == "register":
-        return register_tag(world, block.body, block.attrs.get("name", ""), block.attrs.get("doc", ""))
-    if block.tag == "system":
-        delete = block.attrs.get("delete", "") in {"1", "true", "yes"}
-        return set_system(world, block.body, block.attrs.get("name", ""), delete)
-    if block.tag == "tool":
-        return set_tool_doc(world, block.attrs.get("name", ""), block.attrs.get("doc", "") or block.body)
-    if block.tag == "skill":
-        from desmos.skills import load_skill_body
-
-        name = (block.attrs.get("name") or block.body).strip()
-        skill = next((s for s in world.skills if s.name == name), None)
-        if skill is None:
-            known = ", ".join(sorted(s.name for s in world.skills)) or "none"
-            return f"unknown skill {name!r}. Available: {known}. Write .desmos/skills/<name>/SKILL.md then <reload/> to add one."
-        return load_skill_body(skill, world.model)
-    if block.tag == "reload":
-        from desmos.kernel.loop import reload
-
-        return reload(world)
-    if block.tag == "reload_sdk":
-        from desmos.kernel.loop import reload_sdk
-
-        return reload_sdk(world)
-    if block.tag == "evolve":
-        from desmos.state.generations import evolve
-
-        return evolve(world, (block.body or block.attrs.get("reason") or "").strip() or "unspecified")
-    if block.tag == "rollback":
-        from desmos.state.generations import rollback
-
-        raw = block.attrs.get("n") or block.body.strip() or "1"
-        try:
-            n = int(raw)
-        except ValueError:
-            return f"rollback failed: bad n {raw!r}"
-        return rollback(world, n)
-    if block.tag == "refine":
-        from desmos.state.refine import handle_refine
-
-        return handle_refine(world, block.body, block.attrs)
-    if block.tag == "memory":
-        from desmos.state.memory import handle_memory
-
-        return handle_memory(world, block.body, block.attrs)
+    legacy = LEGACY_TO_CANONICAL.get(block.tag)
+    if legacy is not None:
+        # Inverted ownership (canonical cut step 2): every legacy frozen
+        # spelling is a thin forwarder into the canonical family operation,
+        # which owns the implementation. Results are byte-identical for both
+        # spellings; the attrs copy keeps run_op's pops off the caller's Block.
+        family, op = legacy
+        return run_op(
+            world, family, op, block.body, dict(block.attrs),
+            on_chunk=on_chunk, should_stop=should_stop, meta=meta,
+        )
     tool = world.tools.get(block.tag)
     if tool is None or tool.handler is None:
         if tool is None:

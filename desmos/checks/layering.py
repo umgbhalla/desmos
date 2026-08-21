@@ -48,13 +48,14 @@ ALLOWED_FN_EDGES = {
     ("desmos.kernel.catalog", "desmos.state.memory"),
     ("desmos.kernel.catalog", "desmos.state.persist"),
     ("desmos.kernel.catalog", "desmos.transport.dialect"),
-    ("desmos.kernel.dispatch", "desmos.skills"),
-    ("desmos.kernel.dispatch", "desmos.state.find"),  # <find> engine + <edit> frecency touch
-    ("desmos.kernel.dispatch", "desmos.state.recall"),  # <recall> shells the memex-desmos fork
-    ("desmos.kernel.dispatch", "desmos.state.generations"),
-    ("desmos.kernel.dispatch", "desmos.state.memory"),
     ("desmos.kernel.dispatch", "desmos.state.refine"),
     ("desmos.kernel.dispatch", "desmos.state.persist"),
+    ("desmos.kernel.canonical", "desmos.skills"),  # <harness op=skill> loader
+    ("desmos.kernel.canonical", "desmos.state.find"),  # find engine + edit frecency touch
+    ("desmos.kernel.canonical", "desmos.state.recall"),  # recall shells the memex-desmos fork
+    ("desmos.kernel.canonical", "desmos.state.generations"),
+    ("desmos.kernel.canonical", "desmos.state.memory"),
+    ("desmos.kernel.canonical", "desmos.state.refine"),
     ("desmos.kernel.canonical", "desmos.agents.subagent"),
     ("desmos.kernel.canonical", "desmos.state.compact"),
     ("desmos.kernel.canonical", "desmos.state.persist"),

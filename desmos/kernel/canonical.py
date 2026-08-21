@@ -79,6 +79,10 @@ def normalize(world: World, block: Block):
         return _bad_op(block, op)
     target = ROUTES.get(block.tag, {}).get(op)
     if target is not None:
+        if target in LEGACY_TO_CANONICAL:
+            # The canonical family owns this implementation (run_op below);
+            # no legacy registration in world.tools is consulted or required.
+            return Block(block.tag, body, {**attrs, "op": op})
         if target not in world.tools:
             return f"{block.tag} op {op!r} is unavailable in this world"
         return Block(target, body, attrs)
@@ -89,36 +93,129 @@ def normalize(world: World, block: Block):
 
 def policy_target(block: Block) -> str:
     op, _ = _op(block)
+    routed = ROUTES.get(block.tag, {}).get(op)
+    if routed is not None:
+        return routed
     return DIRECT_TARGETS.get((block.tag, op), block.tag)
 
 
-def direct(world: World, block: Block) -> str:
+#: Legacy tag -> (family, op). The canonical family operation owns the code
+#: path (run_op below); these tags are thin compatibility forwarders into it
+#: (canonical cut step 2). Every LEGACY_FROZEN spelling maps here.
+LEGACY_TO_CANONICAL = {
+    "python": ("exec", "python"),
+    "bash": ("exec", "bash"),
+    "shell": ("exec", "shell"),
+    "find": ("workspace", "find"),
+    "edit": ("workspace", "edit"),
+    "memory": ("knowledge", "memory"),
+    "recall": ("knowledge", "recall"),
+    "system": ("knowledge", "system"),
+    "register": ("harness", "register"),
+    "tool": ("harness", "describe"),
+    "skill": ("harness", "skill"),
+    "reload": ("harness", "reload"),
+    "reload_sdk": ("harness", "reload-sdk"),
+    "evolve": ("harness", "evolve"),
+    "rollback": ("harness", "rollback"),
+    "refine": ("harness", "refine"),
+}
+
+
+def direct(world: World, block: Block, *, on_chunk=None, should_stop=None, meta=None) -> str:
     op, attrs = _op(block)
-    if block.tag == "workspace":
-        return _workspace(world, op, block.body, attrs)
-    if block.tag == "knowledge":
-        return _knowledge(world, op, block.body, attrs)
-    if block.tag == "observe":
-        return _observe(world, op, block.body, attrs)
-    if block.tag == "agents":
-        return _agents(op, block.body, attrs)
-    if block.tag == "session":
-        return _session(world, op, block.body, attrs)
-    return _bad_op(block, op)
+    return run_op(
+        world, block.tag, op, block.body, attrs,
+        on_chunk=on_chunk, should_stop=should_stop, meta=meta,
+    )
 
 
+def run_op(world, family, op, body, attrs, *, on_chunk=None, should_stop=None, meta=None):
+    """Run one canonical family operation: the implementations live here."""
+    if family == "exec":
+        return _exec(world, op, body, attrs, on_chunk, should_stop)
+    if family == "workspace":
+        return _workspace(world, op, body, attrs, meta=meta)
+    if family == "knowledge":
+        return _knowledge(world, op, body, attrs)
+    if family == "harness":
+        return _harness(world, op, body, attrs)
+    if family == "observe":
+        return _observe(world, op, body, attrs)
+    if family == "agents":
+        return _agents(op, body, attrs)
+    if family == "session":
+        return _session(world, op, body, attrs)
+    return f"{family}: unknown op {op!r}; expected {'|'.join(operations(family))}"
 
-def _legacy(world, name, body, attrs):
-    tool = world.tools.get(name)
-    if tool is None or tool.handler is None:
-        return None
-    return str(tool.handler(body, **attrs))
+
+def _exec(world, op, body, attrs, on_chunk, should_stop):
+    if op == "python":
+        from desmos.kernel.exec import run_python
+        return run_python(body, world, on_chunk=on_chunk)
+    if op == "bash":
+        from desmos.kernel.exec import run_bash
+        return run_bash(body, world.cwd, on_chunk=on_chunk, should_stop=should_stop)
+    from desmos.kernel.shell import run as run_shell
+    return run_shell(world, body, attrs, on_chunk=on_chunk)
 
 
-def _workspace(world, op, body, attrs):
-    existing = _legacy(world, op, body, attrs)
-    if existing is not None:
-        return existing
+def _harness(world, op, body, attrs):
+    if op == "register":
+        from desmos.kernel.exec import register_tag
+        return register_tag(world, body, attrs.get("name", ""), attrs.get("doc", ""))
+    if op == "describe":
+        from desmos.kernel.dispatch import set_tool_doc
+        return set_tool_doc(world, attrs.get("name", ""), attrs.get("doc", "") or body)
+    if op == "skill":
+        from desmos.skills import load_skill_body
+        name = (attrs.get("name") or body).strip()
+        skill = next((s for s in world.skills if s.name == name), None)
+        if skill is None:
+            known = ", ".join(sorted(s.name for s in world.skills)) or "none"
+            return f"unknown skill {name!r}. Available: {known}. Write .desmos/skills/<name>/SKILL.md then <reload/> to add one."
+        return load_skill_body(skill, world.model)
+    if op == "reload":
+        from desmos.kernel.loop import reload
+        return reload(world)
+    if op == "reload-sdk":
+        from desmos.kernel.loop import reload_sdk
+        return reload_sdk(world)
+    if op == "evolve":
+        from desmos.state.generations import evolve
+        return evolve(world, (body or attrs.get("reason") or "").strip() or "unspecified")
+    if op == "rollback":
+        from desmos.state.generations import rollback
+        raw = attrs.get("n") or body.strip() or "1"
+        try:
+            n = int(raw)
+        except ValueError:
+            return f"rollback failed: bad n {raw!r}"
+        return rollback(world, n)
+    from desmos.state.refine import handle_refine
+    return handle_refine(world, body, attrs)
+
+
+def _workspace(world, op, body, attrs, meta=None):
+    if op == "find":
+        from desmos.state.find import find
+        return find(world, body, **attrs)
+    if op == "edit":
+        from desmos.kernel.edit import apply_edit_line, parse_edit_body
+        old, new = parse_edit_body(body, attrs)
+        # meta is the caller's out-channel for facts only the syscall can know
+        # at run time; the loop lifts them onto the result done event. A failed
+        # edit has no edit site, so it sets nothing.
+        msg, line = apply_edit_line(attrs.get("path", ""), old, new, cwd=world.cwd)
+        if meta is not None and line is not None:
+            meta["line"] = line
+        # Feed the <find> frecency index at the one edit choke point every
+        # world (root and child) routes through; touch() is silent on a
+        # missing/broken engine.
+        if line is not None:
+            from desmos.state.find import touch
+            touch(world, attrs.get("path", ""))
+        return msg
     if op == "read":
         from pathlib import Path
         path = Path(attrs.get("path") or body.strip()).expanduser()
@@ -223,6 +320,16 @@ def _carried_in(world, git):
 
 
 def _knowledge(world, op, body, attrs):
+    if op == "memory":
+        from desmos.state.memory import handle_memory
+        return handle_memory(world, body, attrs)
+    if op == "recall":
+        from desmos.state.recall import handle_recall
+        return handle_recall(world, body, attrs)
+    if op == "system":
+        from desmos.kernel.dispatch import set_system
+        delete = attrs.get("delete", "") in {"1", "true", "yes"}
+        return set_system(world, body, attrs.get("name", ""), delete)
     if op == "plan":
         from desmos.state.plan import handle_plan
         return handle_plan(world, body, **attrs)
@@ -235,9 +342,6 @@ def _knowledge(world, op, body, attrs):
         result = handoff.set_anchors(world, body)
         save(world)
         return result
-    existing = _legacy(world, "todo", body, attrs)
-    if existing is not None:
-        return existing
     from desmos.state.persist import save
     items = [line for line in world.notes.get("todo", "").splitlines() if line.strip()]
     for line in [line.strip() for line in body.splitlines() if line.strip()]:
@@ -330,9 +434,6 @@ def _decide(world, body: str) -> str:
 
 def _observe(world, op, body, attrs):
     if op == "usage":
-        existing = _legacy(world, "usage", body, attrs)
-        if existing is not None:
-            return existing
         from desmos.kernel import prices
         from desmos.state import persist
         if body.strip().lower() in {"ops", "op"}:
@@ -343,9 +444,6 @@ def _observe(world, op, body, attrs):
     if op == "slice":
         return _slice(world, body)
     if op == "trajectory":
-        existing = _legacy(world, "traj", body, attrs)
-        if existing is not None:
-            return existing
         from desmos.transport import complete
         raw = body.strip()
         if raw.isdigit():
@@ -439,9 +537,6 @@ def _agents(op, body, attrs):
 
 def _session(world, op, body, attrs):
     if op == "compact":
-        existing = _legacy(world, "compact", body, attrs)
-        if existing is not None:
-            return existing
         from desmos.state import compact
         result = compact.compact(
             world,
