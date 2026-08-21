@@ -1334,6 +1334,8 @@ def check() -> None:
 
         _check_profiler()
 
+        _check_ambient_reload()
+
         try:
             from IPython.core.interactiveshell import InteractiveShell
         except ImportError:
@@ -1349,6 +1351,82 @@ def check() -> None:
         assert callable(shell.user_ns.get("reset"))
         assert "doc" in ns_names(w4)
         assert dispatch(w4, Block("python", "len(doc)", {})) == "11"
+
+
+def _check_ambient_reload() -> None:
+    """A tool written between turns dispatches on the next turn with no reload;
+    an unchanged tree does not re-run discovery; forced reload still rebuilds."""
+    import os
+    import tempfile
+
+    from desmos.kernel.catalog import catalog
+    from desmos.kernel.loop import install_resources, reload as _reload
+    from desmos.loop import run_turns as _run
+
+    with tempfile.TemporaryDirectory() as tmp:
+        cwd = Path(tmp)
+        (cwd / ".git").mkdir()  # stop the root walk at the tempdir
+        ext_dir = cwd / ".desmos" / "extensions"
+        counter = cwd / "ext-load-count.txt"  # outside every root on purpose
+
+        world = new_world(cwd, state_path=None, persist=False, ns={})
+        assert "greet" not in world.tools
+
+        ext_src = (
+            "from pathlib import Path\n"
+            f"COUNTER = Path({str(counter)!r})\n"
+            "def load(api):\n"
+            "    n = int(COUNTER.read_text()) + 1 if COUNTER.exists() else 1\n"
+            "    COUNTER.write_text(str(n))\n"
+            "    api.tool('greet', 'greets the body',\n"
+            "             lambda body='', **a: 'greeted:' + body.strip())\n"
+        )
+        write_code = (
+            "import pathlib\n"
+            f"d = pathlib.Path({str(ext_dir)!r})\n"
+            "d.mkdir(parents=True, exist_ok=True)\n"
+            f"(d / 'greeter.py').write_text({ext_src!r})\n"
+            "print('written')"
+        )
+
+        calls = {"n": 0}
+
+        def fake(model, system, messages, max_tokens):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return {"content": [{"type": "text", "text": f"<python>{write_code}</python>"}], "usage": {}}
+            if calls["n"] == 2:
+                # no reload was issued between the write and this tag
+                return {"content": [{"type": "text", "text": "<greet>ping</greet>"}], "usage": {}}
+            return {"content": [{"type": "text", "text": "ambient done"}], "usage": {}}
+
+        world.complete_fn = fake
+        out = _run(world, "grow a greeter", quiet=True)
+        assert out.strip() == "ambient done"
+        assert "greet" in world.tools, "ambient reload did not install the new tool"
+        joined = "\n".join(str(m.get("content")) for m in world.messages if m.get("role") == "user")
+        assert "greeted:ping" in joined, f"greet did not dispatch without reload: {joined!r}"
+        assert "<greet>" in catalog(world), "catalog does not reflect the rebuilt registry"
+
+        # Unchanged tree: the turn-boundary sweep skips discovery entirely.
+        install_resources(world)  # absorb any bytecode-cache churn from the import
+        n1 = int(counter.read_text())
+        install_resources(world)
+        install_resources(world)
+        assert int(counter.read_text()) == n1, "unchanged tree re-ran discovery"
+
+        # Touched tree: the sweep sees the new mtime and rediscovers once.
+        target = ext_dir / "greeter.py"
+        st = target.stat()
+        os.utime(target, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000))
+        install_resources(world)
+        assert int(counter.read_text()) == n1 + 1, "changed tree did not rediscover"
+
+        # Explicit reload stays and forces a rebuild even with nothing changed.
+        n2 = int(counter.read_text())
+        msg = _reload(world)
+        assert int(counter.read_text()) == n2 + 1, "harness reload no longer forces a rebuild"
+        assert msg.startswith("reloaded"), msg
 
 
 def _check_anchors() -> None:

@@ -291,9 +291,57 @@ def _ext_hook(fn: Callable[..., Any]) -> Callable[..., Any]:
     return call
 
 
-def install_resources(world: World) -> Any:
+def _resource_signature(cwd: Path) -> tuple:
+    """One stat sweep over every skill/extension root: no reads, no imports.
+
+    The ambient reload at each turn boundary compares this against the last
+    build, so an unchanged tree costs a handful of stat calls and nothing else.
+    Bytecode caches are skipped: an import writing __pycache__ must not look
+    like a grown tool.
+    """
+    from desmos.skills import skill_roots
+    from desmos.state.extensions import extension_roots
+
+    rows: list[tuple[str, int, int]] = []
+    seen: set[str] = set()
+    for root in [root for root, _ in skill_roots(cwd)] + extension_roots(cwd):
+        key = str(root)
+        if key in seen:
+            continue
+        seen.add(key)
+        if not root.is_dir():
+            continue
+        try:
+            st = root.stat()
+        except OSError:
+            continue
+        rows.append((key, st.st_mtime_ns, -1))
+        for path in root.rglob("*"):
+            if "__pycache__" in path.parts:
+                continue
+            try:
+                ps = path.stat()
+            except OSError:
+                continue
+            rows.append((str(path), ps.st_mtime_ns, ps.st_size))
+    return tuple(sorted(rows))
+
+
+def install_resources(world: World, *, force: bool = False) -> Any:
     from desmos.state.extensions import load_extensions
     from desmos.skills import bind_python_skill, discover_skills
+
+    # Ambient reload: turn() calls this at every turn boundary before the
+    # catalog is assembled, so a skill or extension written mid-session is
+    # live on the very next turn without an explicit <reload/>. Rebuilding
+    # means re-importing extension modules, so it is gated on a stat sweep:
+    # nothing moved under the roots, nothing runs. Explicit harness op=reload
+    # passes force=True and always rebuilds; the sweep result is re-recorded
+    # afterwards either way, so the two paths cannot fight.
+    sig = _resource_signature(world.cwd)
+    cached = getattr(world, "_resources_api", None)
+    if not force and cached is not None and getattr(world, "_resources_sig", None) == sig:
+        return cached
 
     world.skills = discover_skills(world.cwd)
     for skill in world.skills:
@@ -317,11 +365,13 @@ def install_resources(world: World) -> Any:
     for name, doc, handler in api.tools:
         if name not in FROZEN:
             world.tools[name] = Tool(name=name, doc=doc, handler=handler)
+    world._resources_sig = sig  # type: ignore[attr-defined]
+    world._resources_api = api  # type: ignore[attr-defined]
     return api
 
 
 def reload(world: World) -> str:
-    api = install_resources(world)
+    api = install_resources(world, force=True)
     msg = f"reloaded {len(world.skills)} skills, {len(world.tools)} tools"
     errors = getattr(api, "errors", None)
     if errors:
