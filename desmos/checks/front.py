@@ -265,8 +265,11 @@ class _SockClient:
 
 
 def _strip(ev: dict) -> dict:
+    # "sid" strips with the writer stamps: every live wire line carries its
+    # session id (tui-redesign R3, asserted by _check_emit_sid), while SQL
+    # replay rows stay unstamped -- so body comparisons drop it on both sides.
     stamped = {
-        "seq", "ts", "mono_ns", "payload_bytes", "payload_sha256"
+        "seq", "ts", "mono_ns", "payload_bytes", "payload_sha256", "sid"
     }
     return {k: v for k, v in ev.items() if k not in stamped}
 
@@ -372,7 +375,7 @@ def _check_socket() -> None:
             channel = a.until(
                 lambda e: e.get("ev") == "channel", seen=a_events
             )
-            assert channel == {
+            assert _strip(channel) == {
                 "ev": "channel",
                 "channel": "conflicts",
                 "author": "worker-b",
@@ -461,7 +464,9 @@ def _check_socket() -> None:
             assert seqs == sorted(seqs) and len(set(seqs)) == len(seqs), seqs
             assert all(isinstance(e["ts"], int) for e in replayed), replayed[0]
             assert _strip(replayed[0])["ev"] == "ready"
-            assert [_strip(e) for e in replayed[1:]] == a_events, (
+            assert [_strip(e) for e in replayed[1:]] == [
+                _strip(e) for e in a_events
+            ], (
                 "replay does not match what client A saw live"
             )
 
@@ -814,6 +819,62 @@ def _check_daemon_shutdown() -> None:
                 pass
 
 
+def _check_emit_sid() -> None:
+    """R3 wire half: every line the real _emit writes carries "sid" equal to
+    the session header's session_id, exactly once, for plain events and child
+    envelopes alike; the caller's dict and the persisted row stay unstamped."""
+    import io
+    import json
+    import os
+
+    import desmos.front.bridge as B
+    import desmos.state.persist as P
+
+    logged: list[dict] = []
+
+    def fake_record(world, ev, **kw):
+        logged.append(dict(ev))
+        return len(logged)
+
+    buf = io.StringIO()
+    old_wire, old_dead = B._WIRE, B._WIRE_DEAD
+    old_record = P.record_event
+    old_sid = os.environ.get("DESMOS_SESSION_ID")
+    plain = {"ev": "notice", "text": "plain"}
+    child = {"ev": "agent", "id": "c1", "parent": "root", "depth": 1, "text": "hi"}
+    try:
+        os.environ["DESMOS_SESSION_ID"] = "sid-check-1234"
+        B._WIRE, B._WIRE_DEAD = buf, False
+        P.record_event = fake_record
+        B._open_log(type("W", (), {"cwd": Path("/tmp")})())
+        B._emit(plain)
+        B._emit(child)
+        B._emit(plain)  # reuse: the same dict emitted again must not double-stamp
+    finally:
+        B._WIRE, B._WIRE_DEAD = old_wire, old_dead
+        B._LOG_WORLD = None
+        P.record_event = old_record
+        if old_sid is None:
+            os.environ.pop("DESMOS_SESSION_ID", None)
+        else:
+            os.environ["DESMOS_SESSION_ID"] = old_sid
+
+    header = logged[0]
+    assert header["ev"] == "session" and header["session_id"] == "sid-check-1234"
+    lines = buf.getvalue().splitlines()
+    assert len(lines) == 3, lines
+    for line in lines:
+        ev = json.loads(line)
+        assert ev["sid"] == header["session_id"], ev
+        assert line.count('"sid"') == 1, line
+    envelope = json.loads(lines[1])
+    assert envelope["id"] == "c1" and envelope["parent"] == "root"
+    assert envelope["depth"] == 1 and envelope["ev"] == "agent"
+    # The caller's dict was copied, not mutated, and persistence is unstamped.
+    assert "sid" not in plain and "sid" not in child
+    assert all("sid" not in row for row in logged[1:])
+
+
 def check() -> None:
     import tempfile
 
@@ -1162,6 +1223,7 @@ def check() -> None:
         _check_path_deps_tracked()
         _check_vendor_patch()
         _check_release_tui_launcher()
+    _check_emit_sid()
     _check_socket()
     _check_daemon()
     _check_daemon_shutdown()

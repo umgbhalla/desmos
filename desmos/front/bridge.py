@@ -147,8 +147,9 @@ class _Client:
             pass
 
 # The event log (contract C2): every event this funnel sees is also appended
-# Durable replay lives in the harness database. The wire remains unstamped;
-# sequence/time belong to the bridge writer and are added only to SQL rows.
+# Durable replay lives in the harness database. Every wire line is stamped
+# with its session id ("sid", tui-redesign R3); sequence/time still belong to
+# the bridge writer and are added only to SQL rows.
 _LOG_WORLD: Any = None
 _SEQ = 0
 
@@ -193,7 +194,13 @@ def _log(ev: dict[str, Any]) -> None:
 
 def _emit(ev: dict[str, Any]) -> None:
     global _WIRE_DEAD
-    line = json.dumps(ev, default=str) + "\n"
+    # Stamp the wire line with its session (tui-redesign R3): a shallow copy,
+    # not set-and-forget, because callers reuse and re-emit their dicts and
+    # the durable log below records the caller's event unstamped -- the sid
+    # belongs to the wire, persistence stays exactly as it was.
+    wire_ev = dict(ev)
+    wire_ev["sid"] = os.environ.get("DESMOS_SESSION_ID", "")
+    line = json.dumps(wire_ev, default=str) + "\n"
     data = line.encode("utf-8")
     with _WIRE_LOCK:
         _log(ev)

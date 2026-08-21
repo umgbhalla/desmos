@@ -47,6 +47,19 @@ def _validate_bin() -> Path | None:
     return max(built, key=lambda p: p.stat().st_mtime)
 
 
+def _desid(ndjson: str) -> str:
+    """Drop the per-line session stamp before typed validation. Every live
+    wire line carries "sid" (tui-redesign R3, wire half); the typed Event
+    vocabulary in crates/desmos-events does not know the stamp yet (reader
+    half pending), so the bodies are validated without it."""
+    out = []
+    for line in ndjson.splitlines():
+        event = json.loads(line)
+        event.pop("sid", None)
+        out.append(json.dumps(event, separators=(",", ":")))
+    return "\n".join(out) + ("\n" if out else "")
+
+
 def _validate(binary: Path, ndjson: str, what: str, *, log: bool = False) -> None:
     ran = subprocess.run(
         [str(binary)] + (["--log"] if log else []),
@@ -175,6 +188,10 @@ def _check_log_forms(binary: Path, tmp: Path, stream: str, replay: str) -> None:
         assert Path(head.get("cwd", "")).resolve() == cwd.resolve(), head
         stamped = [json.loads(line) for line in text.splitlines()]
         wire = [json.loads(line) for line in stream.splitlines()]
+        # Every live wire line is stamped with the session it belongs to
+        # (R3); the stamp is not part of the persisted body.
+        for event in wire:
+            assert event.pop("sid", None) == session_id, event
         stamp_keys = {
             "seq", "ts", "mono_ns", "payload_bytes", "payload_sha256"
         }
@@ -198,7 +215,7 @@ def check() -> None:
         _validate(binary, fixture.read_text(encoding="utf-8"), str(fixture))
     with tempfile.TemporaryDirectory() as tmp:
         stream, replay = _drive_bridge(Path(tmp))
-        _validate(binary, stream, "the live bridge stream")
+        _validate(binary, _desid(stream), "the live bridge stream")
         _check_log_forms(binary, Path(tmp), stream, replay)
     # The bin still rejects: feeding it a kind outside the vocabulary must
     # fail, or every assert above was vacuous — in both forms.
