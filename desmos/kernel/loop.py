@@ -242,25 +242,6 @@ def deliver_steer(world, text: str, *, n: int = 0, emit=None) -> None:
 
 
 _BUILTIN_DOCS = (
-    ("python", "exec Python in the persistent kernel"),
-    ("bash", "isolated one-shot command in cwd — no state kept; use only when reset is useful"),
-    ("shell", "preferred persistent pty: id= names the session, state/processes survive; long commands are monitored and resume you when they land; interrupt=1, close=1"),
-    ("edit", "replace one occurrence: path= and body old\\n---\\nnew"),
-    ("find", "fuzzy path search (fff): body is a path fragment, limit= caps hits — path search only, bash/rg owns content grep"),
-    ("recall", "BM25 search of prior-session history via the external memex-desmos fork: body is the query, limit= caps hits, mode=hybrid|semantic opts into embeddings — absent fork refuses and names scripts/memex-setup.sh"),
-    ("register", "install a tag: name= and doc=, body is def handle"),
-    ("system", "write or delete a system note (name=, optional delete=1)"),
-    ("tool", "rewrite a tool description: name= and doc="),
-    ("skill", "load full SKILL.md: name="),
-    ("reload", "rediscover skills and extensions now"),
-    ("reload_sdk", "reimport desmos.* and rebind step; next complete() uses the new ABI"),
-    ("evolve", "snapshot grown state as the next generation"),
-    ("rollback", "restore generation n="),
-    ("refine", "review grown tags against the record: the census, or tombstone=NAME reason=, or revive=NAME"),
-    (
-        "memory",
-        "structured durable memory: body remembers; actions show/search/read/forget/verify/consolidate",
-    ),
     ("exec", "op=python|bash|shell — computation and persistent process sessions"),
     ("workspace", "op=find|read|edit|see|commit — repository search, files, media, and version control"),
     ("knowledge", "op=memory|recall|system|todo — durable facts, history, doctrine, and work state"),
@@ -781,7 +762,7 @@ def turn(
             # race: the kernel ran the command and holds the output that names
             # the sha, so the row downstream never attributes a commit the
             # kernel did not report.
-            if b.tag in ("bash", "shell"):
+            if b.tag == "exec" and (b.attrs.get("op") or "").lower() in ("bash", "shell"):
                 sha = committed_sha(b.body, r)
                 if sha is not None:
                     meta["repo"] = {"committed": sha}

@@ -242,9 +242,9 @@ def _check_canonical_emissions() -> None:
     """
     import re
 
-    from desmos.kernel.const import COMPAT_ALIASES
+    from desmos.kernel.const import REMOVED_TAGS
 
-    names = "|".join(sorted(COMPAT_ALIASES))
+    names = "|".join(sorted(REMOVED_TAGS))
     pattern = re.compile(r"Block\(\s*['\"](" + names + r")['\"]")
     offenders: list[str] = []
     for path in sorted(Path(__file__).parent.glob("*.py")):

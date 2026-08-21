@@ -53,7 +53,7 @@ once. On low-impact ambiguity, pick the likelier reading and name it.
 
 def _tool_lines(world: Any) -> str:
     from desmos.kernel.canonical import DIRECT_TARGETS, ROUTES, operations
-    from desmos.kernel.const import CANONICAL, COMPAT_ALIASES
+    from desmos.kernel.const import CANONICAL, REMOVED_TAGS
 
     tools = getattr(world, "tools", {}) or {}
     lines = ["# available syscalls", "These are the only tags you have."]
@@ -62,10 +62,10 @@ def _tool_lines(world: Any) -> str:
         return ROUTES.get(fam, {}).get(op) or DIRECT_TARGETS.get((fam, op), fam)
 
     for name in sorted(tools):
-        # Legacy spellings still dispatch for transcript compatibility, but a
-        # child is taught only the canonical families and genuinely grown
-        # tags (canonical cut step 3).
-        if name in COMPAT_ALIASES:
+        # Retired legacy spellings are rejected at dispatch (canonical cut
+        # step 5); a child is taught only the canonical families and
+        # genuinely grown tags.
+        if name in REMOVED_TAGS:
             continue
         doc = getattr(tools[name], "doc", "")
         if name in CANONICAL:

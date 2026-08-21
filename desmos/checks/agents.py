@@ -25,7 +25,7 @@ def check() -> None:
         reload_subagent.bind(world)
         reload_subagent.set_emitter(reload_emit)
         dispatch(world, Block("harness", "", {"op": "reload-sdk"}))
-        assert "reload_sdk" in world.tools
+        assert "harness" in world.tools
         assert reload_subagent.PARENT is world, "SDK reload orphaned later subagent spawns"
         assert reload_subagent._EMIT is reload_emit, "SDK reload dropped child event routing"
 
@@ -153,13 +153,13 @@ def check() -> None:
         # --- canonical cut step 3: a child's prompt advertises only the seven
         # canonical families plus grown tools; legacy spellings still dispatch
         # but are never taught, and grants written either way scope the same.
-        from desmos.kernel.const import COMPAT_ALIASES as _ALIASES, LEGACY_FROZEN as _LEGACY
+        from desmos.kernel.const import REMOVED_TAGS as _REMOVED
         from desmos.agents.subagent_contracts import TaskContract as _TC3
 
         for _agent3 in S.AGENTS:
             _cfg3 = resolve(_agent3)
             _p3 = _child_world(_cfg3, parent, budget=1).system_override
-            for _name3 in _LEGACY | _ALIASES:
+            for _name3 in _REMOVED:
                 assert f"<{_name3}>" not in _p3, (_agent3, _name3)
         _edit3 = _child_world(resolve("general"), parent).system_override
         assert "<exec>" in _edit3 and "<workspace>" in _edit3, _edit3
@@ -187,7 +187,7 @@ def check() -> None:
             # it one real call and then its answer.
             if len(messages) <= 1:
                 _lt = chr(60)
-                text = f"{_lt}python>print(2 + 2){_lt}/python>"
+                text = f'{_lt}exec op="python">print(2 + 2){_lt}/exec>'
             else:
                 text = "child said ok"
             return {"content": [{"type": "text", "text": text}], "usage": {}}
@@ -434,7 +434,7 @@ def check() -> None:
                 # than one run, and a counter leaks across them.
                 if len(messages) <= 1:
                     lt = chr(60)
-                    call = f"{lt}python>print(1){lt}/python>"
+                    call = f'{lt}exec op="python">print(1){lt}/exec>'
                     return {"content": [{"type": "text", "text": call}], "usage": {}}
                 return {"content": [{"type": "text", "text": big}], "usage": {}}
 
@@ -567,7 +567,7 @@ def check() -> None:
                     # a toolless run is unconditional.
                     if not any(m.get("role") == "assistant" for m in messages):
                         lt = chr(60)
-                        text = f"{lt}python>print(1){lt}/python>"
+                        text = f'{lt}exec op="python">print(1){lt}/exec>'
                     else:
                         text = "leaf ok"
                 elif not any(m.get("role") == "assistant" for m in messages):

@@ -93,13 +93,13 @@ def normalize(world: World, block: Block):
         return _bad_op(block, op)
     target = ROUTES.get(block.tag, {}).get(op)
     if target is not None:
-        if target in LEGACY_TO_CANONICAL:
-            # The canonical family owns this implementation (run_op below);
-            # no legacy registration in world.tools is consulted or required.
-            return Block(block.tag, body, {**attrs, "op": op})
-        if target not in world.tools:
-            return f"{block.tag} op {op!r} is unavailable in this world"
-        return Block(target, body, attrs)
+        if target in GROWN_TARGETS:
+            if target not in world.tools:
+                return f"{block.tag} op {op!r} is unavailable in this world"
+            return Block(target, body, attrs)
+        # The canonical family owns this implementation (run_op below);
+        # no other registration in world.tools is consulted or required.
+        return Block(block.tag, body, {**attrs, "op": op})
     if op not in DIRECT_OPS.get(block.tag, ()):
         return _bad_op(block, op)
     return Block(block.tag, body, {**attrs, "op": op})
@@ -113,27 +113,11 @@ def policy_target(block: Block) -> str:
     return DIRECT_TARGETS.get((block.tag, op), block.tag)
 
 
-#: Legacy tag -> (family, op). The canonical family operation owns the code
-#: path (run_op below); these tags are thin compatibility forwarders into it
-#: (canonical cut step 2). Every LEGACY_FROZEN spelling maps here.
-LEGACY_TO_CANONICAL = {
-    "python": ("exec", "python"),
-    "bash": ("exec", "bash"),
-    "shell": ("exec", "shell"),
-    "find": ("workspace", "find"),
-    "edit": ("workspace", "edit"),
-    "memory": ("knowledge", "memory"),
-    "recall": ("knowledge", "recall"),
-    "system": ("knowledge", "system"),
-    "register": ("harness", "register"),
-    "tool": ("harness", "describe"),
-    "skill": ("harness", "skill"),
-    "reload": ("harness", "reload"),
-    "reload_sdk": ("harness", "reload-sdk"),
-    "evolve": ("harness", "evolve"),
-    "rollback": ("harness", "rollback"),
-    "refine": ("harness", "refine"),
-}
+#: ROUTES targets that live outside run_op: grown tools an op forwards to.
+#: Every other ROUTES target is a scope-policy name whose implementation the
+#: canonical family owns outright (canonical cut step 5: the legacy
+#: compatibility forwarders are gone).
+GROWN_TARGETS = frozenset({"trajectory_retrace"})
 
 
 def direct(world: World, block: Block, *, on_chunk=None, should_stop=None, meta=None) -> str:

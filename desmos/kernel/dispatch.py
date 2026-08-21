@@ -156,6 +156,16 @@ def _dispatch(
         else:
             block = normalized
 
+    if canonical_direct is None:
+        # Canonical cut step 5: a retired spelling no longer dispatches. It
+        # answers with its canonical replacement -- rejection, not silence,
+        # and not a traceback. Grown tags outside REMOVED_TAGS are untouched.
+        from desmos.kernel.const import REMOVED_TAGS
+
+        guidance = REMOVED_TAGS.get(block.tag)
+        if guidance is not None:
+            return f"<{block.tag}> was removed; use {guidance}."
+
     # Before the hooks and before the frozen chain: a denied tag must not reach
     # third-party code and must not run. Refuse in prose, never raise -- a raise
     # here kills the child's turn instead of teaching it what it may call.
@@ -195,19 +205,6 @@ def _dispatch(
 
         return direct(
             world, canonical_direct,
-            on_chunk=on_chunk, should_stop=should_stop, meta=meta,
-        )
-    from desmos.kernel.canonical import LEGACY_TO_CANONICAL, run_op
-
-    legacy = LEGACY_TO_CANONICAL.get(block.tag)
-    if legacy is not None:
-        # Inverted ownership (canonical cut step 2): every legacy frozen
-        # spelling is a thin forwarder into the canonical family operation,
-        # which owns the implementation. Results are byte-identical for both
-        # spellings; the attrs copy keeps run_op's pops off the caller's Block.
-        family, op = legacy
-        return run_op(
-            world, family, op, block.body, dict(block.attrs),
             on_chunk=on_chunk, should_stop=should_stop, meta=meta,
         )
     tool = world.tools.get(block.tag)

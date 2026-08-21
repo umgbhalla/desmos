@@ -48,7 +48,7 @@ def response(text: str, usage: int = 1) -> dict[str, Any]:
 
 
 def tool_call() -> dict[str, Any]:
-    return response(f"{LT}python>print(2 + 2){LT}/python>", 2)
+    return response(f'{LT}exec op="python">print(2 + 2){LT}/exec>', 2)
 
 
 def self_check() -> None:
@@ -116,7 +116,7 @@ def self_check() -> None:
             assert settled["state"] == "done" and settled["stage"] == "accepted", settled
             assert settled["stop_reason"] == "completed" and settled["accepted"] is True
             assert settled["usage"]["input_tokens"] + settled["usage"]["output_tokens"] == 10
-            assert settled["observed_tools"] == ["python"]
+            assert settled["observed_tools"] == ["exec"]
             assert run.judgment is not None and run.judgment.accepted
             assert systems[0] == systems[1], "one child keeps one dedicated system prompt"
             assert "# act before reporting" in systems[0]
@@ -155,7 +155,7 @@ def self_check() -> None:
             subagents.wait(recovery_id, timeout=5, poll=0.01)
             recovery = subagents.RUNS[recovery_id]
             assert recovery.state == "done" and recovery.result.startswith("recovered report")
-            assert recovery.steers == 1 and recovery.observed_tools == ["python"]
+            assert recovery.steers == 1 and recovery.observed_tools == ["exec"]
             assert any(
                 ev.get("id") == recovery_id
                 and ev.get("stage") == "steering"

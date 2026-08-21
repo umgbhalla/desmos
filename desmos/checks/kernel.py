@@ -224,8 +224,8 @@ def check() -> None:
 
         assert world.thinking == "low"
 
-        assert "reload" in world.tools and world.tools["reload"].frozen
-        assert "reload_sdk" in world.tools and world.tools["reload_sdk"].frozen
+        assert "harness" in world.tools and world.tools["harness"].frozen
+        assert "exec" in world.tools and world.tools["exec"].frozen
         assert any(s.name == "skill-creator" for s in world.skills)
         assert "skill-creator" in dispatch(world, Block("harness", "", {"op": "skill", "name": "skill-creator"}))
         assert any(s.name == "edit" for s in world.skills) or "edit" in world.tools
@@ -321,9 +321,13 @@ def check() -> None:
         assert lone[0].body == ""
         assert lone[3].attrs == {"n": "1"}
         assert lone[4].attrs == {"name": "ping"}
-        assert dispatch(world, blocks[0]) == "ok"  # step-5: legacy tag dispatch proof
-        assert world.ns["x"] == 2
-        assert dispatch(world, blocks[1]).strip() == "hi"  # step-5: legacy tag dispatch proof
+        # Canonical cut step 5: retired spellings reject with guidance and
+        # never execute -- the body must not reach the kernel namespace.
+        refused = dispatch(world, blocks[0])
+        assert "removed" in refused and "exec op=python" in refused, refused
+        assert "x" not in world.ns, "a removed tag executed anyway"
+        refused = dispatch(world, blocks[1])
+        assert "removed" in refused and "exec op=bash" in refused, refused
 
         # The advertised surface is seven capability families. Compatibility
         # aliases still execute, but they do not compete in the tool catalog.
@@ -344,7 +348,25 @@ def check() -> None:
             assert marker + alias + ">" not in tool_block, alias
 
         assert dispatch(canonical, Block("exec", "20 + 22", {"op": "python"})) == "42"
-        assert dispatch(canonical, Block("python", "20 + 22", {})) == "42"  # step-5: legacy alias dispatch proof; remove with the compat routes
+        # Canonical cut step 5: every removed spelling answers with a one-line
+        # rejection naming its canonical replacement, never silence or a
+        # traceback -- and never a result.
+        for legacy, hint in (
+            ("python", "exec op=python"),
+            ("bash", "exec op=bash"),
+            ("grep", "workspace op=find mode=grep"),
+            ("sleeper", "exec op=shell"),
+        ):
+            refusal = dispatch(canonical, Block(legacy, "20 + 22", {}))
+            assert "removed" in refusal and hint in refusal, (legacy, refusal)
+            assert "Traceback" not in refusal, (legacy, refusal)
+        # ... while a grown tag that is not a legacy name dispatches untouched.
+        from desmos.kernel.types import Tool as _Tool
+        canonical.tools["interface"] = _Tool(
+            "interface", "grown probe", handler=lambda body: f"grown:{body}"
+        )
+        assert dispatch(canonical, Block("interface", "ok", {})) == "grown:ok"
+        del canonical.tools["interface"]
         read_back = dispatch(
             canonical,
             Block("workspace", "", {"op": "read", "path": "canonical.txt", "lines": "2-3"}),
@@ -363,14 +385,14 @@ def check() -> None:
         dispatch(canonical, Block("exec", "printf canonical", {"op": "bash"}))
         assert observed_tags == ["bash"], observed_tags
 
-        # Canonical cut step 2 wiring proof: the canonical families own their
-        # implementations. One call per family must still succeed after every
-        # same-named legacy tool (LEGACY_FROZEN + COMPAT_ALIASES) is deleted
-        # from world.tools -- canonical no longer depends on legacy registration.
-        from desmos.kernel.const import COMPAT_ALIASES
+        # Canonical wiring proof: the canonical families own their
+        # implementations. One call per family must still succeed with every
+        # removed spelling absent from world.tools -- canonical depends on no
+        # legacy registration (they are no longer seeded at all, step 5).
+        from desmos.kernel.const import REMOVED_TAGS
 
         wired = new_world(cwd, state_path=None, persist=False)
-        for name in COMPAT_ALIASES:
+        for name in REMOVED_TAGS:
             wired.tools.pop(name, None)
         assert dispatch(wired, Block("exec", "20 + 22", {"op": "python"})) == "42"
         wired_read = dispatch(
@@ -397,9 +419,9 @@ def check() -> None:
         failed = dispatch(
             world,
             Block(
-                "python",
+                "exec",
                 "def diag_outer():\n    raise RuntimeError('structured boom')\ndiag_outer()",
-                {},
+                {"op": "python"},
             ),
         )
         assert "RuntimeError: structured boom" in failed, failed
@@ -475,12 +497,12 @@ def check() -> None:
         def fake_usage(_model, _system, messages, _max_tokens):
             if any("<result" in (m.get("content") or "") for m in messages):
                 return {"content": [{"type": "text", "text": "hello"}], "usage": {}}
-            return {"content": [{"type": "text", "text": "<usage/>"}], "usage": {}}
+            return {"content": [{"type": "text", "text": "<stats/>"}], "usage": {}}
 
         w_usage = new_world(cwd, state_path=cwd / "harness-usage.json", ns={})
         dispatch(
             w_usage,
-            Block("harness", "def handle(body, **a):\n    return 'tokens:0'\n", {"op": "register", "name": "usage", "doc": "stats"}),
+            Block("harness", "def handle(body, **a):\n    return 'tokens:0'\n", {"op": "register", "name": "stats", "doc": "stats"}),
         )
         w_usage.complete_fn = fake_usage
         bind_step(w_usage)
@@ -561,12 +583,12 @@ def check() -> None:
         w_raise = new_world(cwd, state_path=cwd / "harness-raise.json", ns={})
         # An ambiguous edit body raises ValueError out of dispatch -- the exact
         # call that first produced this.
-        ambiguous = "<edit path=\"nope.txt\">a\n---\nb\n---\nc</edit>"
+        ambiguous = "<workspace op=\"edit\" path=\"nope.txt\">a\n---\nb\n---\nc</workspace>"
 
         def raising_complete(_model, _system, _messages, _max_tokens):
             return {
                 "content": [
-                    {"type": "text", "text": f"<bash>echo ranfirst</bash>\n{ambiguous}\n<bash>echo ranlast</bash>"}
+                    {"type": "text", "text": f'<exec op="bash">echo ranfirst</exec>\n{ambiguous}\n<exec op="bash">echo ranlast</exec>'}
                 ],
                 "usage": {},
             }
@@ -575,7 +597,7 @@ def check() -> None:
         from desmos.loop import turn as _turn
 
         _speech, raise_results, _done, _asst, _note = _turn(w_raise, list(w_raise.messages), 512)
-        assert [b.tag for b, _ in raise_results] == ["bash", "edit", "bash"], raise_results
+        assert [b.tag for b, _ in raise_results] == ["exec", "workspace", "exec"], raise_results
         assert raise_results[0][1].strip() == "ranfirst", "a raise ate an earlier syscall's output"
         assert "ValueError" in raise_results[1][1], raise_results[1][1]
         assert raise_results[2][1].strip() == "ranlast", "a raise ended the batch early"
@@ -639,7 +661,7 @@ def check() -> None:
         # scan_spans' char offsets unconverted -- slicing the encoded speech
         # must give back exactly the dispatched call, and each result event
         # must name which span it came from.
-        span_speech = "héllo <bash>echo spanned</bash> done"
+        span_speech = 'héllo <exec op="bash">echo spanned</exec> done'
 
         def spans_complete(_model, _system, _messages, _max_tokens, _c=[0]):
             _c[0] += 1
@@ -653,7 +675,7 @@ def check() -> None:
         completes = [e for e in evs_sp if e.get("ev") == "complete"]
         ((a, z),) = completes[0]["spans"]
         sliced = span_speech.encode("utf-8")[a:z].decode("utf-8")
-        assert sliced == "<bash>echo spanned</bash>", sliced
+        assert sliced == '<exec op="bash">echo spanned</exec>', sliced
         for phase in ("start", "done"):
             (r,) = [e for e in evs_sp if e.get("ev") == "result" and e.get("phase") == phase]
             assert r.get("span_idx") == 0, r
@@ -671,12 +693,12 @@ def check() -> None:
             _c[0] += 1
             if _c[0] == 1:
                 return {
-                    "content": [{"type": "text", "text": '<edit path="lined.txt">findme three\n---\nfound three</edit>'}],
+                    "content": [{"type": "text", "text": '<workspace op="edit" path="lined.txt">findme three\n---\nfound three</workspace>'}],
                     "usage": {},
                 }
             if _c[0] == 2:
                 return {
-                    "content": [{"type": "text", "text": '<edit path="lined.txt">absent\n---\nx</edit>'}],
+                    "content": [{"type": "text", "text": '<workspace op="edit" path="lined.txt">absent\n---\nx</workspace>'}],
                     "usage": {},
                 }
             return {"content": [{"type": "text", "text": "done"}], "usage": {}}
@@ -706,9 +728,9 @@ def check() -> None:
         def commit_complete(_model, _system, _messages, _max_tokens, _c=[0]):
             _c[0] += 1
             if _c[0] == 1:
-                text = f"<bash>git add c.txt && {_git_commit} -m claim</bash>"
+                text = f'<exec op="bash">git add c.txt && {_git_commit} -m claim</exec>'
             elif _c[0] == 2:
-                text = f"<bash>{_git_commit} -m nothing</bash>"
+                text = f'<exec op="bash">{_git_commit} -m nothing</exec>'
             else:
                 text = "done"
             return {"content": [{"type": "text", "text": text}], "usage": {}}
@@ -1065,7 +1087,7 @@ def check() -> None:
         # did not run, which is nonsense ahead of the output of what did.
         w_mix = new_world(cwd, state_path=None, persist=False, ns={})
         n_m = {"n": 0}
-        half = "ok <bash>echo hi</" + "bash> and now <python>print(1)"
+        half = 'ok <exec op="bash">echo hi</' + 'exec> and now <exec op="python">print(1)'
 
         def mixed(_m, _s, _msgs, _mt, _n=n_m, _t=half):
             _n["n"] += 1
@@ -1087,7 +1109,7 @@ def check() -> None:
             for i, m in enumerate(w_mix.messages)
             if m.get("role") == "user"
         ]
-        note_at = [i for i, x in rows if "python (no closing tag)" in x]
+        note_at = [i for i, x in rows if "exec (no closing tag)" in x]
         res_at = [i for i, x in rows if "hi" in x]
         assert note_at and res_at, (note_at, res_at, rows)
         assert min(note_at) >= max(res_at), (note_at, res_at)
@@ -1449,7 +1471,7 @@ def _check_ambient_reload() -> None:
         def fake(model, system, messages, max_tokens):
             calls["n"] += 1
             if calls["n"] == 1:
-                return {"content": [{"type": "text", "text": f"<python>{write_code}</python>"}], "usage": {}}
+                return {"content": [{"type": "text", "text": f'<exec op="python">{write_code}</exec>'}], "usage": {}}
             if calls["n"] == 2:
                 # no reload was issued between the write and this tag
                 return {"content": [{"type": "text", "text": "<greet>ping</greet>"}], "usage": {}}

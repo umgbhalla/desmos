@@ -2,24 +2,41 @@ from __future__ import annotations
 
 import os
 
-LEGACY_FROZEN = frozenset(
-    {
-        "python", "bash", "shell", "edit", "find", "recall", "register",
-        "system", "tool", "skill", "reload", "reload_sdk", "evolve",
-        "rollback", "refine", "memory",
-    }
-)
 CANONICAL = frozenset(
     {"exec", "workspace", "knowledge", "harness", "observe", "agents", "session"}
 )
-# Accepted forever for transcript/generation compatibility, but not advertised.
-COMPAT_ALIASES = LEGACY_FROZEN | frozenset(
-    {
-        "commit", "compact", "grep", "read", "see", "sleeper", "todo",
-        "traj", "trajectory_retrace", "usage",
-    }
-)
-FROZEN = LEGACY_FROZEN | CANONICAL
+#: Retired tag -> canonical replacement (canonical cut step 5). The single map
+#: the dispatch rejection reads from: a removed spelling answers with guidance,
+#: never silence and never a traceback. trajectory_retrace is exempt: it is a
+#: grown tool that observe op=retrace still routes to.
+REMOVED_TAGS = {
+    "python": "exec op=python",
+    "bash": "exec op=bash",
+    "shell": "exec op=shell",
+    "sleeper": "exec op=shell (monitored commands resume you when they land)",
+    "find": "workspace op=find",
+    "grep": "workspace op=find mode=grep",
+    "read": "workspace op=read",
+    "edit": "workspace op=edit",
+    "see": "workspace op=see",
+    "commit": "workspace op=commit",
+    "memory": "knowledge op=memory",
+    "recall": "knowledge op=recall",
+    "system": "knowledge op=system",
+    "todo": "knowledge op=todo",
+    "register": "harness op=register",
+    "tool": "harness op=describe",
+    "skill": "harness op=skill",
+    "reload": "harness op=reload",
+    "reload_sdk": "harness op=reload-sdk",
+    "evolve": "harness op=evolve",
+    "rollback": "harness op=rollback",
+    "refine": "harness op=refine",
+    "usage": "observe op=usage",
+    "traj": "observe op=trajectory",
+    "compact": "session op=compact",
+}
+FROZEN = CANONICAL
 
 RESULT_CAP = 8000
 #: The tighter cap that bounds what a result puts back into the transcript;
@@ -49,7 +66,7 @@ Seven canonical capability families are advertised:
 
 The required op selects an existing proven operation. Its body and remaining
 attributes keep that operation's native shape. Unknown ops fail explicitly.
-Legacy tag names remain accepted for old transcripts but are not the interface.
+Legacy tag names are removed; a retired spelling answers with its replacement.
 
 Peek with exec op="python"; do not dump the heap. Prefer exec op="shell" for
 commands whose cwd, environment, process, or monitor must survive. Grow only a

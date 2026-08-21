@@ -147,10 +147,13 @@ def volatile(world: World, delta: str = "") -> str:
 
 def advertised_names(world: World) -> list[str]:
     """Canonical families plus truly custom tools; never compatibility aliases."""
-    from desmos.kernel.const import CANONICAL, COMPAT_ALIASES
+    from desmos.kernel.const import CANONICAL, REMOVED_TAGS
 
     canonical = sorted(name for name in world.tools if name in CANONICAL)
-    custom = sorted(name for name in world.tools if name not in CANONICAL | COMPAT_ALIASES)
+    custom = sorted(
+        name for name in world.tools
+        if name not in CANONICAL and name not in REMOVED_TAGS
+    )
     return [*canonical, *custom]
 
 def catalog(world: World) -> str:
