@@ -84,7 +84,7 @@ def census(world: World) -> list[dict[str, Any]]:
         conn.close()
 
     calls: dict[str, dict[str, Any]] = {}
-    for payload_json, _ts in events:
+    for payload_json, raw_ts in events:
         try:
             payload = json.loads(payload_json)
         except ValueError:
@@ -94,22 +94,37 @@ def census(world: World) -> list[dict[str, Any]]:
         tag = str(payload.get("tag") or "")
         if not tag:
             continue
-        slot = calls.setdefault(tag, {"calls": 0, "errors": 0})
+        slot = calls.setdefault(tag, {"calls": 0, "errors": 0, "last_ms": 0})
         slot["calls"] += 1
         if _failed(str(payload.get("text") or "")):
             slot["errors"] += 1
+        try:
+            slot["last_ms"] = max(slot["last_ms"], int(raw_ts or 0))
+        except ValueError:
+            pass
 
     out: list[dict[str, Any]] = []
     for row in rows:
         name = str(row["name"])
-        seen = calls.get(name, {"calls": 0, "errors": 0})
+        seen = calls.get(name, {"calls": 0, "errors": 0, "last_ms": 0})
         born = str(row["updated_at"] or "")
         later = sum(1 for started in starts if born and started > born)
+        doc = str(row["doc"] or "")
+        last_ms = int(seen.get("last_ms", 0))
         item = {
             "name": name,
-            "doc": str(row["doc"] or ""),
+            "doc": doc,
             "calls": int(seen["calls"]),
             "errors": int(seen["errors"]),
+            "last_used": (
+                datetime.fromtimestamp(last_ms / 1000, tz=timezone.utc).isoformat()
+                if last_ms > 0
+                else ""
+            ),
+            # The catalog line this tool costs on every request, in the same
+            # chars/4 estimate the budget code uses. Paid whether or not the
+            # tag is ever dispatched -- that is why an unused line is rot.
+            "tokens": (len(f"<{name}> {doc}") + 3) // 4,
             "sessions_since": later,
             "tombstoned_at": str(row["tombstoned_at"] or ""),
             "reason": str(row["tombstone_reason"] or ""),
@@ -132,15 +147,72 @@ def _verdict(item: dict[str, Any]) -> str:
     return "keep"
 
 
+def evidence_line(item: dict[str, Any]) -> str:
+    """One line of usage evidence: what the record says this tool did."""
+    last = item["last_used"][:10] if item["last_used"] else "never"
+    return (
+        f"{item['calls']} calls, {item['errors']} errors, last used {last},"
+        f" ~{item['tokens']} catalog tokens/turn"
+    )
+
+
+def describe(world: World, name: str, doc: str) -> str:
+    """A grown tool's doc plus its evidence row, for the describe path."""
+    for item in census(world):
+        if item["name"] == name:
+            return f"<{name}> {doc}\nevidence: {evidence_line(item)} — {item['verdict']}"
+    return f"<{name}> {doc}\nevidence: not on the record for this workspace."
+
+
+def epitaph(world: World, tag: str) -> str | None:
+    """One-line tombstone for a retired grown tag, or None if it never lived.
+
+    Dispatch calls this only on its unknown-tag path, never on a hit, so the
+    live catalog costs nothing and a dead tag answers instead of vanishing.
+    """
+    from desmos.state import persist
+
+    if not world.persist:
+        return None
+    path = persist.state_file(world)
+    if not path.is_file():
+        return None
+    conn = persist._open(path)
+    try:
+        workspace = persist._workspace_id(conn, world, create=False)
+        if workspace is None:
+            return None
+        row = conn.execute(
+            "SELECT tombstoned_at, tombstone_reason FROM tools"
+            " WHERE workspace_id = ? AND name = ? AND frozen = 0"
+            " AND tombstoned_at <> ''",
+            (workspace, tag),
+        ).fetchone()
+    finally:
+        conn.close()
+    if row is None:
+        return None
+    return (
+        f"<{tag}> was retired {str(row['tombstoned_at'])[:10]}:"
+        f" {row['tombstone_reason']}. Its source stays on the record;"
+        f" harness op=refine revive={tag} restores it."
+    )
+
+
 def report(world: World) -> str:
     rows = census(world)
     if not rows:
         return "no grown tools in this workspace."
     lines = [f"grown tools: {len(rows)}"]
     for item in rows:
-        detail = f"{item['calls']} calls, {item['errors']} errors"
+        detail = f"earning: {evidence_line(item)}" if item["calls"] else evidence_line(item)
         if item["verdict"] == "unused":
-            detail = f"never called across {item['sessions_since']} later sessions"
+            detail = (
+                f"never used across {item['sessions_since']} later sessions,"
+                f" ~{item['tokens']} catalog tokens/turn wasted"
+            )
+        elif item["verdict"] == "broken":
+            detail = evidence_line(item)
         elif item["verdict"] == "tombstoned":
             detail = f"tombstoned {item['tombstoned_at'][:10]}: {item['reason']}"
         lines.append(f"  {item['verdict']:<10} {item['name']:<16} {detail}")

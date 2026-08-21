@@ -102,6 +102,12 @@ def set_tool_doc(world: World, name: str, doc: str) -> str:
         known = ", ".join(sorted(world.tools)) or "none"
         return f"unknown tool {name!r}. Existing: {known}. <tool> rewrites a doc; <register> installs a new tag."
     if not doc.strip():
+        # Empty doc is a describe, not a rewrite: a grown tool answers with
+        # its usage evidence read off the calls record (constitution D3).
+        if not world.tools[name].frozen:
+            from desmos.state.refine import describe
+
+            return describe(world, name, world.tools[name].doc)
         return "tool failed: doc required"
     world.tools[name].doc = doc.strip()
     save(world)
@@ -268,6 +274,14 @@ def _dispatch(
         return handle_memory(world, block.body, block.attrs)
     tool = world.tools.get(block.tag)
     if tool is None or tool.handler is None:
+        if tool is None:
+            # A retired grown tag answers with its tombstone, never silence:
+            # the row outlives the registry entry (constitution A1/D2).
+            from desmos.state.refine import epitaph
+
+            note = epitaph(world, block.tag)
+            if note:
+                return note
         from desmos.kernel.catalog import advertised_names
 
         known = ", ".join(advertised_names(world)) or "none"

@@ -1779,7 +1779,7 @@ def _check_refine(cwd: Path) -> None:
     )
     assert out == "registered <rotter>", out
 
-    for _ in range(2):
+    for i in range(2):
         # dispatch turns a raising handler into its traceback -- that string is
         # the result the loop records, so it is the string refine must read.
         text = dispatch(world, Block("rotter", "", {}))
@@ -1787,7 +1787,7 @@ def _check_refine(cwd: Path) -> None:
         persist.record_event(
             world,
             {"ev": "result", "phase": "done", "tag": "rotter", "attrs": {}, "text": text},
-            ts_ms=0,
+            ts_ms=1_700_000_000_000 + i,  # 2023-11-14; the later call must win
             mono_ns=0,
         )
 
@@ -1795,6 +1795,14 @@ def _check_refine(cwd: Path) -> None:
     assert rows["rotter"]["calls"] == 2, rows["rotter"]
     assert rows["rotter"]["errors"] == 2, rows["rotter"]
     assert rows["rotter"]["verdict"] == "broken", rows["rotter"]
+    # Usage evidence is derived, not counted: last-used is the newest result
+    # event's timestamp, and the catalog line has a token price.
+    assert rows["rotter"]["last_used"].startswith("2023-11-14"), rows["rotter"]
+    assert rows["rotter"]["tokens"] > 0, rows["rotter"]
+
+    # describe (harness op=describe -> <tool> with no doc) shows the evidence.
+    out = dispatch(world, Block("harness", "", {"op": "describe", "name": "rotter"}))
+    assert "2 calls" in out and "2 errors" in out and "2023-11-14" in out, out
     out = dispatch(world, Block("harness", "", {"op": "refine"}))
     assert "broken" in out and "rotter" in out, out
 
@@ -1818,12 +1826,19 @@ def _check_refine(cwd: Path) -> None:
     rows = {item["name"]: item for item in refine.census(world)}
     assert rows["napper"]["verdict"] == "unused", rows["napper"]
 
+    from desmos.kernel.catalog import catalog
+
+    assert "<rotter>" in catalog(world), "grown tool missing from catalog"
     out = dispatch(
         world,
         Block("harness", "", {"op": "refine", "tombstone": "rotter", "reason": "only ever raised"}),
     )
     assert "tombstoned <rotter>" in out, out
     assert "rotter" not in world.tools, sorted(world.tools)
+    assert "<rotter>" not in catalog(world), "tombstoned tool still in catalog"
+    # A dead tag answers with a one-line tombstone, not silence.
+    out = dispatch(world, Block("rotter", "", {}))
+    assert "retired" in out and "revive=rotter" in out, out
     persist.save(world)
 
     back = new_world(home, state_path=home / "harness.sqlite3")
