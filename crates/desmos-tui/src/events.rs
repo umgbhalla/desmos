@@ -679,6 +679,20 @@ pub(crate) fn handle_event(app: &mut App, ev: Value) {
                 ));
             }
         }
+        // A queued model switch the bridge refused (no credential, unknown
+        // model). The "queued" badge would otherwise outlive the request it
+        // announces -- nothing else ever reports this model string back.
+        "model_rejected" => {
+            let m = ev.get("model").and_then(Value::as_str).unwrap_or("");
+            if app
+                .model_pending
+                .as_ref()
+                .is_some_and(|(p, _)| p == m || m.is_empty())
+            {
+                app.model_pending = None;
+                app.notify(format!("model switch refused: {m}"));
+            }
+        }
         // Not a terminator. loop.py fires this for a reply the endpoint cut
         // short and keeps looping, and the reader thread synthesises one for
         // any unparseable NDJSON line. Clearing running here read as idle while

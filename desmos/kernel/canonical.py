@@ -197,7 +197,9 @@ def _harness(world, op, body, attrs):
 def _workspace(world, op, body, attrs, meta=None):
     if op == "find":
         from desmos.state.find import find
-        return find(world, body, **attrs)
+        query = (body or "").strip() or str(attrs.pop("query", ""))
+        attrs.pop("query", None)
+        return find(world, query, **attrs)
     if op == "edit":
         from desmos.kernel.edit import apply_edit_line, parse_edit_body
         old, new = parse_edit_body(body, attrs)

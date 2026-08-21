@@ -6039,6 +6039,31 @@ mod tests {
     }
 
     #[test]
+    fn a_refused_switch_takes_its_queued_badge_down() {
+        let mut app = App::new();
+        app.model = "claude-opus-5".into();
+        app.running = true;
+        let _ = apply_picker(
+            None,
+            &mut app,
+            picker::PickerAction::Apply {
+                model: "gpt-5.6-sol".into(),
+                effort: "low".into(),
+            },
+        );
+        assert!(app.model_pending.is_some());
+        // The bridge could not perform the switch: no snapshot or post will
+        // ever name gpt-5.6-sol, so this event is the only thing that can
+        // retire the badge.
+        handle_event(&mut app, json!({"ev": "model_rejected", "model": "gpt-5.6-sol"}));
+        assert!(
+            app.model_pending.is_none(),
+            "a refused switch must not stay queued forever"
+        );
+        assert_eq!(app.model, "claude-opus-5", "the wire never moved");
+    }
+
+    #[test]
     fn density_is_the_default_and_the_story_gets_the_rows() {
         // The single policy point: every pane's appearance comes from here.
         // /dense used to write a setting nothing read: every pad here was a

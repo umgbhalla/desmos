@@ -1354,6 +1354,10 @@ def check() -> None:
             proc.stdin.flush()
             bad = json.loads(proc.stdout.readline())
             assert bad["ev"] == "error" and "gpt-9-nope" in bad["text"], bad
+            # A refusal retires the TUI's "queued" badge; without this event
+            # a mid-step switch that fails would stay painted forever.
+            gone = json.loads(proc.stdout.readline())
+            assert gone["ev"] == "model_rejected" and gone["model"] == "gpt-9-nope", gone
 
             # The TUI pokes the inbox when a follow-up is queued, so that a step
             # parked on background work sees `has_input` and hands the turn back.

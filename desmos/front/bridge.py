@@ -904,6 +904,10 @@ def _drive(
                     notice = _settings.switch(world, model, effort)
                 except ValueError as exc:
                     _emit({"ev": "error", "text": str(exc)})
+                    # The TUI painted a "queued" badge when this op was sent
+                    # mid-step. A refusal means the queue is empty again; say
+                    # so, or the badge claims a switch that will never land.
+                    _emit({"ev": "model_rejected", "model": model})
                     continue
                 _emit(_snapshot(world))
                 # A provider change drops the old provider's thinking from every

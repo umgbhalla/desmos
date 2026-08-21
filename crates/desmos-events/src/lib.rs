@@ -400,6 +400,12 @@ pub enum Event {
     Notice {
         text: String,
     },
+    /// A queued model switch the bridge refused (front/bridge.py, op=model
+    /// ValueError path). The TUI uses it to retire the "queued" badge.
+    #[serde(rename = "model_rejected")]
+    ModelRejected {
+        model: String,
+    },
     Channel {
         channel: String,
         author: String,
@@ -542,6 +548,10 @@ pub fn parse_log_line(line: &str) -> Result<LogLine, String> {
         .remove("ts")
         .and_then(|v| v.as_i64())
         .ok_or("log line missing int ts")?;
+    // The SQL event rows carry the monotonic stamp too (state/persist.py);
+    // the attach replay pops it before serving. A stamp, not part of the
+    // event body, so it is stripped like seq/ts rather than taught to Event.
+    obj.remove("mono_ns");
     let event: Event =
         serde_json::from_value(serde_json::Value::Object(obj)).map_err(|e| e.to_string())?;
     Ok(LogLine::Stamped { seq, ts, event })

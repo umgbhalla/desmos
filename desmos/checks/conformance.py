@@ -109,7 +109,9 @@ def _drive_bridge(tmp: Path) -> tuple[str, str]:
             ({"op": "picker"}, 1),                         # picker
             # Crossing providers: snapshot + the thinking-fence notice.
             ({"op": "model", "model": "gpt-5.6-luna", "effort": "low"}, 2),
-            ({"op": "model", "model": "gpt-9-nope"}, 1),   # error
+            # A refused switch: the error, then the model_rejected event that
+            # retires the TUI's "queued" badge.
+            ({"op": "model", "model": "gpt-9-nope"}, 2),
             ({"op": "reset"}, 2),                          # speech + snapshot
             ({"op": "thinking", "level": "low"}, 1),       # snapshot
             # C3 on an unknown id: intervention + its prose notice twin.
