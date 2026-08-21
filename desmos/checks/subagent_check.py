@@ -188,7 +188,7 @@ def self_check() -> None:
             assert not quiet.observed_tools, quiet.observed_tools
 
             child = subagents._child_world(subagents.resolve("explore"), parent, contract)
-            assert set(child.tools) <= {"python"} and "agents" not in child.tools
+            assert set(child.tools) <= {"python", "exec"} and "agents" not in child.tools
             custom_cfg = subagents.resolve(
                 "planner",
                 model="gpt-5.6-luna",

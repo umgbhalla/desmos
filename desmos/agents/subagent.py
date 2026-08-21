@@ -362,6 +362,28 @@ def _persist(run: Run) -> None:
         pass
 
 
+def _expand_grants(names) -> set[str]:
+    """The one translation seam for capability grants (canonical cut step 3).
+
+    Grants may be written as canonical family names (exec, workspace, ...) or
+    as the legacy tag names CAPS still uses; both scope identically. A family
+    name expands to the family tag plus every dispatch target its ops route
+    to; a legacy target keeps its op-level grant and carries its family tag so
+    the child's prompt and evidence counting see the canonical spelling.
+    """
+    from desmos.kernel.canonical import TARGET_FAMILY, family_targets
+    from desmos.kernel.const import CANONICAL
+
+    out: set[str] = set()
+    for name in names:
+        out.add(name)
+        if name in CANONICAL:
+            out |= family_targets(name)
+        elif name in TARGET_FAMILY:
+            out.add(TARGET_FAMILY[name])
+    return out
+
+
 def _scoped_tags(capability: str, contract: TaskContract | None) -> set[str] | None:
     """Tags the child may run: capability ∩ contract. None means every tag.
 
@@ -370,9 +392,9 @@ def _scoped_tags(capability: str, contract: TaskContract | None) -> set[str] | N
     demanding one, so the run can only end in no_tool_evidence. Spawn-time is
     where that is cheap to say; the model discovering it costs a real run.
     """
-    allowed: set[str] | None = set(CAPS[capability]) or None
+    allowed: set[str] | None = _expand_grants(CAPS[capability]) or None
     if contract is not None and contract.allowed_tools:
-        permitted = set(contract.allowed_tools)
+        permitted = _expand_grants(contract.allowed_tools)
         allowed = permitted if allowed is None else allowed & permitted
         if not allowed:
             raise ValueError(
@@ -409,7 +431,9 @@ def _child_world(
         # task contracts still receive it even when their ordinary tool list is
         # narrower; dispatch intercepts it before any parent handler is reached.
         if todo_actor is not None:
-            allowed.add("todo")
+            # knowledge rides along so the prompt can advertise the bridge as
+            # knowledge op=todo; the bare tag stays for the dispatch intercept.
+            allowed.update(("todo", "knowledge"))
         from desmos.kernel.dispatch import set_scope
 
         # The prune keeps the child's prompt truthful (subagent_prompt reads

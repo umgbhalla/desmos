@@ -43,6 +43,20 @@ DIRECT_OPS = {
 
 FAMILIES = tuple(dict.fromkeys(tuple(ROUTES) + tuple(DIRECT_OPS)))
 
+#: dispatch-scope target -> owning canonical family, for grant translation
+#: (canonical cut step 3). Ops without an explicit target answer as the family.
+TARGET_FAMILY = {target: fam for fam, ops in ROUTES.items() for target in ops.values()}
+TARGET_FAMILY.update({target: fam for (fam, _o), target in DIRECT_TARGETS.items()})
+
+
+def family_targets(fam):
+    """Every dispatch-scope target the family's ops route to, plus the family."""
+    targets = {fam}
+    targets.update(ROUTES.get(fam, {}).values())
+    for op in DIRECT_OPS.get(fam, ()):
+        targets.add(DIRECT_TARGETS.get((fam, op), fam))
+    return targets
+
 
 def operations(family):
     return tuple(ROUTES.get(family, ())) + DIRECT_OPS.get(family, ())

@@ -52,11 +52,33 @@ once. On low-impact ambiguity, pick the likelier reading and name it.
 
 
 def _tool_lines(world: Any) -> str:
+    from desmos.kernel.canonical import DIRECT_TARGETS, ROUTES, operations
+    from desmos.kernel.const import CANONICAL, COMPAT_ALIASES
+
+    tools = getattr(world, "tools", {}) or {}
     lines = ["# available syscalls", "These are the only tags you have."]
-    for name in sorted(getattr(world, "tools", {}) or {}):
-        tool = world.tools[name]
+
+    def _target(fam: str, op: str) -> str:
+        return ROUTES.get(fam, {}).get(op) or DIRECT_TARGETS.get((fam, op), fam)
+
+    for name in sorted(tools):
+        # Legacy spellings still dispatch for transcript compatibility, but a
+        # child is taught only the canonical families and genuinely grown
+        # tags (canonical cut step 3).
+        if name in COMPAT_ALIASES:
+            continue
+        doc = getattr(tools[name], "doc", "")
+        if name in CANONICAL:
+            # Advertise only the ops this child's scope can actually answer.
+            ops = [
+                op for op in operations(name)
+                if _target(name, op) == name or _target(name, op) in tools
+            ]
+            head, dash, tail = doc.partition(" — ")
+            if ops and dash and head.startswith("op="):
+                doc = f"op={'|'.join(ops)} — {tail}"
         form = f"{LT}{name}{GT}body{LT}/{name}{GT}"
-        lines.append(f"{form}  {getattr(tool, 'doc', '')}".rstrip())
+        lines.append(f"{form}  {doc}".rstrip())
     return "\n".join(lines)
 
 
@@ -65,8 +87,8 @@ def _tool_lines(world: Any) -> str:
 # prompt that still describes the old one.
 _CAPABILITY_GUIDE: dict[str, str] = {
     "read": (
-        "Read-only: investigate freely and change nothing. You have no edit "
-        "tag; do not propose a patch as though you had applied it."
+        "Read-only: investigate freely and change nothing. You have no "
+        "workspace op=edit; do not propose a patch as though you had applied it."
     ),
     "edit": (
         "Edit capability: make the smallest complete change, then run its real "
@@ -74,8 +96,8 @@ _CAPABILITY_GUIDE: dict[str, str] = {
         "change that was never executed is an unproven change."
     ),
     "orchestrator": (
-        "Orchestrator: you have no bash, python, edit, or shell -- you cannot "
-        "read files or run commands yourself. To look around, fork an explore "
+        "Orchestrator: you have no exec family and no workspace op=edit -- you "
+        "cannot read files or run commands yourself. To look around, fork an explore "
         "child through the agents syscall and read its report; fork worker "
         "children for changes. Your job is decomposition, judgment, and the "
         "integrated final answer."

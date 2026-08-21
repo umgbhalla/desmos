@@ -148,6 +148,30 @@ def check() -> None:
             ), (family, op, out)
         assert not probe.exists(), "an orchestrator wrote to disk"
 
+        # --- canonical cut step 3: a child's prompt advertises only the seven
+        # canonical families plus grown tools; legacy spellings still dispatch
+        # but are never taught, and grants written either way scope the same.
+        from desmos.kernel.const import COMPAT_ALIASES as _ALIASES, LEGACY_FROZEN as _LEGACY
+        from desmos.agents.subagent_contracts import TaskContract as _TC3
+
+        for _agent3 in S.AGENTS:
+            _cfg3 = resolve(_agent3)
+            _p3 = _child_world(_cfg3, parent, budget=1).system_override
+            for _name3 in _LEGACY | _ALIASES:
+                assert f"<{_name3}>" not in _p3, (_agent3, _name3)
+        _edit3 = _child_world(resolve("general"), parent).system_override
+        assert "<exec>" in _edit3 and "<workspace>" in _edit3, _edit3
+        assert "<agents>" in _child_world(resolve("orchestrator"), parent, budget=1).system_override
+        _c3 = _TC3.simple("canonical grant", tools=["exec", "workspace"])
+        _gw3 = _child_world(resolve("general"), parent, _c3)
+        assert {"exec", "bash", "workspace", "edit"} <= (scope_of(_gw3) or set()), scope_of(_gw3)
+        assert dispatch(_gw3, Block("exec", "echo canon", {"op": "bash"})).strip() == "canon"
+        _rt3 = cwd / "canon3.txt"
+        _rt3.write_text("alpha\n", encoding="utf-8")
+        dispatch(_gw3, Block("workspace", "alpha\n---\nbeta", {"op": "edit", "path": str(_rt3)}))
+        assert _rt3.read_text(encoding="utf-8") == "beta\n"
+        assert "outside this agent's scope" in dispatch(_gw3, Block("exec", "x", {"op": "shell"}))
+
         import os
 
         evs_spawn: list[dict] = []
