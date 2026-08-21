@@ -730,6 +730,90 @@ def _check_daemon() -> None:
             time.sleep(0.05)
 
 
+def _check_daemon_shutdown() -> None:
+    """{"op":"shutdown"} over the socket: quit authority for a daemon bridge.
+
+    A --daemon bridge has no stdio owner, so the socket op must take the
+    whole process down cleanly -- pid file removed, owned socket unlinked --
+    and a second shutdown while stopping must be harmless.
+    """
+    import os
+    import signal
+    import subprocess
+    import sys
+    import tempfile
+    import time
+
+    root = Path(__file__).resolve().parents[2]
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        cwd = tmp / "w"
+        cwd.mkdir()
+        env = dict(os.environ)
+        env["DESMOS_SETTINGS"] = str(tmp / "settings.json")
+        env["PYTHONPATH"] = str(root)
+        env["OPENAI_API_KEY"] = "check-only"
+        env["DESMOS_TOOL_SYSCALLS"] = "0"
+        argv = [sys.executable, "-m", "desmos", "bridge", "--cwd", str(cwd), "--daemon"]
+        first = subprocess.run(
+            argv, capture_output=True, text=True, timeout=60, env=env, cwd=str(cwd)
+        )
+        assert first.returncode == 0, (first.returncode, first.stdout, first.stderr)
+        pid = int(first.stdout.strip())
+        dot = cwd / ".desmos"
+        pid_file = dot / "bridge.pid"
+        sock_path = dot / "bridge.sock"
+
+        def log_tail() -> str:
+            log = dot / "bridge.log"
+            return log.read_text(encoding="utf-8")[-2000:] if log.is_file() else "<no log>"
+
+        deadline = time.time() + 30
+        while not sock_path.exists():
+            assert time.time() < deadline, f"daemon never bound the socket; log: {log_tail()}"
+            time.sleep(0.05)
+        try:
+            client = _SockClient(sock_path)
+            second = _SockClient(sock_path)
+            try:
+                client.send({"op": "attach", "since": 0})
+                client.until(lambda e: e.get("ev") == "ready")
+                client.send({"op": "shutdown"})
+                # Idempotent: a second shutdown while stopping is harmless.
+                try:
+                    second.send({"op": "shutdown"})
+                except OSError:
+                    pass  # the bridge may already be gone; that is the point
+                # The final notice is best-effort on the wire (process exit
+                # races the writer thread) but durable in the event log.
+            finally:
+                client.close()
+                second.close()
+
+            # The daemon process itself must exit...
+            deadline = time.time() + 30
+            while True:
+                try:
+                    os.kill(pid, 0)
+                except ProcessLookupError:
+                    break
+                assert time.time() < deadline, f"daemon survived shutdown; log: {log_tail()}"
+                time.sleep(0.05)
+            # ...and the SIGTERM-path cleanup must have run.
+            deadline = time.time() + 30
+            while pid_file.exists() or sock_path.exists():
+                assert time.time() < deadline, (
+                    f"shutdown cleanup incomplete: pid_file={pid_file.exists()} "
+                    f"sock={sock_path.exists()}; log: {log_tail()}"
+                )
+                time.sleep(0.05)
+        finally:
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+
+
 def check() -> None:
     import tempfile
 
@@ -1080,3 +1164,4 @@ def check() -> None:
         _check_release_tui_launcher()
     _check_socket()
     _check_daemon()
+    _check_daemon_shutdown()

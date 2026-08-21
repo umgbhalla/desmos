@@ -378,9 +378,26 @@ def _serve_client(
                 continue
             with _WIRE_LOCK:
                 register_locked()
+            if op == "quit":
+                # A socket quit detaches this client only; the bridge (and
+                # any other attached client) keeps running. Taking the whole
+                # process down is the explicit shutdown op below.
+                return
+            if op == "shutdown":
+                # Quit authority for a daemon bridge: --daemon has no stdio
+                # owner, so socket "quit" (which only detaches this client)
+                # left nothing that could order the process down. Stop any
+                # running step, say goodbye on the funnel, and hand _drive
+                # its terminator so serve()'s finally unlinks the owned
+                # socket and daemonize()'s finally drops the pid file -- the
+                # same cleanup path SIGTERM takes. Idempotent: cancel is a
+                # latch and a surplus None in the inbox is never read, so a
+                # second shutdown while stopping is harmless.
+                cancel.set()
+                _emit({"ev": "notice", "text": "bridge shutting down"})
+                inbox.put(None)
+                return
             if _handle_oob(msg, world, inbox, cancel, pause):
-                if op == "quit":
-                    return
                 continue
             inbox.put(msg)
     except OSError:
