@@ -1284,6 +1284,35 @@ def check() -> None:
         assert py.read_text() == "x = 1\n", "a file that would not compile was written anyway"
         assert py.read_text(encoding="utf-8") == "x = 1\n"
 
+        # Friction shadow observer (kernel/friction.py): counters on the World
+        # append a one-line nudge through real dispatch, at most once per
+        # threshold crossing, with a cooldown. Zero extra API calls.
+        w_fr = new_world(cwd, state_path=None, persist=False, ns={})
+        same = "40 + 2"
+        fr1 = dispatch(w_fr, Block("python", same, {}))
+        fr2 = dispatch(w_fr, Block("python", same, {}))
+        fr3 = dispatch(w_fr, Block("python", same, {}))
+        fr4 = dispatch(w_fr, Block("python", same, {}))
+        assert fr1 == "42" and fr2 == "42", (fr1, fr2)
+        assert "growing a tool" in fr3, fr3
+        assert fr3.splitlines()[0] == "42", fr3
+        assert "[friction]" not in fr4, "cooldown failed: the fourth repeat nudged again"
+
+        # Two consecutive tracebacks on one tag nudge exactly once.
+        w_ff = new_world(cwd, state_path=None, persist=False, ns={})
+        ff1 = dispatch(w_ff, Block("python", "raise RuntimeError('fr one')", {}))
+        ff2 = dispatch(w_ff, Block("python", "raise RuntimeError('fr two')", {}))
+        ff3 = dispatch(w_ff, Block("python", "raise RuntimeError('fr three')", {}))
+        assert "[friction]" not in ff1, ff1
+        assert "failed 2x in a row" in ff2, ff2
+        assert "[friction]" not in ff3, "a failure nudge repeated inside its cooldown"
+
+        # A clean run never nudges.
+        w_fc = new_world(cwd, state_path=None, persist=False, ns={})
+        for clean_body in ("1 + 1", "2 + 2", "3 + 3"):
+            clean_out = dispatch(w_fc, Block("python", clean_body, {}))
+            assert "[friction]" not in clean_out, clean_out
+
         # docs/identity.md, driven: the in-memory row survives <reload_sdk/>
         # (ns, notes, messages), and <rollback> restores notes without touching
         # memory records or the transcript. Last before attach: reload_sdk

@@ -124,9 +124,15 @@ def dispatch(
 ) -> str:
     token = CALLER_WORLD.set(world)
     try:
-        return _dispatch(world, block, on_chunk=on_chunk, should_stop=should_stop, meta=meta)
+        result = _dispatch(world, block, on_chunk=on_chunk, should_stop=should_stop, meta=meta)
     finally:
         CALLER_WORLD.reset(token)
+    # Shadow observer (kernel/friction.py): bump this world's in-memory
+    # friction counters and maybe append one nudge line to the result --
+    # the todo_nudge channel, with zero extra API calls.
+    from desmos.kernel.friction import observe as friction_observe
+
+    return friction_observe(world, block, result)
 
 
 def _dispatch(
