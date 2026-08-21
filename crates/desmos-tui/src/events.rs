@@ -868,3 +868,129 @@ pub(crate) fn wire_compacted(n: u64, kept: u64, summary: &str) -> RenderBlock {
         OtherToolCallBlock::new(head, "context compacted".to_string()).with_output(body),
     ))
 }
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    /// Every block in one pane as text, so containment can be asserted
+    /// without touching a renderer: the markdown export carries prose
+    /// (`copy_text`), the Debug form carries tool-call fields (command,
+    /// output).
+    fn dump(pane: &ScrollbackState) -> String {
+        let blocks: Vec<&RenderBlock> = (0..pane.len())
+            .filter_map(|i| pane.entry(i))
+            .map(|e| &e.block)
+            .collect();
+        let md = xai_grok_pager::scrollback::export::render_blocks_to_markdown(
+            blocks.iter().copied(),
+        );
+        let dbg: String = blocks.iter().map(|b| format!("{b:?}\n")).collect();
+        format!("{md}\n{dbg}")
+    }
+
+    /// tui-redesign R3 (front half): two subjects never cross-paint. Each
+    /// child owns its Sess; speech, calls, and results routed by id must land
+    /// only in that child's panes and never in the sibling's or the root's.
+    #[test]
+    fn two_children_never_cross_paint() {
+        let mut app = App::new();
+        // Spawn two subjects through the real lifecycle events.
+        handle_event(
+            &mut app,
+            json!({"ev": "subagent", "phase": "started", "id": "alpha",
+                   "agent": "explore", "task": "alpha task"}),
+        );
+        handle_event(
+            &mut app,
+            json!({"ev": "subagent", "phase": "started", "id": "beta",
+                   "agent": "edit", "task": "beta task"}),
+        );
+
+        // Child A: speech, then a call (result start) and its result (done).
+        // The result event also flushes buffered speech into A's story.
+        handle_event(
+            &mut app,
+            json!({"ev": "child", "id": "alpha", "kind": "speech",
+                   "text": "alpha-speaks-here", "delta": false}),
+        );
+        handle_event(
+            &mut app,
+            json!({"ev": "child", "id": "alpha", "kind": "result",
+                   "phase": "start", "tag": "exec", "attrs": {"op": "bash"},
+                   "body": "echo alpha-command-body"}),
+        );
+        handle_event(
+            &mut app,
+            json!({"ev": "child", "id": "alpha", "kind": "result",
+                   "phase": "done", "tag": "exec", "attrs": {"op": "bash"},
+                   "text": "alpha-call-output"}),
+        );
+
+        // Child B: different text, through the same seam handle_event uses.
+        handle_child(
+            &mut app,
+            &json!({"ev": "child", "id": "beta", "kind": "speech",
+                    "text": "beta-speaks-here", "delta": false}),
+        );
+        handle_child(
+            &mut app,
+            &json!({"ev": "child", "id": "beta", "kind": "result",
+                    "phase": "done", "tag": "exec", "attrs": {"op": "bash"},
+                    "text": "beta-call-output"}),
+        );
+
+        let a_story = dump(&app.children["alpha"].sess.story);
+        let a_calls = dump(&app.children["alpha"].sess.calls);
+        let b_story = dump(&app.children["beta"].sess.story);
+        let b_calls = dump(&app.children["beta"].sess.calls);
+        let root_story = dump(&app.sess.story);
+
+        // A's panes hold A's text and none of B's.
+        assert!(a_story.contains("alpha-speaks-here"), "A story: {a_story}");
+        assert!(a_calls.contains("alpha-command-body"), "A calls: {a_calls}");
+        assert!(a_calls.contains("alpha-call-output"), "A calls: {a_calls}");
+        assert!(!a_story.contains("beta-speaks-here"), "B leaked into A story: {a_story}");
+        assert!(!a_calls.contains("beta-call-output"), "B leaked into A calls: {a_calls}");
+
+        // B's panes hold B's text and none of A's.
+        assert!(b_story.contains("beta-speaks-here"), "B story: {b_story}");
+        assert!(b_calls.contains("beta-call-output"), "B calls: {b_calls}");
+        assert!(!b_story.contains("alpha-speaks-here"), "A leaked into B story: {b_story}");
+        assert!(!b_calls.contains("alpha-command-body"), "A leaked into B calls: {b_calls}");
+        assert!(!b_calls.contains("alpha-call-output"), "A leaked into B calls: {b_calls}");
+
+        // Neither child's speech or output leaked into the root story. The
+        // root keeps only the spawn cards (task titles), never child panes.
+        for token in [
+            "alpha-speaks-here",
+            "beta-speaks-here",
+            "alpha-call-output",
+            "beta-call-output",
+        ] {
+            assert!(!root_story.contains(token), "{token} leaked into root: {root_story}");
+        }
+
+        // Forward-compat: an event stamped with an unknown extra field `sid`
+        // is tolerated unchanged — same routing, input value untouched.
+        let stamped = json!({"ev": "child", "id": "beta", "kind": "speech",
+                             "text": "beta-second-line", "delta": false,
+                             "sid": "beta"});
+        let before = stamped.clone();
+        handle_child(&mut app, &stamped);
+        assert_eq!(stamped, before, "handle_child mutated the wire event");
+        handle_child(
+            &mut app,
+            &json!({"ev": "child", "id": "beta", "kind": "result",
+                    "phase": "done", "tag": "exec", "text": "beta-flush",
+                    "sid": "beta"}),
+        );
+        let b_story = dump(&app.children["beta"].sess.story);
+        assert!(b_story.contains("beta-second-line"), "sid-stamped speech lost: {b_story}");
+        let a_story = dump(&app.children["alpha"].sess.story);
+        assert!(!a_story.contains("beta-second-line"), "sid-stamped speech cross-painted: {a_story}");
+        assert_eq!(app.children.len(), 2, "sid must not mint a new child");
+    }
+}
