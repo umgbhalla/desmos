@@ -762,6 +762,9 @@ def _migrate(conn: sqlite3.Connection) -> None:
         # gate is satisfied. The old _drop_seat_scaffold that retired the
         # premature schema is gone; nothing may drop the declared table again.
         _add_column(conn, "sessions", "seat_id", "TEXT NOT NULL DEFAULT ''")
+        # B1 (docs/seats.md section 1): a note written by a bound session
+        # carries the seat id; unseated workspaces keep '' and read as before.
+        _add_column(conn, "notes", "seat_id", "TEXT NOT NULL DEFAULT ''")
         for shared in ("notes", "tools"):
             _add_column(conn, shared, "updated_at", "TEXT NOT NULL DEFAULT ''")
         # Which purse paid for a call. Older rows keep '' and are counted
@@ -1256,6 +1259,23 @@ def retire_seat(
     return seat
 
 
+def _attribution_seat(conn: sqlite3.Connection, session: str | None) -> str:
+    """The seat id new accumulation is attributed to, or '' (B1).
+
+    Attribution requires a live binding to an unretired seat: a retired seat
+    keeps every record it earned but accepts no new attribution (A1), and an
+    unseated session writes workspace-scoped rows exactly as before.
+    """
+    if not session:
+        return ""
+    row = conn.execute(
+        "SELECT s.seat_id FROM sessions s JOIN seats t ON t.id = s.seat_id"
+        " WHERE s.id = ? AND t.retired_at = ''",
+        (session,),
+    ).fetchone()
+    return "" if row is None else str(row["seat_id"])
+
+
 def seat_binding(world: World) -> dict[str, Any] | None:
     """The seat this attach is bound to, or would bind on its first write."""
     if not world.persist:
@@ -1442,6 +1462,7 @@ def _save_data(conn: sqlite3.Connection, world: World, data: dict[str, Any]) -> 
                 (workspace,),
             )
         }
+        seat_stamp = _attribution_seat(conn, session)
         for name, body in data["notes"].items():
             if not isinstance(body, str):
                 continue
@@ -1454,9 +1475,9 @@ def _save_data(conn: sqlite3.Connection, world: World, data: dict[str, Any]) -> 
                 continue
             conn.execute(
                 "INSERT OR REPLACE INTO"
-                " notes(workspace_id, name, body, updated_at)"
-                " VALUES (?, ?, ?, ?)",
-                (workspace, str(name), body, now),
+                " notes(workspace_id, name, body, updated_at, seat_id)"
+                " VALUES (?, ?, ?, ?, ?)",
+                (workspace, str(name), body, now, seat_stamp),
             )
         stored_tools = {
             str(r["name"]): (str(r["doc"] or ""), r["source"], str(r["updated_at"] or ""))

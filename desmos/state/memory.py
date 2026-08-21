@@ -234,6 +234,21 @@ def _find(records: list[dict[str, Any]], record_id: str) -> dict[str, Any] | Non
     return next((r for r in records if r.get("id") == record_id), None)
 
 
+def _stamp_seat(world: World, record: dict[str, Any]) -> None:
+    """Attribute the record to the bound seat (constitution B1).
+
+    Only a live binding to an unretired seat stamps; an unseated workspace
+    writes the record exactly as before, and a retired seat accepts no new
+    attribution. records.jsonl stays the append-only source of truth -- the
+    seat id is a field on the record, nothing moves.
+    """
+    from desmos.state.persist import seat_binding
+
+    seat = seat_binding(world)
+    if seat and not str(seat.get("retired_at") or ""):
+        record["seat"] = str(seat["id"])
+
+
 def remember(
     world: World,
     content: str,
@@ -296,6 +311,7 @@ def remember(
         if source not in sources:
             sources.append(source)
         action = "updated"
+    _stamp_seat(world, target)
     _save(root, records)
     return f"{action} {target['id']} ({len([r for r in records if r.get('status') == 'active'])} active)"
 

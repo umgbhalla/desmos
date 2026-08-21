@@ -424,6 +424,7 @@ def check() -> None:
         _check_schema_tolerance()
         _check_seats()
         _check_seat_hardening()
+        _check_seat_accumulation()
         _check_quarantine_manifest()
         _check_quarantine_gate()
         _check_prune_manifest()
@@ -696,6 +697,117 @@ def _check_seat_hardening() -> None:
     third = subprocess.run(cmd, capture_output=True, text=True, env=env)
     assert third.returncode == 0, third.stderr
     print("seat hardening check ok")
+
+
+def _check_seat_accumulation() -> None:
+    """B1: notes and memory carry the seat id when bound; unbound unchanged.
+
+    Falsifiers: a bound session's note row and memory record carry the seat
+    id; an unseated workspace writes rows with no attribution, byte-for-byte
+    today's behaviour; a fork still refuses remember() (B3); a retired seat
+    accepts no new attribution while keeping everything it earned (A1).
+    """
+    import tempfile
+    from argparse import Namespace
+
+    from desmos.front import cli as front_cli
+    from desmos.state import memory as memory_store
+    from desmos.state import persist
+
+    saved = {
+        k: os.environ.get(k)
+        for k in (persist.SESSION_ID_ENV, persist.SESSION_PID_ENV)
+    }
+
+    def fresh_run() -> str:
+        rid = persist._uuid7()
+        os.environ[persist.SESSION_ID_ENV] = rid
+        os.environ[persist.SESSION_PID_ENV] = str(os.getpid())
+        return rid
+
+    def note_seats(path):
+        conn = persist._connect(path)
+        rows = {
+            str(r["name"]): str(r["seat_id"])
+            for r in conn.execute("SELECT name, seat_id FROM notes")
+        }
+        conn.close()
+        return rows
+
+    def release(world, rid):
+        key = str(persist._presence_path(world, rid).resolve())
+        lease = persist._PRESENCE_LEASES.pop(key, None)
+        if lease is not None:
+            lease.close()
+
+    try:
+        # Unseated workspace: no attribution anywhere -- identical to before.
+        rid = fresh_run()
+        plain_root = Path(tempfile.mkdtemp())
+        plain = new_world(plain_root, persist=True)
+        plain.notes["free"] = "workspace scoped"
+        persist.save(plain)
+        memory_store.remember(plain, "unseated fact", source="check")
+        assert note_seats(persist.state_file(plain)) == {"free": ""}, \
+            note_seats(persist.state_file(plain))
+        _, records = memory_store._ensure_records(plain)
+        assert records and all("seat" not in r for r in records), records
+        release(plain, rid)
+
+        # Seated workspace: birth, restart to bind, then accumulate.
+        rid = fresh_run()
+        root = Path(tempfile.mkdtemp())
+        first = new_world(root, persist=True)
+        persist.save(first)
+        path = persist.state_file(first)
+        rc = front_cli.cmd_seat(Namespace(
+            action="new", role="navigator", charter="accumulate", cwd=str(root),
+        ))
+        assert rc == 0, "seat birth failed"
+        release(first, rid)
+        fresh_run()
+        bound = new_world(root, persist=True)
+        # A session becomes a row (and binds) once it records something.
+        persist.record_event(
+            bound, {"ev": "notice", "content": "bound"}, ts_ms=1, mono_ns=1,
+        )
+        bound.notes["earned"] = "seat scoped"
+        persist.save(bound)
+        seat = persist.seat_binding(bound)
+        assert seat and seat["id"], "restart did not bind"
+        seat_id = str(seat["id"])
+        assert note_seats(path).get("earned") == seat_id, note_seats(path)
+        memory_store.remember(bound, "seated fact", source="check")
+        _, records = memory_store._ensure_records(bound)
+        stamped = [r for r in records if r.get("seat") == seat_id]
+        assert len(stamped) == 1 and stamped[0]["content"] == "seated fact", records
+
+        # Forks stay anonymous (B3): remember() is refused outright.
+        child = new_world(root, persist=False)
+        out = memory_store.remember(child, "fork fact", source="check")
+        assert "disabled" in out, out
+
+        # A retired seat accepts no new attribution; earned rows stay stamped.
+        rc = front_cli.cmd_seat(Namespace(
+            action="retire", reason="accumulation probe", cwd=str(root),
+        ))
+        assert rc == 0, "retire failed"
+        bound.notes["late"] = "after retirement"
+        persist.save(bound)
+        rows = note_seats(path)
+        assert rows.get("late") == "", rows
+        assert rows.get("earned") == seat_id, rows
+        memory_store.remember(bound, "late fact", source="check")
+        _, records = memory_store._ensure_records(bound)
+        late = [r for r in records if r.get("content") == "late fact"]
+        assert late and "seat" not in late[0], late
+    finally:
+        for key, value in saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+    print("seat accumulation check ok")
 
 
 def _check_quarantine_manifest() -> None:
