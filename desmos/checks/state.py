@@ -374,6 +374,7 @@ def check() -> None:
         _check_slice(cwd)
         _check_schema_tolerance()
         _check_seats()
+        _check_seat_hardening()
         _check_quarantine_manifest()
         _check_quarantine_gate()
         _check_prune_manifest()
@@ -565,6 +566,87 @@ def _check_seats() -> None:
             else:
                 os.environ[key] = value
     print("seats check ok")
+
+
+def _check_seat_hardening() -> None:
+    """Birth uniqueness and structural append-only for the seat record (A1).
+
+    Falsifiers: a second `seat new` in a seated workspace must be refused at
+    the operator surface with a retire-first message; a raw sqlite UPDATE of
+    the charter, a raw DELETE of the row, and a rewrite of a written tombstone
+    must all be refused by the schema itself (triggers + partial unique
+    index), not merely by polite Python; seat events must be equally immovable.
+    After a tombstone, a new birth is legal: the unique index is partial.
+    """
+    import sqlite3
+    import subprocess
+    import sys
+    import tempfile
+    from datetime import datetime, timezone
+
+    from desmos.state import persist
+
+    root = Path(tempfile.mkdtemp())
+    env = dict(os.environ)
+    env.pop(persist.SESSION_ID_ENV, None)
+    env.pop(persist.SESSION_PID_ENV, None)
+    cmd = [
+        sys.executable, "-B", "-m", "desmos", "seat", "new",
+        "--role", "navigator", "--charter", "steer", "--cwd", str(root),
+    ]
+    first = subprocess.run(cmd, capture_output=True, text=True, env=env)
+    assert first.returncode == 0, first.stderr
+    second = subprocess.run(cmd, capture_output=True, text=True, env=env)
+    assert second.returncode != 0, "a second birth minted a second active seat"
+    assert "retire" in second.stderr, second.stderr
+
+    world = new_world(root, persist=False)
+    world.persist = True
+    path = persist.state_file(world)
+    conn = persist._connect(path)
+    try:
+        rows = conn.execute("SELECT * FROM seats").fetchall()
+        assert len(rows) == 1, "second birth left more than one seat row"
+
+        def refused(sql: str, params: tuple = ()) -> bool:
+            try:
+                with conn:
+                    conn.execute(sql, params)
+            except sqlite3.IntegrityError:
+                return True
+            return False
+
+        # Structural append-only: the schema refuses even a raw connection.
+        assert refused("UPDATE seats SET charter = 'rewritten'"), \
+            "raw UPDATE of the charter was accepted"
+        assert refused("DELETE FROM seats"), "raw DELETE of the seat row was accepted"
+        assert refused(
+            "INSERT INTO seats(id, workspace_id, charter, role, created_at)"
+            " SELECT 'twin', workspace_id, charter, role, created_at FROM seats"
+        ), "the partial unique index let a racing second active seat in"
+        # Seat events are equally immovable.
+        assert refused("UPDATE events SET payload_json='{}' WHERE kind='seat_birth'"), \
+            "raw UPDATE of a seat event was accepted"
+        assert refused("DELETE FROM events WHERE kind='seat_birth'"), \
+            "raw DELETE of a seat event was accepted"
+        # Tombstone-once: the first write lands, any rewrite is refused.
+        now = datetime.now(timezone.utc).isoformat()
+        with conn:
+            conn.execute(
+                "UPDATE seats SET retired_at = ?, retire_reason = 'probe'"
+                " WHERE retired_at = ''",
+                (now,),
+            )
+        assert refused("UPDATE seats SET retired_at = '2030-01-01T00:00:00+00:00'"), \
+            "a written tombstone was rewritten"
+        assert refused("UPDATE seats SET retire_reason = 'revised'"), \
+            "a written tombstone reason was rewritten"
+    finally:
+        conn.close()
+    # A retired workspace may seat a successor: the index is partial.
+    third = subprocess.run(cmd, capture_output=True, text=True, env=env)
+    assert third.returncode == 0, third.stderr
+    print("seat hardening check ok")
 
 
 def _check_quarantine_manifest() -> None:

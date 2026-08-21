@@ -491,6 +491,34 @@ CREATE TABLE IF NOT EXISTS seats (
 );
 CREATE INDEX IF NOT EXISTS idx_seats_workspace
     ON seats(workspace_id, created_at);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_seats_one_active
+    ON seats(workspace_id) WHERE retired_at = '';
+CREATE TRIGGER IF NOT EXISTS seats_append_only_update
+BEFORE UPDATE ON seats
+WHEN NEW.id IS NOT OLD.id
+  OR NEW.workspace_id IS NOT OLD.workspace_id
+  OR NEW.charter IS NOT OLD.charter
+  OR NEW.role IS NOT OLD.role
+  OR NEW.created_at IS NOT OLD.created_at
+  OR NEW.created_generation IS NOT OLD.created_generation
+BEGIN
+    SELECT RAISE(ABORT,
+        'seats are append-only: only the tombstone may be written (A1)');
+END;
+CREATE TRIGGER IF NOT EXISTS seats_tombstone_once
+BEFORE UPDATE ON seats
+WHEN OLD.retired_at != ''
+ AND (NEW.retired_at IS NOT OLD.retired_at
+   OR NEW.retire_reason IS NOT OLD.retire_reason)
+BEGIN
+    SELECT RAISE(ABORT, 'seat tombstone is write-once (A1)');
+END;
+CREATE TRIGGER IF NOT EXISTS seats_no_delete
+BEFORE DELETE ON seats
+BEGIN
+    SELECT RAISE(ABORT,
+        'seats are never deleted; retire writes a tombstone (A1)');
+END;
 CREATE TABLE IF NOT EXISTS messages (
     session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
     seq INTEGER NOT NULL,
@@ -545,6 +573,18 @@ CREATE TABLE IF NOT EXISTS events (
     payload_sha256 TEXT NOT NULL DEFAULT '',
     PRIMARY KEY (session_id, seq)
 );
+CREATE TRIGGER IF NOT EXISTS seat_events_no_update
+BEFORE UPDATE ON events
+WHEN OLD.kind LIKE 'seat_%'
+BEGIN
+    SELECT RAISE(ABORT, 'seat events are append-only (A1)');
+END;
+CREATE TRIGGER IF NOT EXISTS seat_events_no_delete
+BEFORE DELETE ON events
+WHEN OLD.kind LIKE 'seat_%'
+BEGIN
+    SELECT RAISE(ABORT, 'seat events are never deleted (A1)');
+END;
 CREATE VIRTUAL TABLE IF NOT EXISTS history_fts USING fts5(
     workspace_id UNINDEXED,
     session_id UNINDEXED,
@@ -1138,12 +1178,25 @@ def create_seat(
         with conn:
             workspace = _workspace_id(conn, world)
             assert workspace is not None
-            conn.execute(
-                "INSERT INTO seats(id, workspace_id, charter, role,"
-                " created_at, created_generation, retired_at, retire_reason)"
-                " VALUES (?, ?, ?, ?, ?, ?, '', '')",
-                (seat, workspace, charter, role, now, int(world.generation)),
-            )
+            if _active_seats(conn, workspace):
+                raise SeatError(
+                    "workspace already has an active seat; retire it first"
+                    " (python -m desmos seat retire --reason ...)"
+                )
+            try:
+                conn.execute(
+                    "INSERT INTO seats(id, workspace_id, charter, role,"
+                    " created_at, created_generation, retired_at, retire_reason)"
+                    " VALUES (?, ?, ?, ?, ?, ?, '', '')",
+                    (seat, workspace, charter, role, now, int(world.generation)),
+                )
+            except sqlite3.IntegrityError as exc:
+                # idx_seats_one_active: a racing second birth lands here even
+                # when the in-code check above saw an empty workspace.
+                raise SeatError(
+                    "workspace already has an active seat; retire it first"
+                    " (python -m desmos seat retire --reason ...)"
+                ) from exc
     finally:
         conn.close()
     record_event(
