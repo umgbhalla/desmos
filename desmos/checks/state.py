@@ -17,8 +17,68 @@ def _memory(body: str, attrs: dict | None = None) -> Block:
     return Block("knowledge", body, {"op": "memory", **(attrs or {})})
 
 
+
+def _spine_sequence_check() -> None:
+    """An old v14 file upgrades, and replay inserts are globally idempotent."""
+    import sqlite3
+    import tempfile
+
+    from desmos.front import spine
+    from desmos.loop import new_world
+    from desmos.state import persist
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        path = root / "old.sqlite3"
+        old_schema = persist.SCHEMA_SQL.replace(
+            "    created_at TEXT NOT NULL,\n    spine_seq INTEGER\n"
+            ");\nCREATE TABLE IF NOT EXISTS channel_cursors",
+            "    created_at TEXT NOT NULL\n"
+            ");\nCREATE TABLE IF NOT EXISTS channel_cursors",
+        )
+        assert old_schema != persist.SCHEMA_SQL
+        db = sqlite3.connect(path)
+        db.executescript(old_schema)
+        db.execute(
+            "ALTER TABLE schema_migrations"
+            " ADD COLUMN min_reader INTEGER NOT NULL DEFAULT 0"
+        )
+        db.execute(
+            "INSERT INTO schema_migrations(version, applied_at, min_reader)"
+            " VALUES (14, 'old', 9)"
+        )
+        db.commit()
+        db.close()
+
+        world = new_world(root, state_path=path)
+        db = persist._open(path)
+        columns = {
+            row["name"] for row in db.execute("PRAGMA table_info(channel_messages)")
+        }
+        indexes = {
+            row["name"] for row in db.execute("PRAGMA index_list(channel_messages)")
+        }
+        assert "spine_seq" in columns
+        assert "ux_channel_spine" in indexes
+        db.close()
+
+        event = {
+            "channel": "migration-check",
+            "seq": 7,
+            "author": "remote",
+            "seat": "other",
+            "body": "once",
+            "ts": "now",
+        }
+        assert spine.ingest(world, [event, event]) == 1
+        assert spine.ingest(world, [event]) == 0
+        rows = persist.ordered_read(world, "migration-check")
+        assert len(rows) == 1 and rows[0]["spine_seq"] == 7
+
 def check() -> None:
     import tempfile
+
+    _spine_sequence_check()
 
     with tempfile.TemporaryDirectory() as tmp:
         cwd = Path(tmp)

@@ -59,7 +59,7 @@ def _seat() -> str:
 
 
 def ingest(world: World, events: list[dict[str, Any]]) -> int:
-    """Insert remote events beyond each channel's cursor; skip our own."""
+    """Insert events by their global channel sequence; skip our own outbox loop."""
     if not events:
         return 0
     db = _open(state_file(world))
@@ -74,34 +74,29 @@ def ingest(world: World, events: list[dict[str, Any]]) -> int:
                 seq = int(ev.get("seq", 0))
                 if not channel or seq <= 0:
                     continue
-                row = db.execute(
-                    "SELECT seq FROM spine_cursors WHERE channel = ?",
-                    (channel,),
-                ).fetchone()
-                cursor = int(row["seq"]) if row else 0
-                if seq <= cursor:
-                    continue
                 mark = str(ev.get("fingerprint", ""))
                 ours = mark and db.execute(
                     "SELECT 1 FROM outbox WHERE fingerprint = ?", (mark,)
                 ).fetchone()
                 if not ours:
-                    db.execute(
-                        "INSERT INTO channel_messages(workspace_id, session_id,"
-                        " channel, run_id, author, body, created_at)"
-                        " VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    cur = db.execute(
+                        "INSERT OR IGNORE INTO channel_messages(workspace_id,"
+                        " session_id, channel, run_id, author, body, created_at,"
+                        " spine_seq) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                         (
                             workspace, session, channel,
                             str(ev.get("seat", "") or "spine"),
                             str(ev.get("author", "") or "spine"),
                             str(ev.get("body", "")),
                             str(ev.get("ts", "")),
+                            seq,
                         ),
                     )
-                    written += 1
+                    written += max(cur.rowcount, 0)
                 db.execute(
                     "INSERT INTO spine_cursors(channel, seq) VALUES (?, ?)"
-                    " ON CONFLICT(channel) DO UPDATE SET seq = excluded.seq",
+                    " ON CONFLICT(channel) DO UPDATE SET"
+                    " seq = MAX(spine_cursors.seq, excluded.seq)",
                     (channel, seq),
                 )
     finally:
@@ -121,32 +116,48 @@ def _append_frame(row: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def sync(world: World, timeout: float = RECV_TIMEOUT) -> dict[str, Any]:
-    """One full exchange: sub, snapshot-ingest, drain the outbox, return counts."""
+def _connect(world: World, timeout: float):
     from websockets.sync.client import connect
 
-    report: dict[str, Any] = {"ingested": 0, "sent": 0, "failed": 0, "error": ""}
     headers = {"Authorization": f"Bearer {token(world)}"}
-    with connect(
-        url(), additional_headers=headers, open_timeout=timeout, close_timeout=5
-    ) as ws:
+    try:
+        return connect(
+            url(), additional_headers=headers, open_timeout=timeout, close_timeout=5
+        )
+    except Exception as exc:
+        response = getattr(exc, "response", None)
+        status = getattr(response, "status_code", None)
+        if status is None:
+            status = getattr(exc, "status_code", None)
+        if status == 401:
+            raise RuntimeError(
+                "spine authentication failed (401): check DESMOS_SPINE_TOKEN"
+            ) from exc
+        raise
+
+
+def _recv_until(ws, want: str, timeout: float,
+                events: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    while True:
+        frame = json.loads(ws.recv(timeout=timeout))
+        if frame.get("op") == "event" and events is not None:
+            events.append(frame)
+            continue
+        if frame.get("op") == want:
+            return frame
+        if frame.get("op") == "error":
+            raise RuntimeError(f"spine: {frame.get('error')}")
+
+
+def sync(world: World, timeout: float = RECV_TIMEOUT) -> dict[str, Any]:
+    """One full exchange: sub, snapshot-ingest, drain the outbox, return counts."""
+    report: dict[str, Any] = {"ingested": 0, "sent": 0, "failed": 0, "error": ""}
+    with _connect(world, timeout) as ws:
         ws.send(json.dumps({"op": "sub", "channels": ["*"]}))
         events: list[dict[str, Any]] = []
-
-        def recv_until(want: str) -> dict[str, Any]:
-            while True:
-                frame = json.loads(ws.recv(timeout=timeout))
-                if frame.get("op") == "event":
-                    events.append(frame)
-                    continue
-                if frame.get("op") == want:
-                    return frame
-                if frame.get("op") == "error":
-                    raise RuntimeError(f"spine: {frame.get('error')}")
-
-        recv_until("subbed")
+        _recv_until(ws, "subbed", timeout, events)
         ws.send(json.dumps({"op": "snapshot"}))
-        snap = recv_until("snapshot")
+        snap = _recv_until(ws, "snapshot", timeout, events)
         for entry in snap.get("channels", []):
             events.extend(entry.get("tail", []))
 
@@ -156,28 +167,84 @@ def sync(world: World, timeout: float = RECV_TIMEOUT) -> dict[str, Any]:
         for row in rows:
             ws.send(json.dumps(_append_frame(row)))
         wanted = {r["fingerprint"] for r in rows}
-        acked: set[str] = set()
-        while acked != wanted:
-            ack = recv_until("ack")
+        acks: dict[str, int] = {}
+        while acks.keys() != wanted:
+            ack = _recv_until(ws, "ack", timeout, events)
             mark = str(ack.get("fingerprint", ""))
             if mark not in wanted:
                 raise RuntimeError("spine: ack for unknown fingerprint")
-            acked.add(mark)
-        if acked:
+            seq = int(ack.get("seq", 0))
+            if seq <= 0:
+                raise RuntimeError("spine: ack has invalid seq")
+            acks[mark] = seq
+        if acks:
             db = _open(state_file(world))
             try:
                 with db:
-                    db.executemany(
-                        "UPDATE outbox SET sent_at = ?, attempts = attempts + 1"
-                        " WHERE fingerprint = ? AND sent_at IS NULL",
-                        [(outbox._now(), mark) for mark in sorted(acked)],
-                    )
+                    for mark, seq in sorted(acks.items()):
+                        row = db.execute(
+                            "SELECT payload_json FROM outbox WHERE fingerprint = ?",
+                            (mark,),
+                        ).fetchone()
+                        if row is None:
+                            raise RuntimeError("spine: ack outbox row disappeared")
+                        message_id = int(json.loads(row["payload_json"])["id"])
+                        db.execute(
+                            "UPDATE channel_messages SET spine_seq = ?"
+                            " WHERE id = ? AND spine_seq IS NULL",
+                            (seq, message_id),
+                        )
+                        db.execute(
+                            "UPDATE outbox SET sent_at = ?, attempts = attempts + 1"
+                            " WHERE fingerprint = ? AND sent_at IS NULL",
+                            (outbox._now(), mark),
+                        )
             finally:
                 db.close()
-        report["sent"] = len(acked)
+        report["sent"] = len(acks)
         report["ingested"] = ingest(world, events)
     return report
 
+
+def _local_max_seq(world: World, channel: str) -> int:
+    db = _open(state_file(world))
+    try:
+        row = db.execute(
+            "SELECT COALESCE(MAX(spine_seq), 0) AS seq"
+            " FROM channel_messages WHERE channel = ?",
+            (channel,),
+        ).fetchone()
+        return int(row["seq"])
+    finally:
+        db.close()
+
+
+def bootstrap(world: World, timeout: float = RECV_TIMEOUT) -> dict[str, int]:
+    """Rebuild every advertised channel from D1/hot-log replay pages."""
+    ingested = 0
+    with _connect(world, timeout) as ws:
+        ws.send(json.dumps({"op": "snapshot"}))
+        snap = _recv_until(ws, "snapshot", timeout)
+        channels = [
+            str(entry.get("channel", ""))
+            for entry in snap.get("channels", [])
+            if entry.get("channel")
+        ]
+        for channel in channels:
+            since = _local_max_seq(world, channel)
+            while True:
+                ws.send(json.dumps({
+                    "op": "replay", "channel": channel,
+                    "since": since, "limit": 500,
+                }))
+                page = _recv_until(ws, "replay", timeout)
+                page_events = list(page.get("events", []))
+                ingested += ingest(world, page_events)
+                next_seq = page.get("next")
+                if next_seq is None:
+                    break
+                since = int(next_seq)
+    return {"channels": len(channels), "ingested": ingested}
 
 def run_forever(world: World, interval: float = 5.0) -> None:
     """Drain and ingest until the process dies; offline is a wait, not an error."""

@@ -26,7 +26,7 @@ from desmos.kernel.types import Tool, World
 _UMASK = os.umask(0)
 os.umask(_UMASK)
 
-SCHEMA_VERSION = 14  # 14: seats + sessions.seat_id (docs/seats.md; B2 satisfied)
+SCHEMA_VERSION = 15  # 15: global spine sequence on channel messages
 #: Oldest build that can still read this schema. Additive changes leave it
 #: alone; anything an older reader would misread raises it.
 MIN_READER_VERSION = 9
@@ -612,7 +612,8 @@ CREATE TABLE IF NOT EXISTS channel_messages (
     run_id TEXT NOT NULL,
     author TEXT NOT NULL,
     body TEXT NOT NULL,
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    spine_seq INTEGER
 );
 CREATE TABLE IF NOT EXISTS channel_cursors (
     run_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
@@ -770,6 +771,13 @@ def _migrate(conn: sqlite3.Connection) -> None:
         # Which purse paid for a call. Older rows keep '' and are counted
         # against whatever account asks, because they predate the question.
         _add_column(conn, "calls", "account", "TEXT NOT NULL DEFAULT ''")
+        # Nullable keeps every pre-spine and not-yet-acked local row; SQLite
+        # permits multiple NULLs in this unique index.
+        _add_column(conn, "channel_messages", "spine_seq", "INTEGER")
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS ux_channel_spine "
+            "ON channel_messages(channel, spine_seq)"
+        )
         # A grown tool that rotted is retired, not erased: the source stays,
         # the date and the reason are recorded, and revive undoes it.
         _add_column(conn, "tools", "tombstoned_at", "TEXT NOT NULL DEFAULT ''")
@@ -1949,6 +1957,33 @@ def channel_tail(
                 WHERE workspace_id = ? AND channel = ?
                 ORDER BY id DESC LIMIT ?
             ) ORDER BY id
+            """,
+            (workspace, channel or "conflicts", max(1, min(int(limit), 200))),
+        ).fetchall()
+        return [dict(row) for row in rows]
+    finally:
+        db.close()
+
+
+def ordered_read(
+    world: World, channel: str = "conflicts", limit: int = 50
+) -> list[dict[str, Any]]:
+    """Read a channel in spine order, with local/unacked rows last."""
+    if not world.persist:
+        return []
+    announce(world)
+    db = _open(state_file(world))
+    try:
+        workspace = _workspace_id(db, world, create=False)
+        if workspace is None:
+            return []
+        rows = db.execute(
+            """
+            SELECT id, channel, run_id, author, body, created_at, spine_seq
+            FROM channel_messages
+            WHERE workspace_id = ? AND channel = ?
+            ORDER BY spine_seq NULLS LAST, id
+            LIMIT ?
             """,
             (workspace, channel or "conflicts", max(1, min(int(limit), 200))),
         ).fetchall()
