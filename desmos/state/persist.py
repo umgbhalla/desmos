@@ -1820,6 +1820,19 @@ def channel_post(
                 ),
             )
             message_id = int(cur.lastrowid)
+            # Same-transaction outbox row: the post replicates to the spine
+            # or the whole insert never happened. Imported here because
+            # outbox imports this module.
+            from desmos.state import outbox as _outbox
+
+            _outbox.enqueue_conn(db, workspace, "channel_post", {
+                "id": message_id,
+                "channel": channel or "conflicts",
+                "run_id": run,
+                "author": author.strip() or run,
+                "body": text,
+                "created_at": now,
+            })
     finally:
         db.close()
     return {

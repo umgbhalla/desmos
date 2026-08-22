@@ -130,12 +130,14 @@ export class Spine extends DurableObject<Env> {
         channel: msg.channel,
         seq: result.seq,
         author: msg.author,
+        seat: msg.seat,
+        fingerprint: msg.fingerprint,
         body: msg.body,
         ts: result.ts,
       });
       for (const socket of this.ctx.getWebSockets()) {
         const attachment = socket.deserializeAttachment() as Attachment | null;
-        if (attachment?.channels.includes(msg.channel)) {
+        if (attachment?.channels.includes(msg.channel) || attachment?.channels.includes("*")) {
           try { socket.send(event); } catch { /* stale socket */ }
         }
       }
