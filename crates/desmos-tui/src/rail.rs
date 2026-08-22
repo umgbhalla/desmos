@@ -33,6 +33,7 @@ pub(crate) enum Target {
     Root,
     Child(String),
     Background,
+    Channel(String),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -99,6 +100,19 @@ pub(crate) fn rows(app: &App) -> Vec<Row> {
         label,
         presence: Presence::Running,
     }));
+    rows.extend(app.channels.iter().map(|channel| Row {
+        target: Target::Channel(channel.channel.clone()),
+        label: if channel.unread > 0 {
+            format!("#{}  {}", channel.channel, channel.unread)
+        } else {
+            format!("#{}", channel.channel)
+        },
+        presence: if channel.unread > 0 {
+            Presence::FinishedUnseen
+        } else {
+            Presence::FinishedSeen
+        },
+    }));
     rows
 }
 
@@ -118,6 +132,9 @@ pub(crate) fn activate(app: &mut App) {
             app.focus = Focus::Story;
         }
         Target::Background => {}
+        Target::Channel(channel) => {
+            app.pending_channel_read = Some(channel);
+        }
     }
 }
 

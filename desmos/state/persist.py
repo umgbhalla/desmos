@@ -1862,6 +1862,88 @@ def channel_read(
         db.close()
 
 
+def channel_list(world: World) -> list[dict[str, Any]]:
+    """Channels in this workspace with this run's durable unread cursor."""
+    if not world.persist:
+        return []
+    announce(world)
+    db = _open(state_file(world))
+    run = run_id()
+    try:
+        workspace = _workspace_id(db, world, create=False)
+        if workspace is None:
+            return []
+        rows = db.execute(
+            """
+            SELECT m.channel,
+                   COALESCE(c.last_seen, 0) AS last_seen,
+                   MAX(m.id) AS max_id,
+                   SUM(CASE WHEN m.id > COALESCE(c.last_seen, 0)
+                            AND m.run_id != ? THEN 1 ELSE 0 END) AS unread,
+                   (SELECT x.body FROM channel_messages x
+                    WHERE x.workspace_id = m.workspace_id
+                      AND x.channel = m.channel
+                    ORDER BY x.id DESC LIMIT 1) AS preview,
+                   (SELECT x.author FROM channel_messages x
+                    WHERE x.workspace_id = m.workspace_id
+                      AND x.channel = m.channel
+                    ORDER BY x.id DESC LIMIT 1) AS author,
+                   (SELECT x.created_at FROM channel_messages x
+                    WHERE x.workspace_id = m.workspace_id
+                      AND x.channel = m.channel
+                    ORDER BY x.id DESC LIMIT 1) AS ts
+            FROM channel_messages m
+            LEFT JOIN channel_cursors c
+              ON c.run_id = ? AND c.channel = m.channel
+            WHERE m.workspace_id = ?
+            GROUP BY m.channel, c.last_seen
+            ORDER BY max_id DESC
+            """,
+            (run, run, workspace),
+        ).fetchall()
+        entries = [dict(row) for row in rows]
+        for entry in entries:
+            preview = " ".join(str(entry["preview"] or "").split())
+            entry["preview"] = (
+                preview if len(preview) <= 120
+                else preview[:119].rstrip() + "…"
+            )
+            entry["unread"] = int(entry["unread"] or 0)
+            entry["last_seen"] = int(entry["last_seen"] or 0)
+            entry["max_id"] = int(entry["max_id"] or 0)
+        return entries
+    finally:
+        db.close()
+
+
+def channel_tail(
+    world: World, channel: str = "conflicts", limit: int = 50
+) -> list[dict[str, Any]]:
+    """Newest channel messages, returned in chronological order."""
+    if not world.persist:
+        return []
+    announce(world)
+    db = _open(state_file(world))
+    try:
+        workspace = _workspace_id(db, world, create=False)
+        if workspace is None:
+            return []
+        rows = db.execute(
+            """
+            SELECT * FROM (
+                SELECT id, channel, run_id, author, body, created_at
+                FROM channel_messages
+                WHERE workspace_id = ? AND channel = ?
+                ORDER BY id DESC LIMIT ?
+            ) ORDER BY id
+            """,
+            (workspace, channel or "conflicts", max(1, min(int(limit), 200))),
+        ).fetchall()
+        return [dict(row) for row in rows]
+    finally:
+        db.close()
+
+
 def channel_inbox(
     world: World, channel: str = "conflicts", limit: int = 20
 ) -> dict[str, Any]:

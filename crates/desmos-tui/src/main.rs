@@ -1065,10 +1065,10 @@ fn seed_spawn(app: &mut App) {
     app.sess
         .story
         .push_block(RenderBlock::Subagent(SubagentBlock::completed(
-        task,
-        id,
-        Duration::from_secs(4),
-    )));
+            task,
+            id,
+            Duration::from_secs(4),
+        )));
 }
 
 fn main() -> io::Result<()> {
@@ -1098,6 +1098,9 @@ fn main() -> io::Result<()> {
         seed_demo(&mut app);
     }
     wait_ready(bridge.as_mut(), &mut app)?;
+    if attached && let Some(b) = bridge.as_mut() {
+        b.send(&json!({"op": "channels"}))?;
+    }
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -1242,6 +1245,14 @@ fn run(
         if died {
             // Drop the dead handle, or the next pass re-notifies every 80ms.
             bridge = None;
+        }
+
+        if let Some(channel) = app.pending_channel_read.take()
+            && let Some(b) = bridge.as_mut()
+        {
+            b.send(&json!({"op": "channel_read", "channel": channel}))?;
+            dirty = true;
+            last_activity = Instant::now();
         }
 
         if app.drain_after && !app.running {
@@ -1610,91 +1621,91 @@ fn submit_prompt_inner(
         // acknowledgement back when nothing drew app.status; the notice on the
         // composer's edge is that acknowledgement now, and it lapses, which is
         // the right lifetime for "theme changed".
-    if let Some(name) = line.strip_prefix("/theme") {
-        let name = name.trim();
-        if name.is_empty() {
-            app.notify(format!("theme {}", Theme::current_kind().display_name()));
-        } else if let Some(kind) = ThemeKind::from_name(name) {
-            let kind = if kind.is_auto() {
-                theme_cache::resolve_initial_theme()
+        if let Some(name) = line.strip_prefix("/theme") {
+            let name = name.trim();
+            if name.is_empty() {
+                app.notify(format!("theme {}", Theme::current_kind().display_name()));
+            } else if let Some(kind) = ThemeKind::from_name(name) {
+                let kind = if kind.is_auto() {
+                    theme_cache::resolve_initial_theme()
+                } else {
+                    kind
+                };
+                theme_cache::set(kind);
+                app.apply_grok_settings();
+                app.notify(format!("theme {}", kind.display_name()));
             } else {
-                kind
-            };
-            theme_cache::set(kind);
+                app.notify("theme: groknight tokyonight grokday rosepine oscura auto");
+            }
+        } else if line == "/timestamps" {
+            let on = !appearance_cache::load_timestamps();
+            appearance_cache::set_timestamps(on);
             app.apply_grok_settings();
-            app.notify(format!("theme {}", kind.display_name()));
-        } else {
-            app.notify("theme: groknight tokyonight grokday rosepine oscura auto");
-        }
-    } else if line == "/timestamps" {
-        let on = !appearance_cache::load_timestamps();
-        appearance_cache::set_timestamps(on);
-        app.apply_grok_settings();
             app.notify(if on {
                 "timestamps on"
             } else {
                 "timestamps off"
             });
-    } else if line == "/compact" || line == "/dense" {
-        // `/compact` reads like "fold the transcript" and does not — folding is
-        // the server's, on its own trigger, and there is no client verb for it.
-        // This only changes row spacing. `/dense` says that; the old name stays
-        // so muscle memory does not hit an unknown command.
-        let on = !appearance_cache::load();
-        appearance_cache::set(on);
-        app.apply_grok_settings();
-        app.notify(if on {
-            "dense rows on (this is spacing, not transcript folding)"
-        } else {
-            "dense rows off"
-        });
-    } else if let Some(rest) = line.strip_prefix("/model") {
-        // The bridge op has always existed; nothing typed to it. The picker is
-        // still the discoverable path -- this is for people who already know
-        // what they want.
-        let want = rest.trim();
-        if want.is_empty() {
-            let (m, e) = (app.model.clone(), app.thinking.clone());
-            app.picker.open_for_change(&m, &e);
-        } else if let Some(b) = bridge.as_mut() {
-            b.send(&json!({"op": "model", "model": want, "effort": app.thinking}))?;
-            app.notify(format!("model {want}"));
-        }
-    } else if let Some(level) = line.strip_prefix("/thinking") {
-        let level = level.trim();
-        if !level.is_empty() {
-            if let Some(b) = bridge.as_mut() {
-                b.send(&json!({"op":"thinking","level": level}))?;
+        } else if line == "/compact" || line == "/dense" {
+            // `/compact` reads like "fold the transcript" and does not — folding is
+            // the server's, on its own trigger, and there is no client verb for it.
+            // This only changes row spacing. `/dense` says that; the old name stays
+            // so muscle memory does not hit an unknown command.
+            let on = !appearance_cache::load();
+            appearance_cache::set(on);
+            app.apply_grok_settings();
+            app.notify(if on {
+                "dense rows on (this is spacing, not transcript folding)"
+            } else {
+                "dense rows off"
+            });
+        } else if let Some(rest) = line.strip_prefix("/model") {
+            // The bridge op has always existed; nothing typed to it. The picker is
+            // still the discoverable path -- this is for people who already know
+            // what they want.
+            let want = rest.trim();
+            if want.is_empty() {
+                let (m, e) = (app.model.clone(), app.thinking.clone());
+                app.picker.open_for_change(&m, &e);
+            } else if let Some(b) = bridge.as_mut() {
+                b.send(&json!({"op": "model", "model": want, "effort": app.thinking}))?;
+                app.notify(format!("model {want}"));
             }
-            app.thinking = level.into();
-            app.notify(format!("thinking {level}"));
+        } else if let Some(level) = line.strip_prefix("/thinking") {
+            let level = level.trim();
+            if !level.is_empty() {
+                if let Some(b) = bridge.as_mut() {
+                    b.send(&json!({"op":"thinking","level": level}))?;
+                }
+                app.thinking = level.into();
+                app.notify(format!("thinking {level}"));
+            }
+        } else if line == "/reset" {
+            if let Some(b) = bridge.as_mut() {
+                b.send(&json!({"op":"reset"}))?;
+            }
+            app.sess.story.clear();
+            app.sess.calls.clear();
+            app.sess.posts.clear();
+            app.sess.wire_manual.clear();
+            app.post_in.clear();
+            app.post_out.clear();
+            app.post_req = json!({});
+            app.post_resp = json!({});
+            app.post_inspect = None;
+            app.post_n = 0;
+            app.post_out_n = 0;
+            app.queue.clear();
+            app.pending_steers.clear();
+            app.queue_edit = None;
+            app.send_now = false;
+            app.notify("transcript cleared");
+        } else if line == "/reload" {
+            if let Some(b) = bridge.as_mut() {
+                b.send(&json!({"op":"reload"}))?;
+            }
+            app.notify("reloading skills and extensions");
         }
-    } else if line == "/reset" {
-        if let Some(b) = bridge.as_mut() {
-            b.send(&json!({"op":"reset"}))?;
-        }
-        app.sess.story.clear();
-        app.sess.calls.clear();
-        app.sess.posts.clear();
-        app.sess.wire_manual.clear();
-        app.post_in.clear();
-        app.post_out.clear();
-        app.post_req = json!({});
-        app.post_resp = json!({});
-        app.post_inspect = None;
-        app.post_n = 0;
-        app.post_out_n = 0;
-        app.queue.clear();
-        app.pending_steers.clear();
-        app.queue_edit = None;
-        app.send_now = false;
-        app.notify("transcript cleared");
-    } else if line == "/reload" {
-        if let Some(b) = bridge.as_mut() {
-            b.send(&json!({"op":"reload"}))?;
-        }
-        app.notify("reloading skills and extensions");
-    }
         return Ok(false);
     }
     if app.running && !force_step {
@@ -1961,7 +1972,7 @@ fn poll_wait(app: &App, recent_activity: bool) -> Duration {
     let short = recent_activity
         || app.notice.is_some()          // lapse on time, not up to 1s late
         || app.file_picker.is_open()     // scan results stream in
-        || app.git.busy();               // a read is in flight
+        || app.git.busy(); // a read is in flight
     if short { SHORT_WAIT } else { IDLE_WAIT }
 }
 
@@ -2257,7 +2268,10 @@ fn pane_keys(focus: Focus) -> (&'static str, &'static [(&'static str, &'static s
     match focus {
         Focus::Rail => (
             "sessions",
-            &[("j k", "select a session"), ("enter", "open selected session")],
+            &[
+                ("j k", "select a session"),
+                ("enter", "open selected session"),
+            ],
         ),
         Focus::Story | Focus::Calls => (
             "story / Activity",
@@ -2734,7 +2748,10 @@ mod tests {
         assert_eq!(attach, json!({"op": "attach", "since": 0}));
         let ev = bridge.rx.recv_timeout(Duration::from_secs(5)).unwrap();
         assert_eq!(ev.get("seq").and_then(Value::as_u64), Some(7));
-        assert!(bridge.child.is_none(), "a connected bridge must own no child");
+        assert!(
+            bridge.child.is_none(),
+            "a connected bridge must own no child"
+        );
         assert!(
             bridge.is_connected(),
             "a connected bridge must report is_connected"
@@ -2764,7 +2781,10 @@ mod tests {
         if !attached {
             app.session_picker = session::SessionPicker::discover(&std::env::temp_dir());
         }
-        assert!(!app.session_picker.open, "picker must stay closed on attach");
+        assert!(
+            !app.session_picker.open,
+            "picker must stay closed on attach"
+        );
         drop(bridge);
         let _ = std::fs::remove_file(&sock);
 
@@ -3323,8 +3343,8 @@ mod tests {
         let row = |app: &App| {
             (0..app.sess.story.len()).find_map(|i| {
                 match app.sess.story.entry(i).map(|e| &e.block) {
-                Some(RenderBlock::System(b)) => Some(b.text.clone()),
-                _ => None,
+                    Some(RenderBlock::System(b)) => Some(b.text.clone()),
+                    _ => None,
                 }
             })
         };
@@ -3507,8 +3527,8 @@ mod tests {
         let idx = (0..app.sess.story.len())
             .find(|i| {
                 matches!(
-                app.sess.story.entry(*i).map(|entry| &entry.block),
-                Some(RenderBlock::System(_))
+                    app.sess.story.entry(*i).map(|entry| &entry.block),
+                    Some(RenderBlock::System(_))
                 )
             })
             .expect("work summary row");
@@ -3516,12 +3536,12 @@ mod tests {
         let area = app.traj_area;
         let point = (area.y..area.bottom())
             .find_map(|row| {
-            (area.x..area.right()).find_map(|col| {
-                let block = app.sess.story_sel.hit_test_visible_block(col, row)?;
-                (block.entry_idx == idx
-                    && app.sess.story_sel.hit_test_text_exact(col, row).is_none())
+                (area.x..area.right()).find_map(|col| {
+                    let block = app.sess.story_sel.hit_test_visible_block(col, row)?;
+                    (block.entry_idx == idx
+                        && app.sess.story_sel.hit_test_text_exact(col, row).is_none())
                     .then_some((col, row))
-            })
+                })
             })
             .expect("summary block has no clickable non-text cell");
 
@@ -3561,10 +3581,10 @@ mod tests {
         let kinds: Vec<&str> = (0..app.sess.story.len())
             .filter_map(|i| {
                 app.sess.story.entry(i).map(|e| match &e.block {
-                RenderBlock::Thinking(_) => "Thinking",
-                RenderBlock::System(_) => "System",
-                RenderBlock::AgentMessage(_) => "AgentMessage",
-                _ => "other",
+                    RenderBlock::Thinking(_) => "Thinking",
+                    RenderBlock::System(_) => "System",
+                    RenderBlock::AgentMessage(_) => "AgentMessage",
+                    _ => "other",
                 })
             })
             .collect();
@@ -3849,8 +3869,8 @@ mod tests {
         }
         let row = (0..app.sess.story.len()).find_map(|i| {
             match app.sess.story.entry(i).map(|e| &e.block) {
-            Some(RenderBlock::System(b)) => Some(b.text.clone()),
-            _ => None,
+                Some(RenderBlock::System(b)) => Some(b.text.clone()),
+                _ => None,
             }
         });
         assert!(row.is_none(), "edits created a Story work row: {row:?}");
@@ -4116,8 +4136,18 @@ mod tests {
             Ok(b) => b,
             Err(_) => return,
         };
-        bridge.child.as_mut().expect("loopback spawns").kill().unwrap();
-        bridge.child.as_mut().expect("loopback spawns").wait().unwrap();
+        bridge
+            .child
+            .as_mut()
+            .expect("loopback spawns")
+            .kill()
+            .unwrap();
+        bridge
+            .child
+            .as_mut()
+            .expect("loopback spawns")
+            .wait()
+            .unwrap();
 
         let err = wait_ready(Some(&mut bridge), &mut app).expect_err("dead bridge launched TUI");
         assert_eq!(err.kind(), io::ErrorKind::BrokenPipe);
@@ -4149,10 +4179,7 @@ mod tests {
             json!({"ev": "notice", "text": "steer queued"}),
         );
         assert_eq!(running.sess.story.len(), 0, "queue ack is not a Story turn");
-        handle_event(
-            &mut running,
-            json!({"ev": "steer", "text": "go left"}),
-        );
+        handle_event(&mut running, json!({"ev": "steer", "text": "go left"}));
         assert!(running.pending_steers.is_empty());
         let delivered = paint(&mut running, 120, 34);
         assert!(!delivered.contains("Steer pending"), "{delivered}");
@@ -4228,10 +4255,7 @@ mod tests {
             .recv_timeout(std::time::Duration::from_secs(5))
             .expect("decision answer did not reach the bridge");
         assert_eq!(sent["op"], "step");
-        assert_eq!(
-            sent["text"],
-            "decide:decision-123456 — Deploy now?: ship"
-        );
+        assert_eq!(sent["text"], "decide:decision-123456 — Deploy now?: ship");
         assert!(app.prompt.to_send().is_empty());
 
         handle_event(
@@ -4318,8 +4342,8 @@ mod tests {
         let prompt_idx = (0..app.sess.story.len())
             .find(|index| {
                 matches!(
-                app.sess.story.entry(*index).map(|entry| &entry.block),
-                Some(RenderBlock::UserPrompt(_))
+                    app.sess.story.entry(*index).map(|entry| &entry.block),
+                    Some(RenderBlock::UserPrompt(_))
                 )
             })
             .unwrap();
@@ -6055,7 +6079,10 @@ mod tests {
         // The bridge could not perform the switch: no snapshot or post will
         // ever name gpt-5.6-sol, so this event is the only thing that can
         // retire the badge.
-        handle_event(&mut app, json!({"ev": "model_rejected", "model": "gpt-5.6-sol"}));
+        handle_event(
+            &mut app,
+            json!({"ev": "model_rejected", "model": "gpt-5.6-sol"}),
+        );
         assert!(
             app.model_pending.is_none(),
             "a refused switch must not stay queued forever"
@@ -6540,7 +6567,7 @@ mod tests {
             &mut pasted_command,
             KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
         )
-            .unwrap();
+        .unwrap();
         assert_ne!(
             pasted_command.status, "transcript cleared",
             "a pasted /reset executed as a local command"
@@ -6555,7 +6582,7 @@ mod tests {
             &mut typed_command,
             KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
         )
-            .unwrap();
+        .unwrap();
         assert_eq!(typed_command.status, "transcript cleared");
 
         let png = png_file("paste-slash");
@@ -9101,4 +9128,3 @@ mod tests {
         );
     }
 }
-

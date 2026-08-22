@@ -449,6 +449,60 @@ pub(crate) fn handle_event(app: &mut App, ev: Value) {
                 app.status = "idle".into();
             }
         }
+        "channels" => {
+            app.channels = ev
+                .get("channels")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|row| {
+                    Some(crate::ChannelRow {
+                        channel: row.get("channel")?.as_str()?.to_string(),
+                        unread: row.get("unread").and_then(Value::as_u64).unwrap_or(0),
+                        last_seen: row.get("last_seen").and_then(Value::as_u64).unwrap_or(0),
+                        max_id: row.get("max_id").and_then(Value::as_u64).unwrap_or(0),
+                        preview: row
+                            .get("preview")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string(),
+                        author: row
+                            .get("author")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string(),
+                        ts: row
+                            .get("ts")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string(),
+                    })
+                })
+                .collect();
+        }
+        "channel_story" => {
+            let channel = ev
+                .get("channel")
+                .and_then(Value::as_str)
+                .unwrap_or("conflicts");
+            if let Some(row) = app.channels.iter_mut().find(|row| row.channel == channel) {
+                row.unread = 0;
+                row.last_seen = row.max_id;
+            }
+            let mut text = format!("#{channel}");
+            if let Some(messages) = ev.get("messages").and_then(Value::as_array) {
+                for message in messages {
+                    let author = message
+                        .get("author")
+                        .and_then(Value::as_str)
+                        .unwrap_or("peer");
+                    let body = message.get("body").and_then(Value::as_str).unwrap_or("");
+                    text.push_str(&format!("\n\n{author}: {body}"));
+                }
+            }
+            app.story_push(RenderBlock::system(text));
+            app.focus = crate::Focus::Story;
+        }
         "subagent" => handle_subagent(app, &ev),
         "child" => handle_child(app, &ev),
         "thinking" => {
@@ -773,9 +827,9 @@ pub(crate) fn apply_result(calls: &mut ScrollbackState, exec: &mut ExecStream, e
                                 let formatted = format_result(text);
                                 if formatted != text
                                     || block.output.as_ref().is_none_or(|s| s.is_empty())
-                            {
+                                {
                                     block.output = Some(formatted);
-                            }
+                                }
                             }
                             if looks_failed(operation, text) {
                                 block.set_error(Some(
@@ -889,6 +943,34 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn channels_event_populates_channel_rows_and_unread() {
+        let mut app = App::new();
+        handle_event(
+            &mut app,
+            json!({
+                "ev": "channels",
+                "channels": [
+                    {
+                        "channel": "conflicts", "unread": 3,
+                        "last_seen": 4, "max_id": 9,
+                        "preview": "merge conflict", "author": "peer",
+                        "ts": "2026-08-22T00:00:00+00:00"
+                    },
+                    {
+                        "channel": "release", "unread": 0,
+                        "last_seen": 7, "max_id": 7,
+                        "preview": "shipped", "author": "peer",
+                        "ts": "2026-08-22T00:01:00+00:00"
+                    }
+                ]
+            }),
+        );
+
+        assert_eq!(app.channels.len(), 2);
+        assert_eq!(app.channels[0].unread, 3);
+    }
+
     /// Every block in one pane as text, so containment can be asserted
     /// without touching a renderer: the markdown export carries prose
     /// (`copy_text`), the Debug form carries tool-call fields (command,
@@ -898,9 +980,8 @@ mod tests {
             .filter_map(|i| pane.entry(i))
             .map(|e| &e.block)
             .collect();
-        let md = xai_grok_pager::scrollback::export::render_blocks_to_markdown(
-            blocks.iter().copied(),
-        );
+        let md =
+            xai_grok_pager::scrollback::export::render_blocks_to_markdown(blocks.iter().copied());
         let dbg: String = blocks.iter().map(|b| format!("{b:?}\n")).collect();
         format!("{md}\n{dbg}")
     }
@@ -966,15 +1047,30 @@ mod tests {
         assert!(a_story.contains("alpha-speaks-here"), "A story: {a_story}");
         assert!(a_calls.contains("alpha-command-body"), "A calls: {a_calls}");
         assert!(a_calls.contains("alpha-call-output"), "A calls: {a_calls}");
-        assert!(!a_story.contains("beta-speaks-here"), "B leaked into A story: {a_story}");
-        assert!(!a_calls.contains("beta-call-output"), "B leaked into A calls: {a_calls}");
+        assert!(
+            !a_story.contains("beta-speaks-here"),
+            "B leaked into A story: {a_story}"
+        );
+        assert!(
+            !a_calls.contains("beta-call-output"),
+            "B leaked into A calls: {a_calls}"
+        );
 
         // B's panes hold B's text and none of A's.
         assert!(b_story.contains("beta-speaks-here"), "B story: {b_story}");
         assert!(b_calls.contains("beta-call-output"), "B calls: {b_calls}");
-        assert!(!b_story.contains("alpha-speaks-here"), "A leaked into B story: {b_story}");
-        assert!(!b_calls.contains("alpha-command-body"), "A leaked into B calls: {b_calls}");
-        assert!(!b_calls.contains("alpha-call-output"), "A leaked into B calls: {b_calls}");
+        assert!(
+            !b_story.contains("alpha-speaks-here"),
+            "A leaked into B story: {b_story}"
+        );
+        assert!(
+            !b_calls.contains("alpha-command-body"),
+            "A leaked into B calls: {b_calls}"
+        );
+        assert!(
+            !b_calls.contains("alpha-call-output"),
+            "A leaked into B calls: {b_calls}"
+        );
 
         // Neither child's speech or output leaked into the root story. The
         // root keeps only the spawn cards (task titles), never child panes.
@@ -984,7 +1080,10 @@ mod tests {
             "alpha-call-output",
             "beta-call-output",
         ] {
-            assert!(!root_story.contains(token), "{token} leaked into root: {root_story}");
+            assert!(
+                !root_story.contains(token),
+                "{token} leaked into root: {root_story}"
+            );
         }
 
         // Forward-compat: an event stamped with an unknown extra field `sid`
@@ -1002,9 +1101,15 @@ mod tests {
                     "sid": "beta"}),
         );
         let b_story = dump(&app.children["beta"].sess.story);
-        assert!(b_story.contains("beta-second-line"), "sid-stamped speech lost: {b_story}");
+        assert!(
+            b_story.contains("beta-second-line"),
+            "sid-stamped speech lost: {b_story}"
+        );
         let a_story = dump(&app.children["alpha"].sess.story);
-        assert!(!a_story.contains("beta-second-line"), "sid-stamped speech cross-painted: {a_story}");
+        assert!(
+            !a_story.contains("beta-second-line"),
+            "sid-stamped speech cross-painted: {a_story}"
+        );
         assert_eq!(app.children.len(), 2, "sid must not mint a new child");
     }
 }

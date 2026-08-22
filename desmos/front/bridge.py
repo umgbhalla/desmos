@@ -450,6 +450,47 @@ def _serve_client(
                 except OSError:
                     return
                 continue
+            if op == "channels":
+                from desmos.state.persist import channel_list
+                try:
+                    entries = channel_list(world)
+                except Exception as exc:  # noqa: BLE001 -- name it, don't die
+                    reply = {"ev": "error", "text": f"channels failed: {exc}"}
+                else:
+                    reply = {"ev": "channels", "channels": entries}
+                reply["sid"] = os.environ.get("DESMOS_SESSION_ID", "")
+                line = json.dumps(reply, default=str) + "\n"
+                try:
+                    wire.push(line.encode("utf-8"))
+                except OSError:
+                    return
+                continue
+            if op == "channel_read":
+                from desmos.state.persist import (
+                    channel_dismiss,
+                    channel_tail,
+                )
+                channel = str(msg.get("channel") or "conflicts")
+                try:
+                    messages = channel_tail(world, channel=channel, limit=50)
+                    through = max(
+                        (int(item["id"]) for item in messages), default=0
+                    )
+                    channel_dismiss(world, channel=channel, through=through)
+                    reply = {
+                        "ev": "channel_story",
+                        "channel": channel,
+                        "messages": messages,
+                    }
+                except Exception as exc:  # noqa: BLE001 -- name it, don't die
+                    reply = {"ev": "error", "text": f"channel read failed: {exc}"}
+                reply["sid"] = os.environ.get("DESMOS_SESSION_ID", "")
+                line = json.dumps(reply, default=str) + "\n"
+                try:
+                    wire.push(line.encode("utf-8"))
+                except OSError:
+                    return
+                continue
             if op == "quit":
                 # A socket quit detaches this client only; the bridge (and
                 # any other attached client) keeps running. Taking the whole
@@ -606,6 +647,7 @@ def _watch_channel(
     from desmos.state.persist import (
         channel_dismiss,
         channel_inbox,
+        channel_list,
         peer_channel,
         run_id,
     )
@@ -614,12 +656,14 @@ def _watch_channel(
     last_peer = {"request": 0, "reply": 0}
     while not stop.wait(0.25):
         try:
+            activity = False
             info = channel_inbox(world, limit=50)
             fresh = [
                 message for message in info["messages"]
                 if int(message["id"]) > last_emitted
             ]
             if fresh:
+                activity = True
                 last_emitted = max(int(message["id"]) for message in fresh)
                 latest = fresh[-1]
                 preview = " ".join(str(latest["body"]).split())
@@ -683,6 +727,9 @@ def _watch_channel(
                     # Queue first, then commit the durable cursor. A failure can
                     # duplicate one exchange after restart, but cannot lose it.
                     channel_dismiss(world, channel=channel, through=message_id)
+                    activity = True
+            if activity:
+                _emit({"ev": "channels", "channels": channel_list(world)})
         except Exception:  # noqa: BLE001 -- peer activity must not kill the bridge
             continue
 

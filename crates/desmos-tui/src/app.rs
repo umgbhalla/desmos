@@ -5,17 +5,15 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::time::Instant;
 
+use crate::input::Media;
 use ratatui::layout::Rect;
 use serde_json::{Value, json};
 use xai_grok_pager::appearance::{self, cache as appearance_cache};
-use xai_grok_pager::theme::ThemeKind;
-use crate::input::Media;
 use xai_grok_pager::scrollback::text_selection::{
     ActiveTextDrag, PendingTextDrag, PersistentTextSelection, RangeHit, ResolvedSelectionModel,
 };
-use xai_grok_pager::scrollback::{
-    EntryId, RenderBlock, ScratchBuffer, ScrollbackState,
-};
+use xai_grok_pager::scrollback::{EntryId, RenderBlock, ScratchBuffer, ScrollbackState};
+use xai_grok_pager::theme::ThemeKind;
 use xai_grok_pager::theme::cache as theme_cache;
 use xai_grok_pager::views::block_viewer::BlockViewerPane;
 
@@ -23,9 +21,8 @@ use crate::json_tree::JsonTree;
 use crate::prompt::PromptBuf;
 use crate::queue::QueryQueue;
 use crate::{
-    CacheMeter, ExecStream, NOTICE_TTL, PostInspect, PostRows, StreamCursor, ViewerSrc,
-    fuzzy, grok_appearance, initial_theme, picker, session, side, slash, viewer_for_entry,
-    wire_push,
+    CacheMeter, ExecStream, NOTICE_TTL, PostInspect, PostRows, StreamCursor, ViewerSrc, fuzzy,
+    grok_appearance, initial_theme, picker, session, side, slash, viewer_for_entry, wire_push,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -327,7 +324,11 @@ impl Sess {
 
     /// This session's story or wire scrollback, by the caller's pane bool.
     pub(crate) fn scroll(&mut self, calls: bool) -> &mut ScrollbackState {
-        if calls { &mut self.calls } else { &mut self.story }
+        if calls {
+            &mut self.calls
+        } else {
+            &mut self.story
+        }
     }
 
     pub(crate) fn text(&mut self, calls: bool) -> &mut TextSel {
@@ -339,7 +340,11 @@ impl Sess {
     }
 
     pub(crate) fn sel(&self, calls: bool) -> &ResolvedSelectionModel {
-        if calls { &self.calls_sel } else { &self.story_sel }
+        if calls {
+            &self.calls_sel
+        } else {
+            &self.story_sel
+        }
     }
 }
 
@@ -420,6 +425,17 @@ pub(crate) struct Decision {
     pub(crate) status: DecisionStatus,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ChannelRow {
+    pub(crate) channel: String,
+    pub(crate) unread: u64,
+    pub(crate) last_seen: u64,
+    pub(crate) max_id: u64,
+    pub(crate) preview: String,
+    pub(crate) author: String,
+    pub(crate) ts: String,
+}
+
 pub(crate) struct App {
     pub(crate) prompt: PromptBuf,
     pub(crate) model: String,
@@ -433,6 +449,8 @@ pub(crate) struct App {
     /// sleeper, any submitted task. Non-empty means the session will resume
     /// itself when one lands, which is the one thing polling gets wrong.
     pub(crate) background: Vec<String>,
+    pub(crate) channels: Vec<ChannelRow>,
+    pub(crate) pending_channel_read: Option<String>,
     /// Bridge-owned decisions waiting for a one-key human answer, oldest first.
     pub(crate) decisions: Vec<Decision>,
     /// Slash completion for the composer. Recomputed on every keystroke that
@@ -556,6 +574,8 @@ impl App {
             thinking: String::new(),
             model_pending: None,
             background: Vec::new(),
+            channels: Vec::new(),
+            pending_channel_read: None,
             decisions: Vec::new(),
             slash: slash::Slash::default(),
             slash_paste_guard: false,
@@ -862,7 +882,11 @@ impl App {
     /// hit-test compute the same number instead of sharing a cached one.
     pub(crate) fn tree_skip(&self) -> usize {
         let h = self.call_area.height.saturating_sub(2) as usize;
-        if h == 0 { 0 } else { self.tree_sel.saturating_sub(h - 1) }
+        if h == 0 {
+            0
+        } else {
+            self.tree_sel.saturating_sub(h - 1)
+        }
     }
 
     pub(crate) fn focused_scroll(&mut self) -> &mut ScrollbackState {
