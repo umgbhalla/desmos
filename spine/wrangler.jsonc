@@ -1,0 +1,22 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "desmos-spine",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-03-17",
+  "account_id": "54a86ffba6a98141d2b1b4a1035334ed",
+  "durable_objects": {
+    "bindings": [
+      { "name": "SPINE", "class_name": "Spine" }
+    ]
+  },
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["Spine"] }
+  ],
+  "d1_databases": [
+    {
+      "binding": "ARCHIVE",
+      "database_name": "desmos-spine",
+      "database_id": "25a43445-439a-4a65-a394-545fe2103568"
+    }
+  ]
+}
