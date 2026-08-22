@@ -30,6 +30,23 @@ def url() -> str:
     return os.environ.get("DESMOS_SPINE_URL", DEFAULT_URL).strip()
 
 
+def token(world: World | None = None) -> str:
+    """The shared spine secret: env first, then the workspace .env file."""
+    got = os.environ.get("DESMOS_SPINE_TOKEN", "").strip()
+    if got:
+        return got
+    root = world.cwd if world is not None else None
+    for base in filter(None, [root, os.getcwd()]):
+        try:
+            for line in open(os.path.join(str(base), ".env")):
+                key, _, value = line.strip().partition("=")
+                if key == "DESMOS_SPINE_TOKEN" and value:
+                    return value.strip()
+        except OSError:
+            continue
+    return ""
+
+
 def _ensure(db) -> None:
     db.execute(
         "CREATE TABLE IF NOT EXISTS spine_cursors("
@@ -109,7 +126,10 @@ def sync(world: World, timeout: float = RECV_TIMEOUT) -> dict[str, Any]:
     from websockets.sync.client import connect
 
     report: dict[str, Any] = {"ingested": 0, "sent": 0, "failed": 0, "error": ""}
-    with connect(url(), open_timeout=timeout, close_timeout=5) as ws:
+    headers = {"Authorization": f"Bearer {token(world)}"}
+    with connect(
+        url(), additional_headers=headers, open_timeout=timeout, close_timeout=5
+    ) as ws:
         ws.send(json.dumps({"op": "sub", "channels": ["*"]}))
         events: list[dict[str, Any]] = []
 

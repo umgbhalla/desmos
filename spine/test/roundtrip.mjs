@@ -4,6 +4,9 @@ const base = process.argv[2];
 if (!base) throw new Error("usage: node test/roundtrip.mjs https://worker-url");
 const wsUrl = new URL("/ws", base);
 wsUrl.protocol = wsUrl.protocol === "https:" ? "wss:" : "ws:";
+if (process.env.DESMOS_SPINE_TOKEN) {
+  wsUrl.searchParams.set("token", process.env.DESMOS_SPINE_TOKEN);
+}
 
 function client() {
   const ws = new WebSocket(wsUrl);

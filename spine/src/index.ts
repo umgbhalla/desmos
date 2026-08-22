@@ -3,7 +3,18 @@ import { DurableObject } from "cloudflare:workers";
 export interface Env {
   SPINE: DurableObjectNamespace<Spine>;
   ARCHIVE: D1Database;
+  SPINE_TOKEN: string;
 }
+
+/** Constant-time compare; length leak is fine, content leak is not. */
+const tokenOk = (given: string, want: string): boolean => {
+  if (!want || given.length !== want.length) return false;
+  let diff = 0;
+  for (let i = 0; i < want.length; i++) {
+    diff |= given.charCodeAt(i) ^ want.charCodeAt(i);
+  }
+  return diff === 0;
+};
 
 type Attachment = { channels: string[] };
 type Append = {
@@ -26,7 +37,14 @@ export default {
     const url = new URL(request.url);
     const stub = env.SPINE.get(env.SPINE.idFromName("spine"));
     if (url.pathname === "/health") return stub.fetch("https://spine/health");
-    if (url.pathname === "/ws") return stub.fetch(request);
+    if (url.pathname === "/ws") {
+      const bearer = (request.headers.get("authorization") ?? "").replace(/^Bearer\s+/i, "");
+      const given = bearer || url.searchParams.get("token") || "";
+      if (!tokenOk(given, env.SPINE_TOKEN ?? "")) {
+        return Promise.resolve(json({ error: "unauthorized" }, 401));
+      }
+      return stub.fetch(request);
+    }
     return Promise.resolve(json({ error: "not found" }, 404));
   },
 } satisfies ExportedHandler<Env>;
