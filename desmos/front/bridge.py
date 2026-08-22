@@ -808,6 +808,15 @@ def serve(cwd: Path) -> int:
     cancel = threading.Event()
     pause = threading.Event()
     channel_stop = threading.Event()
+    if os.environ.get("DESMOS_SPINE", "").strip() not in {"", "0", "off"}:
+        # The spine drainer is additive: offline it waits, it never blocks
+        # the bridge, and the outbox holds anything it has not shipped.
+        from desmos.front import spine as _spine
+
+        threading.Thread(
+            target=_spine.run_forever, args=(world,), daemon=True,
+            name="spine-drainer",
+        ).start()
     inbox: queue.Queue[dict[str, Any] | None] = queue.Queue()
     # The log first: ready and everything after it must be in the replay file.
     _open_log(world)

@@ -157,3 +157,19 @@ def sync(world: World, timeout: float = RECV_TIMEOUT) -> dict[str, Any]:
         report["sent"] = len(acked)
         report["ingested"] = ingest(world, events)
     return report
+
+
+def run_forever(world: World, interval: float = 5.0) -> None:
+    """Drain and ingest until the process dies; offline is a wait, not an error."""
+    import time
+
+    delay = interval
+    while True:
+        try:
+            report = sync(world)
+            delay = interval
+            if report["sent"] or report["ingested"]:
+                continue  # something moved; look again immediately
+        except Exception:
+            delay = min(delay * 2, 300.0)
+        time.sleep(delay)
