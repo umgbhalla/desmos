@@ -1,3 +1,4 @@
+import WebSocket from "ws";
 import assert from "node:assert/strict";
 const base = process.argv[2], admin = (process.env.DESMOS_SPINE_ADMIN_TOKEN ?? process.env.DESMOS_SPINE_TOKEN);
 if (!base || !admin) throw new Error("usage: DESMOS_SPINE_TOKEN=... node test/roundtrip.mjs https://worker-url");
@@ -15,8 +16,9 @@ async function mint(seat) {
 function client(token) {
   const url = new URL("/ws", base);
   url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
-  url.searchParams.set("token", token);
-  const ws = new WebSocket(url), queue = [], waiters = [];
+  const ws = new WebSocket(url, {
+    headers: { authorization: `Bearer ${token}` },
+  }), queue = [], waiters = [];
   ws.addEventListener("message", ({ data }) => {
     const msg = JSON.parse(data), waiter = waiters.shift();
     if (waiter) waiter(msg); else queue.push(msg);
@@ -41,6 +43,12 @@ console.log("PASS admin token on /ws returned 401");
 const stamp = `${Date.now()}-${crypto.randomUUID()}`;
 const seat = `roundtrip-${stamp}`, token = await mint(seat);
 console.log("PASS minted fresh seat with 64-hex token");
+const queryOnly = new URL("/ws", base);
+queryOnly.searchParams.set("token", token);
+const queryRejected = await fetch(queryOnly);
+assert.equal(queryRejected.status, 401);
+console.log("PASS query-string seat token returned 401");
+
 const listed = await adminFetch("/seats"), listing = await listed.json();
 assert.equal(listed.status, 200);
 const row = listing.seats.find((x) => x.seat === seat);
@@ -66,6 +74,15 @@ assert.deepEqual(events.map((x) => x.seq), [1, 2]);
 assert.deepEqual(events.map((x) => x.seat), [seat, seat]);
 console.log("PASS subscribed client received seqs 1,2 with server-stamped seat");
 console.log("PASS duplicate fingerprint acked seq 1 twice and emitted once");
+
+const otherChannel = `${channel}-other`;
+b.ws.send(JSON.stringify({
+  op: "append", channel: otherChannel, fingerprint: `${stamp}-1`,
+  author: "b", body: "same fingerprint, different channel",
+}));
+const otherAck = await b.next();
+assert.equal(otherAck.seq, 1);
+console.log("PASS same fingerprint on two channels received independent seqs");
 
 b.ws.send(JSON.stringify({ op: "snapshot" }));
 const snapshot = await b.next();

@@ -206,12 +206,19 @@ def sync(world: World, timeout: float = RECV_TIMEOUT) -> dict[str, Any]:
     return report
 
 
-def _local_max_seq(world: World, channel: str) -> int:
+def _local_contiguous_seq(world: World, channel: str) -> int:
+    """Largest k for which every channel sequence from 1 through k exists."""
     db = _open(state_file(world))
     try:
         row = db.execute(
-            "SELECT COALESCE(MAX(spine_seq), 0) AS seq"
-            " FROM channel_messages WHERE channel = ?",
+            "WITH ordered AS ("
+            " SELECT spine_seq,"
+            " ROW_NUMBER() OVER (ORDER BY spine_seq) AS expected"
+            " FROM (SELECT DISTINCT spine_seq FROM channel_messages"
+            " WHERE channel = ? AND spine_seq > 0)"
+            ") SELECT COALESCE("
+            " MIN(CASE WHEN spine_seq != expected THEN expected - 1 END),"
+            " COALESCE(MAX(spine_seq), 0)) AS seq FROM ordered",
             (channel,),
         ).fetchone()
         return int(row["seq"])
@@ -231,7 +238,7 @@ def bootstrap(world: World, timeout: float = RECV_TIMEOUT) -> dict[str, int]:
             if entry.get("channel")
         ]
         for channel in channels:
-            since = _local_max_seq(world, channel)
+            since = _local_contiguous_seq(world, channel)
             while True:
                 ws.send(json.dumps({
                     "op": "replay", "channel": channel,

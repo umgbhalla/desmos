@@ -15,11 +15,8 @@ const tokenOk = (given: string, want: string): boolean => {
 const json = (value: unknown, status = 200) => new Response(JSON.stringify(value), {
   status, headers: { "content-type": "application/json" },
 });
-const credential = (request: Request): string => {
-  const url = new URL(request.url);
-  return (request.headers.get("authorization") ?? "").replace(/^Bearer\s+/i, "") ||
-    url.searchParams.get("token") || "";
-};
+const credential = (request: Request): string =>
+  (request.headers.get("authorization") ?? "").replace(/^Bearer\s+/i, "");
 const hex = (bytes: ArrayBuffer | Uint8Array): string =>
   [...new Uint8Array(bytes)].map((x) => x.toString(16).padStart(2, "0")).join("");
 const hash = async (value: string): Promise<string> =>
@@ -58,18 +55,31 @@ export class Spine extends DurableObject<Env> {
         CREATE TABLE IF NOT EXISTS counters (
           channel TEXT PRIMARY KEY, seq INTEGER NOT NULL
         );
-        CREATE TABLE IF NOT EXISTS hot_log (
-          channel TEXT NOT NULL, seq INTEGER NOT NULL,
-          fingerprint TEXT NOT NULL UNIQUE, author TEXT NOT NULL,
-          seat TEXT NOT NULL, body TEXT NOT NULL, ts TEXT NOT NULL,
-          PRIMARY KEY (channel, seq)
+        CREATE TABLE IF NOT EXISTS migrations (
+          name TEXT PRIMARY KEY
         );
-        CREATE INDEX IF NOT EXISTS hot_channel_seq ON hot_log(channel, seq DESC);
         CREATE TABLE IF NOT EXISTS seats (
           seat TEXT PRIMARY KEY, token_hash TEXT NOT NULL UNIQUE,
           created_at TEXT NOT NULL, retired_at TEXT
         );
       `);
+      const migrated = [...this.ctx.storage.sql.exec(
+        "SELECT 1 FROM migrations WHERE name = 'channel_fingerprint'",
+      )][0];
+      if (!migrated) {
+        this.ctx.storage.sql.exec(`
+          DROP TABLE IF EXISTS hot_log;
+          CREATE TABLE hot_log (
+            channel TEXT NOT NULL, seq INTEGER NOT NULL,
+            fingerprint TEXT NOT NULL, author TEXT NOT NULL,
+            seat TEXT NOT NULL, body TEXT NOT NULL, ts TEXT NOT NULL,
+            PRIMARY KEY (channel, seq),
+            UNIQUE (channel, fingerprint)
+          );
+          CREATE INDEX hot_channel_seq ON hot_log(channel, seq DESC);
+          INSERT INTO migrations(name) VALUES ('channel_fingerprint');
+        `);
+      }
     });
   }
 
@@ -172,7 +182,8 @@ export class Spine extends DurableObject<Env> {
     const result = this.ctx.storage.transactionSync(() => {
       const sql = this.ctx.storage.sql;
       const prior = [...sql.exec<{ seq: number }>(
-        "SELECT seq FROM hot_log WHERE fingerprint = ?", msg.fingerprint,
+        "SELECT seq FROM hot_log WHERE channel = ? AND fingerprint = ?",
+        msg.channel, msg.fingerprint,
       )][0];
       if (prior) return { seq: prior.seq, duplicate: true, ts: undefined };
       const counter = [...sql.exec<{ seq: number }>(`INSERT INTO counters(channel, seq)
