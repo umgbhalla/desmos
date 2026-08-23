@@ -29,6 +29,7 @@ RECV_TIMEOUT = 20.0
 SYS_PRESENCE = "sys.presence"
 SYS_COLD = "sys.cold"
 SYS_MEMORY = "sys.memory"
+SYS_WORK = "sys.work"
 PRESENCE_BUCKET_MIN = 10
 
 #: outbox kind -> reserved channel for structured machine facts.
@@ -36,6 +37,7 @@ SYS_CHANNEL_BY_KIND = {
     "cold_session": SYS_COLD,
     "presence": SYS_PRESENCE,
     "memory_record": SYS_MEMORY,
+    "work": SYS_WORK,
 }
 
 
@@ -75,6 +77,12 @@ def _ensure(db) -> None:
         " channel TEXT PRIMARY KEY, seq INTEGER NOT NULL)"
     )
     db.execute(
+        "CREATE TABLE IF NOT EXISTS spine_work("
+        " work_id TEXT NOT NULL, t TEXT NOT NULL,"
+        " host TEXT NOT NULL DEFAULT '', body TEXT NOT NULL,"
+        " seq INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(work_id, t, host))"
+    )
+    db.execute(
         "CREATE TABLE IF NOT EXISTS spine_peers("
         " host TEXT NOT NULL, run_id TEXT NOT NULL,"
         " session_id TEXT NOT NULL DEFAULT '', pid INTEGER NOT NULL DEFAULT 0,"
@@ -112,6 +120,8 @@ def ingest(world: World, events: list[dict[str, Any]]) -> int:
                     written += _ingest_presence(db, ev)
                 elif not ours and channel == SYS_MEMORY:
                     written += _ingest_memory(world, ev)
+                elif not ours and channel == SYS_WORK:
+                    written += _ingest_work(db, ev)
                 elif not ours:
                     cur = db.execute(
                         "INSERT OR IGNORE INTO channel_messages(workspace_id,"
@@ -196,6 +206,129 @@ def _enqueue_presence(world: World) -> None:
         "sessions": [dict(r) for r in rows],
     }
     outbox.enqueue(world, "presence", payload)
+
+
+def _ingest_work(db, ev: dict[str, Any]) -> int:
+    """File one sys.work message into spine_work; malformed bodies drop."""
+    try:
+        payload = json.loads(str(ev.get("body", "")))
+    except ValueError:
+        return 0
+    if not isinstance(payload, dict):
+        return 0
+    wid = str(payload.get("work_id", "")).strip()
+    t = str(payload.get("t", "")).strip()
+    if not wid or t not in {"request", "claim", "result"}:
+        return 0
+    host = str(payload.get("host") or payload.get("origin") or "")
+    cur = db.execute(
+        "INSERT OR IGNORE INTO spine_work(work_id, t, host, body, seq)"
+        " VALUES (?, ?, ?, ?, ?)",
+        (wid, t, host, str(ev.get("body", "")), int(ev.get("seq", 0))),
+    )
+    return max(cur.rowcount, 0)
+
+
+def _record_work(world: World, payload: dict[str, Any]) -> None:
+    """Write our own protocol step locally; our appends never ingest back."""
+    db = _open(state_file(world))
+    try:
+        with db:
+            _ensure(db)
+            db.execute(
+                "INSERT OR IGNORE INTO spine_work(work_id, t, host, body, seq)"
+                " VALUES (?, ?, ?, ?, 0)",
+                (
+                    str(payload.get("work_id", "")),
+                    str(payload.get("t", "")),
+                    str(payload.get("host") or payload.get("origin") or ""),
+                    json.dumps(payload, default=str),
+                ),
+            )
+    finally:
+        db.close()
+
+
+#: work ids this process is currently executing; restart-safe dedupe is the
+#: claim row in spine_work, this set only stops one process double-launching.
+_WORK_IN_FLIGHT: set[str] = set()
+
+
+def _serve_work(world: World, runner=None) -> None:
+    """Claim and execute sys.work requests addressed to this host."""
+    import threading
+
+    seat = _seat()
+    db = _open(state_file(world))
+    try:
+        _ensure(db)
+        reqs = db.execute(
+            "SELECT work_id, body FROM spine_work WHERE t = 'request'"
+        ).fetchall()
+        todo = []
+        for row in reqs:
+            wid = str(row["work_id"])
+            try:
+                payload = json.loads(row["body"])
+            except ValueError:
+                continue
+            if str(payload.get("target", "")) != seat or wid in _WORK_IN_FLIGHT:
+                continue
+            mine = db.execute(
+                "SELECT 1 FROM spine_work WHERE work_id = ? AND host = ?"
+                " AND t IN ('claim', 'result')",
+                (wid, seat),
+            ).fetchone()
+            if mine is not None:
+                continue
+            todo.append((wid, payload))
+    finally:
+        db.close()
+    for wid, payload in todo:
+        claim = {"t": "claim", "work_id": wid, "host": seat}
+        _record_work(world, claim)
+        outbox.enqueue(world, "work", claim)
+        _WORK_IN_FLIGHT.add(wid)
+        if runner is not None:
+            runner(world, wid, payload)
+            continue
+        threading.Thread(
+            target=_run_work, args=(world, wid, payload),
+            name=f"spine-work-{wid}", daemon=True,
+        ).start()
+
+
+def _run_work(world: World, wid: str, payload: dict[str, Any]) -> None:
+    """Execute one claimed request as a local subagent; publish the result."""
+    from desmos.agents.remote import RESULT_CAP
+
+    status, output = "done", ""
+    try:
+        from desmos.agents import subagent
+        from desmos.kernel.dispatch import CALLER_WORLD
+
+        CALLER_WORLD.set(world)
+        subagent.bind(world)
+        rid = subagent.spawn(
+            str(payload.get("task", "")),
+            agent=str(payload.get("agent", "general")) or "general",
+            _register_pending=False,
+        )
+        if " " in str(rid):
+            status, output = "refused", str(rid)
+        else:
+            subagent.wait(rid, timeout=float(payload.get("timeout", 3600.0)))
+            output = str(subagent.result(rid))
+    except Exception as exc:
+        status, output = "error", f"{type(exc).__name__}: {exc}"
+    finally:
+        _WORK_IN_FLIGHT.discard(wid)
+    result = {
+        "t": "result", "work_id": wid, "host": _seat(),
+        "status": status, "output": output[:RESULT_CAP],
+    }
+    _record_work(world, result)
+    outbox.enqueue(world, "work", result)
 
 
 def _ingest_memory(world: World, ev: dict[str, Any]) -> int:
@@ -396,6 +529,7 @@ def run_forever(world: World, interval: float = 5.0) -> None:
     while True:
         try:
             report = sync(world)
+            _serve_work(world)
             delay = interval
             if report["sent"] or report["ingested"]:
                 continue  # something moved; look again immediately

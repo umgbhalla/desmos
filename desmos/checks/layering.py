@@ -57,6 +57,10 @@ ALLOWED_FN_EDGES = {
     ("desmos.kernel.canonical", "desmos.state.memory"),
     ("desmos.kernel.canonical", "desmos.state.refine"),
     ("desmos.kernel.canonical", "desmos.agents.subagent"),
+    # remote spawn: the agents op dispatches host= to the spine requester,
+    # and the requester reads the seat name the spine module owns.
+    ("desmos.kernel.canonical", "desmos.agents.remote"),
+    ("desmos.agents.remote", "desmos.front.spine"),
     ("desmos.kernel.canonical", "desmos.state.compact"),
     ("desmos.kernel.canonical", "desmos.state.persist"),
     ("desmos.kernel.canonical", "desmos.state.plan"),  # <knowledge op=plan> store

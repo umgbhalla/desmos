@@ -179,12 +179,90 @@ def _check_spine_memory() -> None:
         assert memory._find(got, record["id"])["content"] == "newer local truth"
 
 
+def _check_spine_work() -> None:
+    """sys.work round trip: request, single claim, result resumes the asker."""
+    import tempfile
+
+    from desmos.agents import remote
+    from desmos.front import spine
+    from desmos.state import outbox
+
+    keep = os.environ.get("DESMOS_SEAT")
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            asker = new_world(root / "a", state_path=root / "a" / "s.sqlite3")
+            doer = new_world(root / "b", state_path=root / "b" / "s.sqlite3")
+
+            os.environ["DESMOS_SEAT"] = "asker-host"
+            out = remote.request(asker, "doer-host", "say hi")
+            assert out.startswith("remote spawn refused"), out
+            presence = {
+                "channel": spine.SYS_PRESENCE, "seq": 1, "author": "d",
+                "seat": "d", "ts": "now",
+                "body": json.dumps({"host": "doer-host", "sessions": [
+                    {"run_id": "r", "session_id": "s", "pid": 1, "cwd": "/",
+                     "generation": 1, "model": "m", "started_at": "t"},
+                ]}),
+            }
+            assert spine.ingest(asker, [presence]) == 1
+            out = remote.request(asker, "doer-host", "say hi", timeout=30)
+            assert "dispatched to doer-host" in out, out
+            req = [r for r in outbox.pending(asker, 50) if r["kind"] == "work"]
+            assert len(req) == 1
+            frame = spine._append_frame(req[0])
+            assert frame is not None and frame["channel"] == spine.SYS_WORK
+            wid = json.loads(frame["body"])["work_id"]
+
+            os.environ["DESMOS_SEAT"] = "doer-host"
+            ev = {"channel": spine.SYS_WORK, "seq": 2, "author": "a",
+                  "seat": "a", "ts": "now", "body": frame["body"]}
+            assert spine.ingest(doer, [ev]) == 1
+            ran = []
+
+            def fake_runner(world, work_id, payload):
+                ran.append(work_id)
+                result = {"t": "result", "work_id": work_id,
+                          "host": "doer-host", "status": "done",
+                          "output": "hi from doer"}
+                spine._record_work(world, result)
+                outbox.enqueue(world, "work", result)
+                spine._WORK_IN_FLIGHT.discard(work_id)
+
+            spine._serve_work(doer, runner=fake_runner)
+            assert ran == [wid], ran
+            spine._serve_work(doer, runner=fake_runner)
+            assert ran == [wid], "second serve must not re-claim"
+            frames = [
+                spine._append_frame(r)
+                for r in outbox.pending(doer, 50)
+                if r["kind"] == "work"
+            ]
+            result_frame = next(
+                f for f in frames
+                if json.loads(f["body"]).get("t") == "result"
+            )
+
+            os.environ["DESMOS_SEAT"] = "asker-host"
+            ev = {"channel": spine.SYS_WORK, "seq": 3, "author": "d",
+                  "seat": "d", "ts": "now", "body": result_frame["body"]}
+            assert spine.ingest(asker, [ev]) == 1
+            got = remote.await_result(asker, wid, timeout=5)
+            assert "hi from doer" in got and "[done]" in got, got
+    finally:
+        if keep is None:
+            os.environ.pop("DESMOS_SEAT", None)
+        else:
+            os.environ["DESMOS_SEAT"] = keep
+
+
 def check() -> None:
     import tempfile
 
     _spine_sequence_check()
     _check_spine_presence()
     _check_spine_memory()
+    _check_spine_work()
 
     with tempfile.TemporaryDirectory() as tmp:
         cwd = Path(tmp)

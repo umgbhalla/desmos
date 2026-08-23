@@ -141,7 +141,7 @@ def run_op(world, family, op, body, attrs, *, on_chunk=None, should_stop=None, m
     if family == "observe":
         return _observe(world, op, body, attrs)
     if family == "agents":
-        return _agents(op, body, attrs)
+        return _agents(world, op, body, attrs)
     if family == "session":
         return _session(world, op, body, attrs)
     return f"{family}: unknown op {op!r}; expected {'|'.join(operations(family))}"
@@ -489,8 +489,15 @@ def _simple(attrs):
     return scope or None
 
 
-def _agents(op, body, attrs):
+def _agents(world, op, body, attrs):
     from desmos.agents import subagent as agents
+    if op == "spawn" and attrs.get("host", "").strip():
+        from desmos.agents import remote
+        return remote.request(
+            world, attrs.pop("host"), body,
+            agent=attrs.pop("agent", "general"),
+            timeout=float(attrs.pop("timeout", 3600.0)),
+        )
     if op == "lineage":
         rid = body.strip() or attrs.get("id", "")
         if not rid:
