@@ -17,6 +17,9 @@ cat > "$PLIST" <<EOF
     <string>$PY</string><string>-B</string><string>-m</string><string>desmos</string><string>spine</string>
   </array>
   <key>WorkingDirectory</key><string>$REPO</string>
+  <key>EnvironmentVariables</key><dict>
+    <key>PATH</key><string>$HOME/.local/bin:$HOME/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
   <key>StandardOutPath</key><string>$REPO/.desmos/logs/spine.log</string>
