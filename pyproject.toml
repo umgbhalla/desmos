@@ -8,6 +8,7 @@ dependencies = []
 
 [project.optional-dependencies]
 kernel = ["ipython>=8", "ipykernel"]
+spine = ["websockets>=12"]
 
 [project.scripts]
 desmos = "desmos.cli:main"
