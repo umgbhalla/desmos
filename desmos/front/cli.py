@@ -102,6 +102,16 @@ def cmd_run(args: argparse.Namespace) -> int:
     return run(args)
 
 
+def cmd_spine(args: argparse.Namespace) -> int:
+    from pathlib import Path
+
+    from desmos.front import spine
+    from desmos.kernel.loop import new_world
+
+    spine.run_forever(new_world(Path.cwd()), interval=float(args.interval))
+    return 0
+
+
 def cmd_bridge(args: argparse.Namespace) -> int:
     _on_path()
     cwd = Path(args.cwd).resolve()
@@ -469,6 +479,10 @@ def main() -> int:
     r.add_argument("--cwd", default=".")
     r.add_argument("--out", default="")
     r.set_defaults(func=cmd_run)
+
+    sp = sub.add_parser("spine", help="sync daemon: drain outbox, ingest, serve sys.work")
+    sp.add_argument("--interval", default="2.0", help="idle poll seconds (default 2)")
+    sp.set_defaults(func=cmd_spine)
 
     b = sub.add_parser("bridge", help="JSONL stdio bridge (used by desmos-tui)")
     b.add_argument("--cwd", default=".")

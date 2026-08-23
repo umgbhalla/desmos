@@ -24,7 +24,7 @@ from desmos.state import outbox
 from desmos.state.persist import _open, state_file
 
 RESULT_CAP = 4000
-POLL_S = 2.0
+POLL_S = 1.0
 DEFAULT_TIMEOUT_S = 3600.0
 
 
