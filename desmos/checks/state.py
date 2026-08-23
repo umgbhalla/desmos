@@ -129,6 +129,22 @@ def _check_spine_presence() -> None:
         assert len(remote) == 1 and remote[0]["host"] == "hyperion", got
         assert remote[0]["run_id"] == "r-hyp"
         assert all(p.get("host") for p in got)
+        # A snapshot replaying an OLDER presence event must not clobber newer.
+        newer = dict(ev, seq=5, body=json.dumps({
+            "host": "hyperion", "sessions": [{
+                "run_id": "r-new", "session_id": "s-hyp", "pid": 43,
+                "cwd": "/", "generation": 8, "model": "m", "started_at": "t",
+            }]}))
+        stale = dict(ev, seq=3, body=json.dumps({
+            "host": "hyperion", "sessions": [{
+                "run_id": "r-stale", "session_id": "s-hyp", "pid": 99,
+                "cwd": "/", "generation": 1, "model": "m", "started_at": "t",
+            }]}))
+        assert spine.ingest(world, [newer]) == 1
+        assert spine.ingest(world, [stale]) == 0, "stale seq must be skipped"
+        got = persist.peers(world)
+        remote = [p for p in got if p.get("remote")]
+        assert len(remote) == 1 and remote[0]["run_id"] == "r-new", got
         # Presence is a structured fact, never a chat row.
         assert persist.ordered_read(world, spine.SYS_PRESENCE) == []
 
@@ -180,12 +196,12 @@ def _check_spine_memory() -> None:
 
 
 def _check_spine_work() -> None:
-    """sys.work round trip: request, single claim, result resumes the asker."""
+    """sys.work rides channel_messages: request, single claim, crash recovery."""
     import tempfile
 
-    from desmos.agents import remote
+    from desmos.agents import pending, remote
     from desmos.front import spine
-    from desmos.state import outbox
+    from desmos.state import outbox, persist
 
     keep = os.environ.get("DESMOS_SEAT")
     try:
@@ -193,23 +209,37 @@ def _check_spine_work() -> None:
             root = Path(tmp)
             asker = new_world(root / "a", state_path=root / "a" / "s.sqlite3")
             doer = new_world(root / "b", state_path=root / "b" / "s.sqlite3")
+            for w in (asker, doer):
+                db = persist._open(persist.state_file(w))
+                try:
+                    persist._session_id(db, w, persist._workspace_id(db, w))
+                    db.commit()
+                finally:
+                    db.close()
 
             os.environ["DESMOS_SEAT"] = "asker-host"
             out = remote.request(asker, "doer-host", "say hi")
             assert out.startswith("remote spawn refused"), out
+            from datetime import datetime, timezone
+            now = datetime.now(timezone.utc).isoformat()
             presence = {
                 "channel": spine.SYS_PRESENCE, "seq": 1, "author": "d",
-                "seat": "d", "ts": "now",
+                "seat": "d", "ts": now,
                 "body": json.dumps({"host": "doer-host", "sessions": [
                     {"run_id": "r", "session_id": "s", "pid": 1, "cwd": "/",
                      "generation": 1, "model": "m", "started_at": "t"},
                 ]}),
             }
             assert spine.ingest(asker, [presence]) == 1
+            # Stale presence must not count as live.
+            assert remote.known_hosts(asker) == {"doer-host"}
             out = remote.request(asker, "doer-host", "say hi", timeout=30)
             assert "dispatched to doer-host" in out, out
-            req = [r for r in outbox.pending(asker, 50) if r["kind"] == "work"]
-            assert len(req) == 1
+            parked = [t.name for t in pending._bucket(asker)]
+            assert any("remote w-" in n for n in parked), parked
+            req = [r for r in outbox.pending(asker, 50)
+                   if r["kind"] == "channel_post"]
+            assert len(req) == 1, req
             frame = spine._append_frame(req[0])
             assert frame is not None and frame["channel"] == spine.SYS_WORK
             wid = json.loads(frame["body"])["work_id"]
@@ -222,11 +252,9 @@ def _check_spine_work() -> None:
 
             def fake_runner(world, work_id, payload):
                 ran.append(work_id)
-                result = {"t": "result", "work_id": work_id,
-                          "host": "doer-host", "status": "done",
-                          "output": "hi from doer"}
-                spine._record_work(world, result)
-                outbox.enqueue(world, "work", result)
+                spine.post_work(world, {
+                    "t": "result", "work_id": work_id, "host": "doer-host",
+                    "status": "done", "output": "hi from doer"})
                 spine._WORK_IN_FLIGHT.discard(work_id)
 
             spine._serve_work(doer, runner=fake_runner)
@@ -236,7 +264,7 @@ def _check_spine_work() -> None:
             frames = [
                 spine._append_frame(r)
                 for r in outbox.pending(doer, 50)
-                if r["kind"] == "work"
+                if r["kind"] == "channel_post"
             ]
             result_frame = next(
                 f for f in frames
@@ -249,6 +277,30 @@ def _check_spine_work() -> None:
             assert spine.ingest(asker, [ev]) == 1
             got = remote.await_result(asker, wid, timeout=5)
             assert "hi from doer" in got and "[done]" in got, got
+
+            # Crash recovery: a claim by this seat with no result and no
+            # in-flight thread answers with an error instead of poisoning
+            # the request forever.
+            os.environ["DESMOS_SEAT"] = "doer-host"
+            wid2 = "w-crashed00001"
+            req2 = json.dumps({"t": "request", "work_id": wid2,
+                               "target": "doer-host", "agent": "general",
+                               "task": "x", "origin": "asker-host"})
+            claim2 = json.dumps({"t": "claim", "work_id": wid2,
+                                 "host": "doer-host"})
+            evs = [
+                {"channel": spine.SYS_WORK, "seq": 4, "author": "a",
+                 "seat": "a", "ts": "now", "body": req2},
+                {"channel": spine.SYS_WORK, "seq": 5, "author": "d",
+                 "seat": "d", "ts": "now", "body": claim2},
+            ]
+            assert spine.ingest(doer, evs) == 2
+            ran2 = []
+            spine._serve_work(doer, runner=lambda *a: ran2.append(a))
+            assert ran2 == [], "crashed claim must not relaunch"
+            res = remote.find_result(doer, wid2)
+            assert res is not None and res["status"] == "error", res
+            assert "restarted" in res["output"], res
     finally:
         if keep is None:
             os.environ.pop("DESMOS_SEAT", None)

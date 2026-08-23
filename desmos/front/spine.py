@@ -7,8 +7,8 @@ loses nothing -- the outbox holds. Idempotency is the outbox fingerprint: the
 DO deduplicates appends on it, and ingest skips events whose fingerprint is in
 our own outbox (they started here).
 
-Per-channel total order comes from the DO's seq; ``spine_cursors`` records the
-highest seq ingested per channel so a reconnect resumes instead of replaying.
+Per-channel total order comes from the DO's seq; bootstrap resumes each
+channel from the highest contiguous spine_seq already in channel_messages.
 """
 
 from __future__ import annotations
@@ -37,7 +37,6 @@ SYS_CHANNEL_BY_KIND = {
     "cold_session": SYS_COLD,
     "presence": SYS_PRESENCE,
     "memory_record": SYS_MEMORY,
-    "work": SYS_WORK,
 }
 
 
@@ -73,23 +72,20 @@ def enabled(world: World | None = None) -> bool:
 
 def _ensure(db) -> None:
     db.execute(
-        "CREATE TABLE IF NOT EXISTS spine_cursors("
-        " channel TEXT PRIMARY KEY, seq INTEGER NOT NULL)"
-    )
-    db.execute(
-        "CREATE TABLE IF NOT EXISTS spine_work("
-        " work_id TEXT NOT NULL, t TEXT NOT NULL,"
-        " host TEXT NOT NULL DEFAULT '', body TEXT NOT NULL,"
-        " seq INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(work_id, t, host))"
-    )
-    db.execute(
         "CREATE TABLE IF NOT EXISTS spine_peers("
         " host TEXT NOT NULL, run_id TEXT NOT NULL,"
         " session_id TEXT NOT NULL DEFAULT '', pid INTEGER NOT NULL DEFAULT 0,"
         " cwd TEXT NOT NULL DEFAULT '', generation INTEGER NOT NULL DEFAULT 0,"
         " model TEXT NOT NULL DEFAULT '', started_at TEXT NOT NULL DEFAULT '',"
-        " seen_at TEXT NOT NULL DEFAULT '', PRIMARY KEY(host, run_id))"
+        " seen_at TEXT NOT NULL DEFAULT '', seq INTEGER NOT NULL DEFAULT 0,"
+        " PRIMARY KEY(host, run_id))"
     )
+    try:
+        db.execute("ALTER TABLE spine_peers ADD COLUMN seq INTEGER NOT NULL DEFAULT 0")
+    except Exception:
+        pass  # column already there (or table just created with it)
+    db.execute("DROP TABLE IF EXISTS spine_cursors")
+    db.execute("DROP TABLE IF EXISTS spine_work")
 
 
 def _seat() -> str:
@@ -120,8 +116,6 @@ def ingest(world: World, events: list[dict[str, Any]]) -> int:
                     written += _ingest_presence(db, ev)
                 elif not ours and channel == SYS_MEMORY:
                     written += _ingest_memory(world, ev)
-                elif not ours and channel == SYS_WORK:
-                    written += _ingest_work(db, ev)
                 elif not ours:
                     cur = db.execute(
                         "INSERT OR IGNORE INTO channel_messages(workspace_id,"
@@ -137,12 +131,6 @@ def ingest(world: World, events: list[dict[str, Any]]) -> int:
                         ),
                     )
                     written += max(cur.rowcount, 0)
-                db.execute(
-                    "INSERT INTO spine_cursors(channel, seq) VALUES (?, ?)"
-                    " ON CONFLICT(channel) DO UPDATE SET"
-                    " seq = MAX(spine_cursors.seq, excluded.seq)",
-                    (channel, seq),
-                )
     finally:
         db.close()
     return written
@@ -208,45 +196,12 @@ def _enqueue_presence(world: World) -> None:
     outbox.enqueue(world, "presence", payload)
 
 
-def _ingest_work(db, ev: dict[str, Any]) -> int:
-    """File one sys.work message into spine_work; malformed bodies drop."""
-    try:
-        payload = json.loads(str(ev.get("body", "")))
-    except ValueError:
-        return 0
-    if not isinstance(payload, dict):
-        return 0
-    wid = str(payload.get("work_id", "")).strip()
-    t = str(payload.get("t", "")).strip()
-    if not wid or t not in {"request", "claim", "result"}:
-        return 0
-    host = str(payload.get("host") or payload.get("origin") or "")
-    cur = db.execute(
-        "INSERT OR IGNORE INTO spine_work(work_id, t, host, body, seq)"
-        " VALUES (?, ?, ?, ?, ?)",
-        (wid, t, host, str(ev.get("body", "")), int(ev.get("seq", 0))),
-    )
-    return max(cur.rowcount, 0)
+def post_work(world: World, payload: dict[str, Any]) -> None:
+    """Post one sys.work protocol step; local row and outbox share a txn."""
+    from desmos.state.persist import channel_post
 
-
-def _record_work(world: World, payload: dict[str, Any]) -> None:
-    """Write our own protocol step locally; our appends never ingest back."""
-    db = _open(state_file(world))
-    try:
-        with db:
-            _ensure(db)
-            db.execute(
-                "INSERT OR IGNORE INTO spine_work(work_id, t, host, body, seq)"
-                " VALUES (?, ?, ?, ?, 0)",
-                (
-                    str(payload.get("work_id", "")),
-                    str(payload.get("t", "")),
-                    str(payload.get("host") or payload.get("origin") or ""),
-                    json.dumps(payload, default=str),
-                ),
-            )
-    finally:
-        db.close()
+    channel_post(world, json.dumps(payload, default=str),
+                 channel=SYS_WORK, author=_seat())
 
 
 #: work ids this process is currently executing; restart-safe dedupe is the
@@ -262,32 +217,47 @@ def _serve_work(world: World, runner=None) -> None:
     db = _open(state_file(world))
     try:
         _ensure(db)
-        reqs = db.execute(
-            "SELECT work_id, body FROM spine_work WHERE t = 'request'"
+        rows = db.execute(
+            "SELECT body FROM channel_messages WHERE channel = ? ORDER BY id",
+            (SYS_WORK,),
         ).fetchall()
-        todo = []
-        for row in reqs:
-            wid = str(row["work_id"])
-            try:
-                payload = json.loads(row["body"])
-            except ValueError:
-                continue
-            if str(payload.get("target", "")) != seat or wid in _WORK_IN_FLIGHT:
-                continue
-            mine = db.execute(
-                "SELECT 1 FROM spine_work WHERE work_id = ? AND host = ?"
-                " AND t IN ('claim', 'result')",
-                (wid, seat),
-            ).fetchone()
-            if mine is not None:
-                continue
-            todo.append((wid, payload))
     finally:
         db.close()
-    for wid, payload in todo:
-        claim = {"t": "claim", "work_id": wid, "host": seat}
-        _record_work(world, claim)
-        outbox.enqueue(world, "work", claim)
+    requests: dict[str, dict[str, Any]] = {}
+    claimed: set[str] = set()
+    resulted: set[str] = set()
+    for row in rows:
+        try:
+            payload = json.loads(str(row["body"]))
+        except ValueError:
+            continue
+        if not isinstance(payload, dict):
+            continue
+        wid = str(payload.get("work_id", "")).strip()
+        t = str(payload.get("t", ""))
+        if not wid:
+            continue
+        if t == "request":
+            requests[wid] = payload
+        elif t == "claim" and str(payload.get("host", "")) == seat:
+            claimed.add(wid)
+        elif t == "result" and str(payload.get("host", "")) == seat:
+            resulted.add(wid)
+    for wid, payload in requests.items():
+        if str(payload.get("target", "")) != seat or wid in _WORK_IN_FLIGHT:
+            continue
+        if wid in resulted:
+            continue
+        if wid in claimed:
+            # Claimed before a crash and never finished: answer instead of
+            # leaving the request poisoned forever.
+            post_work(world, {
+                "t": "result", "work_id": wid, "host": seat,
+                "status": "error",
+                "output": "executor restarted mid-run; re-spawn if still wanted",
+            })
+            continue
+        post_work(world, {"t": "claim", "work_id": wid, "host": seat})
         _WORK_IN_FLIGHT.add(wid)
         if runner is not None:
             runner(world, wid, payload)
@@ -327,8 +297,7 @@ def _run_work(world: World, wid: str, payload: dict[str, Any]) -> None:
         "t": "result", "work_id": wid, "host": _seat(),
         "status": status, "output": output[:RESULT_CAP],
     }
-    _record_work(world, result)
-    outbox.enqueue(world, "work", result)
+    post_work(world, result)
 
 
 def _ingest_memory(world: World, ev: dict[str, Any]) -> int:
@@ -353,13 +322,19 @@ def _ingest_presence(db, ev: dict[str, Any]) -> int:
     host = str(payload.get("host", ""))
     if not host or host == _seat():
         return 0
+    seq = int(ev.get("seq", 0))
+    have = db.execute(
+        "SELECT MAX(seq) FROM spine_peers WHERE host = ?", (host,)
+    ).fetchone()[0]
+    if have is not None and seq <= int(have):
+        return 0
     db.execute("DELETE FROM spine_peers WHERE host = ?", (host,))
     written = 0
     for s in payload.get("sessions", []):
         db.execute(
             "INSERT OR REPLACE INTO spine_peers(host, run_id, session_id,"
-            " pid, cwd, generation, model, started_at, seen_at)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            " pid, cwd, generation, model, started_at, seen_at, seq)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 host,
                 str(s.get("run_id", "")),
@@ -370,6 +345,7 @@ def _ingest_presence(db, ev: dict[str, Any]) -> int:
                 str(s.get("model", "")),
                 str(s.get("started_at", "")),
                 str(ev.get("ts", "")) or str(payload.get("bucket", "")),
+                seq,
             ),
         )
         written += 1

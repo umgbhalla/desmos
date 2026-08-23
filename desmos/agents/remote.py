@@ -8,9 +8,9 @@ One protocol, three message shapes on the reserved sys.work channel:
 
 The DO's per-channel total order arbitrates claims. Execution is the
 target daemon's job (desmos.front.spine._serve_work); this module is the
-requester half: validate the target against live presence, enqueue the
-request, and park a pending task that resumes the step when the result
-row lands in spine_work.
+requester half: validate the target against live presence, post the
+request to sys.work, and park a pending task that resumes the step when
+the result message lands in channel_messages.
 """
 
 from __future__ import annotations
@@ -20,12 +20,12 @@ import time
 import uuid
 from typing import Any
 
-from desmos.state import outbox
 from desmos.state.persist import _open, state_file
 
 RESULT_CAP = 4000
 POLL_S = 1.0
 DEFAULT_TIMEOUT_S = 3600.0
+STALE_PRESENCE_S = 1800.0
 
 
 def _seat() -> str:
@@ -35,35 +35,61 @@ def _seat() -> str:
 
 
 def known_hosts(world: Any) -> set[str]:
+    """Hosts with presence fresh enough to trust (seen within 30 minutes)."""
+    from datetime import datetime, timezone
+
     db = _open(state_file(world))
     try:
         try:
-            rows = db.execute("SELECT DISTINCT host FROM spine_peers").fetchall()
+            rows = db.execute(
+                "SELECT host, MAX(seen_at) AS seen FROM spine_peers"
+                " GROUP BY host"
+            ).fetchall()
         except Exception:
             return set()
-        return {str(r["host"]) for r in rows}
     finally:
         db.close()
+    now = datetime.now(timezone.utc)
+    live: set[str] = set()
+    for r in rows:
+        seen = str(r["seen"] or "")
+        try:
+            at = datetime.fromisoformat(seen.replace("Z", "+00:00"))
+            if at.tzinfo is None:
+                at = at.replace(tzinfo=timezone.utc)
+            if (now - at).total_seconds() > STALE_PRESENCE_S:
+                continue
+        except ValueError:
+            pass  # unparseable timestamps stay trusted rather than vanish
+        live.add(str(r["host"]))
+    return live
 
 
 def find_result(world: Any, work_id: str) -> dict[str, Any] | None:
+    from desmos.front.spine import SYS_WORK
+
     db = _open(state_file(world))
     try:
         try:
-            row = db.execute(
-                "SELECT body FROM spine_work WHERE work_id = ? AND t = 'result'",
-                (work_id,),
-            ).fetchone()
+            rows = db.execute(
+                "SELECT body FROM channel_messages WHERE channel = ?"
+                " AND body LIKE ? ORDER BY id",
+                (SYS_WORK, f'%{work_id}%'),
+            ).fetchall()
         except Exception:
-            return None
-        if row is None:
-            return None
-        try:
-            return json.loads(row["body"])
-        except ValueError:
             return None
     finally:
         db.close()
+    for row in rows:
+        try:
+            payload = json.loads(str(row["body"]))
+        except ValueError:
+            continue
+        if (isinstance(payload, dict)
+                and str(payload.get("t", "")) == "result"
+                and str(payload.get("work_id", "")) == work_id):
+            return payload
+    return None
 
 
 def await_result(
@@ -80,7 +106,7 @@ def await_result(
         time.sleep(POLL_S)
     return (
         f"remote work {work_id}: no result within {int(timeout)}s;"
-        " it may still land later in spine_work"
+        " it may still land later on sys.work"
     )
 
 
@@ -106,7 +132,9 @@ def request(
             f" (known: {sorted(hosts) or 'none'})"
         )
     work_id = f"w-{uuid.uuid4().hex[:12]}"
-    outbox.enqueue(world, "work", {
+    from desmos.front.spine import post_work
+
+    post_work(world, {
         "t": "request", "work_id": work_id, "target": host,
         "agent": agent or "general", "task": task, "origin": seat,
     })
