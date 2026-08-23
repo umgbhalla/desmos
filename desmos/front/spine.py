@@ -25,6 +25,11 @@ from desmos.state.persist import _open, _session_id, _workspace_id, state_file
 DEFAULT_URL = "wss://desmos-spine.umg-bhalla88.workers.dev/ws"
 RECV_TIMEOUT = 20.0
 
+#: Reserved channels: structured machine facts, not chat.
+SYS_PRESENCE = "sys.presence"
+SYS_COLD = "sys.cold"
+PRESENCE_BUCKET_MIN = 10
+
 
 def url() -> str:
     return os.environ.get("DESMOS_SPINE_URL", DEFAULT_URL).strip()
@@ -61,6 +66,14 @@ def _ensure(db) -> None:
         "CREATE TABLE IF NOT EXISTS spine_cursors("
         " channel TEXT PRIMARY KEY, seq INTEGER NOT NULL)"
     )
+    db.execute(
+        "CREATE TABLE IF NOT EXISTS spine_peers("
+        " host TEXT NOT NULL, run_id TEXT NOT NULL,"
+        " session_id TEXT NOT NULL DEFAULT '', pid INTEGER NOT NULL DEFAULT 0,"
+        " cwd TEXT NOT NULL DEFAULT '', generation INTEGER NOT NULL DEFAULT 0,"
+        " model TEXT NOT NULL DEFAULT '', started_at TEXT NOT NULL DEFAULT '',"
+        " seen_at TEXT NOT NULL DEFAULT '', PRIMARY KEY(host, run_id))"
+    )
 
 
 def _seat() -> str:
@@ -87,7 +100,9 @@ def ingest(world: World, events: list[dict[str, Any]]) -> int:
                 ours = mark and db.execute(
                     "SELECT 1 FROM outbox WHERE fingerprint = ?", (mark,)
                 ).fetchone()
-                if not ours:
+                if not ours and channel == SYS_PRESENCE:
+                    written += _ingest_presence(db, ev)
+                elif not ours:
                     cur = db.execute(
                         "INSERT OR IGNORE INTO channel_messages(workspace_id,"
                         " session_id, channel, run_id, author, body, created_at,"
@@ -113,16 +128,95 @@ def ingest(world: World, events: list[dict[str, Any]]) -> int:
     return written
 
 
-def _append_frame(row: dict[str, Any]) -> dict[str, Any]:
+def _append_frame(row: dict[str, Any]) -> dict[str, Any] | None:
+    """The wire frame for one outbox row; None for kinds that stay local."""
     payload = json.loads(row["payload_json"])
-    return {
-        "op": "append",
-        "channel": str(payload.get("channel") or "conflicts"),
-        "fingerprint": row["fingerprint"],
-        "author": str(payload.get("author") or "anon"),
-        "seat": _seat(),
-        "body": str(payload.get("body") or " "),
+    kind = str(row["kind"])
+    if kind == "channel_post":
+        return {
+            "op": "append",
+            "channel": str(payload.get("channel") or "conflicts"),
+            "fingerprint": row["fingerprint"],
+            "author": str(payload.get("author") or "anon"),
+            "seat": _seat(),
+            "body": str(payload.get("body") or " "),
+        }
+    if kind in ("cold_session", "presence"):
+        return {
+            "op": "append",
+            "channel": SYS_COLD if kind == "cold_session" else SYS_PRESENCE,
+            "fingerprint": row["fingerprint"],
+            "author": _seat(),
+            "seat": _seat(),
+            "body": json.dumps(payload, default=str) or " ",
+        }
+    return None
+
+
+def _enqueue_presence(world: World) -> None:
+    """Publish this machine's live sessions, deduped per time bucket.
+
+    The payload fingerprints identically within one bucket while the session
+    set is unchanged, so ``INSERT OR IGNORE`` rate-limits the heartbeat for
+    free: at most one presence append per bucket per real change.
+    """
+    from datetime import datetime, timezone
+
+    db = _open(state_file(world))
+    try:
+        workspace = _workspace_id(db, world, create=False)
+        if workspace is None:
+            return
+        rows = db.execute(
+            "SELECT run_id, session_id, pid, cwd, generation, model,"
+            " started_at FROM active_runs WHERE workspace_id = ?"
+            " ORDER BY run_id",
+            (workspace,),
+        ).fetchall()
+    finally:
+        db.close()
+    if not rows:
+        return
+    now = datetime.now(timezone.utc)
+    minute = (now.minute // PRESENCE_BUCKET_MIN) * PRESENCE_BUCKET_MIN
+    payload = {
+        "host": _seat(),
+        "bucket": now.strftime("%Y-%m-%dT%H:") + f"{minute:02d}",
+        "sessions": [dict(r) for r in rows],
     }
+    outbox.enqueue(world, "presence", payload)
+
+
+def _ingest_presence(db, ev: dict[str, Any]) -> int:
+    """Replace one remote host's peer rows with its latest presence payload."""
+    try:
+        payload = json.loads(str(ev.get("body", "")))
+    except ValueError:
+        return 0
+    host = str(payload.get("host", ""))
+    if not host or host == _seat():
+        return 0
+    db.execute("DELETE FROM spine_peers WHERE host = ?", (host,))
+    written = 0
+    for s in payload.get("sessions", []):
+        db.execute(
+            "INSERT OR REPLACE INTO spine_peers(host, run_id, session_id,"
+            " pid, cwd, generation, model, started_at, seen_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                host,
+                str(s.get("run_id", "")),
+                str(s.get("session_id", "")),
+                int(s.get("pid") or 0),
+                str(s.get("cwd", "")),
+                int(s.get("generation") or 0),
+                str(s.get("model", "")),
+                str(s.get("started_at", "")),
+                str(ev.get("ts", "")) or str(payload.get("bucket", "")),
+            ),
+        )
+        written += 1
+    return written
 
 
 def _connect(world: World, timeout: float):
@@ -170,11 +264,17 @@ def sync(world: World, timeout: float = RECV_TIMEOUT) -> dict[str, Any]:
         for entry in snap.get("channels", []):
             events.extend(entry.get("tail", []))
 
-        rows = [
-            r for r in outbox.pending(world, 500) if r["kind"] == "channel_post"
-        ]
-        for row in rows:
-            ws.send(json.dumps(_append_frame(row)))
+        _enqueue_presence(world)
+        rows = []
+        frames = []
+        for r in outbox.pending(world, 500):
+            frame = _append_frame(r)
+            if frame is None:
+                continue
+            rows.append(r)
+            frames.append(frame)
+        for frame in frames:
+            ws.send(json.dumps(frame))
         wanted = {r["fingerprint"] for r in rows}
         acks: dict[str, int] = {}
         while acks.keys() != wanted:
@@ -192,17 +292,19 @@ def sync(world: World, timeout: float = RECV_TIMEOUT) -> dict[str, Any]:
                 with db:
                     for mark, seq in sorted(acks.items()):
                         row = db.execute(
-                            "SELECT payload_json FROM outbox WHERE fingerprint = ?",
+                            "SELECT kind, payload_json FROM outbox"
+                            " WHERE fingerprint = ?",
                             (mark,),
                         ).fetchone()
                         if row is None:
                             raise RuntimeError("spine: ack outbox row disappeared")
-                        message_id = int(json.loads(row["payload_json"])["id"])
-                        db.execute(
-                            "UPDATE channel_messages SET spine_seq = ?"
-                            " WHERE id = ? AND spine_seq IS NULL",
-                            (seq, message_id),
-                        )
+                        if row["kind"] == "channel_post":
+                            message_id = int(json.loads(row["payload_json"])["id"])
+                            db.execute(
+                                "UPDATE channel_messages SET spine_seq = ?"
+                                " WHERE id = ? AND spine_seq IS NULL",
+                                (seq, message_id),
+                            )
                         db.execute(
                             "UPDATE outbox SET sent_at = ?, attempts = attempts + 1"
                             " WHERE fingerprint = ? AND sent_at IS NULL",

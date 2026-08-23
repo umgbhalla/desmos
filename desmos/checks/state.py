@@ -75,10 +75,69 @@ def _spine_sequence_check() -> None:
         rows = persist.ordered_read(world, "migration-check")
         assert len(rows) == 1 and rows[0]["spine_seq"] == 7
 
+def _check_spine_presence() -> None:
+    """Presence and cold-session rows ride the spine; peers() sees remote hosts."""
+    import tempfile
+
+    from desmos.front import spine
+    from desmos.state import outbox, persist
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        world = new_world(root, state_path=root / "s.sqlite3")
+        db = persist._open(persist.state_file(world))
+        try:
+            workspace_id = persist._workspace_id(db, world)
+            persist._session_id(db, world, workspace_id)
+            db.commit()
+        finally:
+            db.close()
+        persist.announce(world)
+        spine._enqueue_presence(world)
+        rows = outbox.pending(world, 50)
+        frames = {r["kind"]: spine._append_frame(r) for r in rows}
+        assert "presence" in frames, rows
+        assert frames["presence"]["channel"] == spine.SYS_PRESENCE
+        cold_frame = spine._append_frame({
+            "kind": "cold_session",
+            "fingerprint": "f-cold",
+            "payload_json": json.dumps({"session_id": "s-old", "rows": 2}),
+        })
+        assert cold_frame is not None and cold_frame["channel"] == spine.SYS_COLD
+        assert spine._append_frame({
+            "kind": "mystery", "fingerprint": "x", "payload_json": "{}",
+        }) is None
+        ev = {
+            "channel": spine.SYS_PRESENCE,
+            "seq": 1,
+            "author": "hyperion",
+            "seat": "hyperion",
+            "ts": "2026-08-23T00:00:00+00:00",
+            "body": json.dumps({
+                "host": "hyperion",
+                "bucket": "2026-08-23T00:00",
+                "sessions": [{
+                    "run_id": "r-hyp", "session_id": "s-hyp", "pid": 42,
+                    "cwd": "/Users/umang/hub/desmos", "generation": 7,
+                    "model": "claude-opus-5", "started_at": "2026-08-23",
+                }],
+            }),
+        }
+        assert spine.ingest(world, [ev]) == 1
+        got = persist.peers(world)
+        remote = [p for p in got if p.get("remote")]
+        assert len(remote) == 1 and remote[0]["host"] == "hyperion", got
+        assert remote[0]["run_id"] == "r-hyp"
+        assert all(p.get("host") for p in got)
+        # Presence is a structured fact, never a chat row.
+        assert persist.ordered_read(world, spine.SYS_PRESENCE) == []
+
+
 def check() -> None:
     import tempfile
 
     _spine_sequence_check()
+    _check_spine_presence()
 
     with tempfile.TemporaryDirectory() as tmp:
         cwd = Path(tmp)

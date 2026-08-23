@@ -1784,6 +1784,27 @@ def peers(world: World) -> list[dict[str, Any]]:
                     )
             finally:
                 probe.close()
+        import socket as _sock
+
+        local_host = os.environ.get("DESMOS_SEAT", "") or _sock.gethostname()
+        for item in live:
+            item["host"] = local_host
+        try:
+            remote = db.execute(
+                "SELECT host, run_id, session_id, pid, cwd, generation,"
+                " model, started_at, seen_at FROM spine_peers"
+                " ORDER BY host, run_id",
+            ).fetchall()
+        except sqlite3.OperationalError:
+            remote = []
+        for row in remote:
+            item = dict(row)
+            if item["host"] == local_host:
+                continue
+            item["workspace_id"] = workspace
+            item["self"] = False
+            item["remote"] = True
+            live.append(item)
     finally:
         db.close()
     return live
