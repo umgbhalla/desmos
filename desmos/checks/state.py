@@ -308,6 +308,158 @@ def _check_spine_work() -> None:
             os.environ["DESMOS_SEAT"] = keep
 
 
+
+def _check_spine_sync_wiring() -> None:
+    """sync() over a fake socket: send, ack, retire outbox, mark spine_seq."""
+    import tempfile
+
+    from desmos.front import spine
+    from desmos.state import outbox, persist
+
+    class FakeWS:
+        def __init__(self):
+            self.sent = []
+            self.queue = []
+            self.seq = 0
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def send(self, raw):
+            frame = json.loads(raw)
+            self.sent.append(frame)
+            op = frame.get("op")
+            if op == "sub":
+                self.queue.append({"op": "subbed"})
+            elif op == "snapshot":
+                self.queue.append({"op": "snapshot", "channels": [{
+                    "channel": spine.SYS_WORK, "tail": [{
+                        "op": "event", "channel": spine.SYS_WORK, "seq": 7,
+                        "fingerprint": "remote-f", "author": "elsewhere",
+                        "seat": "elsewhere", "ts": "now",
+                        "body": "{\"t\": \"claim\", \"work_id\": \"w-x\","
+                                " \"host\": \"elsewhere\"}",
+                    }],
+                }]})
+            elif op == "append":
+                self.seq += 1
+                self.queue.append({"op": "ack",
+                                   "fingerprint": frame["fingerprint"],
+                                   "seq": self.seq})
+
+        def recv(self, timeout=None):
+            return json.dumps(self.queue.pop(0))
+
+    keep_connect = spine._connect
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        world = new_world(root, state_path=root / "s.sqlite3")
+        db = persist._open(persist.state_file(world))
+        try:
+            persist._session_id(db, world, persist._workspace_id(db, world))
+            db.commit()
+        finally:
+            db.close()
+        persist.channel_post(world, "hello wire", channel="dev", author="me")
+        assert any(r["kind"] == "channel_post" for r in outbox.pending(world, 50))
+        ws = FakeWS()
+        spine._connect = lambda w, timeout: ws
+        try:
+            report = spine.sync(world)
+        finally:
+            spine._connect = keep_connect
+        assert [f["op"] for f in ws.sent[:2]] == ["sub", "snapshot"], ws.sent
+        appended = [f for f in ws.sent if f["op"] == "append"]
+        assert any(f["body"] == "hello wire" for f in appended), appended
+        assert report["sent"] == len(appended) and report["sent"] >= 1, report
+        assert report["ingested"] == 1, report
+        assert outbox.pending(world, 50) == [], "acked rows must retire"
+        db = persist._open(persist.state_file(world))
+        try:
+            row = db.execute(
+                "SELECT spine_seq FROM channel_messages WHERE body = ?",
+                ("hello wire",),
+            ).fetchone()
+            got = db.execute(
+                "SELECT body FROM channel_messages WHERE channel = ?",
+                (spine.SYS_WORK,),
+            ).fetchall()
+        finally:
+            db.close()
+        assert row is not None and int(row["spine_seq"] or 0) > 0, dict(row or {})
+        assert len(got) == 1 and "w-x" in str(got[0]["body"]), got
+
+
+def _check_spine_run_work() -> None:
+    """_run_work itself: refusal, success with truncation, and error paths."""
+    import tempfile
+    import threading
+
+    def run_threaded(*args):
+        # Production runs _run_work on its own thread, where CALLER_WORLD
+        # dies with the thread. Calling it inline would leak the tmp world
+        # into every later check's contextvar.
+        from desmos.front import spine as _spine
+
+        t = threading.Thread(target=_spine._run_work, args=args)
+        t.start()
+        t.join(30)
+        assert not t.is_alive(), "_run_work hung"
+
+    from desmos.agents import remote, subagent
+    from desmos.front import spine
+    from desmos.state import persist
+
+    keep_seat = os.environ.get("DESMOS_SEAT")
+    keep = (subagent.bind, subagent.spawn, subagent.wait, subagent.result)
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            world = new_world(root, state_path=root / "s.sqlite3")
+            db = persist._open(persist.state_file(world))
+            try:
+                persist._session_id(db, world, persist._workspace_id(db, world))
+                db.commit()
+            finally:
+                db.close()
+            os.environ["DESMOS_SEAT"] = "doer-host"
+
+            subagent.bind = lambda w: None
+            subagent.spawn = lambda task, agent="general", **kw: (
+                "spawn refused: over budget")
+            run_threaded(world, "w-refuse", {"task": "x"})
+            res = remote.find_result(world, "w-refuse")
+            assert res is not None and res["status"] == "refused", res
+
+            subagent.spawn = lambda task, agent="general", **kw: "rid1"
+            subagent.wait = lambda rid, timeout=0: None
+            subagent.result = lambda rid: "Y" * (remote.RESULT_CAP + 500)
+            spine._WORK_IN_FLIGHT.add("w-ok")
+            run_threaded(world, "w-ok", {"task": "x", "timeout": 5})
+            assert "w-ok" not in spine._WORK_IN_FLIGHT
+            res = remote.find_result(world, "w-ok")
+            assert res is not None and res["status"] == "done", res
+            assert len(res["output"]) == remote.RESULT_CAP, len(res["output"])
+
+            def boom(task, agent="general", **kw):
+                raise RuntimeError("kaput")
+
+            subagent.spawn = boom
+            run_threaded(world, "w-err", {"task": "x"})
+            res = remote.find_result(world, "w-err")
+            assert res is not None and res["status"] == "error", res
+            assert "kaput" in res["output"], res
+    finally:
+        subagent.bind, subagent.spawn, subagent.wait, subagent.result = keep
+        if keep_seat is None:
+            os.environ.pop("DESMOS_SEAT", None)
+        else:
+            os.environ["DESMOS_SEAT"] = keep_seat
+
+
 def check() -> None:
     import tempfile
 
@@ -315,6 +467,8 @@ def check() -> None:
     _check_spine_presence()
     _check_spine_memory()
     _check_spine_work()
+    _check_spine_sync_wiring()
+    _check_spine_run_work()
 
     with tempfile.TemporaryDirectory() as tmp:
         cwd = Path(tmp)
