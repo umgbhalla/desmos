@@ -30,21 +30,30 @@ def url() -> str:
     return os.environ.get("DESMOS_SPINE_URL", DEFAULT_URL).strip()
 
 
-def token(world: World | None = None) -> str:
-    """The shared spine secret: env first, then the workspace .env file."""
-    got = os.environ.get("DESMOS_SPINE_TOKEN", "").strip()
-    if got:
-        return got
+def _dotenv(key: str, world: World | None = None) -> str:
     root = world.cwd if world is not None else None
     for base in filter(None, [root, os.getcwd()]):
         try:
             for line in open(os.path.join(str(base), ".env")):
-                key, _, value = line.strip().partition("=")
-                if key == "DESMOS_SPINE_TOKEN" and value:
+                got, _, value = line.strip().partition("=")
+                if got == key and value:
                     return value.strip()
         except OSError:
             continue
     return ""
+
+
+def token(world: World | None = None) -> str:
+    """The shared spine secret: env first, then the workspace .env file."""
+    return os.environ.get("DESMOS_SPINE_TOKEN", "").strip() or _dotenv(
+        "DESMOS_SPINE_TOKEN", world
+    )
+
+
+def enabled(world: World | None = None) -> bool:
+    """Spine opt-in: DESMOS_SPINE in the env or the workspace .env file."""
+    got = os.environ.get("DESMOS_SPINE", "").strip() or _dotenv("DESMOS_SPINE", world)
+    return got not in {"", "0", "off"}
 
 
 def _ensure(db) -> None:
