@@ -234,6 +234,43 @@ def _find(records: list[dict[str, Any]], record_id: str) -> dict[str, Any] | Non
     return next((r for r in records if r.get("id") == record_id), None)
 
 
+def _publish(world: World, record: dict[str, Any]) -> None:
+    """Queue one record for the spine; replicas apply, never re-publish."""
+    from desmos.state import outbox
+
+    try:
+        outbox.enqueue(world, "memory_record", dict(record))
+    except Exception:
+        # Replication is best-effort; the local write already committed.
+        pass
+
+
+def apply_remote(world: World, record: dict[str, Any]) -> bool:
+    """Merge one replicated record: new ids append, newer updates win.
+
+    Records are whole facts with stable ids and monotonic ``updated``
+    stamps, so last-writer-wins per id converges without merge logic.
+    Applying never publishes, so replication cannot echo.
+    """
+    if not world.persist:
+        return False
+    record_id = str(record.get("id", "")).strip()
+    if not record_id or not isinstance(record.get("content"), str):
+        return False
+    root, records = _ensure_records(world)
+    mine = _find(records, record_id)
+    if mine is None:
+        records.append(dict(record))
+        _save(root, records)
+        return True
+    if str(record.get("updated", "")) > str(mine.get("updated", "")):
+        mine.clear()
+        mine.update(dict(record))
+        _save(root, records)
+        return True
+    return False
+
+
 def _stamp_seat(world: World, record: dict[str, Any]) -> None:
     """Attribute the record to the bound seat (constitution B1).
 
@@ -313,6 +350,7 @@ def remember(
         action = "updated"
     _stamp_seat(world, target)
     _save(root, records)
+    _publish(world, target)
     return f"{action} {target['id']} ({len([r for r in records if r.get('status') == 'active'])} active)"
 
 
@@ -445,6 +483,7 @@ def forget(world: World, record_id: str) -> str:
     record["status"] = "forgotten"
     record["updated"] = _now()
     _save(root, records)
+    _publish(world, record)
     return f"forgot {record['id']}"
 
 
@@ -460,6 +499,7 @@ def verify(world: World, record_id: str) -> str:
     record["updated"] = now
     record["confidence"] = "verified"
     _save(root, records)
+    _publish(world, record)
     return f"verified {record['id']} at {now}"
 
 

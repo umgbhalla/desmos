@@ -133,11 +133,58 @@ def _check_spine_presence() -> None:
         assert persist.ordered_read(world, spine.SYS_PRESENCE) == []
 
 
+def _check_spine_memory() -> None:
+    """Memory records replicate over sys.memory: append, dedupe, LWW."""
+    import tempfile
+
+    from desmos.front import spine
+    from desmos.state import memory, outbox
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        a = new_world(root / "a", state_path=root / "a" / "s.sqlite3")
+        b = new_world(root / "b", state_path=root / "b" / "s.sqlite3")
+        (root / "a").mkdir(exist_ok=True)
+        (root / "b").mkdir(exist_ok=True)
+        out = memory.remember(a, "spine replication test fact", kind="note")
+        assert out.startswith("remembered"), out
+        rows = [r for r in outbox.pending(a, 50) if r["kind"] == "memory_record"]
+        assert len(rows) == 1, rows
+        frame = spine._append_frame(rows[0])
+        assert frame is not None and frame["channel"] == spine.SYS_MEMORY
+        ev = {
+            "channel": spine.SYS_MEMORY,
+            "seq": 1,
+            "author": "nemesis",
+            "seat": "nemesis",
+            "ts": "now",
+            "body": frame["body"],
+        }
+        assert spine.ingest(b, [ev]) == 1
+        record = json.loads(frame["body"])
+        got = memory._load_records(memory.memory_root(b))
+        mine = memory._find(got, record["id"])
+        assert mine is not None and mine["content"] == record["content"], got
+        # Replay is a no-op; applying never re-publishes.
+        assert spine.ingest(b, [ev]) == 0
+        assert not [
+            r for r in outbox.pending(b, 50) if r["kind"] == "memory_record"
+        ]
+        # LWW: a strictly newer local update refuses an older replica.
+        memory.remember(
+            b, "newer local truth", record_id=record["id"], kind="note"
+        )
+        assert spine.ingest(b, [dict(ev, seq=2)]) == 0
+        got = memory._load_records(memory.memory_root(b))
+        assert memory._find(got, record["id"])["content"] == "newer local truth"
+
+
 def check() -> None:
     import tempfile
 
     _spine_sequence_check()
     _check_spine_presence()
+    _check_spine_memory()
 
     with tempfile.TemporaryDirectory() as tmp:
         cwd = Path(tmp)

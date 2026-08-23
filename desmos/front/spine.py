@@ -28,7 +28,15 @@ RECV_TIMEOUT = 20.0
 #: Reserved channels: structured machine facts, not chat.
 SYS_PRESENCE = "sys.presence"
 SYS_COLD = "sys.cold"
+SYS_MEMORY = "sys.memory"
 PRESENCE_BUCKET_MIN = 10
+
+#: outbox kind -> reserved channel for structured machine facts.
+SYS_CHANNEL_BY_KIND = {
+    "cold_session": SYS_COLD,
+    "presence": SYS_PRESENCE,
+    "memory_record": SYS_MEMORY,
+}
 
 
 def url() -> str:
@@ -102,6 +110,8 @@ def ingest(world: World, events: list[dict[str, Any]]) -> int:
                 ).fetchone()
                 if not ours and channel == SYS_PRESENCE:
                     written += _ingest_presence(db, ev)
+                elif not ours and channel == SYS_MEMORY:
+                    written += _ingest_memory(world, ev)
                 elif not ours:
                     cur = db.execute(
                         "INSERT OR IGNORE INTO channel_messages(workspace_id,"
@@ -141,10 +151,11 @@ def _append_frame(row: dict[str, Any]) -> dict[str, Any] | None:
             "seat": _seat(),
             "body": str(payload.get("body") or " "),
         }
-    if kind in ("cold_session", "presence"):
+    channel = SYS_CHANNEL_BY_KIND.get(kind)
+    if channel is not None:
         return {
             "op": "append",
-            "channel": SYS_COLD if kind == "cold_session" else SYS_PRESENCE,
+            "channel": channel,
             "fingerprint": row["fingerprint"],
             "author": _seat(),
             "seat": _seat(),
@@ -185,6 +196,19 @@ def _enqueue_presence(world: World) -> None:
         "sessions": [dict(r) for r in rows],
     }
     outbox.enqueue(world, "presence", payload)
+
+
+def _ingest_memory(world: World, ev: dict[str, Any]) -> int:
+    """Apply one replicated memory record; malformed bodies are dropped."""
+    from desmos.state import memory as _memory
+
+    try:
+        record = json.loads(str(ev.get("body", "")))
+    except ValueError:
+        return 0
+    if not isinstance(record, dict):
+        return 0
+    return 1 if _memory.apply_remote(world, record) else 0
 
 
 def _ingest_presence(db, ev: dict[str, Any]) -> int:
