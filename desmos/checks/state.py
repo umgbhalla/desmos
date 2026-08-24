@@ -195,6 +195,35 @@ def _check_spine_memory() -> None:
         assert memory._find(got, record["id"])["content"] == "newer local truth"
 
 
+def _check_roster() -> None:
+    """Named agents and declared channels: seed, upsert, liveness field."""
+    import tempfile
+
+    from desmos.state import persist
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        world = new_world(root, state_path=root / "s.sqlite3")
+        got = persist.roster(world)
+        names = {a["name"]: a for a in got["agents"]}
+        assert "main" in names and names["main"]["kind"] == "chief", names
+        assert "hyperion" in names and names["hyperion"]["kind"] == "bot"
+        chans = {c["name"]: c for c in got["channels"]}
+        assert {"general", "build", "ops"} <= set(chans), chans
+        assert chans["sys.work"]["kind"] == "sys"
+        assert names["main"]["live"] is True, "chief runs on this seat"
+        persist.agent_upsert(world, "auditor", kind="fork", parent="main")
+        persist.channel_declare(world, "lab", description="experiments")
+        got = persist.roster(world)
+        forks = [a for a in got["agents"] if a["parent"] == "main"]
+        assert [a["name"] for a in forks] == ["auditor"], forks
+        assert any(c["name"] == "lab" for c in got["channels"])
+        persist.agent_upsert(world, "auditor", status="retired")
+        got = persist.roster(world)
+        assert all(a["name"] != "auditor" for a in got["agents"])
+    print("roster check ok")
+
+
 def _check_spine_work() -> None:
     """sys.work rides channel_messages: request, single claim, crash recovery."""
     import tempfile
@@ -466,6 +495,7 @@ def check() -> None:
     _spine_sequence_check()
     _check_spine_presence()
     _check_spine_memory()
+    _check_roster()
     _check_spine_work()
     _check_spine_sync_wiring()
     _check_spine_run_work()

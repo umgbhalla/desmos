@@ -458,6 +458,11 @@ pub(crate) fn handle_event(app: &mut App, ev: Value) {
                 .filter_map(|row| {
                     Some(crate::ChannelRow {
                         channel: row.get("channel")?.as_str()?.to_string(),
+                        kind: row
+                            .get("kind")
+                            .and_then(Value::as_str)
+                            .unwrap_or("adhoc")
+                            .to_string(),
                         unread: row.get("unread").and_then(Value::as_u64).unwrap_or(0),
                         last_seen: row.get("last_seen").and_then(Value::as_u64).unwrap_or(0),
                         max_id: row.get("max_id").and_then(Value::as_u64).unwrap_or(0),

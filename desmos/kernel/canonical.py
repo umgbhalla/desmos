@@ -37,7 +37,7 @@ DIRECT_OPS = {
         "spawn", "fanout", "resume", "lineage",
         "status", "result", "structured-result", "judgment", "wait",
     ),
-    "session": ("compact", "status", "switch", "peers", "inbox", "read", "post", "dismiss"),
+    "session": ("compact", "status", "switch", "peers", "agents", "inbox", "read", "post", "dismiss"),
 }
 
 
@@ -556,10 +556,22 @@ def _session(world, op, body, attrs):
             "model": world.model, "thinking": world.thinking,
             "generation": world.generation, "messages": len(world.messages),
         })
-    if op in {"peers", "inbox", "read", "post", "dismiss"}:
+    if op in {"peers", "agents", "inbox", "read", "post", "dismiss"}:
         from desmos.state import persist
         if op == "peers":
             return json.dumps(persist.peers(world), default=str)
+        if op == "agents":
+            name = str(attrs.get("name", "")).strip()
+            if name:
+                return json.dumps(persist.agent_upsert(
+                    world, name,
+                    kind=str(attrs.get("kind", "fork")),
+                    host=str(attrs.get("host", "")),
+                    parent=str(attrs.get("parent", "")),
+                    session_id=str(attrs.get("session_id", "")),
+                    status=str(attrs.get("status", "active")),
+                ), default=str)
+            return json.dumps(persist.roster(world), default=str)
         channel = attrs.get("channel", "conflicts")
         if op == "inbox":
             return json.dumps(

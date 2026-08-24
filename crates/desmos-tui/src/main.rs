@@ -1098,7 +1098,12 @@ fn main() -> io::Result<()> {
         seed_demo(&mut app);
     }
     wait_ready(bridge.as_mut(), &mut app)?;
-    if attached && let Some(b) = bridge.as_mut() {
+    // Roster UX: no transcript modal. Resume the newest session (main)
+    // immediately; a fresh workspace just starts new.
+    if let Some(choice) = app.session_picker.auto_resume() {
+        apply_session_choice(bridge.as_mut(), &mut app, choice)?;
+    }
+    if let Some(b) = bridge.as_mut() {
         b.send(&json!({"op": "channels"}))?;
     }
 
@@ -8412,18 +8417,8 @@ mod tests {
         let rail = app.rail_area;
         assert!(rail.width > 0, "the rail is not on screen");
 
-        // Row 0 is the root, so row 1 is the first child.
-        handle_mouse(
-            &mut app,
-            click(
-                MouseEventKind::Down(MouseButton::Left),
-                rail.x + 2,
-                rail.y + 2,
-            ),
-        );
-        assert_eq!(app.rail_sel, 1);
-        assert_eq!(app.viewing.as_deref(), Some("c1"));
-
+        // Row 0 is the AGENTS header, row 1 is main, so row 2 is the
+        // first child (border eats one line: screen y = row index + 1).
         handle_mouse(
             &mut app,
             click(
@@ -8433,18 +8428,29 @@ mod tests {
             ),
         );
         assert_eq!(app.rail_sel, 2);
-        assert_eq!(app.viewing.as_deref(), Some("c2"));
+        assert_eq!(app.viewing.as_deref(), Some("c1"));
 
-        // The root row puts the story pane back on the root session.
         handle_mouse(
             &mut app,
             click(
                 MouseEventKind::Down(MouseButton::Left),
                 rail.x + 2,
-                rail.y + 1,
+                rail.y + 4,
             ),
         );
-        assert_eq!(app.rail_sel, 0);
+        assert_eq!(app.rail_sel, 3);
+        assert_eq!(app.viewing.as_deref(), Some("c2"));
+
+        // The main row puts the story pane back on the root session.
+        handle_mouse(
+            &mut app,
+            click(
+                MouseEventKind::Down(MouseButton::Left),
+                rail.x + 2,
+                rail.y + 2,
+            ),
+        );
+        assert_eq!(app.rail_sel, 1);
         assert_eq!(app.viewing, None);
 
         // A click below the last row only focuses the rail.
@@ -8454,11 +8460,11 @@ mod tests {
             click(
                 MouseEventKind::Down(MouseButton::Left),
                 rail.x + 2,
-                rail.y + 8,
+                rail.y + 9,
             ),
         );
         assert_eq!(app.focus, Focus::Rail);
-        assert_eq!(app.rail_sel, 0);
+        assert_eq!(app.rail_sel, 1);
         assert_eq!(app.viewing, None);
     }
 

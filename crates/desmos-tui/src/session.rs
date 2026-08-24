@@ -101,6 +101,17 @@ impl SessionPicker {
         Some(choice)
     }
 
+    /// Roster UX: never ask which transcript. The newest session is main;
+    /// open on it, or report None on a fresh workspace so the caller starts
+    /// a new session.
+    pub(crate) fn auto_resume(&mut self) -> Option<Choice> {
+        if !self.open {
+            return None;
+        }
+        let choice = self.resume(0)?;
+        self.close(choice)
+    }
+
     pub(crate) fn resumed_turns(&self) -> &[Turn] {
         &self.turns
     }

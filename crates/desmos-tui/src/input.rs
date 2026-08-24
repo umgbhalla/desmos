@@ -382,10 +382,9 @@ pub(crate) fn handle_key(
     }
 
     if app.focus == Focus::Rail {
-        let last = rail::rows(app).len().saturating_sub(1);
         match key.code {
-            KeyCode::Char('j') | KeyCode::Down => app.rail_sel = (app.rail_sel + 1).min(last),
-            KeyCode::Char('k') | KeyCode::Up => app.rail_sel = app.rail_sel.saturating_sub(1),
+            KeyCode::Char('j') | KeyCode::Down => rail::step(app, true),
+            KeyCode::Char('k') | KeyCode::Up => rail::step(app, false),
             KeyCode::Enter | KeyCode::Right => rail::activate(app),
             KeyCode::Char('i') => app.set_focus(Focus::Input),
             _ => {}

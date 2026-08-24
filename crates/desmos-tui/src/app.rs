@@ -428,6 +428,7 @@ pub(crate) struct Decision {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ChannelRow {
     pub(crate) channel: String,
+    pub(crate) kind: String,
     pub(crate) unread: u64,
     pub(crate) last_seen: u64,
     pub(crate) max_id: u64,
@@ -607,7 +608,7 @@ impl App {
             queue_edit: None,
             drain_after: false,
             children: HashMap::new(),
-            rail_sel: 0,
+            rail_sel: 1, // rows[0] is the AGENTS header; main sits under it
             rail_seen: HashSet::new(),
             rail_area: Rect::default(),
             tree_open: false,

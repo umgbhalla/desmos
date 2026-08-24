@@ -26,7 +26,7 @@ from desmos.kernel.types import Tool, World
 _UMASK = os.umask(0)
 os.umask(_UMASK)
 
-SCHEMA_VERSION = 15  # 15: global spine sequence on channel messages
+SCHEMA_VERSION = 16  # 16: named agents roster + declared channels
 #: Oldest build that can still read this schema. Additive changes leave it
 #: alone; anything an older reader would misread raises it.
 MIN_READER_VERSION = 9
@@ -621,6 +621,25 @@ CREATE TABLE IF NOT EXISTS channel_cursors (
     last_seen INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (run_id, channel)
 );
+CREATE TABLE IF NOT EXISTS agents (
+    name TEXT PRIMARY KEY,
+    kind TEXT NOT NULL DEFAULT 'fork'
+        CHECK (kind IN ('chief', 'fork', 'bot')),
+    host TEXT NOT NULL DEFAULT '',
+    parent TEXT NOT NULL DEFAULT '',
+    session_id TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'active'
+        CHECK (status IN ('active', 'retired')),
+    created_at TEXT NOT NULL DEFAULT '',
+    updated_at TEXT NOT NULL DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS channels (
+    name TEXT PRIMARY KEY,
+    kind TEXT NOT NULL DEFAULT 'static'
+        CHECK (kind IN ('static', 'sys')),
+    description TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT ''
+);
 CREATE TABLE IF NOT EXISTS work_items (
     id TEXT PRIMARY KEY,
     workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
@@ -740,6 +759,40 @@ def _check_reader(rows: list[sqlite3.Row]) -> None:
         )
 
 
+#: The roster every workspace starts with: the chief agent, the machines
+#: that take remote work, and the static channels. INSERT OR IGNORE keeps
+#: user edits; a row is configuration, not state.
+ROSTER_AGENTS = (
+    ("main", "chief", "", ""),
+    ("hyperion", "bot", "hyperion", ""),
+)
+ROSTER_CHANNELS = (
+    ("general", "static", "talk that belongs to no build"),
+    ("build", "static", "builds, ships, and their evidence"),
+    ("ops", "static", "machines, daemons, deploys"),
+    ("sys.work", "sys", "remote work protocol"),
+    ("sys.presence", "sys", "host heartbeats"),
+    ("sys.memory", "sys", "memory replication"),
+    ("sys.cold", "sys", "cold session bodies"),
+)
+
+
+def _seed_roster(conn: sqlite3.Connection) -> None:
+    now = datetime.now(timezone.utc).isoformat()
+    for name, kind, host, parent in ROSTER_AGENTS:
+        conn.execute(
+            "INSERT OR IGNORE INTO agents(name, kind, host, parent,"
+            " created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (name, kind, host, parent, now, now),
+        )
+    for name, kind, desc in ROSTER_CHANNELS:
+        conn.execute(
+            "INSERT OR IGNORE INTO channels(name, kind, description,"
+            " created_at) VALUES (?, ?, ?, ?)",
+            (name, kind, desc, now),
+        )
+
+
 def _migrate(conn: sqlite3.Connection) -> None:
     """Create the current schema; old layouts are intentionally unsupported."""
     existing = {
@@ -785,6 +838,7 @@ def _migrate(conn: sqlite3.Connection) -> None:
         _add_column(
             conn, "schema_migrations", "min_reader", "INTEGER NOT NULL DEFAULT 0"
         )
+        _seed_roster(conn)
         versions = [int(r["version"]) for r in _version_rows(conn)]
         if versions != [SCHEMA_VERSION]:
             conn.execute("DELETE FROM schema_migrations")
@@ -1810,6 +1864,85 @@ def peers(world: World) -> list[dict[str, Any]]:
     return live
 
 
+
+def roster(world: World) -> dict[str, Any]:
+    """The named world: agents (with liveness from presence) and channels."""
+    announce(world)
+    db = _open(state_file(world))
+    try:
+        agents = [dict(r) for r in db.execute(
+            "SELECT name, kind, host, parent, session_id, status,"
+            " created_at, updated_at FROM agents WHERE status = 'active'"
+            " ORDER BY CASE kind WHEN 'chief' THEN 0 WHEN 'fork' THEN 1"
+            " ELSE 2 END, name",
+        ).fetchall()]
+        channels = [dict(r) for r in db.execute(
+            "SELECT name, kind, description FROM channels"
+            " ORDER BY kind, name",
+        ).fetchall()]
+    finally:
+        db.close()
+    import socket as _sock
+
+    local = os.environ.get("DESMOS_SEAT", "") or _sock.gethostname()
+    seen = {p_["host"] for p_ in peers(world)}
+    for a in agents:
+        home = a["host"] or local
+        a["live"] = home in seen or home == local
+    return {"agents": agents, "channels": channels}
+
+
+def agent_upsert(
+    world: World, name: str, kind: str = "fork", host: str = "",
+    parent: str = "", session_id: str = "", status: str = "active",
+) -> dict[str, Any]:
+    """Name an agent, or move an existing name to a new binding."""
+    name = name.strip()
+    if not name:
+        raise ValueError("agent: missing name")
+    now = datetime.now(timezone.utc).isoformat()
+    db = _open(state_file(world))
+    try:
+        with db:
+            db.execute(
+                "INSERT INTO agents(name, kind, host, parent, session_id,"
+                " status, created_at, updated_at)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+                " ON CONFLICT(name) DO UPDATE SET kind = excluded.kind,"
+                " host = excluded.host, parent = excluded.parent,"
+                " session_id = excluded.session_id, status = excluded.status,"
+                " updated_at = excluded.updated_at",
+                (name, kind, host, parent, session_id, status, now, now),
+            )
+    finally:
+        db.close()
+    return {"name": name, "kind": kind, "host": host, "parent": parent,
+            "status": status}
+
+
+def channel_declare(
+    world: World, name: str, kind: str = "static", description: str = ""
+) -> dict[str, Any]:
+    """Declare a channel; static channels are configuration, not chat."""
+    name = name.strip()
+    if not name:
+        raise ValueError("channel: missing name")
+    db = _open(state_file(world))
+    try:
+        with db:
+            db.execute(
+                "INSERT INTO channels(name, kind, description, created_at)"
+                " VALUES (?, ?, ?, ?)"
+                " ON CONFLICT(name) DO UPDATE SET kind = excluded.kind,"
+                " description = excluded.description",
+                (name, kind, description,
+                 datetime.now(timezone.utc).isoformat()),
+            )
+    finally:
+        db.close()
+    return {"name": name, "kind": kind, "description": description}
+
+
 def peer_channel(target_run: str, kind: str) -> str:
     """Private directed channel for one bounded peer request or reply."""
     target = str(target_run).strip()
@@ -1953,6 +2086,29 @@ def channel_list(world: World) -> list[dict[str, Any]]:
             entry["unread"] = int(entry["unread"] or 0)
             entry["last_seen"] = int(entry["last_seen"] or 0)
             entry["max_id"] = int(entry["max_id"] or 0)
+        # Declared channels are configuration: they exist while empty, and
+        # they carry a kind the UI can group by. Ad-hoc names still show.
+        try:
+            declared = {
+                str(r["name"]): str(r["kind"])
+                for r in db.execute("SELECT name, kind FROM channels")
+            }
+        except sqlite3.OperationalError:
+            declared = {}
+        have = {e["channel"] for e in entries}
+        for entry in entries:
+            entry["kind"] = declared.get(entry["channel"], "adhoc")
+        for name, kind in declared.items():
+            if name not in have:
+                entries.append({
+                    "channel": name, "kind": kind, "last_seen": 0,
+                    "max_id": 0, "unread": 0, "preview": "", "author": "",
+                    "ts": "",
+                })
+        entries.sort(key=lambda e: (
+            {"static": 0, "adhoc": 1, "sys": 2}.get(e["kind"], 1),
+            -e["max_id"], e["channel"],
+        ))
         return entries
     finally:
         db.close()

@@ -30,6 +30,7 @@ impl Presence {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Target {
+    Header,
     Root,
     Child(String),
     Background,
@@ -43,16 +44,27 @@ pub(crate) struct Row {
     pub(crate) presence: Presence,
 }
 
+fn header(label: &str) -> Row {
+    Row {
+        target: Target::Header,
+        label: label.into(),
+        presence: Presence::FinishedSeen,
+    }
+}
+
 pub(crate) fn rows(app: &App) -> Vec<Row> {
-    let mut rows = vec![Row {
-        target: Target::Root,
-        label: "root session".into(),
-        presence: if app.running {
-            Presence::Running
-        } else {
-            Presence::NeedsMe
+    let mut rows = vec![
+        header("agents"),
+        Row {
+            target: Target::Root,
+            label: "main".into(),
+            presence: if app.running {
+                Presence::Running
+            } else {
+                Presence::NeedsMe
+            },
         },
-    }];
+    ];
     let mut children: Vec<_> = app.children.iter().collect();
     children.sort_by_key(|(_, child)| child.seq);
     rows.extend(children.into_iter().map(|(id, child)| {
@@ -100,7 +112,8 @@ pub(crate) fn rows(app: &App) -> Vec<Row> {
         label,
         presence: Presence::Running,
     }));
-    rows.extend(app.channels.iter().map(|channel| Row {
+    rows.push(header("channels"));
+    rows.extend(app.channels.iter().filter(|c| c.kind != "sys").map(|channel| Row {
         target: Target::Channel(channel.channel.clone()),
         label: if channel.unread > 0 {
             format!("#{}  {}", channel.channel, channel.unread)
@@ -121,6 +134,7 @@ pub(crate) fn activate(app: &mut App) {
         return;
     };
     match row.target {
+        Target::Header => {}
         Target::Root => {
             app.viewing = None;
             app.focus = Focus::Story;
@@ -134,6 +148,32 @@ pub(crate) fn activate(app: &mut App) {
         Target::Background => {}
         Target::Channel(channel) => {
             app.pending_channel_read = Some(channel);
+        }
+    }
+}
+
+/// Move the rail cursor one selectable row, skipping section headers.
+pub(crate) fn step(app: &mut App, down: bool) {
+    let rows = rows(app);
+    if rows.is_empty() {
+        return;
+    }
+    let mut i = app.rail_sel.min(rows.len() - 1);
+    loop {
+        if down {
+            if i + 1 >= rows.len() {
+                return;
+            }
+            i += 1;
+        } else {
+            if i == 0 {
+                return;
+            }
+            i -= 1;
+        }
+        if !matches!(rows[i].target, Target::Header) {
+            app.rail_sel = i;
+            return;
         }
     }
 }
@@ -165,6 +205,14 @@ pub(crate) fn draw(f: &mut Frame, area: Rect, app: &mut App) {
         .enumerate()
         .take(inner.height as usize)
         .map(|(i, row)| {
+            if row.target == Target::Header {
+                return Line::from(Span::styled(
+                    format!(" {} ", row.label.to_uppercase()),
+                    Style::default()
+                        .fg(theme.text_secondary)
+                        .add_modifier(Modifier::DIM | Modifier::BOLD),
+                ));
+            }
             let selected = focused && i == app.rail_sel;
             let mut style = Style::default().fg(match row.presence {
                 Presence::Running => theme.accent_success,
@@ -229,16 +277,27 @@ mod tests {
         assert_eq!(
             got,
             vec![
+                (Target::Header, Presence::FinishedSeen),
                 (Target::Root, Presence::NeedsMe),
                 (Target::Child("first".into()), Presence::FinishedUnseen),
                 (Target::Child("second".into()), Presence::Running),
                 (Target::Background, Presence::Running),
+                (Target::Header, Presence::FinishedSeen),
             ]
         );
 
-        app.rail_sel = 1;
+        app.rail_sel = 2;
         activate(&mut app);
         assert_eq!(app.viewing.as_deref(), Some("first"));
-        assert_eq!(rows(&app)[1].presence, Presence::FinishedSeen);
+        assert_eq!(rows(&app)[2].presence, Presence::FinishedSeen);
+
+        // The stepper never lands on a header: from main it walks to the
+        // first child, and upward from main it stays put.
+        app.rail_sel = 1;
+        step(&mut app, true);
+        assert_eq!(app.rail_sel, 2);
+        app.rail_sel = 1;
+        step(&mut app, false);
+        assert_eq!(app.rail_sel, 1);
     }
 }
