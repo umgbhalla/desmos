@@ -1954,7 +1954,7 @@ def peer_channel(target_run: str, kind: str) -> str:
 
 
 def channel_post(
-    world: World, body: str, channel: str = "conflicts", author: str = ""
+    world: World, body: str, channel: str = "general", author: str = ""
 ) -> dict[str, Any]:
     text = body.strip()
     if not text:
@@ -1977,7 +1977,7 @@ def channel_post(
                 VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
-                    workspace, session, channel or "conflicts", run,
+                    workspace, session, channel or "general", run,
                     author.strip() or run, text, now,
                 ),
             )
@@ -1989,7 +1989,7 @@ def channel_post(
 
             _outbox.enqueue_conn(db, workspace, "channel_post", {
                 "id": message_id,
-                "channel": channel or "conflicts",
+                "channel": channel or "general",
                 "run_id": run,
                 "author": author.strip() or run,
                 "body": text,
@@ -1999,7 +1999,7 @@ def channel_post(
         db.close()
     return {
         "id": message_id,
-        "channel": channel or "conflicts",
+        "channel": channel or "general",
         "run_id": run,
         "author": author.strip() or run,
         "body": text,
@@ -2008,7 +2008,7 @@ def channel_post(
 
 
 def channel_read(
-    world: World, channel: str = "conflicts", since: int = 0, limit: int = 50
+    world: World, channel: str = "general", since: int = 0, limit: int = 50
 ) -> list[dict[str, Any]]:
     if not world.persist:
         return []
@@ -2027,7 +2027,7 @@ def channel_read(
             """,
             (
                 workspace,
-                channel or "conflicts",
+                channel or "general",
                 int(since),
                 max(1, min(int(limit), 200)),
             ),
@@ -2115,7 +2115,7 @@ def channel_list(world: World) -> list[dict[str, Any]]:
 
 
 def channel_tail(
-    world: World, channel: str = "conflicts", limit: int = 50
+    world: World, channel: str = "general", limit: int = 50
 ) -> list[dict[str, Any]]:
     """Newest channel messages, returned in chronological order."""
     if not world.persist:
@@ -2135,7 +2135,7 @@ def channel_tail(
                 ORDER BY id DESC LIMIT ?
             ) ORDER BY id
             """,
-            (workspace, channel or "conflicts", max(1, min(int(limit), 200))),
+            (workspace, channel or "general", max(1, min(int(limit), 200))),
         ).fetchall()
         return [dict(row) for row in rows]
     finally:
@@ -2143,7 +2143,7 @@ def channel_tail(
 
 
 def ordered_read(
-    world: World, channel: str = "conflicts", limit: int = 50
+    world: World, channel: str = "general", limit: int = 50
 ) -> list[dict[str, Any]]:
     """Read a channel in spine order, with local/unacked rows last."""
     if not world.persist:
@@ -2162,7 +2162,7 @@ def ordered_read(
             ORDER BY spine_seq NULLS LAST, id
             LIMIT ?
             """,
-            (workspace, channel or "conflicts", max(1, min(int(limit), 200))),
+            (workspace, channel or "general", max(1, min(int(limit), 200))),
         ).fetchall()
         return [dict(row) for row in rows]
     finally:
@@ -2170,7 +2170,7 @@ def ordered_read(
 
 
 def channel_inbox(
-    world: World, channel: str = "conflicts", limit: int = 20
+    world: World, channel: str = "general", limit: int = 20
 ) -> dict[str, Any]:
     """Unread messages from other runs, without advancing the durable cursor."""
     if not world.persist:
@@ -2178,7 +2178,7 @@ def channel_inbox(
     announce(world)
     db = _open(state_file(world))
     run = run_id()
-    name = channel or "conflicts"
+    name = channel or "general"
     try:
         workspace = _workspace_id(db, world, create=False)
         if workspace is None:
@@ -2220,7 +2220,7 @@ def channel_inbox(
 
 
 def channel_dismiss(
-    world: World, channel: str = "conflicts", through: int = 0
+    world: World, channel: str = "general", through: int = 0
 ) -> dict[str, Any]:
     """Advance this run's unread cursor, defaulting to the newest message."""
     if not world.persist:
@@ -2228,7 +2228,7 @@ def channel_dismiss(
     announce(world)
     db = _open(state_file(world))
     run = run_id()
-    name = channel or "conflicts"
+    name = channel or "general"
     try:
         workspace = _workspace_id(db, world, create=False)
         if workspace is None:
@@ -2256,7 +2256,7 @@ def channel_dismiss(
         db.close()
 
 
-def channel_notice(world: World, channel: str = "conflicts") -> str:
+def channel_notice(world: World, channel: str = "general") -> str:
     inbox = channel_inbox(world, channel=channel, limit=1)
     if not inbox["unread"]:
         return ""

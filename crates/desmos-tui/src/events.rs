@@ -489,7 +489,7 @@ pub(crate) fn handle_event(app: &mut App, ev: Value) {
             let channel = ev
                 .get("channel")
                 .and_then(Value::as_str)
-                .unwrap_or("conflicts");
+                .unwrap_or("general");
             if let Some(row) = app.channels.iter_mut().find(|row| row.channel == channel) {
                 row.unread = 0;
                 row.last_seen = row.max_id;
@@ -719,7 +719,7 @@ pub(crate) fn handle_event(app: &mut App, ev: Value) {
             let channel = ev
                 .get("channel")
                 .and_then(Value::as_str)
-                .unwrap_or("conflicts");
+                .unwrap_or("general");
             let author = ev.get("author").and_then(Value::as_str).unwrap_or("peer");
             let preview = ev.get("preview").and_then(Value::as_str).unwrap_or("");
             let unread = ev.get("unread").and_then(Value::as_u64).unwrap_or(1);

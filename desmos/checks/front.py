@@ -368,7 +368,7 @@ def _check_socket() -> None:
                     VALUES (?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
-                        owner[0], owner[1], "conflicts", "peer-check",
+                        owner[0], owner[1], "general", "peer-check",
                         "worker-b", "persist.py conflict", "2026-01-01",
                     ),
                 )
@@ -377,7 +377,7 @@ def _check_socket() -> None:
             )
             assert _strip(channel) == {
                 "ev": "channel",
-                "channel": "conflicts",
+                "channel": "general",
                 "author": "worker-b",
                 "preview": "persist.py conflict",
                 "unread": 1,
@@ -1371,6 +1371,24 @@ def check() -> None:
             pick = json.loads(proc.stdout.readline())
             assert pick["ev"] == "picker" and pick["onboarding"] is False, pick
             assert pick["current"]["model"] == "gpt-5.6-luna", pick
+
+            # Switching channels in the TUI sends these three ops. They lived
+            # only on the socket loop, so a stdio-attached front got
+            # "unknown op 'channel_read'" for every click on the rail. Drive
+            # the real stdin reader, not the helper, or the gap comes back.
+            proc.stdin.write(json.dumps({"op": "channels"}) + "\n")
+            proc.stdin.flush()
+            chans = json.loads(proc.stdout.readline())
+            assert chans["ev"] == "channels", chans
+            names = {row["channel"] for row in chans["channels"]}
+            assert {"general", "build", "ops"} <= names, names
+            proc.stdin.write(
+                json.dumps({"op": "channel_read", "channel": "build"}) + "\n"
+            )
+            proc.stdin.flush()
+            story = json.loads(proc.stdout.readline())
+            assert story["ev"] == "channel_story", story
+            assert story["channel"] == "build", story
         finally:
             proc.stdin.write(json.dumps({"op": "quit"}) + "\n")
             proc.stdin.flush()

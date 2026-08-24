@@ -143,7 +143,7 @@ def _append_frame(row: dict[str, Any]) -> dict[str, Any] | None:
     if kind == "channel_post":
         return {
             "op": "append",
-            "channel": str(payload.get("channel") or "conflicts"),
+            "channel": str(payload.get("channel") or "general"),
             "fingerprint": row["fingerprint"],
             "author": str(payload.get("author") or "anon"),
             "seat": _seat(),
@@ -496,6 +496,32 @@ def bootstrap(world: World, timeout: float = RECV_TIMEOUT) -> dict[str, int]:
                     break
                 since = int(next_seq)
     return {"channels": len(channels), "ingested": ingested}
+
+def purge(world: World, channels: list[str], timeout: float = RECV_TIMEOUT) -> dict[str, int]:
+    """Erase channels at the spine and locally, so a sync cannot resurrect them.
+
+    A local DELETE alone is undone by the next snapshot ingest: the DO still
+    holds the rows and hands them back. Junk channels were immortal until the
+    DO learned this op.
+    """
+    purged = []
+    with _connect(world, timeout) as ws:
+        for channel in channels:
+            ws.send(json.dumps({"op": "purge", "channel": channel}))
+            _recv_until(ws, "purged", timeout)
+            purged.append(channel)
+    db = _open(state_file(world))
+    try:
+        with db:
+            marks = ",".join("?" for _ in purged)
+            cur = db.execute(
+                f"DELETE FROM channel_messages WHERE channel IN ({marks})", purged
+            )
+            removed = max(cur.rowcount, 0)
+    finally:
+        db.close()
+    return {"channels": len(purged), "removed": removed}
+
 
 def run_forever(world: World, interval: float = 5.0) -> None:
     """Drain and ingest until the process dies; offline is a wait, not an error."""

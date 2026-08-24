@@ -359,6 +359,38 @@ def _peer_entries(world: Any) -> list[dict[str, Any]]:
         })
     return out
 
+def _roster_reply(world: "World", op: str, msg: dict[str, Any]) -> dict[str, Any]:
+    """One answer for peers/channels/channel_read, shared by both loops.
+
+    The socket wire loop and the stdio inbox loop must agree on what a
+    channel op returns; two implementations drifted once (the stdio loop
+    simply lacked these ops, so switching channels in a stdio TUI said
+    "unknown op"). Read-only except for the dismiss cursor.
+    """
+    if op == "peers":
+        try:
+            return {"ev": "peers", "peers": _peer_entries(world)}
+        except Exception as exc:  # noqa: BLE001 -- name it, don't die
+            return {"ev": "error", "text": f"peers failed: {exc}"}
+    if op == "channels":
+        from desmos.state.persist import channel_list
+
+        try:
+            return {"ev": "channels", "channels": channel_list(world)}
+        except Exception as exc:  # noqa: BLE001 -- name it, don't die
+            return {"ev": "error", "text": f"channels failed: {exc}"}
+    from desmos.state.persist import channel_dismiss, channel_tail
+
+    channel = str(msg.get("channel") or "general")
+    try:
+        messages = channel_tail(world, channel=channel, limit=50)
+        through = max((int(item["id"]) for item in messages), default=0)
+        channel_dismiss(world, channel=channel, through=through)
+        return {"ev": "channel_story", "channel": channel, "messages": messages}
+    except Exception as exc:  # noqa: BLE001 -- name it, don't die
+        return {"ev": "error", "text": f"channel read failed: {exc}"}
+
+
 def _serve_client(
     conn: socket.socket,
     world: Any,
@@ -433,57 +465,8 @@ def _serve_client(
                 continue
             with _WIRE_LOCK:
                 register_locked()
-            if op == "peers":
-                # R5 rail-over-siblings seam: answer only the asking client
-                # (like attach's replay), never the fan-out. Same push path
-                # as every other socket line, so it carries "sid" too.
-                try:
-                    entries = _peer_entries(world)
-                except Exception as exc:  # noqa: BLE001 -- name it, don't die
-                    reply = {"ev": "error", "text": f"peers failed: {exc}"}
-                else:
-                    reply = {"ev": "peers", "peers": entries}
-                reply["sid"] = os.environ.get("DESMOS_SESSION_ID", "")
-                line = json.dumps(reply, default=str) + "\n"
-                try:
-                    wire.push(line.encode("utf-8"))
-                except OSError:
-                    return
-                continue
-            if op == "channels":
-                from desmos.state.persist import channel_list
-                try:
-                    entries = channel_list(world)
-                except Exception as exc:  # noqa: BLE001 -- name it, don't die
-                    reply = {"ev": "error", "text": f"channels failed: {exc}"}
-                else:
-                    reply = {"ev": "channels", "channels": entries}
-                reply["sid"] = os.environ.get("DESMOS_SESSION_ID", "")
-                line = json.dumps(reply, default=str) + "\n"
-                try:
-                    wire.push(line.encode("utf-8"))
-                except OSError:
-                    return
-                continue
-            if op == "channel_read":
-                from desmos.state.persist import (
-                    channel_dismiss,
-                    channel_tail,
-                )
-                channel = str(msg.get("channel") or "conflicts")
-                try:
-                    messages = channel_tail(world, channel=channel, limit=50)
-                    through = max(
-                        (int(item["id"]) for item in messages), default=0
-                    )
-                    channel_dismiss(world, channel=channel, through=through)
-                    reply = {
-                        "ev": "channel_story",
-                        "channel": channel,
-                        "messages": messages,
-                    }
-                except Exception as exc:  # noqa: BLE001 -- name it, don't die
-                    reply = {"ev": "error", "text": f"channel read failed: {exc}"}
+            if op in ("peers", "channels", "channel_read"):
+                reply = _roster_reply(world, op, msg)
                 reply["sid"] = os.environ.get("DESMOS_SESSION_ID", "")
                 line = json.dumps(reply, default=str) + "\n"
                 try:
@@ -999,6 +982,8 @@ def _drive(
                 level = str(msg.get("level") or "low").strip()
                 world.thinking = level
                 _emit(_snapshot(world))
+            elif op in ("peers", "channels", "channel_read"):
+                _emit(_roster_reply(world, op, msg))
             elif op == "typed":
                 # The TUI queued a follow-up. Nothing to do here: run_turns
                 # polls `has_input`, which is `not inbox.empty()`, so landing

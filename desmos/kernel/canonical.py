@@ -572,7 +572,7 @@ def _session(world, op, body, attrs):
                     status=str(attrs.get("status", "active")),
                 ), default=str)
             return json.dumps(persist.roster(world), default=str)
-        channel = attrs.get("channel", "conflicts")
+        channel = attrs.get("channel", "general")
         if op == "inbox":
             return json.dumps(
                 persist.channel_inbox(

@@ -2044,7 +2044,7 @@ def _check_session_channel(cwd: Path) -> None:
                 ),
             )
         )
-        assert posted["channel"] == "conflicts" and posted["id"] > 0, posted
+        assert posted["channel"] == "general" and posted["id"] > 0, posted
         directed = json.loads(
             dispatch(
                 world,
@@ -2075,14 +2075,14 @@ def _check_session_channel(cwd: Path) -> None:
                 VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
-                    workspace, peer_id, "conflicts", peer_id,
+                    workspace, peer_id, "general", peer_id,
                     "worker-b", "I also need persist.py.", "2026-01-02",
                 ),
             )
         inbox = json.loads(dispatch(world, Block("session", "", {"op": "inbox"})))
         assert inbox["unread"] == 1 and inbox["messages"][0]["author"] == "worker-b", inbox
         from desmos.kernel.catalog import volatile
-        assert "IRC #conflicts: 1 unread from worker-b" in volatile(world)
+        assert "IRC #general: 1 unread from worker-b" in volatile(world)
 
         messages = json.loads(
             dispatch(
@@ -2104,7 +2104,7 @@ def _check_session_channel(cwd: Path) -> None:
                 VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
-                    workspace, peer_id, "conflicts", peer_id,
+                    workspace, peer_id, "general", peer_id,
                     "worker-b", "Resolved.", "2026-01-03",
                 ),
             )

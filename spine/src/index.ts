@@ -159,6 +159,8 @@ export class Spine extends DurableObject<Env> {
         ws.send(JSON.stringify(this.snapshot()));
       } else if (msg.op === "replay") {
         await this.replay(ws, msg);
+      } else if (msg.op === "purge") {
+        await this.purge(ws, msg);
       } else {
         ws.send(JSON.stringify({ op: "error", error: "unknown op" }));
       }
@@ -231,6 +233,20 @@ export class Spine extends DurableObject<Env> {
     const events = ordered.slice(0, limit);
     const next = ordered.length > limit ? events.at(-1)!.seq : null;
     ws.send(JSON.stringify({ op: "replay", channel: msg.channel, events, next }));
+  }
+
+  private async purge(ws: WebSocket, msg: Record<string, unknown>): Promise<void> {
+    // Erase a channel everywhere it lives: hot log, its counter, and the D1
+    // archive. Without this, every client's snapshot-sync resurrects rows
+    // deleted locally -- junk channels were immortal.
+    if (typeof msg.channel !== "string" || !msg.channel) throw new Error("invalid channel");
+    this.ctx.storage.transactionSync(() => {
+      this.ctx.storage.sql.exec("DELETE FROM hot_log WHERE channel = ?", msg.channel);
+      this.ctx.storage.sql.exec("DELETE FROM counters WHERE channel = ?", msg.channel);
+    });
+    await this.env.ARCHIVE.prepare("DELETE FROM log WHERE channel = ?")
+      .bind(msg.channel).run();
+    ws.send(JSON.stringify({ op: "purged", channel: msg.channel }));
   }
 
   private snapshot(): unknown {
