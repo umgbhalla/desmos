@@ -615,6 +615,11 @@ def _session(world, op, body, attrs):
             return str(exc)
         if target:
             message.update({"to": target, "kind": "request"})
+        else:
+            from desmos.agents import remote as _remote
+            dispatched = _remote.mention_dispatch(world, channel, body)
+            if dispatched:
+                message["dispatched"] = dispatched
         return json.dumps(message, default=str)
     model = body.strip() or attrs.pop("model", "")
     if not model:

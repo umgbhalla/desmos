@@ -116,6 +116,8 @@ def request(
     task: str,
     agent: str = "general",
     timeout: float = DEFAULT_TIMEOUT_S,
+    reply_channel: str = "",
+    reply_as: str = "",
 ) -> str:
     """Dispatch one task to a live remote host; the reply is a pending task."""
     host = host.strip()
@@ -140,11 +142,62 @@ def request(
     })
     from desmos.agents import pending
 
-    pending.submit(
-        world, f"remote {work_id} -> {host}",
-        lambda: await_result(world, work_id, timeout),
-    )
+    def _finish() -> str:
+        out = await_result(world, work_id, timeout)
+        if reply_channel:
+            # The asker posted in a channel, so the bot answers there too.
+            from desmos.state.persist import channel_post
+
+            try:
+                channel_post(world, out, channel=reply_channel,
+                             author=reply_as or host)
+            except ValueError:
+                pass
+        return out
+
+    pending.submit(world, f"remote {work_id} -> {host}", _finish)
     return (
         f"remote work {work_id} dispatched to {host} ({agent or 'general'});"
         " the result resumes this step as a background task"
     )
+
+
+def mention_dispatch(world: Any, channel: str, body: str) -> list[str]:
+    """@bot mentions in a channel post become remote work on the bot's host.
+
+    Returns one dispatch note per live bot mentioned; unknown names and sys
+    channels are left alone. The bot's answer is posted back to the channel
+    by the pending task that awaits it.
+    """
+    import re
+
+    if channel.startswith("sys."):
+        return []
+    names = list(dict.fromkeys(re.findall(r"@([\w.-]+)", body)))
+    if not names:
+        return []
+    db = _open(state_file(world))
+    try:
+        try:
+            rows = db.execute(
+                "SELECT name, host FROM agents"
+                " WHERE kind = 'bot' AND status = 'active'",
+            ).fetchall()
+        except Exception:
+            return []
+    finally:
+        db.close()
+    bots = {str(r["name"]): str(r["host"]) or str(r["name"]) for r in rows}
+    notes = []
+    for name in names:
+        host = bots.get(name)
+        if not host:
+            continue
+        task = re.sub(rf"@{re.escape(name)}\b", "", body).strip()
+        if not task:
+            continue
+        notes.append(request(
+            world, host, task,
+            reply_channel=channel, reply_as=name,
+        ))
+    return notes

@@ -338,6 +338,81 @@ def _check_spine_work() -> None:
 
 
 
+def _check_mention_dispatch() -> None:
+    """@bot in a channel post becomes remote work; the answer posts back."""
+    import tempfile
+    from datetime import datetime, timezone
+
+    from desmos.agents import pending, remote
+    from desmos.front import spine
+    from desmos.state import persist
+
+    keep = os.environ.get("DESMOS_SEAT")
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            world = new_world(root, state_path=root / "s.sqlite3")
+            db = persist._open(persist.state_file(world))
+            try:
+                persist._session_id(db, world, persist._workspace_id(db, world))
+                db.commit()
+            finally:
+                db.close()
+            os.environ["DESMOS_SEAT"] = "asker-host"
+            now = datetime.now(timezone.utc).isoformat()
+            presence = {
+                "channel": spine.SYS_PRESENCE, "seq": 1, "author": "h",
+                "seat": "h", "ts": now,
+                "body": json.dumps({"host": "hyperion", "sessions": [
+                    {"run_id": "r", "session_id": "s", "pid": 1, "cwd": "/",
+                     "generation": 1, "model": "m", "started_at": now},
+                ]}),
+            }
+            assert spine.ingest(world, [presence]) == 1
+            assert remote.mention_dispatch(world, "sys.work", "@hyperion x") == []
+            assert remote.mention_dispatch(world, "build", "@nobody x") == []
+            assert remote.mention_dispatch(world, "build", "@hyperion") == []
+            notes = remote.mention_dispatch(
+                world, "build", "@hyperion run the suite")
+            assert len(notes) == 1 and "dispatched to hyperion" in notes[0]
+
+            db = persist._open(persist.state_file(world))
+            try:
+                rows = db.execute(
+                    "SELECT body FROM channel_messages WHERE channel = ?",
+                    (spine.SYS_WORK,),
+                ).fetchall()
+            finally:
+                db.close()
+            reqs = []
+            for row in rows:
+                try:
+                    payload = json.loads(str(row["body"]))
+                except ValueError:
+                    continue
+                if payload.get("t") == "request":
+                    reqs.append(payload)
+            assert len(reqs) == 1, reqs
+            assert reqs[0]["task"] == "run the suite", reqs
+            assert reqs[0]["target"] == "hyperion"
+            wid = reqs[0]["work_id"]
+
+            spine.post_work(world, {
+                "t": "result", "work_id": wid, "host": "hyperion",
+                "status": "done", "output": "suite green"})
+            task = next(t for t in pending._bucket(world) if wid in t.name)
+            assert task.done.wait(20), "mention reply never landed"
+            assert task.error == "", task.error
+            got = persist.channel_read(world, channel="build", limit=5)
+            assert got and got[-1]["author"] == "hyperion", got
+            assert "suite green" in got[-1]["body"], got[-1]
+    finally:
+        if keep is None:
+            os.environ.pop("DESMOS_SEAT", None)
+        else:
+            os.environ["DESMOS_SEAT"] = keep
+
+
 def _check_spine_sync_wiring() -> None:
     """sync() over a fake socket: send, ack, retire outbox, mark spine_seq."""
     import tempfile
@@ -497,6 +572,7 @@ def check() -> None:
     _check_spine_memory()
     _check_roster()
     _check_spine_work()
+    _check_mention_dispatch()
     _check_spine_sync_wiring()
     _check_spine_run_work()
 
