@@ -22,7 +22,10 @@ fn main() {
         })
     };
     let mut commit = git(&["rev-parse", "--short", "HEAD"]).unwrap_or_else(|| "unknown".into());
-    if git(&["status", "--porcelain"]).is_some_and(|s| !s.is_empty()) {
+    // Tracked changes only. Untracked files -- notes, scratch, a downloaded
+    // book -- do not go into the binary, and counting them marks every build
+    // dirty forever, which makes the stamp stop meaning anything.
+    if git(&["status", "--porcelain", "--untracked-files=no"]).is_some_and(|s| !s.is_empty()) {
         commit.push_str("-dirty");
     }
     println!("cargo:rustc-env=DESMOS_COMMIT={commit}");
