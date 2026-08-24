@@ -886,9 +886,10 @@ fn parse_args() -> (String, String, bool) {
             }
             "--version" | "-V" => {
                 println!(
-                    "desmos-tui {} ({})",
+                    "desmos-tui {} ({}, {})",
                     env!("CARGO_PKG_VERSION"),
-                    env!("DESMOS_PROFILE")
+                    env!("DESMOS_PROFILE"),
+                    env!("DESMOS_COMMIT")
                 );
                 std::process::exit(0);
             }
@@ -1071,8 +1072,28 @@ fn seed_spawn(app: &mut App) {
         )));
 }
 
+/// Record which build is actually running, where the kernel can read it.
+///
+/// `--version` describes a file on disk, and after a rebuild that file is a
+/// different binary than the live process. Only the running image can say
+/// what it is, so it says so once at startup.
+fn write_build_stamp(cwd: &str, pid: u32) -> Option<PathBuf> {
+    let dir = PathBuf::from(cwd).join(".desmos");
+    std::fs::create_dir_all(&dir).ok()?;
+    let path = dir.join("run-tui.json");
+    let stamp = json!({
+        "pid": pid,
+        "commit": env!("DESMOS_COMMIT"),
+        "profile": env!("DESMOS_PROFILE"),
+        "version": env!("CARGO_PKG_VERSION"),
+    });
+    std::fs::write(&path, stamp.to_string()).ok()?;
+    Some(path)
+}
+
 fn main() -> io::Result<()> {
     let (python, cwd, demo) = parse_args();
+    write_build_stamp(&cwd, std::process::id());
     let mut bridge = if demo {
         None
     } else {
@@ -8998,6 +9019,28 @@ mod tests {
         let mut out: Vec<u8> = Vec::new();
         flush_media(&mut app, &mut out).unwrap();
         assert!(out.is_empty());
+    }
+
+    #[test]
+    fn build_stamp_names_the_running_image() {
+        let dir = std::env::temp_dir().join(format!(
+            "desmos-build-stamp-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cwd = dir.to_str().unwrap();
+        let path = super::write_build_stamp(cwd, 4242).expect("stamp written");
+        let text = std::fs::read_to_string(&path).unwrap();
+        let stamp: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(stamp["pid"], 4242);
+        assert_eq!(stamp["commit"], env!("DESMOS_COMMIT"));
+        assert_ne!(stamp["commit"], "unknown");
+        assert_eq!(stamp["profile"], env!("DESMOS_PROFILE"));
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

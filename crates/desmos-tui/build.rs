@@ -10,4 +10,22 @@ fn main() {
     // a fresh release one are otherwise indistinguishable from the outside.
     let profile = std::env::var("PROFILE").unwrap_or_else(|_| "unknown".into());
     println!("cargo:rustc-env=DESMOS_PROFILE={profile}");
+
+    // Which source this binary came from. A profile alone cannot tell a
+    // front built two commits ago from the one that ships the fix you are
+    // looking for, and the answer has to come from the running image --
+    // comparing file mtimes guesses, and guesses wrongly after a rebuild.
+    let git = |args: &[&str]| -> Option<String> {
+        let out = std::process::Command::new("git").args(args).output().ok()?;
+        out.status.success().then(|| {
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        })
+    };
+    let mut commit = git(&["rev-parse", "--short", "HEAD"]).unwrap_or_else(|| "unknown".into());
+    if git(&["status", "--porcelain"]).is_some_and(|s| !s.is_empty()) {
+        commit.push_str("-dirty");
+    }
+    println!("cargo:rustc-env=DESMOS_COMMIT={commit}");
+    println!("cargo:rerun-if-changed=../../.git/HEAD");
+    println!("cargo:rerun-if-changed=../../.git/index");
 }
