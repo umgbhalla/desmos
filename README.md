@@ -2,7 +2,7 @@
 
 # desmos
 
-**A coding agent that rebuilds its own harness, and has to prove every change.**
+**A coding agent that rebuilds its own harness, live, and keeps every change reversible.**
 
 [![release](https://github.com/umgbhalla/desmos/actions/workflows/release.yml/badge.svg)](https://github.com/umgbhalla/desmos/actions/workflows/release.yml)
 [![license](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
@@ -42,15 +42,32 @@ closed at both ends:
 flowchart LR
     W[real work] --> N{miss worth<br/>fixing?}
     N -- no --> W
-    N -- yes --> C[smallest durable<br/>change]
-    C --> R[reload: live on the<br/>next dispatch]
-    R --> P{proven against<br/>real work?}
+    N e1@--> C[smallest durable<br/>change]
+    C e2@--> R[reload: live on the<br/>next dispatch]
+    R e3@--> P{used against<br/>real work?}
     P -- no --> D[delete it]
     D --> W
-    P -- yes --> S[evolve:<br/>generation N+1]
-    S --> W
+    P e4@--> S[evolve:<br/>generation N+1]
+    S e5@--> W
     S -.->|rollback n| C
+    e1@{ animate: true }
+    e2@{ animate: true }
+    e3@{ animate: true }
+    e4@{ animate: true }
+    e5@{ animate: true }
 ```
+
+<sub>The moving edges are the loop as it runs: miss, change, live, kept.</sub>
+
+One row of that table is doctrine rather than a gate. Two of the gates are real:
+`reload-sdk` refuses a tree that fails the reload tier
+([`kernel/loop.py:1452`](desmos/kernel/loop.py)), and a child that claims a
+result without ever calling a syscall fails with `no_tool_evidence`
+([`agents/subagent.py:706`](desmos/agents/subagent.py)). **prove** is not one of
+them: nothing blocks `evolve` on missing evidence, and `evolve(world, reason="")`
+takes an optional string ([`state/generations.py:75`](desmos/state/generations.py)).
+What the harness guarantees is that every change is reversible and on the record.
+Deciding a change earned its line is the operator's half of the loop.
 
 The ceiling is deliberate. A generation is a snapshot a human can read and
 revert, the base prompt is not self-writable, and no part of the loop turns
@@ -78,6 +95,31 @@ sequential `step` calls share one transcript.
 The same property is what lets capability be discovered instead of compiled in.
 One external syscall tool advertises seven families, and the catalog behind them
 is state the agent writes; the next `complete()` sees the change.
+
+### A writable catalog inside a cached prefix
+
+A catalog the agent rewrites mid-run is a cache problem. The prefix runs tools,
+then system, then messages, so one byte moved inside the catalog block
+invalidates every token behind it. So the block is frozen as first sent this
+run, and the change ships as a unified diff in the uncached tail
+([`kernel/catalog.py:274`](desmos/kernel/catalog.py)).
+
+```mermaid
+flowchart LR
+    subgraph PREFIX["cached prefix - held still all run"]
+        direction LR
+        T["tools"] --> SYS["system: ABI +<br/>catalog frozen at run start"] --> MSG["messages"]
+    end
+    subgraph TAIL["uncached tail - rewritten every step"]
+        direction LR
+        DELTA["catalog diff<br/>since the freeze"] --> VOL["volatile: ns index,<br/>memory, runtime"]
+    end
+    MSG --> DELTA
+    DELTA -.->|"diff over 4000 chars"| REFREEZE["refreeze the block:<br/>pay the prefix once"]
+```
+
+A few hundred tokens at the tail instead of the whole prefix, until the
+difference stops being cheaper than the truth.
 
 ## Runtime architecture
 
@@ -220,8 +262,38 @@ it is wanted, `evolve` snapshots grown state as a numbered generation, and
 
 Every call in a reply runs, in written order, and all results come back together
 as user-role result blocks on the same transcript. Any call takes `end="TOKEN"`
-so a body can safely contain tag text. Legacy single-purpose tag names stay
-accepted so old transcripts still replay.
+so a body can safely contain tag text. Legacy single-purpose tag names are
+retired, not aliased: `<python>`, `<edit>`, `<register>` and the rest no longer
+dispatch. A retired spelling is answered with its canonical replacement, from
+the one map both sides read (`REMOVED_TAGS` in
+[`kernel/const.py:12`](desmos/kernel/const.py), refused in
+[`kernel/dispatch.py:160`](desmos/kernel/dispatch.py)) - rejection, never
+silence and never a traceback.
+
+### What one call goes through
+
+```mermaid
+flowchart TD
+    SPEECH[model reply] --> SCAN["scan: prose is speech,<br/>XML tags are syscalls"]
+    SCAN --> FAM{"one of the<br/>seven families?"}
+    FAM -- yes --> NORM["canonical.normalize:<br/>op picks the dispatch target"]
+    FAM -- no --> RET{"retired spelling?"}
+    RET -- yes --> GUID[/"&lt;python&gt; was removed;<br/>use exec op=python"/]
+    RET -- no --> GROWN["grown tag, tombstone,<br/>or unknown-tag answer"]
+    NORM --> SCOPE{"inside this world's scope?"}
+    GROWN --> SCOPE
+    SCOPE -- no --> DENY[/"outside this agent's scope.<br/>Allowed: ..."/]
+    SCOPE -- yes --> HOOK{"before_dispatch hook<br/>returns a string?"}
+    HOOK -- yes --> VETO[/"the hook's string is<br/>the result; nothing ran"/]
+    HOOK -- no --> RUN["the real handler"]
+    RUN --> SPILL["spill: over 8000 chars goes<br/>to a file, inline clipped to 6000"]
+    SPILL --> BLOCK["result block, same transcript"]
+```
+
+Every exit on the left is prose the model can act on. A denied tag is refused
+before third-party hooks see it, and a tag that was never real gets the
+unknown-tag answer instead, because telling a child that `<grep>` is "withheld"
+teaches it the tag exists.
 
 **Full reference with attributes and result shapes: [docs/tags.md](docs/tags.md).**
 
@@ -302,6 +374,39 @@ flowchart TD
     FORK --> SPECIES[species fork<br/>heap and transcript stay live]
     SPECIES --> WORK
 ```
+
+### The species fork, and the gate in front of it
+
+Editing `desmos/*.py` from inside a turn is the top of the ladder: it changes
+the SDK running the turn that is writing it. The gate that judges the edit runs
+in a fresh subprocess, and its source lives in a string constant, so an edit
+that broke the tree cannot also have broken its judge
+([`kernel/loop.py:1452`](desmos/kernel/loop.py)).
+
+```mermaid
+flowchart LR
+    EDIT["edit desmos/*.py<br/>mid-turn"] e6@--> CALL["harness op=reload-sdk"]
+    CALL e7@--> TIER{{"_RELOAD_TIER<br/>fresh subprocess, 30s cap"}}
+    TIER --> C1["compileall the package"]
+    TIER --> C2["layering self-check"]
+    TIER --> C3["scan round-trip repros"]
+    C1 --> VERDICT{"tier passed?"}
+    C2 --> VERDICT
+    C3 --> VERDICT
+    VERDICT -- no --> KEEP["refused: nothing reimported,<br/>every old module still live"]
+    VERDICT -- yes --> ORDER["_reload_order: import graph<br/>read by AST, dependencies first"]
+    ORDER e8@--> RE["reimport desmos.*,<br/>rebind World and handlers"]
+    RE e9@--> LIVE["new SDK, same heap,<br/>same transcript"]
+    e6@{ animate: true }
+    e7@{ animate: true }
+    e8@{ animate: true }
+    e9@{ animate: true }
+```
+
+The gate is a fitness check, not the test suite: it costs about a second, and it
+catches a tree that will not import, not a loop that compiles and is wrong. The
+reload order is derived, not hand-kept - a hand list fell behind twice, so the
+graph is parsed instead.
 
 Speech and heap values are not memory. Notes, skills, registered tools, memory
 records, and generation snapshots write to stores that the next turn or process
@@ -434,6 +539,19 @@ Pass a `TaskContract` (or the `simple={...}` shorthand) and the parent judges th
 child's claims against what it actually observed — `judgment(id)` is the verdict,
 `result(id)` is only the child's story about itself. A bare string task skips all
 of that and gives you prose you have to take on trust.
+
+```mermaid
+flowchart TD
+    SPAWN["agents op=spawn<br/>task + TaskContract"] --> SCOPE{{"scoped tags =<br/>capability preset ∩ contract.allowed_tools"}}
+    SCOPE -- "empty intersection" --> REFUSE["refused at spawn time:<br/>a child with no syscalls<br/>can only end in no_tool_evidence"]
+    SCOPE -- "non-empty" --> CHILD["child World: own transcript,<br/>own heap, no parent writes,<br/>depth capped at 1"]
+    CHILD --> WORK["it works, or it narrates"]
+    WORK -- "two completions,<br/>zero syscalls" --> NTE["failed: no_tool_evidence"]
+    WORK -- "claims + evidence" --> RESULT["result(id):<br/>the child's story about itself"]
+    RESULT --> JUDGE["judgment(id): the parent's verdict,<br/>claims against what it observed"]
+    CHILD -.->|"writes outside write_paths"| OUT["out of scope, by path component<br/>- src-evil/x never matches src"]
+```
+
 [docs/subagents.md](docs/subagents.md).
 
 ## Development
