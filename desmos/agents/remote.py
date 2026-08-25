@@ -34,6 +34,21 @@ def _seat() -> str:
     return seat()
 
 
+def asker_name() -> str:
+    """What a resident agent elsewhere should call whoever is typing here.
+
+    The seat id is a MAC address; being greeted by one reads like being
+    addressed by a machine. Settings hold a name when the human gave one.
+    """
+    try:
+        from desmos.transport.settings import resolve
+
+        name = (resolve().user or "").strip()
+    except Exception:  # noqa: BLE001 -- a missing name is not an error
+        name = ""
+    return name or "main"
+
+
 def known_hosts(world: Any) -> set[str]:
     """Hosts with presence fresh enough to trust (seen within 30 minutes)."""
     from datetime import datetime, timezone

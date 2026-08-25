@@ -37,6 +37,9 @@ class Settings:
     provider: str = "anthropic"
     model: str = "claude-opus-5"
     effort: str = "low"
+    # What a resident agent elsewhere should call the human at this seat.
+    # Empty means nobody said, and callers fall back to the seat name.
+    user: str = ""
 
     def valid(self) -> bool:
         entry = CATALOG.get(self.provider)
@@ -86,6 +89,7 @@ def load() -> Settings | None:
         provider=str(raw.get("provider") or "anthropic"),
         model=str(raw.get("model") or ""),
         effort=str(raw.get("effort") or "low"),
+        user=str(raw.get("user") or ""),
     )
     return got if got.valid() else None
 
@@ -94,7 +98,8 @@ def save(settings: Settings) -> Path:
     path = settings_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(asdict(settings), indent=2))
+    body = {k: v for k, v in asdict(settings).items() if v != ""}
+    tmp.write_text(json.dumps(body, indent=2))
     os.replace(tmp, path)
     return path
 
