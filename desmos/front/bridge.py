@@ -9,6 +9,7 @@ import socket
 import sys
 import threading
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -359,6 +360,26 @@ def _peer_entries(world: Any) -> list[dict[str, Any]]:
         })
     return out
 
+
+def _local_hhmm(stamp: Any) -> str:
+    """UTC ISO out of the store -> local "HH:MM".
+
+    A channel line needs a time for exactly one question -- did this land
+    just now or an hour ago -- and the front does not parse timestamps. The
+    timezone belongs to the layer that has one, which is this one.
+    """
+    text = str(stamp or "").strip()
+    if not text:
+        return ""
+    try:
+        moment = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return ""
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    return moment.astimezone().strftime("%H:%M")
+
+
 def _roster_reply(world: "World", op: str, msg: dict[str, Any]) -> dict[str, Any]:
     """One answer for peers/channels/channel_read, shared by both loops.
 
@@ -392,6 +413,7 @@ def _roster_reply(world: "World", op: str, msg: dict[str, Any]) -> dict[str, Any
         return {
             "ev": "posted", "channel": channel, "author": "main",
             "body": body, "id": row.get("id", 0), "dispatched": dispatched,
+            "ts": _local_hhmm(row.get("created_at")),
         }
     if op == "agents":
         from desmos.state.persist import roster
@@ -411,7 +433,10 @@ def _roster_reply(world: "World", op: str, msg: dict[str, Any]) -> dict[str, Any
 
     channel = str(msg.get("channel") or "general")
     try:
-        messages = channel_tail(world, channel=channel, limit=50)
+        messages = [
+            dict(item, ts=_local_hhmm(item.get("created_at")))
+            for item in channel_tail(world, channel=channel, limit=50)
+        ]
         through = max((int(item["id"]) for item in messages), default=0)
         channel_dismiss(world, channel=channel, through=through)
         return {"ev": "channel_story", "channel": channel, "messages": messages}
@@ -687,6 +712,7 @@ def _watch_channel(
                     "preview": preview,
                     "unread": info["unread"],
                     "message_id": int(latest["id"]),
+                    "ts": _local_hhmm(latest.get("created_at")),
                 })
 
             for kind in ("request", "reply"):

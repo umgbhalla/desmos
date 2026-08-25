@@ -535,6 +535,11 @@ pub(crate) fn handle_event(app: &mut App, ev: Value) {
                         .and_then(Value::as_str)
                         .unwrap_or("")
                         .to_string(),
+                    ts: message
+                        .get("ts")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string(),
                 })
                 .collect();
             app.channel_view = Some(crate::ChannelView {
@@ -552,6 +557,11 @@ pub(crate) fn handle_event(app: &mut App, ev: Value) {
                     view.messages.push(crate::ChannelMsg {
                         author: "main".into(),
                         body: body.to_string(),
+                        ts: ev
+                            .get("ts")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string(),
                     });
                 }
             }
@@ -790,6 +800,11 @@ pub(crate) fn handle_event(app: &mut App, ev: Value) {
                     view.messages.push(crate::ChannelMsg {
                         author: crate::app::speaker(author),
                         body: body.to_string(),
+                        ts: ev
+                            .get("ts")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string(),
                     });
                     if let Some(row) =
                         app.channels.iter_mut().find(|row| row.channel == channel)

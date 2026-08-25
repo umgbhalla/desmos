@@ -466,6 +466,9 @@ pub(crate) fn speaker(author: &str) -> String {
 pub(crate) struct ChannelMsg {
     pub(crate) author: String,
     pub(crate) body: String,
+    /// Local wall-clock "HH:MM", already formatted by the bridge. The front
+    /// does not parse timestamps: the tz belongs to the layer that has one.
+    pub(crate) ts: String,
 }
 
 /// The channel the story pane is currently showing, if any. `None` means the

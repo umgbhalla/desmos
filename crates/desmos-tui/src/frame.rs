@@ -58,12 +58,21 @@ pub(crate) fn draw_channel(f: &mut Frame, area: Rect, view: &mut ChannelView, fo
         if !lines.is_empty() {
             lines.push(Line::from(""));
         }
-        lines.push(Line::from(Span::styled(
+        let mut head = vec![Span::styled(
             message.author.clone(),
             Style::default()
                 .fg(theme.accent_tool)
                 .add_modifier(Modifier::BOLD),
-        )));
+        )];
+        if !message.ts.is_empty() {
+            head.push(Span::styled(
+                format!("  {}", message.ts),
+                Style::default()
+                    .fg(theme.text_secondary)
+                    .add_modifier(Modifier::DIM),
+            ));
+        }
+        lines.push(Line::from(head));
         for row in wrap_body(&message.body, width) {
             lines.push(Line::from(Span::styled(
                 row,

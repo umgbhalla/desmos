@@ -5525,6 +5525,7 @@ mod tests {
             .map(|i| crate::ChannelMsg {
                 author: "main".into(),
                 body: format!("msg-{i:02}"),
+                ts: String::new(),
             })
             .collect();
         app.channel_view = Some(crate::ChannelView {
@@ -5572,11 +5573,15 @@ mod tests {
             messages: vec![crate::ChannelMsg {
                 author: "main".into(),
                 body: "first words".into(),
+                ts: "14:03".into(),
             }],
             scroll: 0,
         });
         let screen = paint(&mut app, 120, 34);
         assert!(screen.contains("enter posts to #build"), "{screen}");
+        // The one question a channel line needs a clock for: just now, or an
+        // hour ago. The front never parses a timestamp to answer it.
+        assert!(screen.contains("14:03"), "{screen}");
         assert!(!screen.contains("tab queue"), "{screen}");
     }
 
