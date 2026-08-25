@@ -5519,6 +5519,52 @@ mod tests {
     }
 
     #[test]
+    fn a_channel_scrolls_back_without_moving_the_agent_transcript() {
+        let mut app = App::new();
+        let messages = (0..40)
+            .map(|i| crate::ChannelMsg {
+                author: "main".into(),
+                body: format!("msg-{i:02}"),
+            })
+            .collect();
+        app.channel_view = Some(crate::ChannelView {
+            name: "build".into(),
+            messages,
+            scroll: 0,
+        });
+        app.set_focus(Focus::Story);
+
+        let screen = paint(&mut app, 120, 34);
+        assert!(screen.contains("msg-39"), "{screen}");
+        assert!(!screen.contains("msg-00"), "{screen}");
+
+        // Past the top on purpose: the key handler cannot know how many
+        // wrapped rows exist, so the renderer's clamp is what has to hold.
+        for _ in 0..200 {
+            handle_key(
+                None,
+                &mut app,
+                KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE),
+            )
+            .unwrap();
+        }
+        let screen = paint(&mut app, 120, 34);
+        assert!(screen.contains("msg-00"), "{screen}");
+        assert!(!screen.contains("msg-39"), "{screen}");
+
+        for _ in 0..30 {
+            handle_key(
+                None,
+                &mut app,
+                KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE),
+            )
+            .unwrap();
+        }
+        let screen = paint(&mut app, 120, 34);
+        assert!(screen.contains("msg-39"), "{screen}");
+    }
+
+    #[test]
     fn composer_hint_names_the_channel_you_are_standing_in() {
         let mut app = App::new();
         app.channel_view = Some(crate::ChannelView {
@@ -5527,6 +5573,7 @@ mod tests {
                 author: "main".into(),
                 body: "first words".into(),
             }],
+            scroll: 0,
         });
         let screen = paint(&mut app, 120, 34);
         assert!(screen.contains("enter posts to #build"), "{screen}");

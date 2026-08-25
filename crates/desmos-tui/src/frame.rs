@@ -33,7 +33,7 @@ fn wrap_body(text: &str, width: usize) -> Vec<String> {
 }
 
 /// Draw the channel the rail selected, in place of the agent's own story.
-pub(crate) fn draw_channel(f: &mut Frame, area: Rect, view: &ChannelView, focused: bool) {
+pub(crate) fn draw_channel(f: &mut Frame, area: Rect, view: &mut ChannelView, focused: bool) {
     let theme = Theme::current();
     let border = if focused {
         theme.accent_assistant
@@ -80,8 +80,13 @@ pub(crate) fn draw_channel(f: &mut Frame, area: Rect, view: &ChannelView, focuse
         )));
     }
     let height = inner.height as usize;
+    // Only the renderer knows how many wrapped rows the messages became, so
+    // the clamp lives here rather than in the key handler.
+    view.scroll = view.scroll.min(lines.len().saturating_sub(height));
     if lines.len() > height {
-        lines.drain(..lines.len() - height);
+        let end = lines.len() - view.scroll;
+        lines.truncate(end);
+        lines.drain(..end.saturating_sub(height));
     }
     f.render_widget(Paragraph::new(lines), inner);
 }
@@ -377,7 +382,7 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App) {
                 &mut app.media.frame,
             );
         }
-    } else if let Some(view) = app.channel_view.as_ref() {
+    } else if let Some(view) = app.channel_view.as_mut() {
         draw_channel(f, panes[0], view, app.focus == Focus::Story);
         if !app.tree_open {
             draw_scrollback(

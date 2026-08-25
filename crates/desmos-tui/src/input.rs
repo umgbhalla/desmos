@@ -597,6 +597,28 @@ pub(crate) fn handle_key(
         }
         return Ok(false);
     }
+    // A channel in the story pane scrolls itself. The agent's own scrollback
+    // state is still holding the transcript underneath, so reusing it here
+    // would move the wrong pane. `scroll` counts lines up from the live tail.
+    if app.focus == Focus::Story {
+        if let Some(view) = app.channel_view.as_mut() {
+            let step: isize = match key.code {
+                KeyCode::Char('k') | KeyCode::Up => 1,
+                KeyCode::Char('j') | KeyCode::Down => -1,
+                KeyCode::PageUp => 10,
+                KeyCode::PageDown => -10,
+                _ => 0,
+            };
+            if step != 0 {
+                view.scroll = if step > 0 {
+                    view.scroll.saturating_add(step as usize)
+                } else {
+                    view.scroll.saturating_sub(step.unsigned_abs())
+                };
+                return Ok(false);
+            }
+        }
+    }
     // Choice blocks own vertical movement while the story pane is focused.
     // Enter turns the highlighted row into ordinary composer text and follows
     // the exact same submit path as a typed prompt.

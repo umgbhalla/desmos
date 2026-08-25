@@ -540,6 +540,7 @@ pub(crate) fn handle_event(app: &mut App, ev: Value) {
             app.channel_view = Some(crate::ChannelView {
                 name: channel.to_string(),
                 messages,
+                scroll: 0,
             });
             app.focus = crate::Focus::Input;
         }

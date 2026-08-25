@@ -475,6 +475,9 @@ pub(crate) struct ChannelMsg {
 pub(crate) struct ChannelView {
     pub(crate) name: String,
     pub(crate) messages: Vec<ChannelMsg>,
+    /// Wrapped lines held back from the bottom. Zero is the live tail, which
+    /// is why a new message never has to move it: sticky by construction.
+    pub(crate) scroll: usize,
 }
 
 pub(crate) struct App {
