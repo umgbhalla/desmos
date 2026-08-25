@@ -407,7 +407,7 @@ def _roster_reply(world: "World", op: str, msg: dict[str, Any]) -> dict[str, Any
             return {"ev": "error", "text": "post needs a body"}
         try:
             row = channel_post(world, body, channel=channel, author="main")
-            dispatched = remote.mention_dispatch(world, channel, body)
+            dispatched = remote.mention_dispatch(world, channel, body, asker="main")
         except Exception as exc:  # noqa: BLE001 -- name it, don't die
             return {"ev": "error", "text": f"post failed: {exc}"}
         return {

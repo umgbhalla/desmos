@@ -283,7 +283,7 @@ def _run_work(world: World, wid: str, payload: dict[str, Any]) -> None:
             output = resident.respond(
                 world,
                 str(payload.get("task", "")),
-                asker=str(payload.get("origin", "")),
+                asker=str(payload.get("asker", "") or payload.get("origin", "")),
                 channel=str(payload.get("reply_channel", "")),
             )
         except Exception as exc:  # noqa: BLE001 -- name it, don't die

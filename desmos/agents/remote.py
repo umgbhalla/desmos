@@ -134,6 +134,7 @@ def request(
     timeout: float = DEFAULT_TIMEOUT_S,
     reply_channel: str = "",
     reply_as: str = "",
+    asker: str = "",
 ) -> str:
     """Dispatch one task to a live remote host; the reply is a pending task."""
     host = host.strip()
@@ -159,6 +160,10 @@ def request(
         # agent -- one long-lived world with a transcript -- rather than as a
         # fresh contract-bound child that forgets the exchange.
         "reply_channel": reply_channel, "resident": bool(reply_channel),
+        # Who is talking, as a channel reads it. The seat id is a machine
+        # fingerprint -- the resident was being addressed by
+        # "Unknown_e2:03:31:61:8c:9b", which is nobody.
+        "asker": asker or "",
     })
     from desmos.agents import pending
 
@@ -194,7 +199,7 @@ def request(
     return f"remote work {work_id} dispatched to {host} ({agent or 'general'});{where}"
 
 
-def mention_dispatch(world: Any, channel: str, body: str) -> list[str]:
+def mention_dispatch(world: Any, channel: str, body: str, asker: str = "") -> list[str]:
     """@bot mentions in a channel post become remote work on the bot's host.
 
     Returns one dispatch note per live bot mentioned; unknown names and sys
@@ -230,6 +235,6 @@ def mention_dispatch(world: Any, channel: str, body: str) -> list[str]:
             continue
         notes.append(request(
             world, host, task,
-            reply_channel=channel, reply_as=name,
+            reply_channel=channel, reply_as=name, asker=asker,
         ))
     return notes
