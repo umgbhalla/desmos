@@ -38,8 +38,39 @@ def resident_world(world: Any) -> Any:
         path = Path(state_file(world)).parent / "resident.sqlite3"
         got = new_world(cwd=Path(world.cwd), state_path=path)
         bind_step(got)
+        # A fresh world starts on the harness default model, which is not
+        # necessarily one this machine can call: the resident's first answer
+        # was an empty string because the daemon tried Anthropic on a box that
+        # only holds an OpenAI credential. Take the machine's own choice.
+        try:
+            from desmos.transport.settings import resolve, switch
+
+            chosen = resolve()
+            switch(got, chosen.model, chosen.effort)
+        except Exception:  # noqa: BLE001 -- a default model is still a model
+            pass
         _WORLDS[key] = got
     return got
+
+
+def _last_text(resident: Any) -> str:
+    """The last thing the resident said, for when the step returns nothing."""
+    for message in reversed(list(getattr(resident, "messages", []))):
+        if message.get("role") != "assistant":
+            continue
+        content = message.get("content")
+        if isinstance(content, str) and content.strip():
+            return content.strip()
+        if isinstance(content, list):
+            parts = [
+                str(block.get("text", ""))
+                for block in content
+                if isinstance(block, dict) and block.get("type") in (None, "text")
+            ]
+            joined = "\n".join(part for part in parts if part).strip()
+            if joined:
+                return joined
+    return ""
 
 
 def respond(world: Any, task: str, *, asker: str = "", channel: str = "") -> str:
@@ -60,5 +91,10 @@ def respond(world: Any, task: str, *, asker: str = "", channel: str = "") -> str
     )
     with _LOCK:
         resident = resident_world(world)
-        out = resident.ns["step"](prompt)
-    return str(out).strip()[:REPLY_CAP]
+        out = str(resident.ns["step"](prompt)).strip()
+        if not out:
+            # Silence in a channel is indistinguishable from a machine that
+            # is gone. A turn that failed said so in the transcript and
+            # nowhere else; say it where it was asked.
+            out = _last_text(resident) or "(no reply -- the resident's turn produced nothing)"
+    return out[:REPLY_CAP]
