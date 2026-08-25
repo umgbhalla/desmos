@@ -396,13 +396,18 @@ def _workspace_blocks(snapshot: dict[str, Any] | None) -> list[dict[str, str]]:
                 text, kind = part, role
             elif isinstance(part, dict):
                 typ = str(part.get("type") or "")
-                text = str(
-                    part.get("text")
-                    or part.get("thinking")
-                    or part.get("content")
-                    or part.get("name")
-                    or ""
-                )
+                if typ == "custom_tool_call":
+                    text = f"{part.get('name', 'tool')} {part.get('input', '')}".strip()
+                elif typ == "custom_tool_call_output":
+                    text = str(part.get("output") or "")
+                else:
+                    text = str(
+                        part.get("text")
+                        or part.get("thinking")
+                        or part.get("content")
+                        or part.get("name")
+                        or ""
+                    )
                 if not text and typ in {"tool_use", "tool_result"}:
                     text = json.dumps(part, default=str)
                 kind = typ or role
@@ -412,6 +417,7 @@ def _workspace_blocks(snapshot: dict[str, Any] | None) -> list[dict[str, str]]:
                 continue
             activity = kind in {
                 "thinking", "redacted_thinking", "tool_use", "tool_result",
+                "custom_tool_call", "custom_tool_call_output",
             } or (role == "user" and text.lstrip().startswith("<result"))
             out.append({
                 "pane": "activity" if activity else "story",
