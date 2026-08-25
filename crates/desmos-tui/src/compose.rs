@@ -372,7 +372,11 @@ fn draw_slash(f: &mut Frame, input: Rect, app: &App) {
         .borders(Borders::ALL)
         .border_style(Style::default().fg(tone))
         .title(Span::styled(
-            format!(" {mark} commands "),
+            if app.slash.is_mention() {
+                " @ people ".to_string()
+            } else {
+                format!(" {mark} commands ")
+            },
             Style::default().fg(tone).add_modifier(Modifier::BOLD),
         ))
         .style(Style::default().bg(theme.bg_base).fg(theme.text_primary));

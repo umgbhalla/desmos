@@ -80,6 +80,7 @@ pub struct Slash {
     pub items: Vec<Item>,
     /// The part of the line the accepted item replaces.
     head: String,
+    mention: bool,
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -160,9 +161,46 @@ pub fn verdict(line: &str, picker: &Picker) -> Verdict {
 }
 
 impl Slash {
+    /// Complete the final whitespace-delimited @mention without taking over
+    /// ordinary prose. Returns whether this line is currently mention-shaped.
+    pub fn update_mentions(&mut self, line: &str, names: &[String]) -> bool {
+        let start = line.rfind(char::is_whitespace).map_or(0, |i| i + 1);
+        let token = &line[start..];
+        let Some(needle) = token.strip_prefix('@') else {
+            self.mention = false;
+            return false;
+        };
+        if needle.contains(char::is_whitespace) {
+            self.mention = false;
+            return false;
+        }
+        let needle = needle.to_ascii_lowercase();
+        self.head = line[..start].to_string();
+        self.mention = true;
+        let previous = self.items.get(self.sel).map(|i| i.text.clone());
+        self.items = names
+            .iter()
+            .filter(|name| name.to_ascii_lowercase().starts_with(&needle))
+            .map(|name| Item {
+                text: format!("@{name}"),
+                help: String::new(),
+            })
+            .collect();
+        self.sel = previous
+            .and_then(|p| self.items.iter().position(|i| i.text == p))
+            .unwrap_or(0);
+        self.open = !self.items.is_empty();
+        true
+    }
+
+    pub fn is_mention(&self) -> bool {
+        self.open && self.mention
+    }
+
     /// Recompute from the composer. Closes itself when the line stops being a
     /// command, so nothing has to remember to dismiss it.
     pub fn update(&mut self, line: &str, picker: &Picker) {
+        self.mention = false;
         let Some((cmd, arg)) = split(line) else {
             self.close();
             return;
@@ -211,6 +249,7 @@ impl Slash {
         self.open = false;
         self.items.clear();
         self.sel = 0;
+        self.mention = false;
     }
 
     pub fn move_sel(&mut self, by: i32) {
@@ -235,6 +274,9 @@ impl Slash {
     /// keystroke lands in the argument and the list refills with its values.
     pub fn accept(&self) -> Option<String> {
         let item = self.items.get(self.sel)?;
+        if self.mention {
+            return Some(format!("{}{} ", self.head, item.text));
+        }
         if self.head.is_empty() {
             let takes_arg = COMMANDS
                 .iter()

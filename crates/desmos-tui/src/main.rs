@@ -1252,11 +1252,28 @@ fn sync_theme_preview(app: &mut App) {
     }
 }
 
+fn accept_completion(app: &mut App) {
+    if let Some(line) = app.slash.accept() {
+        app.prompt.clear();
+        app.prompt.insert_str(&line);
+        update_slash(app);
+    }
+}
+
 fn update_slash(app: &mut App) {
     if app.slash_paste_guard {
         app.slash.close();
     } else {
-        app.slash.update(&app.prompt.to_send(), &app.picker);
+        let line = app.prompt.to_send();
+        let names: Vec<String> = app
+            .agents
+            .iter()
+            .filter(|agent| agent.live)
+            .map(|agent| agent.name.clone())
+            .collect();
+        if !app.slash.update_mentions(&line, &names) {
+            app.slash.update(&line, &app.picker);
+        }
     }
     sync_theme_preview(app);
 }
@@ -6094,6 +6111,51 @@ mod tests {
         // Prose is not a command.
         s.update("what about /model", &pick);
         assert!(!s.open);
+    }
+
+    #[test]
+    fn mentions_and_commands_complete_by_tab_or_exact_mouse_row() {
+        let mut app = App::new();
+        handle_event(
+            &mut app,
+            json!({"ev":"agents","agents":[
+                {"name":"main","kind":"chief","host":"","live":true},
+                {"name":"hermes","kind":"bot","host":"hermes","live":true},
+                {"name":"hyperion","kind":"bot","host":"hyperion","live":true}
+            ]}),
+        );
+        app.set_focus(Focus::Input);
+        for c in "hey @hyp".chars() {
+            handle_key(None, &mut app, press(KeyCode::Char(c))).unwrap();
+        }
+        assert!(app.slash.is_mention());
+        assert_eq!(app.slash.items.len(), 1);
+        handle_key(None, &mut app, tab()).unwrap();
+        assert_eq!(app.prompt.to_send(), "hey @hyperion ");
+        assert_eq!(app.focus, Focus::Input, "completion must not cycle panes");
+
+        // A click means the visible row, not merely "focus the popup".
+        app.prompt.clear();
+        update_slash(&mut app);
+        handle_key(None, &mut app, press(KeyCode::Char('/'))).unwrap();
+        assert!(app.slash.items.len() >= 2);
+        let expected = app.slash.items[1].text.clone();
+        let _ = paint(&mut app, 100, 30);
+        let popup = slash_popup_area(app.input_area, &app).expect("command popup");
+        handle_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: popup.x + 2,
+                row: popup.y + 2, // inner row 1
+                modifiers: KeyModifiers::NONE,
+            },
+        );
+        assert!(
+            app.prompt.to_send().starts_with(&expected),
+            "clicked row {expected:?}, got {:?}",
+            app.prompt.to_send()
+        );
     }
 
     #[test]

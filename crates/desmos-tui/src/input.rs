@@ -96,11 +96,7 @@ pub(crate) fn handle_key(
             // space, because "/reset " has an empty argument and closes the
             // list. Accepting is only a move if it changes the line.
             KeyCode::Tab => {
-                if let Some(line) = app.slash.accept() {
-                    app.prompt.clear();
-                    app.prompt.insert_str(&line);
-                    update_slash(app);
-                }
+                accept_completion(app);
                 return Ok(false);
             }
             KeyCode::Enter => {
@@ -1131,6 +1127,19 @@ pub(crate) fn handle_mouse(app: &mut App, m: MouseEvent) {
             }
         }
         MouseEventKind::Down(MouseButton::Left) => {
+            if on_slash && app.slash.open {
+                if let Some(area) = slash_popup_area(app.input_area, app) {
+                    let first = area.y.saturating_add(1);
+                    if m.row >= first {
+                        let row = (m.row - first) as usize;
+                        if row < app.slash.items.len().min(8) {
+                            app.slash.sel = row;
+                            accept_completion(app);
+                        }
+                    }
+                }
+                return;
+            }
             if on_rail {
                 app.set_focus(Focus::Rail);
                 if let Some(row) = pane_row(app.rail_area, m.row) {
