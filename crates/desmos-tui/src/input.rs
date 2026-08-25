@@ -600,17 +600,24 @@ pub(crate) fn handle_key(
     // A channel in the story pane scrolls itself. The agent's own scrollback
     // state is still holding the transcript underneath, so reusing it here
     // would move the wrong pane. `scroll` counts lines up from the live tail.
-    if app.focus == Focus::Story {
+    // PageUp/PageDown reach it from the composer too: reading back in a
+    // channel should not cost a focus change, and the composer wants
+    // neither key.
+    let reading_channel = app.focus == Focus::Story && app.channel_view.is_some();
+    let paging_channel = app.channel_view.is_some()
+        && matches!(key.code, KeyCode::PageUp | KeyCode::PageDown);
+    if reading_channel || paging_channel {
         if let Some(view) = app.channel_view.as_mut() {
             // Back to the live tail in one key, because the way out of a
-            // scrollback is the thing you want most while reading one.
-            if matches!(key.code, KeyCode::End | KeyCode::Char('G')) {
+            // scrollback is the thing you want most while reading one. Not
+            // from the composer, where End belongs to the text.
+            if reading_channel && matches!(key.code, KeyCode::End | KeyCode::Char('G')) {
                 view.scroll = 0;
                 return Ok(false);
             }
             let step: isize = match key.code {
-                KeyCode::Char('k') | KeyCode::Up => 1,
-                KeyCode::Char('j') | KeyCode::Down => -1,
+                KeyCode::Char('k') | KeyCode::Up if reading_channel => 1,
+                KeyCode::Char('j') | KeyCode::Down if reading_channel => -1,
                 KeyCode::PageUp => 10,
                 KeyCode::PageDown => -10,
                 _ => 0,

@@ -2296,7 +2296,9 @@ fn pending_input_rows(app: &App) -> usize {
 }
 
 fn input_float_rows(app: &App) -> u16 {
-    u16::from(pending_input_rows(app) == 0 && app.layout.post_h > 0)
+    u16::from(
+        pending_input_rows(app) == 0 && app.layout.post_h > 0 && app.channel_view.is_none(),
+    )
 }
 
 /// The keys a pane answers to. One table, read by the cheatsheet and by the
@@ -5640,6 +5642,10 @@ mod tests {
         // The one question a channel line needs a clock for: just now, or an
         // hour ago. The front never parses a timestamp to answer it.
         assert!(screen.contains("14:03"), "{screen}");
+        // A channel is the whole place while you are in it: the POST cards
+        // describe a conversation you are not looking at, and they were
+        // taking a third of the column.
+        assert!(!screen.contains("POST in"), "{screen}");
         assert!(!screen.contains("tab queue"), "{screen}");
     }
 

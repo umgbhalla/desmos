@@ -303,10 +303,17 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App) {
         .min(work_area.height.saturating_sub(8 + queue_h))
         .max(2 + float_rows + default_rows);
     let bottom_h = queue_h + decision_h + input_h;
-    let post_h = app
-        .layout
-        .post_h
-        .min(body[0].height.saturating_sub(bottom_h + 3));
+    // Standing in a channel, the POST cards describe a conversation you are
+    // not looking at -- and they were taking a third of the column, leaving
+    // the channel nine rows on a forty-row terminal. A channel is the whole
+    // place while you are in it.
+    let post_h = if app.channel_view.is_some() {
+        0
+    } else {
+        app.layout
+            .post_h
+            .min(body[0].height.saturating_sub(bottom_h + 3))
+    };
     let left = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
