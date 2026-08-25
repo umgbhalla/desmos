@@ -15,6 +15,7 @@ PROFILE=release
 PROFILE_SET=0
 COMMITTED=0
 TEST=0
+CHECK=0
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -22,6 +23,7 @@ while [ $# -gt 0 ]; do
     --release) PROFILE=release; PROFILE_SET=1 ;;
     --committed) COMMITTED=1 ;;
     --test) TEST=1 ;;
+    --check) CHECK=1 ;;
     --crate) CRATE=$2; shift ;;
     -h|--help) sed -n '2,10p' "$0"; exit 0 ;;
     *) echo "hyperion-build: unknown arg $1" >&2; exit 2 ;;
@@ -69,6 +71,19 @@ ssh "$HOST" "set -e
   git submodule update --init --recursive -q
   . \"\$HOME/.cargo/env\"
   export CARGO_TARGET_DIR=\"\$HOME/$REMOTE_MAIN/target\"
+  if [ $CHECK = 1 ]; then
+    # The daemon's interpreter, not the system one: hyperion's /usr/bin/python3
+    # is Apple's 3.9, which has no tomllib and reports an invalid escape as a
+    # DeprecationWarning. Three groups failed on that alone.
+    PY=\"\$HOME/$REMOTE_MAIN/.venv/bin/python3\"
+    [ -x \"\$PY\" ] || PY=python3
+    if \"\$PY\" -B -m desmos check > /tmp/hyperion-check.log 2>&1; then
+      tail -1 /tmp/hyperion-check.log
+    else
+      tail -30 /tmp/hyperion-check.log
+      exit 1
+    fi
+  fi
   if [ $TEST = 1 ]; then
     if cargo test $FLAGS -p $CRATE > /tmp/hyperion-test.log 2>&1; then
       grep -E '^test result:' /tmp/hyperion-test.log
@@ -77,7 +92,7 @@ ssh "$HOST" "set -e
         || tail -30 /tmp/hyperion-test.log
       exit 1
     fi
-  else
+  elif [ $CHECK = 0 ]; then
     cargo build $FLAGS -p $CRATE 2>&1 | tail -3
   fi
 "
@@ -85,7 +100,7 @@ ssh "$HOST" "set -e
 # A test run has no artifact to bring home. Its whole point is the second
 # machine: the same source under a different HOME, which is how four
 # card-layout tests were caught depending on the user's own pager.toml.
-if [ "$TEST" = 1 ]; then exit 0; fi
+if [ "$TEST" = 1 ] || [ "$CHECK" = 1 ]; then exit 0; fi
 
 OUT=.desmos/out/hyperion
 mkdir -p "$OUT"
