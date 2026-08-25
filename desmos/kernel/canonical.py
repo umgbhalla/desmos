@@ -607,17 +607,28 @@ def _session(world, op, body, attrs):
             if target not in live:
                 return f"session post: target {target!r} is not active"
             channel = persist.peer_channel(target, "request")
+        from desmos.agents import remote as _remote
+
+        # A post from here is this seat speaking. Left to channel_post's
+        # default the author was run_id(), so my messages reached the other
+        # machine as a 32-hex blob while its own replies were signed
+        # "nemesis" -- and a channel stops being readable at that point.
         try:
             message = persist.channel_post(
-                world, body, channel=channel, author=attrs.get("author", "")
+                world, body, channel=channel,
+                author=attrs.get("author") or _remote.seat_name(),
             )
         except ValueError as exc:
             return str(exc)
         if target:
             message.update({"to": target, "kind": "request"})
         else:
-            from desmos.agents import remote as _remote
-            dispatched = _remote.mention_dispatch(world, channel, body)
+            # And the asker is this seat too, not the human at the keyboard:
+            # the bridge passes asker_name() because a person typed there,
+            # while a mention from the kernel is one agent asking another.
+            dispatched = _remote.mention_dispatch(
+                world, channel, body, asker=_remote.seat_name()
+            )
             if dispatched:
                 message["dispatched"] = dispatched
         return json.dumps(message, default=str)

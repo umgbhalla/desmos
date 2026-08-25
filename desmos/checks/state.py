@@ -428,6 +428,45 @@ def _check_mention_dispatch() -> None:
             got = persist.channel_read(world, channel="build", limit=5)
             assert got and got[-1]["author"] == "hyperion", got
             assert "suite green" in got[-1]["body"], got[-1]
+
+            # Now the kernel's own post path, driven through the real dispatch:
+            # calling channel_post here would prove nothing about what the
+            # syscall passes. This seat signs its own messages, and names
+            # itself as the asker -- the bridge passes the human's name
+            # because a human typed there, while a mention from the kernel is
+            # one agent asking another.
+            posted = json.loads(dispatch(world, Block(
+                "session", "@hyperion status?",
+                {"op": "post", "channel": "build"})))
+            assert posted["author"] == "asker-host", posted
+            assert posted["author"] != posted["run_id"], posted
+            assert posted.get("dispatched") == ["hyperion is thinking..."], posted
+
+            db = persist._open(persist.state_file(world))
+            try:
+                rows = db.execute(
+                    "SELECT body FROM channel_messages WHERE channel = ?"
+                    " ORDER BY id DESC", (spine.SYS_WORK,)).fetchall()
+            finally:
+                db.close()
+            asked = []
+            for row in rows:
+                try:
+                    payload = json.loads(str(row["body"]))
+                except ValueError:
+                    continue
+                if payload.get("t") == "request":
+                    asked.append(payload)
+            assert asked and asked[0]["asker"] == "asker-host", asked[:1]
+
+            # Settle the second exchange too, so no pending thread outlives
+            # the temp workspace it is polling.
+            wid2 = asked[0]["work_id"]
+            spine.post_work(world, {
+                "t": "result", "work_id": wid2, "host": "hyperion",
+                "status": "done", "output": "signed"})
+            task2 = next(t for t in pending._bucket(world) if wid2 in t.name)
+            assert task2.done.wait(20), "kernel-post reply never landed"
     finally:
         if keep is None:
             os.environ.pop("DESMOS_SEAT", None)

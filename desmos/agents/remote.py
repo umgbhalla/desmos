@@ -28,7 +28,8 @@ DEFAULT_TIMEOUT_S = 3600.0
 STALE_PRESENCE_S = 1800.0
 
 
-def _seat() -> str:
+def seat_name() -> str:
+    """This machine's seat, as the channel and every other host see it."""
     from desmos.front.spine import _seat as seat
 
     return seat()
@@ -156,7 +157,7 @@ def request(
     task = task.strip()
     if not task:
         return "remote spawn: missing task"
-    seat = _seat()
+    seat = seat_name()
     if host == seat:
         return "remote spawn: host is this machine; spawn locally instead"
     hosts = known_hosts(world)
