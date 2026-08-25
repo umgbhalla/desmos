@@ -273,6 +273,28 @@ def _run_work(world: World, wid: str, payload: dict[str, Any]) -> None:
     from desmos.agents.remote import RESULT_CAP
 
     status, output = "done", ""
+    if payload.get("resident"):
+        # A mention is addressed to whoever lives here, not to a fresh child.
+        # Same world every time, transcript kept, so the next message in the
+        # channel continues the last one instead of starting over.
+        try:
+            from desmos.agents import resident
+
+            output = resident.respond(
+                world,
+                str(payload.get("task", "")),
+                asker=str(payload.get("origin", "")),
+                channel=str(payload.get("reply_channel", "")),
+            )
+        except Exception as exc:  # noqa: BLE001 -- name it, don't die
+            status, output = "error", f"{type(exc).__name__}: {exc}"
+        finally:
+            _WORK_IN_FLIGHT.discard(wid)
+        post_work(world, {
+            "t": "result", "work_id": wid, "host": _seat(),
+            "status": status, "output": output[:RESULT_CAP],
+        })
+        return
     try:
         from desmos.agents import subagent
         from desmos.kernel.dispatch import CALLER_WORLD

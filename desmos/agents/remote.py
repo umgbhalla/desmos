@@ -92,22 +92,38 @@ def find_result(world: Any, work_id: str) -> dict[str, Any] | None:
     return None
 
 
-def await_result(
+def await_output(
     world: Any, work_id: str, timeout: float = DEFAULT_TIMEOUT_S
-) -> str:
+) -> tuple[str, str, str]:
+    """Wait for one work id: (status, host, output).
+
+    Split out from await_result because a channel reply is the answer itself.
+    Prefixing it with "remote work w-... [done]" made a resident sound like a
+    job report, which is the thing it is not.
+    """
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         payload = find_result(world, work_id)
         if payload is not None:
-            status = str(payload.get("status", "done"))
-            host = str(payload.get("host", "?"))
-            output = str(payload.get("output", ""))
-            return f"remote work {work_id} on {host} [{status}]\n{output}"
+            return (
+                str(payload.get("status", "done")),
+                str(payload.get("host", "?")),
+                str(payload.get("output", "")),
+            )
         time.sleep(POLL_S)
     return (
-        f"remote work {work_id}: no result within {int(timeout)}s;"
-        " it may still land later on sys.work"
+        "timeout", "?",
+        f"no result within {int(timeout)}s; it may still land later on sys.work",
     )
+
+
+def await_result(
+    world: Any, work_id: str, timeout: float = DEFAULT_TIMEOUT_S
+) -> str:
+    status, host, output = await_output(world, work_id, timeout)
+    if status == "timeout":
+        return f"remote work {work_id}: {output}"
+    return f"remote work {work_id} on {host} [{status}]\n{output}"
 
 
 def request(
@@ -139,21 +155,32 @@ def request(
     post_work(world, {
         "t": "request", "work_id": work_id, "target": host,
         "agent": agent or "general", "task": task, "origin": seat,
+        # A mention is a conversation, so the far side answers as its resident
+        # agent -- one long-lived world with a transcript -- rather than as a
+        # fresh contract-bound child that forgets the exchange.
+        "reply_channel": reply_channel, "resident": bool(reply_channel),
     })
     from desmos.agents import pending
 
     def _finish() -> str:
-        out = await_result(world, work_id, timeout)
-        if reply_channel:
-            # The asker posted in a channel, so the bot answers there too.
+        status, from_host, output = await_output(world, work_id, timeout)
+        note = (
+            f"remote work {work_id}: {output}"
+            if status == "timeout"
+            else f"remote work {work_id} on {from_host} [{status}]\n{output}"
+        )
+        if reply_channel and output.strip():
+            # The channel gets the answer, not the accounting. The work id and
+            # the status are for whoever dispatched it; the person reading the
+            # channel wants the sentence.
             from desmos.state.persist import channel_post
 
             try:
-                channel_post(world, out, channel=reply_channel,
-                             author=reply_as or host)
+                channel_post(world, output, channel=reply_channel,
+                             author=reply_as or from_host)
             except ValueError:
                 pass
-        return out
+        return note
 
     pending.submit(world, f"remote {work_id} -> {host}", _finish)
     # Say where the answer will surface. "(general)" is the agent kind, and
