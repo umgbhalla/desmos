@@ -1191,8 +1191,7 @@ fn main() -> io::Result<()> {
         apply_session_choice(bridge.as_mut(), &mut app, choice)?;
     }
     if let Some(b) = bridge.as_mut() {
-        b.send(&json!({"op": "channels"}))?;
-        b.send(&json!({"op": "agents"}))?;
+        b.send(&json!({"op": "roster"}))?;
     }
     announce_build(&mut app, build_notice(&cwd));
 
@@ -1819,11 +1818,36 @@ fn submit_prompt_inner(
         }
         return Ok(false);
     }
-    // Standing in a channel, the composer belongs to the channel: the line
-    // goes to whoever is there, not into this agent's turn. It is also the
-    // only place in the UI where an @bot mention can be typed, which is what
-    // sends work to another machine.
-    let posting_to = app.channel_view.as_ref().map(|view| view.name.clone());
+    // A leading resident mention is an explicit destination from any
+    // composer. Inside a channel the channel remains the reply home; from the
+    // main story it opens the resident DM and posts there. Autocomplete without
+    // routing was merely decorative.
+    let addressed = line
+        .split_whitespace()
+        .next()
+        .and_then(|word| word.strip_prefix('@'))
+        .and_then(|name| {
+            app.agents
+                .iter()
+                .find(|agent| agent.kind == "bot" && agent.live && agent.name == name)
+                .map(|agent| agent.name.clone())
+        });
+    let posting_to = app
+        .channel_view
+        .as_ref()
+        .map(|view| view.name.clone())
+        .or_else(|| addressed.clone());
+    if app.channel_view.is_none()
+        && let Some(channel) = addressed
+    {
+        app.channel_view = Some(crate::ChannelView {
+            name: channel.clone(),
+            messages: Vec::new(),
+            scroll: 0,
+        });
+        app.pending_channel_read = Some(channel);
+        app.focus = Focus::Input;
+    }
     if let Some(channel) = posting_to {
         match bridge.as_mut() {
             Some(b) => b.send(&json!({"op": "post", "channel": channel, "body": line}))?,
@@ -6159,6 +6183,32 @@ mod tests {
     }
 
     #[test]
+    fn a_leading_resident_mention_routes_from_the_main_composer() {
+        let mut app = App::new();
+        handle_event(
+            &mut app,
+            json!({"ev":"roster","version":1,
+                "agents":[
+                    {"name":"main","kind":"chief","host":"","live":true},
+                    {"name":"hyperion","kind":"bot","host":"hyperion","live":true}
+                ],
+                "channels":[{"channel":"ops","kind":"static"}]
+            }),
+        );
+        assert_eq!(app.channels.len(), 1, "the snapshot must update both halves");
+        let before = app.sess.story.len();
+        app.prompt.insert_str("@hyperion system stats");
+        submit_prompt(None, &mut app).unwrap();
+        assert_eq!(app.sess.story.len(), before, "an addressed line is not local speech");
+        assert_eq!(
+            app.channel_view.as_ref().map(|view| view.name.as_str()),
+            Some("hyperion")
+        );
+        assert_eq!(app.pending_channel_read.as_deref(), Some("hyperion"));
+        assert!(app.prompt.to_send().is_empty());
+    }
+
+    #[test]
     fn theme_completion_previews_then_rolls_back_or_commits() {
         let _pin = theme_lock();
         let saved = Theme::current_kind();
@@ -8841,6 +8891,32 @@ mod tests {
         assert_eq!(app.focus, Focus::Rail);
         assert_eq!(app.rail_sel, 1);
         assert_eq!(app.viewing, None);
+    }
+
+    #[test]
+    fn a_scrolled_rail_click_uses_the_list_viewport_offset() {
+        let mut app = App::new();
+        for i in 0..30 {
+            app.ensure_child(&format!("child-{i:02}"), "");
+        }
+        app.set_focus(Focus::Rail);
+        app.rail_sel = rail::rows(&app).len() - 1;
+        let _ = paint(&mut app, 100, 18);
+        let offset = app.rail_list.offset();
+        assert!(offset > 0, "the stateful List did not scroll to selection");
+        let rail = app.rail_area;
+        handle_mouse(
+            &mut app,
+            click(
+                MouseEventKind::Down(MouseButton::Left),
+                rail.x + 2,
+                rail.y + 1,
+            ),
+        );
+        assert_eq!(
+            app.rail_sel, offset,
+            "screen row zero must select the first visible node"
+        );
     }
 
     /// `error` is not a terminator. loop.py fires it for a reply the endpoint

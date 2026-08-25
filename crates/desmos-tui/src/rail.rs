@@ -5,7 +5,7 @@ use ratatui::{
     layout::Rect,
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph},
+    widgets::{Block, Borders, List, ListItem},
 };
 
 use crate::{App, Focus, Theme};
@@ -247,6 +247,7 @@ pub(crate) fn draw(f: &mut Frame, area: Rect, app: &mut App) {
     let focused = app.focus == Focus::Rail;
     let rows = rows(app);
     app.rail_sel = app.rail_sel.min(rows.len().saturating_sub(1));
+    app.rail_list.select(Some(app.rail_sel));
     let border = if focused {
         theme.accent_tool
     } else {
@@ -262,22 +263,17 @@ pub(crate) fn draw(f: &mut Frame, area: Rect, app: &mut App) {
                 .add_modifier(Modifier::BOLD),
         ))
         .style(Style::default().bg(theme.bg_base).fg(theme.text_primary));
-    let inner = block.inner(area);
-    f.render_widget(block, area);
-    let lines = rows
+    let items: Vec<ListItem> = rows
         .iter()
-        .enumerate()
-        .take(inner.height as usize)
-        .map(|(i, row)| {
+        .map(|row| {
             if row.target == Target::Header {
-                return Line::from(Span::styled(
+                return ListItem::new(Line::from(Span::styled(
                     format!(" {} ", row.label.to_uppercase()),
                     Style::default()
                         .fg(theme.text_secondary)
                         .add_modifier(Modifier::DIM | Modifier::BOLD),
-                ));
+                )));
             }
-            let selected = focused && i == app.rail_sel;
             let mut style = Style::default().fg(match row.presence {
                 Presence::Running => theme.accent_success,
                 Presence::NeedsMe => theme.warning,
@@ -290,15 +286,22 @@ pub(crate) fn draw(f: &mut Frame, area: Rect, app: &mut App) {
             if row.presence == Presence::FinishedUnseen {
                 style = style.bg(theme.bg_highlight);
             }
-            if selected {
-                style = style.bg(theme.bg_highlight).add_modifier(Modifier::BOLD);
-            }
-            Line::from(vec![
+            ListItem::new(Line::from(vec![
                 Span::styled(format!("{} ", row.presence.glyph()), style),
                 Span::styled(row.label.clone(), style),
-            ])
+            ]))
+        })
+        .collect();
+    let list = List::new(items)
+        .block(block)
+        .highlight_style(if focused {
+            Style::default()
+                .bg(theme.bg_highlight)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
         });
-    f.render_widget(Paragraph::new(lines.collect::<Vec<_>>()), inner);
+    f.render_stateful_widget(list, area, &mut app.rail_list);
 }
 
 #[cfg(test)]

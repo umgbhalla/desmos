@@ -1143,8 +1143,10 @@ pub(crate) fn handle_mouse(app: &mut App, m: MouseEvent) {
             if on_rail {
                 app.set_focus(Focus::Rail);
                 if let Some(row) = pane_row(app.rail_area, m.row) {
-                    if row < rail::rows(app).len() {
-                        app.rail_sel = row;
+                    let idx = app.rail_list.offset().saturating_add(row);
+                    if idx < rail::rows(app).len() {
+                        app.rail_sel = idx;
+                        app.rail_list.select(Some(idx));
                         rail::activate(app);
                     }
                 }

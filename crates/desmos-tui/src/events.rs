@@ -395,6 +395,48 @@ fn apply_decision(app: &mut App, value: &Value) {
     }
 }
 
+fn roster_agents(ev: &Value) -> Vec<crate::AgentRow> {
+    ev.get("agents")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|row| {
+            Some(crate::AgentRow {
+                name: row.get("name")?.as_str()?.to_string(),
+                kind: row.get("kind").and_then(Value::as_str).unwrap_or("fork").to_string(),
+                host: row.get("host").and_then(Value::as_str).unwrap_or("").to_string(),
+                parent: row.get("parent").and_then(Value::as_str).unwrap_or("").to_string(),
+                session_id: row
+                    .get("session_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                live: row.get("live").and_then(Value::as_bool).unwrap_or(false),
+            })
+        })
+        .collect()
+}
+
+fn roster_channels(ev: &Value) -> Vec<crate::ChannelRow> {
+    ev.get("channels")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|row| {
+            Some(crate::ChannelRow {
+                channel: row.get("channel")?.as_str()?.to_string(),
+                kind: row.get("kind").and_then(Value::as_str).unwrap_or("adhoc").to_string(),
+                unread: row.get("unread").and_then(Value::as_u64).unwrap_or(0),
+                last_seen: row.get("last_seen").and_then(Value::as_u64).unwrap_or(0),
+                max_id: row.get("max_id").and_then(Value::as_u64).unwrap_or(0),
+                preview: row.get("preview").and_then(Value::as_str).unwrap_or("").to_string(),
+                author: row.get("author").and_then(Value::as_str).unwrap_or("").to_string(),
+                ts: row.get("ts").and_then(Value::as_str).unwrap_or("").to_string(),
+            })
+        })
+        .collect()
+}
+
 pub(crate) fn handle_event(app: &mut App, ev: Value) {
     // Every envelope carries seq; the max seen is the reattach cursor.
     if let Some(seq) = ev.get("seq").and_then(Value::as_u64) {
@@ -450,74 +492,16 @@ pub(crate) fn handle_event(app: &mut App, ev: Value) {
             }
         }
         "agents" => {
-            app.agents = ev
-                .get("agents")
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-                .filter_map(|row| {
-                    Some(crate::AgentRow {
-                        name: row.get("name")?.as_str()?.to_string(),
-                        kind: row
-                            .get("kind")
-                            .and_then(Value::as_str)
-                            .unwrap_or("fork")
-                            .to_string(),
-                        host: row
-                            .get("host")
-                            .and_then(Value::as_str)
-                            .unwrap_or("")
-                            .to_string(),
-                        parent: row
-                            .get("parent")
-                            .and_then(Value::as_str)
-                            .unwrap_or("")
-                            .to_string(),
-                        session_id: row
-                            .get("session_id")
-                            .and_then(Value::as_str)
-                            .unwrap_or("")
-                            .to_string(),
-                        live: row.get("live").and_then(Value::as_bool).unwrap_or(false),
-                    })
-                })
-                .collect();
+            app.agents = roster_agents(&ev);
         }
         "channels" => {
-            app.channels = ev
-                .get("channels")
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-                .filter_map(|row| {
-                    Some(crate::ChannelRow {
-                        channel: row.get("channel")?.as_str()?.to_string(),
-                        kind: row
-                            .get("kind")
-                            .and_then(Value::as_str)
-                            .unwrap_or("adhoc")
-                            .to_string(),
-                        unread: row.get("unread").and_then(Value::as_u64).unwrap_or(0),
-                        last_seen: row.get("last_seen").and_then(Value::as_u64).unwrap_or(0),
-                        max_id: row.get("max_id").and_then(Value::as_u64).unwrap_or(0),
-                        preview: row
-                            .get("preview")
-                            .and_then(Value::as_str)
-                            .unwrap_or("")
-                            .to_string(),
-                        author: row
-                            .get("author")
-                            .and_then(Value::as_str)
-                            .unwrap_or("")
-                            .to_string(),
-                        ts: row
-                            .get("ts")
-                            .and_then(Value::as_str)
-                            .unwrap_or("")
-                            .to_string(),
-                    })
-                })
-                .collect();
+            app.channels = roster_channels(&ev);
+        }
+        "roster" => {
+            // One authoritative backend snapshot prevents agents and channels
+            // from briefly belonging to different revisions.
+            app.agents = roster_agents(&ev);
+            app.channels = roster_channels(&ev);
         }
         "channel_story" => {
             let channel = ev

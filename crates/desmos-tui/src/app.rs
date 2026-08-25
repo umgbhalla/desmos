@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use crate::input::Media;
-use ratatui::layout::Rect;
+use ratatui::{layout::Rect, widgets::ListState};
 use serde_json::{Value, json};
 use xai_grok_pager::appearance::{self, cache as appearance_cache};
 use xai_grok_pager::scrollback::text_selection::{
@@ -567,6 +567,9 @@ pub(crate) struct App {
     pub(crate) drain_after: bool,
     pub(crate) children: HashMap<String, ChildSess>,
     pub(crate) rail_sel: usize,
+    /// Stateful List viewport; selected mirrors rail_sel for existing
+    /// activation code while offset is the authoritative click/render window.
+    pub(crate) rail_list: ListState,
     pub(crate) rail_seen: HashSet<String>,
     pub(crate) rail_area: Rect,
     /// Tree-of-runs mode on the Activity column (`t` toggles it): one row per
@@ -663,6 +666,7 @@ impl App {
             drain_after: false,
             children: HashMap::new(),
             rail_sel: 1, // rows[0] is the AGENTS header; main sits under it
+            rail_list: ListState::default().with_selected(Some(1)),
             rail_seen: HashSet::new(),
             rail_area: Rect::default(),
             tree_open: false,
