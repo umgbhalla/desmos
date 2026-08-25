@@ -6519,9 +6519,11 @@ mod tests {
             json!({"ev": "compacted", "n": 7, "kept": 12, "text": "folded 40 turns"}),
         );
         app.set_focus(Focus::Calls);
-        let _ = paint(&mut app, 100, 40);
+        // Wide enough that the card header fits whatever the ambient block pad
+        // is: at 100 columns a one-cell pad clipped "12 kept" to "12 kep".
+        let _ = paint(&mut app, 130, 40);
         expand_calls(&mut app);
-        let wire = paint(&mut app, 100, 60);
+        let wire = paint(&mut app, 130, 60);
         assert!(wire.contains("FOLD"), "{wire}");
         assert!(wire.contains("#7") && wire.contains("12 kept"), "{wire}");
         assert!(wire.contains("folded 40 turns"), "{wire}");
@@ -6561,12 +6563,15 @@ mod tests {
         );
         app.set_focus(Focus::Calls);
         let text = paint(&mut app, 90, 60);
+        // The pad between rail and content is ambient -- `/dense` zeroes it --
+        // so take it from the appearance this app actually built.
+        let pad = " ".repeat(app.sess.calls.appearance().scrollback.layout.block_pad_left as usize);
         // Rail on both headers.
-        assert!(text.contains("\u{2503}\u{25c6} bash"), "{text}");
-        assert!(text.contains("\u{2503}\u{25c6} Edit"), "{text}");
+        assert!(text.contains(&format!("\u{2503}{pad}\u{25c6} bash")), "{text}");
+        assert!(text.contains(&format!("\u{2503}{pad}\u{25c6} Edit")), "{text}");
         // Bodies start in the same column, one gap past the rail.
-        assert!(text.contains("\u{2503}  $ echo hi"), "{text}");
-        assert!(text.contains("\u{2503}  1  old"), "{text}");
+        assert!(text.contains(&format!("\u{2503}{pad}  $ echo hi")), "{text}");
+        assert!(text.contains(&format!("\u{2503}{pad}  1  old")), "{text}");
     }
 
     #[test]
@@ -6711,9 +6716,14 @@ mod tests {
             app.sess.story.appearance().show_timestamps,
             appearance_cache::load_timestamps()
         );
+        // A compact prompt is ours unconditionally: a pager.toml cannot un-ask.
+        assert!(app.sess.calls.appearance().prompt.compact);
+        // The cached `/dense` toggle is carried by the pads, and nothing else
+        // reads it -- that is the setting this test exists to keep wired.
+        let pad = if appearance_cache::load() { 0 } else { 1 };
         assert_eq!(
-            app.sess.calls.appearance().prompt.compact,
-            appearance_cache::load()
+            app.sess.calls.appearance().scrollback.layout.block_pad_left,
+            pad
         );
     }
 
@@ -7804,14 +7814,37 @@ mod tests {
         let text = paint(&mut app, 160, 120);
         // Drop the pane border and the accent gutter; what is left is the
         // content column, where the bullet and the body both have to line up.
-        let rows: Vec<String> = rows_of(&text, app.call_area)
+        let stripped: Vec<String> = rows_of(&text, app.call_area)
             .lines()
             .skip(1)
             .map(|l| {
                 l.trim_end()
                     .trim_end_matches('\u{2502}')
-                    .chars()
-                    .skip(2)
+                    .trim_start_matches('\u{2502}')
+                    .trim_end()
+                    .to_string()
+            })
+            .filter(|l| !l.trim().is_empty())
+            .collect();
+        // Where the content column begins is ambient: the block pad is one cell
+        // by default and zero under `/dense`, so a hardcoded offset only holds
+        // on the machine it was written on. Measure it from the bullets.
+        let gutter = stripped
+            .iter()
+            .filter_map(|l| {
+                let at = l.chars().position(|c| c == '\u{25c6}')?;
+                l.chars()
+                    .take(at)
+                    .all(|c| c == ' ' || c == '\u{2503}' || c == '\u{2502}')
+                    .then_some(at)
+            })
+            .min()
+            .expect("no card header in the calls pane");
+        let rows: Vec<String> = stripped
+            .iter()
+            .map(|l| {
+                l.chars()
+                    .skip(gutter)
                     .collect::<String>()
                     .trim_end()
                     .to_string()
