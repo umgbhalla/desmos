@@ -30,12 +30,23 @@ type EventRow = {
   channel: string; seq: number; author: string; seat: string; body: string; ts: string;
 };
 
+const MAX_FRAME_BYTES = 256 * 1024;
+const MAX_CHANNEL_BYTES = 128;
+const MAX_FINGERPRINT_BYTES = 256;
+const MAX_AUTHOR_BYTES = 128;
+const MAX_BODY_BYTES = 128 * 1024;
+const MAX_SUBSCRIPTIONS = 128;
+const byteLength = (value: string): number => new TextEncoder().encode(value).byteLength;
+const bounded = (value: unknown, max: number): value is string =>
+  typeof value === "string" && value.length > 0 && byteLength(value) <= max;
+
 export default {
   fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
     const stub = env.SPINE.get(env.SPINE.idFromName("spine"));
     if (url.pathname === "/health") return stub.fetch("https://spine/health");
-    if (url.pathname.startsWith("/seats") || url.pathname === "/drain") {
+    if (url.pathname.startsWith("/seats") || url.pathname === "/drain"
+        || url.pathname === "/purge") {
       const given = (request.headers.get("authorization") ?? "").replace(/^Bearer\s+/i, "");
       if (!tokenOk(given, env.SPINE_TOKEN ?? "")) {
         return Promise.resolve(json({ error: "unauthorized" }, 401));
@@ -123,6 +134,15 @@ export class Spine extends DurableObject<Env> {
     if (url.pathname === "/drain" && request.method === "POST") {
       return json({ drained: await this.drain() });
     }
+    if (url.pathname === "/purge" && request.method === "POST") {
+      let body: { channel?: unknown };
+      try { body = await request.json(); } catch { return json({ error: "invalid json" }, 400); }
+      if (!bounded(body.channel, MAX_CHANNEL_BYTES) || body.channel === "*") {
+        return json({ error: "invalid channel" }, 400);
+      }
+      await this.purgeChannel(body.channel);
+      return json({ purged: body.channel });
+    }
     if (url.pathname !== "/ws") return json({ error: "not found" }, 404);
     const tokenHash = await hash(credential(request));
     const active = [...this.ctx.storage.sql.exec<{ seat: string }>(
@@ -147,10 +167,17 @@ export class Spine extends DurableObject<Env> {
     }
     try {
       const text = typeof raw === "string" ? raw : new TextDecoder().decode(raw);
+      if (byteLength(text) > MAX_FRAME_BYTES) throw new Error("frame too large");
       const msg = JSON.parse(text);
       if (msg.op === "sub") {
         const channels = Array.isArray(msg.channels)
-          ? [...new Set<string>(msg.channels.filter((x: unknown) => typeof x === "string"))] : [];
+          ? [...new Set<string>(msg.channels.filter(
+            (x: unknown) => bounded(x, MAX_CHANNEL_BYTES),
+          ))] : [];
+        if (channels.length > MAX_SUBSCRIPTIONS) throw new Error("too many subscriptions");
+        if (Array.isArray(msg.channels) && channels.length !== msg.channels.length) {
+          throw new Error("invalid subscription");
+        }
         ws.serializeAttachment({ channels, seat: attachment.seat } satisfies Attachment);
         ws.send(JSON.stringify({ op: "subbed" }));
       } else if (msg.op === "append") {
@@ -160,7 +187,7 @@ export class Spine extends DurableObject<Env> {
       } else if (msg.op === "replay") {
         await this.replay(ws, msg);
       } else if (msg.op === "purge") {
-        await this.purge(ws, msg);
+        ws.send(JSON.stringify({ op: "error", error: "admin operation" }));
       } else {
         ws.send(JSON.stringify({ op: "error", error: "unknown op" }));
       }
@@ -178,9 +205,16 @@ export class Spine extends DurableObject<Env> {
   }
 
   private async append(ws: WebSocket, msg: Append, seat: string): Promise<void> {
+    const limits = {
+      channel: MAX_CHANNEL_BYTES,
+      fingerprint: MAX_FINGERPRINT_BYTES,
+      author: MAX_AUTHOR_BYTES,
+      body: MAX_BODY_BYTES,
+    } as const;
     for (const key of ["channel", "fingerprint", "author", "body"] as const) {
-      if (typeof msg[key] !== "string" || !msg[key]) throw new Error(`invalid ${key}`);
+      if (!bounded(msg[key], limits[key])) throw new Error(`invalid ${key}`);
     }
+    if (msg.channel === "*") throw new Error("invalid channel");
     const result = this.ctx.storage.transactionSync(() => {
       const sql = this.ctx.storage.sql;
       const prior = [...sql.exec<{ seq: number }>(
@@ -235,18 +269,12 @@ export class Spine extends DurableObject<Env> {
     ws.send(JSON.stringify({ op: "replay", channel: msg.channel, events, next }));
   }
 
-  private async purge(ws: WebSocket, msg: Record<string, unknown>): Promise<void> {
-    // Erase a channel everywhere it lives: hot log, its counter, and the D1
-    // archive. Without this, every client's snapshot-sync resurrects rows
-    // deleted locally -- junk channels were immortal.
-    if (typeof msg.channel !== "string" || !msg.channel) throw new Error("invalid channel");
+  private async purgeChannel(channel: string): Promise<void> {
     this.ctx.storage.transactionSync(() => {
-      this.ctx.storage.sql.exec("DELETE FROM hot_log WHERE channel = ?", msg.channel);
-      this.ctx.storage.sql.exec("DELETE FROM counters WHERE channel = ?", msg.channel);
+      this.ctx.storage.sql.exec("DELETE FROM hot_log WHERE channel = ?", channel);
+      this.ctx.storage.sql.exec("DELETE FROM counters WHERE channel = ?", channel);
     });
-    await this.env.ARCHIVE.prepare("DELETE FROM log WHERE channel = ?")
-      .bind(msg.channel).run();
-    ws.send(JSON.stringify({ op: "purged", channel: msg.channel }));
+    await this.env.ARCHIVE.prepare("DELETE FROM log WHERE channel = ?").bind(channel).run();
   }
 
   private snapshot(): unknown {

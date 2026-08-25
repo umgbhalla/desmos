@@ -84,6 +84,28 @@ const otherAck = await b.next();
 assert.equal(otherAck.seq, 1);
 console.log("PASS same fingerprint on two channels received independent seqs");
 
+b.ws.send(JSON.stringify({ op: "purge", channel: otherChannel }));
+assert.deepEqual(await b.next(), { op: "error", error: "admin operation" });
+console.log("PASS seat WebSocket cannot purge channels");
+
+b.ws.send(JSON.stringify({
+  op: "append", channel, fingerprint: `${stamp}-large`, author: "b",
+  body: "x".repeat(128 * 1024 + 1),
+}));
+assert.deepEqual(await b.next(), { op: "error", error: "invalid body" });
+console.log("PASS oversized append body rejected");
+
+const purgeResponse = await adminFetch("/purge", {
+  method: "POST", body: JSON.stringify({ channel: otherChannel }),
+});
+assert.equal(purgeResponse.status, 200);
+assert.deepEqual(await purgeResponse.json(), { purged: otherChannel });
+b.ws.send(JSON.stringify({ op: "replay", channel: otherChannel, since: 0, limit: 10 }));
+assert.deepEqual(await b.next(), {
+  op: "replay", channel: otherChannel, events: [], next: null,
+});
+console.log("PASS admin HTTP purge removed hot and archived channel rows");
+
 b.ws.send(JSON.stringify({ op: "snapshot" }));
 const snapshot = await b.next();
 assert.equal(snapshot.channels.find((x) => x.channel === channel)?.max_seq, 2);
