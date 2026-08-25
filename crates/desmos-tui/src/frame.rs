@@ -33,6 +33,31 @@ fn wrap_body(text: &str, width: usize) -> Vec<String> {
 }
 
 /// Draw the channel the rail selected, in place of the agent's own story.
+/// One wrapped row split so that `@name` carries its own colour. A mention is
+/// the only token in a channel that does something -- it dispatches work to
+/// another machine -- so it should not read like the rest of the sentence.
+fn mention_spans(row: &str, base: Style, accent: Style) -> Vec<Span<'static>> {
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut plain = String::new();
+    for word in row.split_inclusive(' ') {
+        let token = word.trim_end_matches(' ');
+        let name = token.trim_end_matches(|c: char| !c.is_alphanumeric() && c != '_' && c != '-');
+        if name.len() > 1 && name.starts_with('@') {
+            if !plain.is_empty() {
+                spans.push(Span::styled(std::mem::take(&mut plain), base));
+            }
+            spans.push(Span::styled(name.to_string(), accent));
+            plain.push_str(&word[name.len()..]);
+        } else {
+            plain.push_str(word);
+        }
+    }
+    if !plain.is_empty() {
+        spans.push(Span::styled(plain, base));
+    }
+    spans
+}
+
 pub(crate) fn draw_channel(f: &mut Frame, area: Rect, view: &mut ChannelView, focused: bool) {
     let theme = Theme::current();
     let border = if focused {
@@ -74,9 +99,12 @@ pub(crate) fn draw_channel(f: &mut Frame, area: Rect, view: &mut ChannelView, fo
         }
         lines.push(Line::from(head));
         for row in wrap_body(&message.body, width) {
-            lines.push(Line::from(Span::styled(
-                row,
+            lines.push(Line::from(mention_spans(
+                &row,
                 Style::default().fg(theme.text_primary),
+                Style::default()
+                    .fg(theme.accent_user)
+                    .add_modifier(Modifier::BOLD),
             )));
         }
     }

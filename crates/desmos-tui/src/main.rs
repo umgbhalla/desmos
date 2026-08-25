@@ -5566,6 +5566,40 @@ mod tests {
     }
 
     #[test]
+    fn a_mention_is_lit_where_it_was_typed() {
+        let mut app = App::new();
+        app.channel_view = Some(crate::ChannelView {
+            name: "build".into(),
+            messages: vec![crate::ChannelMsg {
+                author: "main".into(),
+                body: "ask @hyperion to build it, then tell @main".into(),
+                ts: "14:03".into(),
+            }],
+            scroll: 0,
+        });
+        let backend = TestBackend::new(120, 34);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let buf = term.backend().buffer();
+        let theme = Theme::current();
+        let mut lit = 0;
+        let mut plain = 0;
+        for y in 0..buf.area().height {
+            for x in 0..buf.area().width {
+                let cell = &buf[(x, y)];
+                if cell.symbol() == "@" {
+                    if cell.fg == theme.accent_user {
+                        lit += 1;
+                    } else {
+                        plain += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!((lit, plain), (2, 0));
+    }
+
+    #[test]
     fn composer_hint_names_the_channel_you_are_standing_in() {
         let mut app = App::new();
         app.channel_view = Some(crate::ChannelView {
