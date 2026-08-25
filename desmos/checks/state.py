@@ -90,6 +90,23 @@ def _spine_sequence_check() -> None:
         rows = persist.ordered_read(world, "migration-check")
         assert len(rows) == 1 and rows[0]["spine_seq"] == 7
 
+def _check_spine_replay_gap() -> None:
+    """Replay must fail loudly when the server says history is unavailable."""
+    from desmos.front import spine
+
+    assert spine._checked_replay({"events": [{"seq": 2}], "gap": None}, "build") == [
+        {"seq": 2}
+    ]
+    try:
+        spine._checked_replay(
+            {"events": [], "gap": {"from": 4, "to": 9}}, "build"
+        )
+    except RuntimeError as exc:
+        assert "build" in str(exc) and "4..9" in str(exc), exc
+    else:
+        raise AssertionError("a replay gap was accepted as complete history")
+
+
 def _check_spine_admin_purge() -> None:
     """Maintenance purge uses the admin HTTP capability, never a seat socket."""
     import tempfile
@@ -695,6 +712,7 @@ def check() -> None:
     import tempfile
 
     _spine_sequence_check()
+    _check_spine_replay_gap()
     _check_spine_admin_purge()
     _check_spine_presence()
     _check_spine_memory()

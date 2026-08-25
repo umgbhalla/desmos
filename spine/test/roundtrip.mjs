@@ -103,6 +103,7 @@ assert.deepEqual(await purgeResponse.json(), { purged: otherChannel });
 b.ws.send(JSON.stringify({ op: "replay", channel: otherChannel, since: 0, limit: 10 }));
 assert.deepEqual(await b.next(), {
   op: "replay", channel: otherChannel, events: [], next: null,
+  high_watermark: 0, first_available: null, gap: null,
 });
 console.log("PASS admin HTTP purge removed hot and archived channel rows");
 
@@ -115,7 +116,7 @@ const replay = await b.next();
 assert.deepEqual(replay, {
   op: "replay", channel,
   events: events.map(({ channel, seq, author, seat, body, ts }) => ({ channel, seq, author, seat, body, ts })),
-  next: null,
+  next: null, high_watermark: 2, first_available: 1, gap: null,
 });
 console.log("PASS replay returned ordered seqs 1,2 with exact event shape");
 

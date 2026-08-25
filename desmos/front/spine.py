@@ -564,6 +564,16 @@ def _local_contiguous_seq(world: World, channel: str) -> int:
         db.close()
 
 
+def _checked_replay(page: dict[str, Any], channel: str) -> list[dict[str, Any]]:
+    """A page with a declared gap is not a successful replay."""
+    gap = page.get("gap")
+    if gap:
+        raise RuntimeError(
+            f"spine replay gap in {channel}: {gap.get('from')}..{gap.get('to')}"
+        )
+    return list(page.get("events", []))
+
+
 def bootstrap(world: World, timeout: float = RECV_TIMEOUT) -> dict[str, int]:
     """Rebuild every advertised channel from D1/hot-log replay pages."""
     ingested = 0
@@ -583,7 +593,7 @@ def bootstrap(world: World, timeout: float = RECV_TIMEOUT) -> dict[str, int]:
                     "since": since, "limit": 500,
                 }))
                 page = _recv_until(ws, "replay", timeout)
-                page_events = list(page.get("events", []))
+                page_events = _checked_replay(page, channel)
                 ingested += ingest(world, page_events)
                 next_seq = page.get("next")
                 if next_seq is None:

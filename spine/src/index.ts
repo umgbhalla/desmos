@@ -266,7 +266,26 @@ export class Spine extends DurableObject<Env> {
     const ordered = [...merged.values()].sort((a, b) => a.seq - b.seq);
     const events = ordered.slice(0, limit);
     const next = ordered.length > limit ? events.at(-1)!.seq : null;
-    ws.send(JSON.stringify({ op: "replay", channel: msg.channel, events, next }));
+    const counter = [...this.ctx.storage.sql.exec<{ seq: number }>(
+      "SELECT seq FROM counters WHERE channel = ?", msg.channel,
+    )][0];
+    const highWatermark = counter?.seq ?? 0;
+    const archivedMin = await this.env.ARCHIVE.prepare(
+      "SELECT MIN(seq) AS seq FROM log WHERE channel = ?",
+    ).bind(msg.channel).first<{ seq: number | null }>();
+    const hotMin = [...this.ctx.storage.sql.exec<{ seq: number | null }>(
+      "SELECT MIN(seq) AS seq FROM hot_log WHERE channel = ?", msg.channel,
+    )][0];
+    const minima = [archivedMin?.seq, hotMin?.seq]
+      .filter((value): value is number => typeof value === "number");
+    const firstAvailable = minima.length ? Math.min(...minima) : null;
+    const gap = firstAvailable !== null && since + 1 < firstAvailable
+      ? { from: since + 1, to: firstAvailable - 1 }
+      : null;
+    ws.send(JSON.stringify({
+      op: "replay", channel: msg.channel, events, next,
+      high_watermark: highWatermark, first_available: firstAvailable, gap,
+    }));
   }
 
   private async purgeChannel(channel: string): Promise<void> {
