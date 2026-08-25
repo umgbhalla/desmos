@@ -16,6 +16,8 @@ from __future__ import annotations
 import json
 import os
 import socket as _socket
+import sqlite3
+import sys
 from typing import Any
 
 from desmos.kernel.types import World
@@ -89,6 +91,19 @@ def _ensure(db) -> None:
 
 
 _SEAT_CACHE: list[str] = []
+
+
+#: Last warning printed, so a loop that fails every cycle says it once.
+_WARNED: list[str] = []
+
+
+def _warn(text: str) -> None:
+    """One line to stderr, deduped against the previous one."""
+    if _WARNED and _WARNED[-1] == text:
+        return
+    del _WARNED[:]
+    _WARNED.append(text)
+    print(f"spine: {text}", file=sys.stderr, flush=True)
 
 
 def _seat() -> str:
@@ -495,11 +510,28 @@ def sync(world: World, timeout: float = RECV_TIMEOUT) -> dict[str, Any]:
                             raise RuntimeError("spine: ack outbox row disappeared")
                         if row["kind"] == "channel_post":
                             message_id = int(json.loads(row["payload_json"])["id"])
-                            db.execute(
-                                "UPDATE channel_messages SET spine_seq = ?"
-                                " WHERE id = ? AND spine_seq IS NULL",
-                                (seq, message_id),
-                            )
+                            try:
+                                db.execute(
+                                    "UPDATE channel_messages SET spine_seq = ?"
+                                    " WHERE id = ? AND spine_seq IS NULL",
+                                    (seq, message_id),
+                                )
+                            except sqlite3.IntegrityError:
+                                # Another local row already holds this seq for
+                                # this channel: rows left over from an older
+                                # store keep their old numbering while the DO
+                                # numbers afresh. The message is in the cloud
+                                # either way, so the local copy just stays
+                                # unstamped. Raising here killed the whole
+                                # exchange every cycle -- the outbox never
+                                # retired, the next ack collided again, and a
+                                # machine sat unable to ingest for hours while
+                                # looking merely offline.
+                                _warn(
+                                    f"seq {seq} on that channel is already"
+                                    f" taken locally; message {message_id}"
+                                    " stays unstamped"
+                                )
                         db.execute(
                             "UPDATE outbox SET sent_at = ?, attempts = attempts + 1"
                             " WHERE fingerprint = ? AND sent_at IS NULL",
@@ -597,6 +629,10 @@ def run_forever(world: World, interval: float = 5.0) -> None:
             delay = interval
             if report["sent"] or report["ingested"]:
                 continue  # something moved; look again immediately
-        except Exception:
+        except Exception as exc:  # noqa: BLE001 -- offline is normal here
+            # Say it, once per distinct failure. Silence is what made a fatal
+            # constraint violation indistinguishable from a closed lid: an
+            # empty log, a backoff quietly growing to five minutes.
+            _warn(f"{type(exc).__name__}: {exc}")
             delay = min(delay * 2, 300.0)
         time.sleep(delay)
