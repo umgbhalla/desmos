@@ -88,8 +88,38 @@ def _ensure(db) -> None:
     db.execute("DROP TABLE IF EXISTS spine_work")
 
 
+_SEAT_CACHE: list[str] = []
+
+
 def _seat() -> str:
-    return os.environ.get("DESMOS_SEAT", "") or _socket.gethostname() or "seat"
+    """This machine's name, as another machine reads it.
+
+    gethostname() is a MAC-derived placeholder when the network hands out no
+    name -- this Mac answers "Unknown_e2:03:31:61:8c:9b", which is what a
+    resident agent elsewhere ended up calling the host it was talking to, and
+    what a mention would have to spell to route work back here. macOS knows
+    the real name; ask it once and remember.
+    """
+    env = os.environ.get("DESMOS_SEAT", "")
+    if env:
+        return env
+    if _SEAT_CACHE:
+        return _SEAT_CACHE[0]
+    name = (_socket.gethostname() or "").removesuffix(".local")
+    if not name or name.startswith("Unknown") or ":" in name:
+        import subprocess
+
+        try:
+            got = subprocess.run(
+                ["scutil", "--get", "ComputerName"],
+                capture_output=True, text=True, timeout=2,
+            )
+            name = got.stdout.strip() or name
+        except Exception:  # noqa: BLE001 -- not macOS, or no scutil
+            pass
+    name = name or "seat"
+    _SEAT_CACHE.append(name)
+    return name
 
 
 def ingest(world: World, events: list[dict[str, Any]]) -> int:
@@ -350,6 +380,16 @@ def _ingest_presence(db, ev: dict[str, Any]) -> int:
     ).fetchone()[0]
     if have is not None and seq <= int(have):
         return 0
+    # A live machine is mentionable by name. Without this the roster only
+    # knows bots somebody registered by hand, so a mention aimed back at the
+    # host that started the conversation resolved to nothing.
+    stamp = str(ev.get("ts", "")) or ""
+    db.execute(
+        "INSERT OR IGNORE INTO agents(name, kind, host, parent, session_id,"
+        " status, created_at, updated_at)"
+        " VALUES (?, 'bot', ?, '', '', 'active', ?, ?)",
+        (host, host, stamp, stamp),
+    )
     db.execute("DELETE FROM spine_peers WHERE host = ?", (host,))
     written = 0
     for s in payload.get("sessions", []):
