@@ -20,6 +20,7 @@ pub(crate) fn draw_input(f: &mut Frame, area: Rect, app: &mut App) {
     };
     let prefix = " ";
     let focused = app.focus == Focus::Input;
+    let local_context = app.channel_view.is_none() && app.remote_workspace.is_none();
     let signal = input_signal(app);
     let (mut signal_label, mut signal_color) = match signal {
         Some(InputSignal::Inference) => (
@@ -30,7 +31,7 @@ pub(crate) fn draw_input(f: &mut Frame, area: Rect, app: &mut App) {
         // and lists every item; repeating the number on the composer border put
         // "Queue 1" and "Queued 1" one row apart.
         Some(InputSignal::Queued) => (Some("Queued".to_string()), theme.accent_user),
-        Some(InputSignal::Tool) if app.running => (
+        Some(InputSignal::Tool) if app.running && local_context => (
             Some("enter steer · tab queue".to_string()),
             theme.accent_tool,
         ),
@@ -49,11 +50,14 @@ pub(crate) fn draw_input(f: &mut Frame, area: Rect, app: &mut App) {
     if let Some(view) = app.channel_view.as_ref() {
         signal_label = Some(format!("enter posts to #{} · esc leaves", view.name));
         signal_color = theme.accent_user;
+    } else if let Some(view) = app.remote_workspace.as_ref() {
+        signal_label = Some(format!("enter sends to @{} · esc leaves", view.seat));
+        signal_color = theme.accent_user;
     }
     // The whole composer frame is the activity indicator. Runtime states keep
     // their own hue while the bold pulse makes progress visible without adding
     // another status row.
-    let pulse = (app.sess.story.animation_tick() / 6) % 2 == 0;
+    let pulse = (app.sess().story.animation_tick() / 6) % 2 == 0;
     let mut border_style = Style::default().fg(signal_color);
     if signal.is_some() && pulse {
         border_style = border_style.add_modifier(Modifier::BOLD);
@@ -67,7 +71,7 @@ pub(crate) fn draw_input(f: &mut Frame, area: Rect, app: &mut App) {
         width: stop_w,
         height: 1,
     };
-    app.turn_cancel = if app.running { Some(stop_area) } else { None };
+    app.turn_cancel = if app.running && local_context { Some(stop_area) } else { None };
     let mut block = Block::default()
         .borders(Borders::ALL)
         .border_style(border_style);
@@ -94,7 +98,7 @@ pub(crate) fn draw_input(f: &mut Frame, area: Rect, app: &mut App) {
             .sum::<u16>();
         let room = card
             .width
-            .saturating_sub(if app.running { stop_w + 3 } else { 2 })
+            .saturating_sub(if app.running && local_context { stop_w + 3 } else { 2 })
             .saturating_sub(used + 2) as usize;
         let mut text = msg.clone();
         if UnicodeWidthStr::width(text.as_str()) > room {
@@ -116,7 +120,7 @@ pub(crate) fn draw_input(f: &mut Frame, area: Rect, app: &mut App) {
     if !left_title.is_empty() {
         block = block.title(Line::from(left_title));
     }
-    if app.running {
+    if app.running && local_context {
         let hovered = app.mouse.is_some_and(|(c, r)| hit(stop_area, c, r));
         block = block.title(
             Line::from(Span::styled(

@@ -589,8 +589,10 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App) {
     );
     draw_git(f, app.git_area, app);
     draw_files(f, app.files_area, app);
-    draw_queue(f, app.queue_area, app);
-    draw_decisions(f, decision_area, app);
+    if app.channel_view.is_none() && app.remote_workspace.is_none() {
+        draw_queue(f, app.queue_area, app);
+        draw_decisions(f, decision_area, app);
+    }
     draw_input(f, app.input_area, app);
     if app.file_picker.is_open() {
         draw_file_picker(f, app);

@@ -5770,6 +5770,7 @@ mod tests {
     fn a_channel_owns_activity_and_meta_not_just_story() {
         let mut app = App::new();
         app.call_push(RenderBlock::system("LOCAL ACTIVITY MUST NOT LEAK"));
+        app.queue.push("LOCAL QUEUE MUST NOT LEAK".into());
         handle_event(
             &mut app,
             json!({"ev":"channel_story","channel":"build",
@@ -5789,6 +5790,7 @@ mod tests {
         let screen = paint(&mut app, 120, 36);
         assert!(screen.contains("271 passed"), "{screen}");
         assert!(!screen.contains("LOCAL ACTIVITY MUST NOT LEAK"), "{screen}");
+        assert!(!screen.contains("LOCAL QUEUE MUST NOT LEAK"), "{screen}");
         assert!(screen.contains("channel"), "{screen}");
         assert!(!screen.contains("POST in"), "{screen}");
     }
@@ -6282,10 +6284,15 @@ mod tests {
         assert_eq!(remote.generation, 34);
         assert_eq!(remote.spine_seq, 77);
 
+        app.running = true; // local main is busy; remote chrome must not claim it
+        app.queue.push("LOCAL REMOTE QUEUE LEAK".into());
         let screen = paint(&mut app, 120, 36);
         assert!(screen.contains("remote question"), "{screen}");
         assert!(screen.contains("remote reasoning"), "{screen}");
         assert!(screen.contains("Story @hyperion"), "{screen}");
+        assert!(screen.contains("enter sends to @hyperion"), "{screen}");
+        assert!(!screen.contains("LOCAL REMOTE QUEUE LEAK"), "{screen}");
+        assert!(!screen.contains("[stop]"), "{screen}");
         assert!(!screen.contains("POST in"), "{screen}");
     }
 
