@@ -207,7 +207,7 @@ def cmd_tui(args: argparse.Namespace) -> int:
         print("desmos tui needs cargo")
         return 1
     if not grok.is_dir():
-        print("clone grok-build into vendor/grok-build")
+        print("run: git submodule update --init vendor/grok-build")
         return 1
     if getattr(args, "grok", False):
         env["DESMOS_ACP"] = f"{sys.executable} -m desmos acp"

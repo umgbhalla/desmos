@@ -3,7 +3,7 @@ fn main() {
         .join("../../vendor/grok-build/crates/codegen/xai-grok-pager/Cargo.toml");
     if !pager.is_file() {
         panic!(
-            "desmos-tui hosts grok-build ScrollbackPane. clone grok-build into vendor/grok-build"
+            "desmos-tui hosts grok-build ScrollbackPane. run: git submodule update --init vendor/grok-build"
         );
     }
     // `--version` has to say which build is running: a stale debug binary and

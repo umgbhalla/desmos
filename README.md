@@ -225,6 +225,7 @@ ARM64, where a Linux x64 Cargo build is not an equivalent artifact.
 For development from a checkout:
 
 ```bash
+git submodule update --init vendor/grok-build
 uv venv && uv pip install -e ".[kernel]"
 source .venv/bin/activate
 
@@ -572,12 +573,13 @@ protobuf compiler (`brew install protobuf`, or `protobuf-compiler` on Debian).
 a real absolute path so cargo's `rerun-if-changed` stays stable — a bare PATH
 `protoc` makes cargo rebuild the whole pager graph on every launch.
 `python -m desmos tui` hashes our sources and reuses `target/release/desmos-tui`
-unless they changed, so only the first launch is slow. `vendor/grok-build` is
-committed, but a cold build still fetches two git deps; it is not offline.
+unless they changed, so only the first launch is slow. `vendor/grok-build` is a
+pinned submodule; source builds must initialize it first. A cold build still
+fetches two git deps, so it is not offline.
 
-`DESMOS_ACP` is our branch inside the committed pager, not upstream — a sync
-that overwrites it hands `--grok` back to grok's own agent with no compile
-error, so `python -m desmos check` asserts it is still there.
+`DESMOS_ACP` is our branch inside the pinned pager fork, not upstream. Moving
+the gitlink to a commit without it hands `--grok` back to grok's own agent with
+no compile error, so `python -m desmos check` asserts it is still there.
 
 Contributions welcome: [CONTRIBUTING.md](CONTRIBUTING.md).
 Vulnerabilities: [SECURITY.md](SECURITY.md) — never a public issue.

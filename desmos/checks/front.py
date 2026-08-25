@@ -8,11 +8,12 @@ from pathlib import Path
 def _check_path_deps_tracked() -> None:
     """Every `path = ` dep in the root Cargo.toml is committed.
 
-    vendor/grok-build is in the repo so a clone builds without fetching
-    anything. That guarantee is one .gitignore line from being false, and it
-    fails silently: `cargo build` works here because the files are on disk, and
-    breaks only for whoever clones next. It already happened once -- a bare
-    `build/` in a global gitignore swallowed crates/build/xai-proto-build.
+    vendor/grok-build is a committed gitlink, so its path deps are present after
+    submodule initialization. The rest of the guarantee is one .gitignore line
+    from being false, and it fails silently: `cargo build` works here because
+    the files are on disk, then breaks for whoever clones next. It already
+    happened once -- a bare `build/` in a global gitignore swallowed
+    crates/build/xai-proto-build.
 
     Asks git what is tracked rather than what exists, because the whole failure
     mode is a file that exists locally and is not in the repo.
@@ -96,13 +97,12 @@ def _check_path_deps_tracked() -> None:
 
 
 def _check_vendor_patch() -> None:
-    """The vendored pager still carries our DESMOS_ACP branch.
+    """The pinned pager fork still carries our DESMOS_ACP branch.
 
-    vendor/grok-build is committed, so this is not about a missing clone. It
-    is about a sync: pulling upstream over the pager drops the branch, the
-    crate still compiles, and `--grok` silently runs grok's own in-process
-    agent instead of `python -m desmos acp`. Nothing else in the build says a
-    word about it, so assert the two halves of the branch are present.
+    Moving the submodule gitlink to an incompatible fork commit can drop the
+    branch while the crate still compiles. `--grok` then silently runs grok's
+    own in-process agent instead of `python -m desmos acp`. Nothing else in the
+    build says a word about it, so assert the two halves are present.
     """
     pager = (
         Path(__file__).resolve().parents[2]
@@ -1465,10 +1465,10 @@ def check() -> None:
         waiter.join(timeout=5)
         assert landed == [False], landed  # released, and never reported a stop
 
-        # vendor/grok-build is committed now, so the DESMOS_ACP branch cannot
-        # go missing on a fresh clone. What can still go missing is the branch
-        # itself, if a sync overwrites it -- and that is silent, because the
-        # pager compiles either way and just runs grok's agent instead of ours.
+        # The committed gitlink pins grok-build after submodule initialization.
+        # What can still go missing is the DESMOS_ACP branch if that gitlink is
+        # moved to an incompatible fork commit -- and that is silent, because
+        # the pager compiles either way and runs grok's agent instead of ours.
         _check_path_deps_tracked()
         _check_vendor_patch()
         _check_release_tui_launcher()

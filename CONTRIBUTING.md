@@ -18,13 +18,14 @@ changing anything under `desmos/`.
 - **Never commit key material.** CI greps the whole tree, `vendor/` included, for
   key-shaped strings. `.env.example` shows the shape; real keys live in the
   environment or `~/.desmos/auth.json`.
-- **Do not build the workspace.** Every vendored grok crate is a workspace
-  member, so `cargo build --workspace` compiles ~89 packages. Always target a
-  package: `-p desmos-tui`, `-p xai-grok-markdown`.
+- **Do not build the workspace.** Every checked-out crate in the grok-build
+  submodule is a workspace member, so `cargo build --workspace` compiles ~89
+  packages. Always target a package: `-p desmos-tui`, `-p xai-grok-markdown`.
 
 ## Setup
 
 ```bash
+git submodule update --init vendor/grok-build
 uv venv && uv pip install -e ".[kernel]"
 source .venv/bin/activate
 python -m desmos check                     # harness self-check, no API key needed

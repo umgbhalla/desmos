@@ -307,7 +307,7 @@ desmos/
   acp.py         ACP stdio server
   check.py       self-check suite
 crates/desmos-tui/   the Rust TUI
-vendor/grok-build/   committed upstream pager crates (third-party license)
+vendor/grok-build/   pinned pager-fork submodule (third-party license)
 ```
 
 ## Further reading

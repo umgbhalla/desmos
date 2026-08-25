@@ -1,8 +1,8 @@
 # Workspace deps are grok-build's table (paths rewritten to vendor/) so
 # desmos-tui can host ScrollbackPane without forking pager Cargo.toml.
-# vendor/grok-build is committed source, not a clone: `cargo build -p
-# desmos-tui` needs no setup step, and every vendored crate is a member of
-# this workspace. That membership is what decides local ownership -- a
+# vendor/grok-build is a pinned git submodule. Initialize its committed gitlink
+# before a source build; every checked-out grok crate is then a member of this
+# workspace. That membership is what decides local ownership -- a
 # vendored crate whose consumers all say `{ workspace = true }` can be
 # redirected into crates/ by the table below (xai-grok-markdown), while one
 # reached by a hard path = "../.." cannot.

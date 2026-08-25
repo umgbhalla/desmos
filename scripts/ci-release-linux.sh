@@ -10,6 +10,8 @@ export PATH="$CARGO_HOME/bin:$state/protobuf/bin:$PATH"
 rg_path=$(command -v rg)
 export GROK_TOOLS_BUNDLE_RG_PATH="$rg_path"
 export GROK_SHELL_BUNDLE_RG_PATH="$rg_path"
+git -c url."https://github.com/".insteadOf="git@github.com:" \
+  submodule update --init vendor/grok-build
 version=$(python3 -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')
 
 test "$tag" = "v$version"
