@@ -216,6 +216,21 @@ fn meta_id(app: &App) -> MetaId {
             s.to_string()
         }
     };
+    if let Some(channel) = app.channel_view.as_ref() {
+        return MetaId {
+            model: "channel".into(),
+            effort: format!(
+                "{} pending · {} unread", channel.pending_delivery, channel.unread
+            ),
+            generation: format!("seq {}", channel.max_seq),
+            pending: None,
+            theme: Theme::current_kind().display_name().to_string(),
+            session: Some(format!(
+                "#{} · {} people", channel.name, channel.participants.len()
+            )),
+            background: channel.participants.clone(),
+        };
+    }
     if let Some(remote) = app.remote_workspace.as_ref() {
         return MetaId {
             model: dash(&remote.model),
@@ -483,14 +498,14 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App) {
             draw_scrollback(
                 f,
                 panes[1],
-                &mut app.sess.calls,
-                &mut app.sess.calls_scratch,
-                &mut app.sess.calls_sel,
+                &mut view.sess.calls,
+                &mut view.sess.calls_scratch,
+                &mut view.sess.calls_sel,
                 &calls_title,
                 theme.accent_tool,
                 app.focus == Focus::Calls,
                 app.mouse,
-                &app.sess.calls_text,
+                &view.sess.calls_text,
                 &mut app.media.frame,
             );
         }
@@ -560,9 +575,10 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App) {
     );
     let ident = meta_id(app);
     let meter = app
-        .remote_workspace
+        .channel_view
         .as_ref()
-        .map(|remote| &remote.cache)
+        .map(|channel| &channel.cache)
+        .or_else(|| app.remote_workspace.as_ref().map(|remote| &remote.cache))
         .unwrap_or(&app.cache);
     draw_meta(
         f,

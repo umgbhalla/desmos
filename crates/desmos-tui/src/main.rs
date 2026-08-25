@@ -5662,6 +5662,12 @@ mod tests {
         app.channel_view = Some(crate::ChannelView {
             name: "build".into(),
             messages,
+            sess: crate::Sess::new(),
+            cache: crate::CacheMeter::default(),
+            participants: Vec::new(),
+            unread: 0,
+            max_seq: 0,
+            pending_delivery: 0,
             scroll: 0,
         });
         app.set_focus(Focus::Story);
@@ -5730,6 +5736,12 @@ mod tests {
                 body: "ask @hyperion to build it, then tell @main".into(),
                 ts: "14:03".into(),
             }],
+            sess: crate::Sess::new(),
+            cache: crate::CacheMeter::default(),
+            participants: Vec::new(),
+            unread: 0,
+            max_seq: 0,
+            pending_delivery: 0,
             scroll: 0,
         });
         let backend = TestBackend::new(120, 34);
@@ -5755,6 +5767,33 @@ mod tests {
     }
 
     #[test]
+    fn a_channel_owns_activity_and_meta_not_just_story() {
+        let mut app = App::new();
+        app.call_push(RenderBlock::system("LOCAL ACTIVITY MUST NOT LEAK"));
+        handle_event(
+            &mut app,
+            json!({"ev":"channel_story","channel":"build",
+                "messages":[{"author":"main","body":"ship it","ts":"14:03"}],
+                "participants":["hyperion","main"],
+                "activity":[{"type":"result","host":"hyperion",
+                    "status":"done","text":"271 passed","seq":41}],
+                "unread":3,"max_seq":41,"pending_delivery":2
+            }),
+        );
+        let view = app.channel_view.as_ref().unwrap();
+        assert_eq!(view.sess.calls.len(), 1);
+        assert_eq!(view.participants, vec!["hyperion", "main"]);
+        assert_eq!(view.max_seq, 41);
+        assert_eq!(view.pending_delivery, 2);
+
+        let screen = paint(&mut app, 120, 36);
+        assert!(screen.contains("271 passed"), "{screen}");
+        assert!(!screen.contains("LOCAL ACTIVITY MUST NOT LEAK"), "{screen}");
+        assert!(screen.contains("channel"), "{screen}");
+        assert!(!screen.contains("POST in"), "{screen}");
+    }
+
+    #[test]
     fn composer_hint_names_the_channel_you_are_standing_in() {
         let mut app = App::new();
         app.channel_view = Some(crate::ChannelView {
@@ -5764,6 +5803,12 @@ mod tests {
                 body: "first words".into(),
                 ts: "14:03".into(),
             }],
+            sess: crate::Sess::new(),
+            cache: crate::CacheMeter::default(),
+            participants: Vec::new(),
+            unread: 0,
+            max_seq: 0,
+            pending_delivery: 0,
             scroll: 0,
         });
         let screen = paint(&mut app, 120, 34);

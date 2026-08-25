@@ -584,9 +584,46 @@ pub(crate) fn handle_event(app: &mut App, ev: Value) {
                         .to_string(),
                 })
                 .collect();
+            let mut sess = crate::Sess::new();
+            for item in ev
+                .get("activity")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                let typ = item.get("type").and_then(Value::as_str).unwrap_or("work");
+                let host = item.get("host").and_then(Value::as_str).unwrap_or("");
+                let status = item.get("status").and_then(Value::as_str).unwrap_or("");
+                let text = item.get("text").and_then(Value::as_str).unwrap_or("");
+                let line = [typ, host, status, text]
+                    .into_iter()
+                    .filter(|part| !part.is_empty())
+                    .collect::<Vec<_>>()
+                    .join(" · ");
+                if !line.is_empty() {
+                    sess.calls.push_block(RenderBlock::system(&line));
+                }
+            }
+            let participants = ev
+                .get("participants")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect();
             app.channel_view = Some(crate::ChannelView {
                 name: channel.to_string(),
                 messages,
+                sess,
+                cache: crate::CacheMeter::default(),
+                participants,
+                unread: ev.get("unread").and_then(Value::as_u64).unwrap_or(0),
+                max_seq: ev.get("max_seq").and_then(Value::as_u64).unwrap_or(0),
+                pending_delivery: ev
+                    .get("pending_delivery")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
                 scroll: 0,
             });
             app.focus = crate::Focus::Input;

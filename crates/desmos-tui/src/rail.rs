@@ -204,6 +204,12 @@ fn enter_channel(app: &mut App, name: String) {
         app.channel_view = Some(crate::ChannelView {
             name: name.clone(),
             messages: Vec::new(),
+            sess: crate::Sess::new(),
+            cache: crate::CacheMeter::default(),
+            participants: Vec::new(),
+            unread: 0,
+            max_seq: 0,
+            pending_delivery: 0,
             scroll: 0,
         });
     }

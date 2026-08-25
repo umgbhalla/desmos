@@ -482,6 +482,13 @@ pub(crate) struct ChannelMsg {
 pub(crate) struct ChannelView {
     pub(crate) name: String,
     pub(crate) messages: Vec<ChannelMsg>,
+    /// Work lifecycle for this channel drives Activity independently of main.
+    pub(crate) sess: Sess,
+    pub(crate) cache: CacheMeter,
+    pub(crate) participants: Vec<String>,
+    pub(crate) unread: u64,
+    pub(crate) max_seq: u64,
+    pub(crate) pending_delivery: u64,
     /// Wrapped lines held back from the bottom. Zero is the live tail, which
     /// is why a new message never has to move it: sticky by construction.
     pub(crate) scroll: usize,
