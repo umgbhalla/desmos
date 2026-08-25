@@ -13,6 +13,21 @@ from desmos.catalog import system_prompt
 from desmos.types import Block
 
 
+def _peer() -> str:
+    """A host name that is never this machine.
+
+    These checks used to spell the other machine by its real name, which passed
+    everywhere except on hyperion: _ingest_presence correctly drops a host's
+    own presence, so every assertion downstream of it failed there and the
+    suite was green here and red on the box running the daemon.
+    """
+    from desmos.front import spine
+
+    name = "peerbox"
+    assert name != spine._seat(), f"rename this machine or the constant: {name}"
+    return name
+
+
 def _memory(body: str, attrs: dict | None = None) -> Block:
     return Block("knowledge", body, {"op": "memory", **(attrs or {})})
 
@@ -110,11 +125,11 @@ def _check_spine_presence() -> None:
         ev = {
             "channel": spine.SYS_PRESENCE,
             "seq": 1,
-            "author": "hyperion",
-            "seat": "hyperion",
+            "author": _peer(),
+            "seat": _peer(),
             "ts": "2026-08-23T00:00:00+00:00",
             "body": json.dumps({
-                "host": "hyperion",
+                "host": _peer(),
                 "bucket": "2026-08-23T00:00",
                 "sessions": [{
                     "run_id": "r-hyp", "session_id": "s-hyp", "pid": 42,
@@ -126,17 +141,17 @@ def _check_spine_presence() -> None:
         assert spine.ingest(world, [ev]) == 1
         got = persist.peers(world)
         remote = [p for p in got if p.get("remote")]
-        assert len(remote) == 1 and remote[0]["host"] == "hyperion", got
+        assert len(remote) == 1 and remote[0]["host"] == _peer(), got
         assert remote[0]["run_id"] == "r-hyp"
         assert all(p.get("host") for p in got)
         # A snapshot replaying an OLDER presence event must not clobber newer.
         newer = dict(ev, seq=5, body=json.dumps({
-            "host": "hyperion", "sessions": [{
+            "host": _peer(), "sessions": [{
                 "run_id": "r-new", "session_id": "s-hyp", "pid": 43,
                 "cwd": "/", "generation": 8, "model": "m", "started_at": "t",
             }]}))
         stale = dict(ev, seq=3, body=json.dumps({
-            "host": "hyperion", "sessions": [{
+            "host": _peer(), "sessions": [{
                 "run_id": "r-stale", "session_id": "s-hyp", "pid": 99,
                 "cwd": "/", "generation": 1, "model": "m", "started_at": "t",
             }]}))
@@ -171,8 +186,8 @@ def _check_spine_memory() -> None:
         ev = {
             "channel": spine.SYS_MEMORY,
             "seq": 1,
-            "author": "nemesis",
-            "seat": "nemesis",
+            "author": _peer(),
+            "seat": _peer(),
             "ts": "now",
             "body": frame["body"],
         }
@@ -366,7 +381,7 @@ def _check_mention_dispatch() -> None:
             presence = {
                 "channel": spine.SYS_PRESENCE, "seq": 1, "author": "h",
                 "seat": "h", "ts": now,
-                "body": json.dumps({"host": "hyperion", "sessions": [
+                "body": json.dumps({"host": _peer(), "sessions": [
                     {"run_id": "r", "session_id": "s", "pid": 1, "cwd": "/",
                      "generation": 1, "model": "m", "started_at": now},
                 ]}),
@@ -381,17 +396,17 @@ def _check_mention_dispatch() -> None:
                     "SELECT name, kind, host, status FROM agents")}
             finally:
                 db.close()
-            assert bots.get("hyperion") == {
-                "name": "hyperion", "kind": "bot",
-                "host": "hyperion", "status": "active"}, bots
-            assert remote.mention_dispatch(world, "sys.work", "@hyperion x") == []
+            assert bots.get(_peer()) == {
+                "name": _peer(), "kind": "bot",
+                "host": _peer(), "status": "active"}, bots
+            assert remote.mention_dispatch(world, "sys.work", f"@{_peer()} x") == []
             assert remote.mention_dispatch(world, "build", "@nobody x") == []
-            assert remote.mention_dispatch(world, "build", "@hyperion") == []
+            assert remote.mention_dispatch(world, "build", f"@{_peer()}") == []
             notes = remote.mention_dispatch(
-                world, "build", "@hyperion run the suite")
+                world, "build", f"@{_peer()} run the suite")
             # A mention is a conversation: the note names who is answering,
             # not a work id, an agent kind, or where the reply will land.
-            assert notes == ["hyperion is thinking..."], notes
+            assert notes == [f"{_peer()} is thinking..."], notes
 
             db = persist._open(persist.state_file(world))
             try:
@@ -411,11 +426,11 @@ def _check_mention_dispatch() -> None:
                     reqs.append(payload)
             assert len(reqs) == 1, reqs
             assert reqs[0]["task"] == "run the suite", reqs
-            assert reqs[0]["target"] == "hyperion"
+            assert reqs[0]["target"] == _peer()
             wid = reqs[0]["work_id"]
 
             spine.post_work(world, {
-                "t": "result", "work_id": wid, "host": "hyperion",
+                "t": "result", "work_id": wid, "host": _peer(),
                 "status": "done", "output": "suite green"})
             task = next(t for t in pending._bucket(world) if wid in t.name)
             assert task.done.wait(20), "mention reply never landed"
@@ -426,7 +441,7 @@ def _check_mention_dispatch() -> None:
             assert task.path is None, task.path
             assert pending.wait_next(world, timeout=1) == [], "quiet woke the step"
             got = persist.channel_read(world, channel="build", limit=5)
-            assert got and got[-1]["author"] == "hyperion", got
+            assert got and got[-1]["author"] == _peer(), got
             assert "suite green" in got[-1]["body"], got[-1]
 
             # Now the kernel's own post path, driven through the real dispatch:
@@ -436,11 +451,11 @@ def _check_mention_dispatch() -> None:
             # because a human typed there, while a mention from the kernel is
             # one agent asking another.
             posted = json.loads(dispatch(world, Block(
-                "session", "@hyperion status?",
+                "session", f"@{_peer()} status?",
                 {"op": "post", "channel": "build"})))
             assert posted["author"] == "asker-host", posted
             assert posted["author"] != posted["run_id"], posted
-            assert posted.get("dispatched") == ["hyperion is thinking..."], posted
+            assert posted.get("dispatched") == [f"{_peer()} is thinking..."], posted
 
             db = persist._open(persist.state_file(world))
             try:
@@ -463,7 +478,7 @@ def _check_mention_dispatch() -> None:
             # the temp workspace it is polling.
             wid2 = asked[0]["work_id"]
             spine.post_work(world, {
-                "t": "result", "work_id": wid2, "host": "hyperion",
+                "t": "result", "work_id": wid2, "host": _peer(),
                 "status": "done", "output": "signed"})
             task2 = next(t for t in pending._bucket(world) if wid2 in t.name)
             assert task2.done.wait(20), "kernel-post reply never landed"
