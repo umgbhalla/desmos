@@ -468,6 +468,16 @@ pub(crate) fn handle_event(app: &mut App, ev: Value) {
                             .and_then(Value::as_str)
                             .unwrap_or("")
                             .to_string(),
+                        parent: row
+                            .get("parent")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string(),
+                        session_id: row
+                            .get("session_id")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string(),
                         live: row.get("live").and_then(Value::as_bool).unwrap_or(false),
                     })
                 })

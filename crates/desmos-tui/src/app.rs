@@ -444,6 +444,10 @@ pub(crate) struct AgentRow {
     pub(crate) name: String,
     pub(crate) kind: String,
     pub(crate) host: String,
+    /// Durable roster ownership. Empty means a resident/root agent.
+    pub(crate) parent: String,
+    /// The session backing this named agent, when it has one.
+    pub(crate) session_id: String,
     pub(crate) live: bool,
 }
 

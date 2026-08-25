@@ -53,6 +53,26 @@ fn header(label: &str) -> Row {
     }
 }
 
+fn named_children(app: &App, rows: &mut Vec<Row>, parent: &str, depth: usize) {
+    // The database prevents duplicate names but not a malformed parent cycle;
+    // cap display recursion so bad durable data cannot hang the client.
+    if depth > 16 {
+        return;
+    }
+    for agent in app.agents.iter().filter(|a| a.parent == parent) {
+        rows.push(Row {
+            target: Target::Agent(agent.name.clone()),
+            label: format!("{}├─ {}", "  ".repeat(depth), agent.name),
+            presence: if agent.live {
+                Presence::Running
+            } else {
+                Presence::FinishedSeen
+            },
+        });
+        named_children(app, rows, &agent.name, depth + 1);
+    }
+}
+
 pub(crate) fn rows(app: &App) -> Vec<Row> {
     let mut rows = vec![
         header("agents"),
@@ -66,6 +86,9 @@ pub(crate) fn rows(app: &App) -> Vec<Row> {
             },
         },
     ];
+
+    // Live child sessions belong under this resident root. Their kernel depth
+    // is already authoritative, so the rail only paints it as a tree.
     let mut children: Vec<_> = app.children.iter().collect();
     children.sort_by_key(|(_, child)| child.seq);
     rows.extend(children.into_iter().map(|(id, child)| {
@@ -81,11 +104,12 @@ pub(crate) fn rows(app: &App) -> Vec<Row> {
         } else {
             Presence::FinishedUnseen
         };
-        let mut label = if child.agent.is_empty() {
+        let name = if child.agent.is_empty() {
             id.clone()
         } else {
             child.agent.clone()
         };
+        let mut label = format!("{}├─ {}", "  ".repeat(child.depth as usize), name);
         if !child.stage.is_empty() {
             label.push_str(&format!(" · {}", child.stage));
         }
@@ -108,18 +132,26 @@ pub(crate) fn rows(app: &App) -> Vec<Row> {
             presence,
         }
     }));
-    // Bots are roster rows, not spawn rows: hyperion is in the rail because
-    // the database lists it, whether or not this session has ever talked to
-    // it. Liveness comes from presence, so a dark daemon reads as dark.
-    rows.extend(app.agents.iter().filter(|a| a.kind == "bot").map(|bot| Row {
-        target: Target::Agent(bot.name.clone()),
-        label: format!("@{}", bot.name),
-        presence: if bot.live {
-            Presence::Running
-        } else {
-            Presence::FinishedSeen
-        },
-    }));
+    named_children(app, &mut rows, "main", 0);
+
+    // Every other parentless resident is another top-level agent, not an
+    // @mention disguised as navigation. Its durable children follow it.
+    for root in app
+        .agents
+        .iter()
+        .filter(|a| a.name != "main" && a.parent.is_empty() && a.kind != "fork")
+    {
+        rows.push(Row {
+            target: Target::Agent(root.name.clone()),
+            label: root.name.clone(),
+            presence: if root.live {
+                Presence::Running
+            } else {
+                Presence::FinishedSeen
+            },
+        });
+        named_children(app, &mut rows, &root.name, 0);
+    }
     rows.extend(app.background.iter().cloned().map(|label| Row {
         target: Target::Background,
         label,
@@ -286,6 +318,8 @@ mod tests {
                 "agents": [
                     {"name": "main", "kind": "chief", "host": "", "live": true},
                     {"name": "hyperion", "kind": "bot", "host": "hyperion", "live": true},
+                    {"name": "hyp-child", "kind": "fork", "host": "hyperion",
+                     "parent": "hyperion", "session_id": "s1", "live": true},
                     {"name": "darkbot", "kind": "bot", "host": "dark", "live": false}
                 ]
             }),
@@ -301,11 +335,12 @@ mod tests {
         assert_eq!(
             bots,
             vec![
-                ("@hyperion".to_string(), Presence::Running),
-                ("@darkbot".to_string(), Presence::FinishedSeen),
+                ("hyperion".to_string(), Presence::Running),
+                ("├─ hyp-child".to_string(), Presence::Running),
+                ("darkbot".to_string(), Presence::FinishedSeen),
             ]
         );
-        app.rail_sel = got.iter().position(|r| r.label == "@hyperion").unwrap();
+        app.rail_sel = got.iter().position(|r| r.label == "hyperion").unwrap();
         app.prompt.insert_str("draft stays mine");
         activate(&mut app);
         assert_eq!(app.prompt.to_send(), "draft stays mine");
