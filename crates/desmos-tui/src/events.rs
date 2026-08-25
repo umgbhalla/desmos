@@ -574,6 +574,17 @@ pub(crate) fn handle_event(app: &mut App, ev: Value) {
                 .flatten()
                 .filter_map(Value::as_str)
             {
+                // A toast fades; a channel is a record. What the mention set
+                // in motion belongs in the place the mention was typed.
+                if let Some(view) = app.channel_view.as_mut() {
+                    if view.name == channel {
+                        view.messages.push(crate::ChannelMsg {
+                            author: "·".into(),
+                            body: note.to_string(),
+                            ts: String::new(),
+                        });
+                    }
+                }
                 app.notify(note.to_string());
             }
         }
@@ -1113,8 +1124,10 @@ mod tests {
             }),
         );
         let view = app.channel_view.as_ref().unwrap();
-        assert_eq!(view.messages.len(), 4);
+        assert_eq!(view.messages.len(), 5);
         assert_eq!(view.messages[3].author, "main");
+        // The dispatch stays in the channel after the toast has faded.
+        assert_eq!(view.messages[4].body, "remote work w-2 dispatched to hyperion");
         assert_eq!(app.sess.story.len(), story_before);
     }
 
