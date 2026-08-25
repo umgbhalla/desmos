@@ -2766,6 +2766,17 @@ mod tests {
     /// the first bytes down the wire, and lines the server writes arrive on
     /// the same Receiver<Value> the spawn path feeds.
     #[test]
+    fn ctrl_k_is_one_key_to_the_roster_and_one_key_back() {
+        let mut app = App::new();
+        app.focus = Focus::Input;
+        let hit = || KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL);
+        handle_key(None, &mut app, hit()).unwrap();
+        assert_eq!(app.focus, Focus::Rail, "ctrl-k must reach the roster");
+        handle_key(None, &mut app, hit()).unwrap();
+        assert_eq!(app.focus, Focus::Input, "ctrl-k again must give the composer back");
+    }
+
+    #[test]
     fn connect_attaches_first_and_streams_events() {
         use std::os::unix::net::UnixListener;
         let sock = std::env::temp_dir().join(format!("desmos-conn-{}.sock", std::process::id()));

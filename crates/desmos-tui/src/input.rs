@@ -310,6 +310,17 @@ pub(crate) fn handle_key(
         return queue_prompt(bridge.as_deref_mut(), app);
     }
     match key.code {
+        KeyCode::Char('k') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            // One key to the roster and one key back. Switching channels is
+            // the most repeated move in this UI and it sat ten Tab presses
+            // away, which is how a rail ends up unused.
+            app.set_focus(if app.focus == Focus::Rail {
+                Focus::Input
+            } else {
+                Focus::Rail
+            });
+            return Ok(false);
+        }
         KeyCode::Tab if key.modifiers.contains(KeyModifiers::SHIFT) => {
             app.set_focus(app.focus.prev_open(&pane_open(app)));
             return Ok(false);
