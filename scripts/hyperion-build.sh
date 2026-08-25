@@ -12,19 +12,26 @@ REMOTE_MAIN=${DESMOS_BUILD_REMOTE:-hub/desmos}
 REMOTE_BUILD=${REMOTE_MAIN}-build
 CRATE=desmos-tui
 PROFILE=release
+PROFILE_SET=0
 COMMITTED=0
+TEST=0
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    --dev) PROFILE=dev ;;
-    --release) PROFILE=release ;;
+    --dev) PROFILE=dev; PROFILE_SET=1 ;;
+    --release) PROFILE=release; PROFILE_SET=1 ;;
     --committed) COMMITTED=1 ;;
+    --test) TEST=1 ;;
     --crate) CRATE=$2; shift ;;
     -h|--help) sed -n '2,10p' "$0"; exit 0 ;;
     *) echo "hyperion-build: unknown arg $1" >&2; exit 2 ;;
   esac
   shift
 done
+
+# Tests want the dev profile: hyperion's release target dir is warm for the
+# binary we ship, and a release test build would compile the world again.
+if [ "$TEST" = 1 ] && [ "$PROFILE_SET" = 0 ]; then PROFILE=dev; fi
 
 cd "$(git rev-parse --show-toplevel)"
 SLOT=$(basename "$PWD")
@@ -62,8 +69,23 @@ ssh "$HOST" "set -e
   git submodule update --init --recursive -q
   . \"\$HOME/.cargo/env\"
   export CARGO_TARGET_DIR=\"\$HOME/$REMOTE_MAIN/target\"
-  cargo build $FLAGS -p $CRATE 2>&1 | tail -3
+  if [ $TEST = 1 ]; then
+    if cargo test $FLAGS -p $CRATE > /tmp/hyperion-test.log 2>&1; then
+      grep -E '^test result:' /tmp/hyperion-test.log
+    else
+      grep -E '^test result:|^    tests::' /tmp/hyperion-test.log \
+        || tail -30 /tmp/hyperion-test.log
+      exit 1
+    fi
+  else
+    cargo build $FLAGS -p $CRATE 2>&1 | tail -3
+  fi
 "
+
+# A test run has no artifact to bring home. Its whole point is the second
+# machine: the same source under a different HOME, which is how four
+# card-layout tests were caught depending on the user's own pager.toml.
+if [ "$TEST" = 1 ]; then exit 0; fi
 
 OUT=.desmos/out/hyperion
 mkdir -p "$OUT"
