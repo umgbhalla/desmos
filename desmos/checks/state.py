@@ -239,6 +239,12 @@ def _check_roster() -> None:
         persist.agent_upsert(world, "auditor", status="retired")
         got = persist.roster(world)
         assert all(a["name"] != "auditor" for a in got["agents"])
+
+        # A MAC-derived hostname is failed discovery, not a third resident.
+        ghost = "Unknown_e2:03:31:61:8c:9b"
+        persist.agent_upsert(world, ghost, kind="bot", host=ghost)
+        got = persist.roster(world)
+        assert all(a["name"] != ghost for a in got["agents"]), got
     print("roster check ok")
 
 

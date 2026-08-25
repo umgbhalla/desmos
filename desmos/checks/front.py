@@ -1376,12 +1376,14 @@ def check() -> None:
             # only on the socket loop, so a stdio-attached front got
             # "unknown op 'channel_read'" for every click on the rail. Drive
             # the real stdin reader, not the helper, or the gap comes back.
-            proc.stdin.write(json.dumps({"op": "channels"}) + "\n")
+            proc.stdin.write(json.dumps({"op": "roster"}) + "\n")
             proc.stdin.flush()
-            chans = json.loads(proc.stdout.readline())
-            assert chans["ev"] == "channels", chans
-            names = {row["channel"] for row in chans["channels"]}
+            roster = json.loads(proc.stdout.readline())
+            assert roster["ev"] == "roster" and roster["version"] == 1, roster
+            names = {row["channel"] for row in roster["channels"]}
             assert {"general", "build", "ops"} <= names, names
+            kinds = {row["name"]: row["kind"] for row in roster["agents"]}
+            assert kinds.get("main") == "chief", kinds
             proc.stdin.write(
                 json.dumps({"op": "channel_read", "channel": "build"}) + "\n"
             )
@@ -1389,14 +1391,6 @@ def check() -> None:
             story = json.loads(proc.stdout.readline())
             assert story["ev"] == "channel_story", story
             assert story["channel"] == "build", story
-            # The rail's AGENTS section is roster-backed: bots exist because
-            # the database says so, not because a child was spawned here.
-            proc.stdin.write(json.dumps({"op": "agents"}) + "\n")
-            proc.stdin.flush()
-            crew = json.loads(proc.stdout.readline())
-            assert crew["ev"] == "agents", crew
-            kinds = {row["name"]: row["kind"] for row in crew["agents"]}
-            assert kinds.get("main") == "chief", kinds
             # ...and no machine is seeded into it. A bot row exists only after
             # a live host's presence has been ingested, which is what makes
             # the mention route both ways; the state check drives that path.

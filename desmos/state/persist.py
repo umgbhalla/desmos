@@ -782,6 +782,16 @@ ROSTER_CHANNELS = (
 
 def _seed_roster(conn: sqlite3.Connection) -> None:
     now = datetime.now(timezone.utc).isoformat()
+    # Early macOS host discovery could return a MAC-derived placeholder such as
+    # Unknown_e2:03:31:61:8c:9b. Presence registered it as a resident bot and
+    # the active roster kept painting it forever after seat discovery was
+    # fixed. It is not an offline machine; retire the invalid identity at the
+    # authoritative source.
+    conn.execute(
+        "UPDATE agents SET status = 'retired', updated_at = ?"
+        " WHERE kind = 'bot' AND name = host AND name LIKE 'Unknown_%'",
+        (now,),
+    )
     for name, kind, host, parent in ROSTER_AGENTS:
         conn.execute(
             "INSERT OR IGNORE INTO agents(name, kind, host, parent,"
