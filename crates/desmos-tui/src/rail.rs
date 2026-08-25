@@ -164,7 +164,13 @@ pub(crate) fn activate(app: &mut App) {
         // done by mentioning it in a channel. So selecting it writes the
         // mention and hands you the composer, mid-sentence.
         Target::Agent(name) => {
+            // A bot's channel is where addressing it happens, so selecting
+            // @hyperion stands you in #hyperion with the mention already
+            // typed. Before this the mention went into a composer still
+            // pointed at the local agent, and Enter sent it to the wrong
+            // reader: a message to another machine ran as a prompt here.
             app.prompt.insert_str(&format!("@{name} "));
+            app.pending_channel_read = Some(name);
             app.focus = Focus::Input;
         }
         Target::Channel(channel) => {
@@ -298,6 +304,10 @@ mod tests {
         activate(&mut app);
         assert!(app.prompt.to_send().starts_with("@hyperion"), "{:?}", app.prompt.to_send());
         assert_eq!(app.focus, Focus::Input);
+        // ...and stands you where that mention actually dispatches. Without
+        // this the composer was still pointed at the local agent and Enter
+        // sent a message meant for another machine into this one's turn.
+        assert_eq!(app.pending_channel_read.as_deref(), Some("hyperion"));
     }
 
     #[test]
