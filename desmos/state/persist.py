@@ -762,9 +762,12 @@ def _check_reader(rows: list[sqlite3.Row]) -> None:
 #: The roster every workspace starts with: the chief agent, the machines
 #: that take remote work, and the static channels. INSERT OR IGNORE keeps
 #: user edits; a row is configuration, not state.
+# Only the seat itself. A machine used to be baked in here by name, which is
+# why one host could be mentioned and the other could not: the seed knew
+# "hyperion" and nothing taught any database the other side existed. Live
+# hosts register themselves when their presence is ingested.
 ROSTER_AGENTS = (
     ("main", "chief", "", ""),
-    ("hyperion", "bot", "hyperion", ""),
 )
 ROSTER_CHANNELS = (
     ("general", "static", "talk that belongs to no build"),

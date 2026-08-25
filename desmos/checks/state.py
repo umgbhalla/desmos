@@ -207,7 +207,10 @@ def _check_roster() -> None:
         got = persist.roster(world)
         names = {a["name"]: a for a in got["agents"]}
         assert "main" in names and names["main"]["kind"] == "chief", names
-        assert "hyperion" in names and names["hyperion"]["kind"] == "bot"
+        # Nothing but the seat itself. A machine name in the seed is what made
+        # mentions one-directional: whichever host was spelled here could be
+        # addressed, and the other could not.
+        assert set(names) == {"main"}, names
         chans = {c["name"]: c for c in got["channels"]}
         assert {"general", "build", "ops"} <= set(chans), chans
         assert chans["sys.work"]["kind"] == "sys"
@@ -369,6 +372,18 @@ def _check_mention_dispatch() -> None:
                 ]}),
             }
             assert spine.ingest(world, [presence]) == 1
+            # Ingesting presence is what makes a host mentionable: no seed
+            # names a machine, so if this row is missing the mention below
+            # resolves to nothing and the whole exchange is one-directional.
+            db = persist._open(persist.state_file(world))
+            try:
+                bots = {str(r["name"]): dict(r) for r in db.execute(
+                    "SELECT name, kind, host, status FROM agents")}
+            finally:
+                db.close()
+            assert bots.get("hyperion") == {
+                "name": "hyperion", "kind": "bot",
+                "host": "hyperion", "status": "active"}, bots
             assert remote.mention_dispatch(world, "sys.work", "@hyperion x") == []
             assert remote.mention_dispatch(world, "build", "@nobody x") == []
             assert remote.mention_dispatch(world, "build", "@hyperion") == []

@@ -1397,7 +1397,10 @@ def check() -> None:
             assert crew["ev"] == "agents", crew
             kinds = {row["name"]: row["kind"] for row in crew["agents"]}
             assert kinds.get("main") == "chief", kinds
-            assert kinds.get("hyperion") == "bot", kinds
+            # ...and no machine is seeded into it. A bot row exists only after
+            # a live host's presence has been ingested, which is what makes
+            # the mention route both ways; the state check drives that path.
+            assert not [n for n, k in kinds.items() if k == "bot"], kinds
         finally:
             proc.stdin.write(json.dumps({"op": "quit"}) + "\n")
             proc.stdin.flush()
