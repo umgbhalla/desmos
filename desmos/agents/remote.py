@@ -156,10 +156,15 @@ def request(
         return out
 
     pending.submit(world, f"remote {work_id} -> {host}", _finish)
-    return (
-        f"remote work {work_id} dispatched to {host} ({agent or 'general'});"
-        " the result resumes this step as a background task"
+    # Say where the answer will surface. "(general)" is the agent kind, and
+    # read in a channel it looked like the name of the channel the reply was
+    # going to -- which was never true: the bot answers where it was asked.
+    where = (
+        f" the answer lands in #{reply_channel}"
+        if reply_channel
+        else " the result resumes this step as a background task"
     )
+    return f"remote work {work_id} dispatched to {host} ({agent or 'general'});{where}"
 
 
 def mention_dispatch(world: Any, channel: str, body: str) -> list[str]:
