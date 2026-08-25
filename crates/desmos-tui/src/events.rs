@@ -503,6 +503,54 @@ pub(crate) fn handle_event(app: &mut App, ev: Value) {
             app.agents = roster_agents(&ev);
             app.channels = roster_channels(&ev);
         }
+        "workspace_story" => {
+            let seat = ev.get("seat").and_then(Value::as_str).unwrap_or("");
+            if let Some(view) = app.remote_workspace.as_mut()
+                && view.seat == seat
+            {
+                view.sess = crate::Sess::new();
+                if let Some(snapshot) = ev.get("snapshot").and_then(Value::as_object) {
+                    view.model = snapshot
+                        .get("model").and_then(Value::as_str).unwrap_or("").to_string();
+                    view.thinking = snapshot
+                        .get("thinking").and_then(Value::as_str).unwrap_or("").to_string();
+                    view.generation = snapshot
+                        .get("generation").and_then(Value::as_u64).unwrap_or(0);
+                    view.spine_seq = snapshot
+                        .get("spine_seq").and_then(Value::as_u64).unwrap_or(0);
+                }
+                for block in ev
+                    .get("blocks")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                {
+                    let pane = block.get("pane").and_then(Value::as_str).unwrap_or("story");
+                    let kind = block.get("kind").and_then(Value::as_str).unwrap_or("");
+                    let text = block.get("text").and_then(Value::as_str).unwrap_or("");
+                    if text.is_empty() {
+                        continue;
+                    }
+                    if pane == "activity" {
+                        let rendered = if kind == "thinking" {
+                            RenderBlock::thinking(text)
+                        } else {
+                            RenderBlock::system(text)
+                        };
+                        view.sess.calls.push_block(rendered);
+                    } else {
+                        let rendered = if kind == "user" {
+                            RenderBlock::user_prompt(text)
+                        } else {
+                            RenderBlock::agent_message(text)
+                        };
+                        view.sess.story.push_block(rendered);
+                    }
+                }
+                view.loaded = true;
+                app.focus = crate::Focus::Story;
+            }
+        }
         "channel_story" => {
             let channel = ev
                 .get("channel")

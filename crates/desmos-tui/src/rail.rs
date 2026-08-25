@@ -174,7 +174,29 @@ pub(crate) fn rows(app: &App) -> Vec<Row> {
     rows
 }
 
+fn enter_workspace(app: &mut App, seat: String) {
+    app.tree_open = false;
+    if app.remote_workspace.as_ref().is_none_or(|view| view.seat != seat) {
+        app.remote_workspace = Some(crate::RemoteWorkspaceView {
+            seat: seat.clone(),
+            sess: crate::Sess::new(),
+            model: String::new(),
+            thinking: String::new(),
+            cache: crate::CacheMeter::default(),
+            generation: 0,
+            spine_seq: 0,
+            loaded: false,
+        });
+    }
+    app.channel_view = None;
+    app.viewing = None;
+    app.pending_workspace_read = Some(seat);
+    app.focus = Focus::Input;
+}
+
 fn enter_channel(app: &mut App, name: String) {
+    app.remote_workspace = None;
+    app.viewing = None;
     // Paint the destination immediately instead of leaving the old story on
     // screen during the bridge round trip. Keep an already-open view intact;
     // the channel_story response replaces it with the fresh durable tail.
@@ -198,9 +220,12 @@ pub(crate) fn activate(app: &mut App) {
         Target::Root => {
             app.viewing = None;
             app.channel_view = None;
+            app.remote_workspace = None;
             app.focus = Focus::Story;
         }
         Target::Child(id) => {
+            app.channel_view = None;
+            app.remote_workspace = None;
             app.ensure_child(&id, "");
             app.rail_seen.insert(id.clone());
             app.viewing = Some(id);
@@ -211,7 +236,7 @@ pub(crate) fn activate(app: &mut App) {
         // DM; selecting a channel opens that channel. Neither is allowed to
         // mutate a draft -- Slack does not type @alice because you clicked
         // Alice, and repeated clicks must be idempotent.
-        Target::Agent(name) => enter_channel(app, name),
+        Target::Agent(name) => enter_workspace(app, name),
         Target::Channel(channel) => enter_channel(app, channel),
     }
 }
@@ -348,17 +373,20 @@ mod tests {
         activate(&mut app);
         assert_eq!(app.prompt.to_send(), "draft stays mine");
         assert_eq!(app.focus, Focus::Input);
-        assert_eq!(app.channel_view.as_ref().map(|v| v.name.as_str()), Some("hyperion"));
-        assert_eq!(app.pending_channel_read.as_deref(), Some("hyperion"));
+        assert_eq!(
+            app.remote_workspace.as_ref().map(|v| v.seat.as_str()),
+            Some("hyperion")
+        );
+        assert_eq!(app.pending_workspace_read.as_deref(), Some("hyperion"));
 
-        // Re-entering the same DM is navigation, not another edit or an empty
-        // repaint while the fresh tail is in flight.
-        app.channel_view.as_mut().unwrap().messages.push(crate::ChannelMsg {
-            author: "peer".into(), body: "still visible".into(), ts: String::new(),
-        });
+        // Re-entering the same resident preserves its hydrated workspace while
+        // a fresh snapshot is in flight.
+        app.remote_workspace
+            .as_mut().unwrap().sess.story
+            .push_block(xai_grok_pager::scrollback::RenderBlock::system("still visible"));
         activate(&mut app);
         assert_eq!(app.prompt.to_send(), "draft stays mine");
-        assert_eq!(app.channel_view.as_ref().unwrap().messages.len(), 1);
+        assert_eq!(app.remote_workspace.as_ref().unwrap().sess.story.len(), 1);
     }
 
     #[test]

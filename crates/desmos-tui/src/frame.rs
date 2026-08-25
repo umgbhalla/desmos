@@ -216,6 +216,21 @@ fn meta_id(app: &App) -> MetaId {
             s.to_string()
         }
     };
+    if let Some(remote) = app.remote_workspace.as_ref() {
+        return MetaId {
+            model: dash(&remote.model),
+            effort: dash(&remote.thinking),
+            generation: if remote.generation == 0 {
+                "—".into()
+            } else {
+                remote.generation.to_string()
+            },
+            pending: None,
+            theme: Theme::current_kind().display_name().to_string(),
+            session: Some(format!("{} @{}", if remote.loaded { "remote" } else { "loading" }, remote.seat)),
+            background: Vec::new(),
+        };
+    }
     MetaId {
         model: dash(&app.model),
         effort: dash(&app.thinking),
@@ -307,7 +322,7 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App) {
     // not looking at -- and they were taking a third of the column, leaving
     // the channel nine rows on a forty-row terminal. A channel is the whole
     // place while you are in it.
-    let post_h = if app.channel_view.is_some() {
+    let post_h = if app.channel_view.is_some() || app.remote_workspace.is_some() {
         0
     } else {
         app.layout
@@ -432,6 +447,36 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App) {
                 &mut app.media.frame,
             );
         }
+    } else if let Some(remote) = app.remote_workspace.as_mut() {
+        let story_title = format!("Story @{}", remote.seat);
+        draw_scrollback(
+            f,
+            panes[0],
+            &mut remote.sess.story,
+            &mut remote.sess.story_scratch,
+            &mut remote.sess.story_sel,
+            &story_title,
+            theme.accent_assistant,
+            app.focus == Focus::Story,
+            app.mouse,
+            &remote.sess.story_text,
+            &mut app.media.frame,
+        );
+        if !app.tree_open {
+            draw_scrollback(
+                f,
+                panes[1],
+                &mut remote.sess.calls,
+                &mut remote.sess.calls_scratch,
+                &mut remote.sess.calls_sel,
+                &calls_title,
+                theme.accent_tool,
+                app.focus == Focus::Calls,
+                app.mouse,
+                &remote.sess.calls_text,
+                &mut app.media.frame,
+            );
+        }
     } else if let Some(view) = app.channel_view.as_mut() {
         draw_channel(f, panes[0], view, app.focus == Focus::Story);
         if !app.tree_open {
@@ -514,10 +559,15 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App) {
         app.focus == Focus::PostOut,
     );
     let ident = meta_id(app);
+    let meter = app
+        .remote_workspace
+        .as_ref()
+        .map(|remote| &remote.cache)
+        .unwrap_or(&app.cache);
     draw_meta(
         f,
         app.cache.area,
-        &app.cache,
+        meter,
         app.focus == Focus::Meter,
         &ident,
     );

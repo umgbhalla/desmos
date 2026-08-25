@@ -1364,6 +1364,13 @@ fn run(
             dirty = true;
             last_activity = Instant::now();
         }
+        if let Some(seat) = app.pending_workspace_read.take()
+            && let Some(b) = bridge.as_mut()
+        {
+            b.send(&json!({"op": "workspace_read", "seat": seat}))?;
+            dirty = true;
+            last_activity = Instant::now();
+        }
 
         if app.drain_after && !app.running {
             app.drain_after = false;
@@ -1832,25 +1839,39 @@ fn submit_prompt_inner(
                 .find(|agent| agent.kind == "bot" && agent.live && agent.name == name)
                 .map(|agent| agent.name.clone())
         });
+    let resident = app
+        .remote_workspace
+        .as_ref()
+        .map(|view| view.seat.clone())
+        .or_else(|| addressed.clone());
     let posting_to = app
         .channel_view
         .as_ref()
         .map(|view| view.name.clone())
-        .or_else(|| addressed.clone());
-    if app.channel_view.is_none()
-        && let Some(channel) = addressed
+        .or_else(|| resident.clone());
+    if (app.channel_view.is_none() && app.remote_workspace.is_none())
+        && app.remote_workspace.is_none()
+        && let Some(seat) = addressed
     {
-        app.channel_view = Some(crate::ChannelView {
-            name: channel.clone(),
-            messages: Vec::new(),
-            scroll: 0,
+        app.remote_workspace = Some(crate::RemoteWorkspaceView {
+            seat: seat.clone(),
+            sess: crate::Sess::new(),
+            model: String::new(),
+            thinking: String::new(),
+            cache: crate::CacheMeter::default(),
+            generation: 0,
+            spine_seq: 0,
+            loaded: false,
         });
-        app.pending_channel_read = Some(channel);
+        app.pending_workspace_read = Some(seat);
         app.focus = Focus::Input;
     }
     if let Some(channel) = posting_to {
         match bridge.as_mut() {
-            Some(b) => b.send(&json!({"op": "post", "channel": channel, "body": line}))?,
+            Some(b) => b.send(&json!({
+                "op": "post", "channel": channel, "body": line,
+                "target": resident,
+            }))?,
             None => app.notify("bridge is gone"),
         }
         return Ok(false);
@@ -2405,7 +2426,7 @@ fn pending_input_rows(app: &App) -> usize {
 
 fn input_float_rows(app: &App) -> u16 {
     u16::from(
-        pending_input_rows(app) == 0 && app.layout.post_h > 0 && app.channel_view.is_none(),
+        pending_input_rows(app) == 0 && app.layout.post_h > 0 && (app.channel_view.is_none() && app.remote_workspace.is_none()),
     )
 }
 
@@ -6183,6 +6204,47 @@ mod tests {
     }
 
     #[test]
+    fn a_remote_workspace_hydrates_story_activity_and_meta_together() {
+        let mut app = App::new();
+        app.remote_workspace = Some(crate::RemoteWorkspaceView {
+            seat: "hyperion".into(),
+            sess: crate::Sess::new(),
+            model: String::new(),
+            thinking: String::new(),
+            cache: crate::CacheMeter::default(),
+            generation: 0,
+            spine_seq: 0,
+            loaded: false,
+        });
+        handle_event(
+            &mut app,
+            json!({"ev":"workspace_story","seat":"hyperion",
+                "snapshot":{"model":"gpt-5.6-sol","thinking":"high",
+                    "generation":34,"spine_seq":77},
+                "blocks":[
+                    {"pane":"story","kind":"user","text":"remote question"},
+                    {"pane":"story","kind":"text","text":"remote answer"},
+                    {"pane":"activity","kind":"thinking","text":"remote reasoning"},
+                    {"pane":"activity","kind":"tool_result","text":"remote tool output"}
+                ]
+            }),
+        );
+        let remote = app.remote_workspace.as_ref().unwrap();
+        assert!(remote.loaded);
+        assert_eq!(remote.sess.story.len(), 2);
+        assert_eq!(remote.sess.calls.len(), 2);
+        assert_eq!(remote.model, "gpt-5.6-sol");
+        assert_eq!(remote.generation, 34);
+        assert_eq!(remote.spine_seq, 77);
+
+        let screen = paint(&mut app, 120, 36);
+        assert!(screen.contains("remote question"), "{screen}");
+        assert!(screen.contains("remote reasoning"), "{screen}");
+        assert!(screen.contains("Story @hyperion"), "{screen}");
+        assert!(!screen.contains("POST in"), "{screen}");
+    }
+
+    #[test]
     fn a_leading_resident_mention_routes_from_the_main_composer() {
         let mut app = App::new();
         handle_event(
@@ -6201,10 +6263,10 @@ mod tests {
         submit_prompt(None, &mut app).unwrap();
         assert_eq!(app.sess.story.len(), before, "an addressed line is not local speech");
         assert_eq!(
-            app.channel_view.as_ref().map(|view| view.name.as_str()),
+            app.remote_workspace.as_ref().map(|view| view.seat.as_str()),
             Some("hyperion")
         );
-        assert_eq!(app.pending_channel_read.as_deref(), Some("hyperion"));
+        assert_eq!(app.pending_workspace_read.as_deref(), Some("hyperion"));
         assert!(app.prompt.to_send().is_empty());
     }
 

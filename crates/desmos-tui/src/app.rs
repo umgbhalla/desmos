@@ -487,6 +487,19 @@ pub(crate) struct ChannelView {
     pub(crate) scroll: usize,
 }
 
+/// A resident agent is a whole workspace, not a chat-only replacement for
+/// Story. Its hydrated Sess drives Story and Activity together.
+pub(crate) struct RemoteWorkspaceView {
+    pub(crate) seat: String,
+    pub(crate) sess: Sess,
+    pub(crate) model: String,
+    pub(crate) thinking: String,
+    pub(crate) cache: CacheMeter,
+    pub(crate) generation: u64,
+    pub(crate) spine_seq: u64,
+    pub(crate) loaded: bool,
+}
+
 pub(crate) struct App {
     pub(crate) prompt: PromptBuf,
     pub(crate) model: String,
@@ -502,8 +515,10 @@ pub(crate) struct App {
     pub(crate) background: Vec<String>,
     pub(crate) agents: Vec<AgentRow>,
     pub(crate) channel_view: Option<ChannelView>,
+    pub(crate) remote_workspace: Option<RemoteWorkspaceView>,
     pub(crate) channels: Vec<ChannelRow>,
     pub(crate) pending_channel_read: Option<String>,
+    pub(crate) pending_workspace_read: Option<String>,
     /// Bridge-owned decisions waiting for a one-key human answer, oldest first.
     pub(crate) decisions: Vec<Decision>,
     /// Slash completion for the composer. Recomputed on every keystroke that
@@ -632,8 +647,10 @@ impl App {
             background: Vec::new(),
             agents: Vec::new(),
             channel_view: None,
+            remote_workspace: None,
             channels: Vec::new(),
             pending_channel_read: None,
+            pending_workspace_read: None,
             decisions: Vec::new(),
             slash: slash::Slash::default(),
             slash_paste_guard: false,
@@ -765,6 +782,9 @@ impl App {
 
     /// The session on screen: the child being viewed, else the parent.
     pub(crate) fn sess(&self) -> &Sess {
+        if let Some(remote) = self.remote_workspace.as_ref() {
+            return &remote.sess;
+        }
         if let Some(id) = self.viewing.as_deref() {
             if let Some(c) = self.children.get(id) {
                 return &c.sess;
@@ -776,6 +796,9 @@ impl App {
     /// The session on screen, mutably. The parent-or-child lookup exists
     /// here and in [`App::sess`] and nowhere else.
     pub(crate) fn sess_mut(&mut self) -> &mut Sess {
+        if let Some(remote) = self.remote_workspace.as_mut() {
+            return &mut remote.sess;
+        }
         if let Some(id) = self.viewing.clone() {
             if let Some(c) = self.children.get_mut(&id) {
                 return &mut c.sess;
