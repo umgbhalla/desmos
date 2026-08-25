@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 import desmos.transport.complete as complete
+import desmos.transport.openai as openai_transport
 
 
 class Response:
@@ -149,6 +150,118 @@ def self_check() -> None:
                 os.environ.pop("ANTHROPIC_API_KEY", None)
             else:
                 os.environ["ANTHROPIC_API_KEY"] = old_key
+    _openai_stream_retry()
+
+
+def oa_error(
+    code: str = "server_error",
+    message: str = "Our servers are currently overloaded. Please try again later.",
+) -> dict[str, Any]:
+    return {"type": "error", "error": {"code": code, "message": message}}
+
+
+def oa_success(text: str = "ok") -> list[dict[str, Any]]:
+    item = {
+        "type": "message",
+        "role": "assistant",
+        "content": [{"type": "output_text", "text": text}],
+    }
+    return [
+        {"type": "response.created", "response": {"id": "resp_test"}},
+        {"type": "response.output_text.delta", "delta": text},
+        {
+            "type": "response.completed",
+            "response": {
+                "id": "resp_test",
+                "status": "completed",
+                "usage": {"input_tokens": 3, "output_tokens": 1},
+                "output": [item],
+            },
+        },
+    ]
+
+
+def _openai_stream_retry() -> None:
+    """An overload delivered inside an HTTP 200 must reopen, not become the answer.
+
+    The Responses path had no in-stream ladder at all, so an error event on a
+    200 stream raised straight out of the step -- and a resident agent posted
+    "Our servers are currently overloaded" into a channel as its reply.
+    """
+    old_open = openai_transport._open_with_retry
+    old_sleep = openai_transport._sleep
+    old_cred = openai_transport.auth.credential
+    old_headers = openai_transport.headers_for
+    old_traj = complete.TRAJECTORY_DIR
+    with tempfile.TemporaryDirectory() as tmp:
+        complete.TRAJECTORY_DIR = str(Path(tmp) / "trajectory")
+        try:
+            opened: list[Response] = []
+            queue: list[Response] = [Response([oa_error()]), Response(oa_success("recovered"))]
+
+            def fake_open(*_args: Any, **_kwargs: Any) -> Response:
+                response = queue.pop(0)
+                opened.append(response)
+                return response
+
+            openai_transport.auth.credential = lambda *_a, **_k: None
+            openai_transport.headers_for = lambda _cred: (openai_transport.API_URL, {})
+            openai_transport._open_with_retry = fake_open
+            openai_transport._sleep = lambda *_a, **_k: None
+
+            events: list[dict[str, Any]] = []
+            got = openai_transport.complete(
+                "gpt-5.6-sol",
+                "system",
+                [{"role": "user", "content": "hello"}],
+                100,
+                on_event=events.append,
+            )
+            assert got["content"][0]["text"] == "recovered", got
+            assert len(opened) == 2, "an HTTP-200 overload must reopen the request"
+            retries = [event for event in events if event.get("kind") == "retry"]
+            assert len(retries) == 1 and "server_error" in retries[0]["reason"], retries
+
+            # A permanent stream error is not retried.
+            queue[:] = [Response([oa_error("invalid_request_error", "bad payload")])]
+            opened.clear()
+            try:
+                openai_transport.complete("gpt-5.6-sol", "system", [], 100)
+            except openai_transport.OpenAIStreamError as exc:
+                assert not exc.retryable and not exc.had_output
+            else:
+                raise AssertionError("invalid_request_error should escape")
+            assert len(opened) == 1
+
+            # Visible output is never replayed: the story pane has no retraction.
+            queue[:] = [
+                Response([{"type": "response.output_text.delta", "delta": "part"}, oa_error()])
+            ]
+            opened.clear()
+            try:
+                openai_transport.complete("gpt-5.6-sol", "system", [], 100)
+            except RuntimeError as exc:
+                assert "partial output was already emitted" in str(exc), exc
+            else:
+                raise AssertionError("partial output must not be duplicated by retry")
+            assert len(opened) == 1
+
+            # An unending overload gives up, and says it tried.
+            queue[:] = [Response([oa_error()]) for _ in range(complete.STREAM_RETRIES)]
+            opened.clear()
+            try:
+                openai_transport.complete("gpt-5.6-sol", "system", [], 100)
+            except RuntimeError as exc:
+                assert "gave up after" in str(exc), exc
+            else:
+                raise AssertionError("an unending overload must not return a message")
+            assert len(opened) == complete.STREAM_RETRIES, len(opened)
+        finally:
+            openai_transport._open_with_retry = old_open
+            openai_transport._sleep = old_sleep
+            openai_transport.auth.credential = old_cred
+            openai_transport.headers_for = old_headers
+            complete.TRAJECTORY_DIR = old_traj
 
 
 if __name__ == "__main__":

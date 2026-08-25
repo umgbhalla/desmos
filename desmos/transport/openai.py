@@ -26,9 +26,12 @@ from typing import Any, Callable, Iterable
 from desmos.transport import auth
 from desmos.transport.complete import (
     COMPACT_BLOCK,
+    STREAM_RETRIES,
+    STREAM_RETRY_CAP,
     UNANSWERED_CALL as _UNANSWERED_CALL,
     tool_result_text,
     _open_with_retry,
+    _stream_budget,
     iter_sse_lines,
     log_payload,
     redact_wire,
@@ -441,6 +444,30 @@ def _usage(raw: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+#: In-stream failures worth another attempt. The Anthropic path has had this
+#: list for months; this one had nothing, so an overload delivered inside an
+#: HTTP 200 stream became the turn's answer -- and a resident agent posted
+#: "Our servers are currently overloaded" to a channel as its reply.
+RETRY_STREAM_ERROR_CODES = frozenset(
+    {"server_error", "rate_limit_exceeded", "overloaded", "timeout"}
+)
+
+
+class OpenAIStreamError(RuntimeError):
+    """An error event delivered inside an HTTP-200 Responses SSE stream."""
+
+    def __init__(self, code: str, message: str, *, had_output: bool) -> None:
+        super().__init__(f"OpenAI stream error: {message}")
+        self.code = code
+        self.had_output = had_output
+        text = message.lower()
+        self.retryable = (
+            code in RETRY_STREAM_ERROR_CODES
+            or "overload" in text
+            or "try again" in text
+        )
+
+
 def apply_stream_event(
     state: dict[str, Any],
     ev: dict[str, Any],
@@ -448,10 +475,18 @@ def apply_stream_event(
 ) -> None:
     """Fold one Responses SSE event into the assembled message."""
     kind = ev.get("type") or ""
+    # Anything already streamed is on the reader's screen, and a replay would
+    # duplicate it -- so the retry ladder needs to know before it decides.
+    if kind.endswith(".delta"):
+        state["emitted"] = True
     if kind in {"error", "response.failed"}:
         err = ev.get("error") or (ev.get("response") or {}).get("error") or ev
-        msg = err.get("message") if isinstance(err, dict) else str(err)
-        raise RuntimeError(f"OpenAI stream error: {msg}")
+        if isinstance(err, dict):
+            msg = str(err.get("message") or err)
+            code = str(err.get("code") or err.get("type") or "")
+        else:
+            msg, code = str(err), ""
+        raise OpenAIStreamError(code, msg, had_output=bool(state.get("emitted")))
     if kind == "response.reasoning_summary_text.delta":
         chunk = ev.get("delta") or ""
         if chunk and on_event is not None:
@@ -708,7 +743,10 @@ def complete(
     log_payload(body, [])
     dropped: list[str] = []
     phantom_retries = 0
-    for _ in range(9):
+    stream_attempt = 0
+    # Field drops and stream retries share this loop, so the ladder gets its
+    # own headroom rather than eating the budget for rejected fields.
+    for _ in range(9 + STREAM_RETRIES):
         # The body the drop loop below may still edit, frozen per attempt. The
         # kernel used to re-read the complete.LAST global after this returned,
         # which a subagent POST from the thread pool could overwrite in between,
@@ -725,6 +763,32 @@ def complete(
                 )
                 out["_request"] = sent
                 return out
+        except OpenAIStreamError as exc:
+            final = stream_attempt >= STREAM_RETRIES - 1
+            if not exc.retryable or exc.had_output or final:
+                if exc.had_output and exc.retryable:
+                    raise RuntimeError(
+                        f"{exc}; not retried because partial output was"
+                        " already emitted"
+                    ) from exc
+                if final:
+                    # Say it was retried. "Overloaded" on its own reads as a
+                    # harness that never tried, which sends whoever reads it
+                    # off debugging the wrong thing.
+                    raise RuntimeError(
+                        f"{exc}; gave up after {STREAM_RETRIES} attempts over"
+                        f" ~{int(_stream_budget())}s"
+                    ) from exc
+                raise
+            delay = min(0.5 * (2**stream_attempt), STREAM_RETRY_CAP)
+            stream_attempt += 1
+            if on_event is not None:
+                on_event({
+                    "kind": "retry", "attempt": stream_attempt, "delay": delay,
+                    "reason": f"OpenAI SSE {exc.code or 'error'}",
+                })
+            _sleep(delay)
+            continue
         except urllib.error.HTTPError as e:
             detail = e.read().decode("utf-8", "replace")
             # The two endpoints do not accept the same body -- the Codex backend
