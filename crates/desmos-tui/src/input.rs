@@ -602,6 +602,12 @@ pub(crate) fn handle_key(
     // would move the wrong pane. `scroll` counts lines up from the live tail.
     if app.focus == Focus::Story {
         if let Some(view) = app.channel_view.as_mut() {
+            // Back to the live tail in one key, because the way out of a
+            // scrollback is the thing you want most while reading one.
+            if matches!(key.code, KeyCode::End | KeyCode::Char('G')) {
+                view.scroll = 0;
+                return Ok(false);
+            }
             let step: isize = match key.code {
                 KeyCode::Char('k') | KeyCode::Up => 1,
                 KeyCode::Char('j') | KeyCode::Down => -1,

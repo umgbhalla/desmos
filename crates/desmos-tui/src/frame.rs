@@ -69,7 +69,13 @@ pub(crate) fn draw_channel(f: &mut Frame, area: Rect, view: &mut ChannelView, fo
         .borders(Borders::ALL)
         .border_style(Style::default().fg(border))
         .title(Span::styled(
-            format!(" #{} ", view.name),
+            // Say when the pane is not showing the live tail. Without this a
+            // channel read as silent while the new messages were below.
+            if view.scroll > 0 {
+                format!(" #{} ↑{} ", view.name, view.scroll)
+            } else {
+                format!(" #{} ", view.name)
+            },
             Style::default()
                 .fg(theme.accent_assistant)
                 .add_modifier(Modifier::BOLD),

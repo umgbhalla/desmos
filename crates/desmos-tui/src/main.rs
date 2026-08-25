@@ -5552,6 +5552,30 @@ mod tests {
         let screen = paint(&mut app, 120, 34);
         assert!(screen.contains("msg-00"), "{screen}");
         assert!(!screen.contains("msg-39"), "{screen}");
+        // The title says the pane is not on the live tail, so a channel that
+        // is merely scrolled up does not read as a channel that went quiet.
+        assert!(screen.contains("↑"), "{screen}");
+
+        // One key back to the tail.
+        handle_key(
+            None,
+            &mut app,
+            KeyEvent::new(KeyCode::Char('G'), KeyModifiers::NONE),
+        )
+        .unwrap();
+        let screen = paint(&mut app, 120, 34);
+        assert!(screen.contains("msg-39"), "{screen}");
+        assert!(!screen.contains("↑"), "{screen}");
+
+        for _ in 0..200 {
+            handle_key(
+                None,
+                &mut app,
+                KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE),
+            )
+            .unwrap();
+        }
+        let _ = paint(&mut app, 120, 34);
 
         for _ in 0..30 {
             handle_key(
