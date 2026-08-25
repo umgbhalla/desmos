@@ -372,6 +372,13 @@ def _roster_reply(world: "World", op: str, msg: dict[str, Any]) -> dict[str, Any
             return {"ev": "peers", "peers": _peer_entries(world)}
         except Exception as exc:  # noqa: BLE001 -- name it, don't die
             return {"ev": "error", "text": f"peers failed: {exc}"}
+    if op == "agents":
+        from desmos.state.persist import roster
+
+        try:
+            return {"ev": "agents", "agents": roster(world)["agents"]}
+        except Exception as exc:  # noqa: BLE001 -- name it, don't die
+            return {"ev": "error", "text": f"agents failed: {exc}"}
     if op == "channels":
         from desmos.state.persist import channel_list
 
@@ -465,7 +472,7 @@ def _serve_client(
                 continue
             with _WIRE_LOCK:
                 register_locked()
-            if op in ("peers", "channels", "channel_read"):
+            if op in ("peers", "agents", "channels", "channel_read"):
                 reply = _roster_reply(world, op, msg)
                 reply["sid"] = os.environ.get("DESMOS_SESSION_ID", "")
                 line = json.dumps(reply, default=str) + "\n"
@@ -982,7 +989,7 @@ def _drive(
                 level = str(msg.get("level") or "low").strip()
                 world.thinking = level
                 _emit(_snapshot(world))
-            elif op in ("peers", "channels", "channel_read"):
+            elif op in ("peers", "agents", "channels", "channel_read"):
                 _emit(_roster_reply(world, op, msg))
             elif op == "typed":
                 # The TUI queued a follow-up. Nothing to do here: run_turns

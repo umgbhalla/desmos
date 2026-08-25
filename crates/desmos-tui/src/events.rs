@@ -449,6 +449,30 @@ pub(crate) fn handle_event(app: &mut App, ev: Value) {
                 app.status = "idle".into();
             }
         }
+        "agents" => {
+            app.agents = ev
+                .get("agents")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|row| {
+                    Some(crate::AgentRow {
+                        name: row.get("name")?.as_str()?.to_string(),
+                        kind: row
+                            .get("kind")
+                            .and_then(Value::as_str)
+                            .unwrap_or("fork")
+                            .to_string(),
+                        host: row
+                            .get("host")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string(),
+                        live: row.get("live").and_then(Value::as_bool).unwrap_or(false),
+                    })
+                })
+                .collect();
+        }
         "channels" => {
             app.channels = ev
                 .get("channels")

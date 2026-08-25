@@ -1126,6 +1126,7 @@ fn main() -> io::Result<()> {
     }
     if let Some(b) = bridge.as_mut() {
         b.send(&json!({"op": "channels"}))?;
+        b.send(&json!({"op": "agents"}))?;
     }
 
     enable_raw_mode()?;

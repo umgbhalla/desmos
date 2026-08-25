@@ -437,6 +437,16 @@ pub(crate) struct ChannelRow {
     pub(crate) ts: String,
 }
 
+/// One roster agent: a chief, a fork of it, or a machine bot. These exist
+/// because the database says so -- unlike children, which exist only while a
+/// spawn of this session is alive.
+pub(crate) struct AgentRow {
+    pub(crate) name: String,
+    pub(crate) kind: String,
+    pub(crate) host: String,
+    pub(crate) live: bool,
+}
+
 pub(crate) struct App {
     pub(crate) prompt: PromptBuf,
     pub(crate) model: String,
@@ -450,6 +460,7 @@ pub(crate) struct App {
     /// sleeper, any submitted task. Non-empty means the session will resume
     /// itself when one lands, which is the one thing polling gets wrong.
     pub(crate) background: Vec<String>,
+    pub(crate) agents: Vec<AgentRow>,
     pub(crate) channels: Vec<ChannelRow>,
     pub(crate) pending_channel_read: Option<String>,
     /// Bridge-owned decisions waiting for a one-key human answer, oldest first.
@@ -575,6 +586,7 @@ impl App {
             thinking: String::new(),
             model_pending: None,
             background: Vec::new(),
+            agents: Vec::new(),
             channels: Vec::new(),
             pending_channel_read: None,
             decisions: Vec::new(),

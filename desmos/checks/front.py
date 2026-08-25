@@ -1389,6 +1389,15 @@ def check() -> None:
             story = json.loads(proc.stdout.readline())
             assert story["ev"] == "channel_story", story
             assert story["channel"] == "build", story
+            # The rail's AGENTS section is roster-backed: bots exist because
+            # the database says so, not because a child was spawned here.
+            proc.stdin.write(json.dumps({"op": "agents"}) + "\n")
+            proc.stdin.flush()
+            crew = json.loads(proc.stdout.readline())
+            assert crew["ev"] == "agents", crew
+            kinds = {row["name"]: row["kind"] for row in crew["agents"]}
+            assert kinds.get("main") == "chief", kinds
+            assert kinds.get("hyperion") == "bot", kinds
         finally:
             proc.stdin.write(json.dumps({"op": "quit"}) + "\n")
             proc.stdin.flush()

@@ -34,6 +34,7 @@ pub(crate) enum Target {
     Root,
     Child(String),
     Background,
+    Agent(String),
     Channel(String),
 }
 
@@ -107,6 +108,18 @@ pub(crate) fn rows(app: &App) -> Vec<Row> {
             presence,
         }
     }));
+    // Bots are roster rows, not spawn rows: hyperion is in the rail because
+    // the database lists it, whether or not this session has ever talked to
+    // it. Liveness comes from presence, so a dark daemon reads as dark.
+    rows.extend(app.agents.iter().filter(|a| a.kind == "bot").map(|bot| Row {
+        target: Target::Agent(bot.name.clone()),
+        label: format!("@{}", bot.name),
+        presence: if bot.live {
+            Presence::Running
+        } else {
+            Presence::FinishedSeen
+        },
+    }));
     rows.extend(app.background.iter().cloned().map(|label| Row {
         target: Target::Background,
         label,
@@ -146,6 +159,13 @@ pub(crate) fn activate(app: &mut App) {
             app.focus = Focus::Story;
         }
         Target::Background => {}
+        // Addressing a bot is the only thing you can do with one, and it is
+        // done by mentioning it in a channel. So selecting it writes the
+        // mention and hands you the composer, mid-sentence.
+        Target::Agent(name) => {
+            app.prompt.insert_str(&format!("@{name} "));
+            app.focus = Focus::Input;
+        }
         Target::Channel(channel) => {
             app.pending_channel_read = Some(channel);
         }
@@ -192,7 +212,7 @@ pub(crate) fn draw(f: &mut Frame, area: Rect, app: &mut App) {
         .borders(Borders::ALL)
         .border_style(Style::default().fg(border))
         .title(Span::styled(
-            " Sessions ",
+            " Roster ",
             Style::default()
                 .fg(theme.accent_tool)
                 .add_modifier(Modifier::BOLD),
@@ -243,6 +263,41 @@ mod tests {
 
     use super::*;
     use crate::events::handle_event;
+
+    #[test]
+    fn roster_agents_paint_bots_and_selecting_one_writes_a_mention() {
+        let mut app = App::new();
+        handle_event(
+            &mut app,
+            json!({
+                "ev": "agents",
+                "agents": [
+                    {"name": "main", "kind": "chief", "host": "", "live": true},
+                    {"name": "hyperion", "kind": "bot", "host": "hyperion", "live": true},
+                    {"name": "darkbot", "kind": "bot", "host": "dark", "live": false}
+                ]
+            }),
+        );
+        let got = rows(&app);
+        // The chief is the local session row; the roster must not double it.
+        assert_eq!(got.iter().filter(|r| r.label == "main").count(), 1);
+        let bots: Vec<_> = got
+            .iter()
+            .filter(|r| matches!(r.target, Target::Agent(_)))
+            .map(|r| (r.label.clone(), r.presence))
+            .collect();
+        assert_eq!(
+            bots,
+            vec![
+                ("@hyperion".to_string(), Presence::Running),
+                ("@darkbot".to_string(), Presence::FinishedSeen),
+            ]
+        );
+        app.rail_sel = got.iter().position(|r| r.label == "@hyperion").unwrap();
+        activate(&mut app);
+        assert!(app.prompt.to_send().starts_with("@hyperion"), "{:?}", app.prompt.to_send());
+        assert_eq!(app.focus, Focus::Input);
+    }
 
     #[test]
     fn real_subagent_events_drive_presence_rows_in_spawn_order() {
