@@ -1404,6 +1404,30 @@ def _content_text(content: Any) -> str:
     return ""
 
 
+def _session_snapshot_payload(
+    world: World, session: str, messages: list[Any]
+) -> dict[str, Any]:
+    """A bounded, replay-safe resident workspace projection for the spine."""
+    clean = _strip_opaque(messages[-40:])
+    payload = {
+        "v": 1,
+        "run_id": run_id(),
+        "session_id": session,
+        "cwd": str(world.cwd),
+        "generation": int(world.generation),
+        "model": str(world.model),
+        "thinking": str(world.thinking),
+        "messages": clean,
+    }
+    # The spine accepts 128 KiB bodies. Leave envelope headroom and keep the
+    # newest complete messages rather than byte-truncating JSON.
+    while payload["messages"] and len(
+        json.dumps(payload, separators=(",", ":"), default=str).encode()
+    ) > 120 * 1024:
+        payload["messages"].pop(0)
+    return payload
+
+
 def _save_data(conn: sqlite3.Connection, world: World, data: dict[str, Any]) -> None:
     now = datetime.now(timezone.utc).isoformat()
     conn.execute("BEGIN IMMEDIATE")
@@ -1603,6 +1627,15 @@ def _save_data(conn: sqlite3.Connection, world: World, data: dict[str, Any]) -> 
                 + ", ".join(sorted(set(adopted))),
                 RuntimeWarning,
                 stacklevel=2,
+            )
+        if session and data["messages"]:
+            from desmos.state import outbox as _outbox
+
+            _outbox.enqueue_conn(
+                conn,
+                workspace,
+                "session_snapshot",
+                _session_snapshot_payload(world, session, data["messages"]),
             )
         world.synced_at = now
         conn.commit()
@@ -2151,6 +2184,33 @@ def channel_tail(
             (workspace, channel or "general", max(1, min(int(limit), 200))),
         ).fetchall()
         return [dict(row) for row in rows]
+    finally:
+        db.close()
+
+
+def remote_session_snapshot(world: World, seat: str) -> dict[str, Any] | None:
+    """Latest replicated resident workspace projection for one remote seat."""
+    if not world.persist or not seat.strip():
+        return None
+    db = _open(state_file(world))
+    try:
+        workspace = _workspace_id(db, world, create=False)
+        if workspace is None:
+            return None
+        row = db.execute(
+            "SELECT body, spine_seq, created_at FROM channel_messages"
+            " WHERE workspace_id = ? AND channel = 'sys.session' AND author = ?"
+            " ORDER BY spine_seq DESC, id DESC LIMIT 1",
+            (workspace, seat.strip()),
+        ).fetchone()
+        if row is None:
+            return None
+        payload = json.loads(str(row["body"]))
+        if not isinstance(payload, dict):
+            return None
+        payload["spine_seq"] = int(row["spine_seq"] or 0)
+        payload["received_at"] = str(row["created_at"] or "")
+        return payload
     finally:
         db.close()
 

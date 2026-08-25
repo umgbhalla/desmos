@@ -380,6 +380,47 @@ def _local_hhmm(stamp: Any) -> str:
     return moment.astimezone().strftime("%H:%M")
 
 
+def _workspace_blocks(snapshot: dict[str, Any] | None) -> list[dict[str, str]]:
+    """Normalize provider transcript shapes into the two TUI workspace panes."""
+    if not snapshot:
+        return []
+    out: list[dict[str, str]] = []
+    for message in snapshot.get("messages", []):
+        if not isinstance(message, dict):
+            continue
+        role = str(message.get("role") or "")
+        content = message.get("content")
+        parts = content if isinstance(content, list) else [content]
+        for part in parts:
+            if isinstance(part, str):
+                text, kind = part, role
+            elif isinstance(part, dict):
+                typ = str(part.get("type") or "")
+                text = str(
+                    part.get("text")
+                    or part.get("thinking")
+                    or part.get("content")
+                    or part.get("name")
+                    or ""
+                )
+                if not text and typ in {"tool_use", "tool_result"}:
+                    text = json.dumps(part, default=str)
+                kind = typ or role
+            else:
+                continue
+            if not text:
+                continue
+            activity = kind in {
+                "thinking", "redacted_thinking", "tool_use", "tool_result",
+            } or (role == "user" and text.lstrip().startswith("<result"))
+            out.append({
+                "pane": "activity" if activity else "story",
+                "kind": kind,
+                "text": text,
+            })
+    return out
+
+
 def _roster_reply(world: "World", op: str, msg: dict[str, Any]) -> dict[str, Any]:
     """One answer for peers/channels/channel_read, shared by both loops.
 
@@ -403,12 +444,17 @@ def _roster_reply(world: "World", op: str, msg: dict[str, Any]) -> dict[str, Any
 
         channel = str(msg.get("channel") or "general")
         body = str(msg.get("body") or "")
+        target = str(msg.get("target") or "").strip()
         if not body.strip():
             return {"ev": "error", "text": "post needs a body"}
         try:
             row = channel_post(world, body, channel=channel, author="main")
+            dispatch_body = (
+                body if not target or f"@{target}" in body
+                else f"@{target} {body}"
+            )
             dispatched = remote.mention_dispatch(
-                world, channel, body, asker=remote.asker_name(),
+                world, channel, dispatch_body, asker=remote.asker_name(),
             )
         except Exception as exc:  # noqa: BLE001 -- name it, don't die
             return {"ev": "error", "text": f"post failed: {exc}"}
@@ -417,6 +463,20 @@ def _roster_reply(world: "World", op: str, msg: dict[str, Any]) -> dict[str, Any
             "body": body, "id": row.get("id", 0), "dispatched": dispatched,
             "ts": _local_hhmm(row.get("created_at")),
         }
+    if op == "workspace_read":
+        from desmos.state.persist import remote_session_snapshot
+
+        seat = str(msg.get("seat") or "")
+        try:
+            snapshot = remote_session_snapshot(world, seat)
+            return {
+                "ev": "workspace_story",
+                "seat": seat,
+                "snapshot": snapshot,
+                "blocks": _workspace_blocks(snapshot),
+            }
+        except Exception as exc:  # noqa: BLE001 -- name it, don't die
+            return {"ev": "error", "text": f"workspace read failed: {exc}"}
     if op == "roster":
         from desmos.state.persist import channel_list, roster
 
@@ -533,7 +593,7 @@ def _serve_client(
                 continue
             with _WIRE_LOCK:
                 register_locked()
-            if op in ("peers", "roster", "agents", "channels", "channel_read", "post"):
+            if op in ("peers", "roster", "agents", "channels", "workspace_read", "channel_read", "post"):
                 reply = _roster_reply(world, op, msg)
                 reply["sid"] = os.environ.get("DESMOS_SESSION_ID", "")
                 line = json.dumps(reply, default=str) + "\n"
@@ -1051,7 +1111,7 @@ def _drive(
                 level = str(msg.get("level") or "low").strip()
                 world.thinking = level
                 _emit(_snapshot(world))
-            elif op in ("peers", "roster", "agents", "channels", "channel_read", "post"):
+            elif op in ("peers", "roster", "agents", "channels", "workspace_read", "channel_read", "post"):
                 _emit(_roster_reply(world, op, msg))
             elif op == "typed":
                 # The TUI queued a follow-up. Nothing to do here: run_turns

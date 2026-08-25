@@ -90,6 +90,49 @@ def _spine_sequence_check() -> None:
         rows = persist.ordered_read(world, "migration-check")
         assert len(rows) == 1 and rows[0]["spine_seq"] == 7
 
+def _check_session_snapshot_outbox() -> None:
+    """Saving a resident session publishes one bounded redacted projection."""
+    import tempfile
+
+    from desmos.state import outbox, persist
+
+    root = Path(tempfile.mkdtemp())
+    world = new_world(root, state_path=root / "s.sqlite3")
+    world.messages = [
+        {"role": "user", "content": "remote preload"},
+        {"role": "assistant", "content": [
+            {"type": "thinking", "thinking": "reason"},
+            {"type": "redacted_thinking", "encrypted_content": "secret"},
+            {"type": "text", "text": "answer"},
+        ]},
+    ]
+    persist.save(world)
+    rows = [r for r in outbox.pending(world, 50)
+            if r["kind"] == "session_snapshot"]
+    assert len(rows) == 1, rows
+    payload = json.loads(rows[0]["payload_json"])
+    assert payload["v"] == 1 and payload["messages"][-1]["role"] == "assistant"
+    assert "secret" not in rows[0]["payload_json"], rows[0]["payload_json"]
+    assert len(rows[0]["payload_json"].encode()) <= 120 * 1024
+
+    remote_root = Path(tempfile.mkdtemp())
+    remote = new_world(remote_root, state_path=remote_root / "s.sqlite3")
+    from desmos.front import bridge, spine
+
+    event = {
+        "channel": spine.SYS_SESSION, "seq": 1, "author": "hyperion",
+        "seat": "hyperion", "ts": "now", "body": rows[0]["payload_json"],
+    }
+    assert spine.ingest(remote, [event]) == 1
+    got = persist.remote_session_snapshot(remote, "hyperion")
+    assert got and got["model"] == world.model and got["spine_seq"] == 1, got
+    blocks = bridge._workspace_blocks(got)
+    assert any(b["pane"] == "story" and b["text"] == "remote preload"
+               for b in blocks), blocks
+    assert any(b["pane"] == "activity" and b["text"] == "reason"
+               for b in blocks), blocks
+
+
 def _check_spine_replay_gap() -> None:
     """Replay must fail loudly when the server says history is unavailable."""
     from desmos.front import spine
@@ -712,6 +755,7 @@ def check() -> None:
     import tempfile
 
     _spine_sequence_check()
+    _check_session_snapshot_outbox()
     _check_spine_replay_gap()
     _check_spine_admin_purge()
     _check_spine_presence()

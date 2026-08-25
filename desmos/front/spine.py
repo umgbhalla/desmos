@@ -32,6 +32,7 @@ SYS_PRESENCE = "sys.presence"
 SYS_COLD = "sys.cold"
 SYS_MEMORY = "sys.memory"
 SYS_WORK = "sys.work"
+SYS_SESSION = "sys.session"
 PRESENCE_BUCKET_MIN = 10
 
 #: outbox kind -> reserved channel for structured machine facts.
@@ -39,6 +40,7 @@ SYS_CHANNEL_BY_KIND = {
     "cold_session": SYS_COLD,
     "presence": SYS_PRESENCE,
     "memory_record": SYS_MEMORY,
+    "session_snapshot": SYS_SESSION,
 }
 
 
