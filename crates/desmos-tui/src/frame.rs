@@ -11,6 +11,81 @@ fn hovered_entry(model: &ResolvedSelectionModel, mouse: Option<(u16, u16)>) -> O
     model.hit_test_visible_block(col, row).map(|g| g.entry_idx)
 }
 
+/// Fold one message body to the pane width without a wrapping widget, so the
+/// tail can be kept exactly: a channel scrolled to the bottom is the only
+/// useful place to stand in it.
+fn wrap_body(text: &str, width: usize) -> Vec<String> {
+    let mut out = Vec::new();
+    for raw in text.split('\n') {
+        let mut line = String::new();
+        for word in raw.split_whitespace() {
+            if !line.is_empty() && line.chars().count() + 1 + word.chars().count() > width {
+                out.push(std::mem::take(&mut line));
+            }
+            if !line.is_empty() {
+                line.push(' ');
+            }
+            line.push_str(word);
+        }
+        out.push(line);
+    }
+    out
+}
+
+/// Draw the channel the rail selected, in place of the agent's own story.
+pub(crate) fn draw_channel(f: &mut Frame, area: Rect, view: &ChannelView, focused: bool) {
+    let theme = Theme::current();
+    let border = if focused {
+        theme.accent_assistant
+    } else {
+        theme.bg_base
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(border))
+        .title(Span::styled(
+            format!(" #{} ", view.name),
+            Style::default()
+                .fg(theme.accent_assistant)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .style(Style::default().bg(theme.bg_base).fg(theme.text_primary));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    let width = (inner.width as usize).max(8);
+    let mut lines: Vec<Line> = Vec::new();
+    for message in &view.messages {
+        if !lines.is_empty() {
+            lines.push(Line::from(""));
+        }
+        lines.push(Line::from(Span::styled(
+            message.author.clone(),
+            Style::default()
+                .fg(theme.accent_tool)
+                .add_modifier(Modifier::BOLD),
+        )));
+        for row in wrap_body(&message.body, width) {
+            lines.push(Line::from(Span::styled(
+                row,
+                Style::default().fg(theme.text_primary),
+            )));
+        }
+    }
+    if lines.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "no messages yet — type to post here",
+            Style::default()
+                .fg(theme.text_secondary)
+                .add_modifier(Modifier::DIM),
+        )));
+    }
+    let height = inner.height as usize;
+    if lines.len() > height {
+        lines.drain(..lines.len() - height);
+    }
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
 fn draw_scrollback(
     f: &mut Frame,
     area: Rect,
@@ -299,6 +374,23 @@ pub(crate) fn draw(f: &mut Frame, app: &mut App) {
                 app.focus == Focus::Calls,
                 app.mouse,
                 &child.sess.calls_text,
+                &mut app.media.frame,
+            );
+        }
+    } else if let Some(view) = app.channel_view.as_ref() {
+        draw_channel(f, panes[0], view, app.focus == Focus::Story);
+        if !app.tree_open {
+            draw_scrollback(
+                f,
+                panes[1],
+                &mut app.sess.calls,
+                &mut app.sess.calls_scratch,
+                &mut app.sess.calls_sel,
+                &calls_title,
+                theme.accent_tool,
+                app.focus == Focus::Calls,
+                app.mouse,
+                &app.sess.calls_text,
                 &mut app.media.frame,
             );
         }

@@ -518,19 +518,53 @@ pub(crate) fn handle_event(app: &mut App, ev: Value) {
                 row.unread = 0;
                 row.last_seen = row.max_id;
             }
-            let mut text = format!("#{channel}");
-            if let Some(messages) = ev.get("messages").and_then(Value::as_array) {
-                for message in messages {
-                    let author = message
-                        .get("author")
+            // A channel is a place to stand, not a paste. Filling a view
+            // leaves the agent's own transcript alone, so opening #build
+            // twice does not leave two copies of it in the session history.
+            let messages = ev
+                .get("messages")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .map(|message| crate::ChannelMsg {
+                    author: crate::app::speaker(
+                        message.get("author").and_then(Value::as_str).unwrap_or("peer"),
+                    ),
+                    body: message
+                        .get("body")
                         .and_then(Value::as_str)
-                        .unwrap_or("peer");
-                    let body = message.get("body").and_then(Value::as_str).unwrap_or("");
-                    text.push_str(&format!("\n\n{author}: {body}"));
+                        .unwrap_or("")
+                        .to_string(),
+                })
+                .collect();
+            app.channel_view = Some(crate::ChannelView {
+                name: channel.to_string(),
+                messages,
+            });
+            app.focus = crate::Focus::Input;
+        }
+        "posted" => {
+            let channel = ev.get("channel").and_then(Value::as_str).unwrap_or("");
+            let body = ev.get("body").and_then(Value::as_str).unwrap_or("");
+            if let Some(view) = app.channel_view.as_mut() {
+                if view.name == channel {
+                    view.messages.push(crate::ChannelMsg {
+                        author: "main".into(),
+                        body: body.to_string(),
+                    });
                 }
             }
-            app.story_push(RenderBlock::system(text));
-            app.focus = crate::Focus::Story;
+            // A mention leaves for another machine. Say so where it was
+            // typed; the answer lands in the same channel later.
+            for note in ev
+                .get("dispatched")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+            {
+                app.notify(note.to_string());
+            }
         }
         "subagent" => handle_subagent(app, &ev),
         "child" => handle_child(app, &ev),
@@ -747,6 +781,24 @@ pub(crate) fn handle_event(app: &mut App, ev: Value) {
             let author = ev.get("author").and_then(Value::as_str).unwrap_or("peer");
             let preview = ev.get("preview").and_then(Value::as_str).unwrap_or("");
             let unread = ev.get("unread").and_then(Value::as_u64).unwrap_or(1);
+            // Standing in the channel means seeing it arrive, not being
+            // told elsewhere that something arrived.
+            if let Some(view) = app.channel_view.as_mut() {
+                if view.name == channel {
+                    let body = ev.get("body").and_then(Value::as_str).unwrap_or(preview);
+                    view.messages.push(crate::ChannelMsg {
+                        author: crate::app::speaker(author),
+                        body: body.to_string(),
+                    });
+                    if let Some(row) =
+                        app.channels.iter_mut().find(|row| row.channel == channel)
+                    {
+                        row.unread = 0;
+                        row.last_seen = row.max_id;
+                    }
+                    return;
+                }
+            }
             if let Some(kind) = ev.get("directed").and_then(Value::as_str) {
                 let body = ev.get("body").and_then(Value::as_str).unwrap_or(preview);
                 app.story_push(RenderBlock::SessionEvent(SessionEventBlock::new(
@@ -971,6 +1023,62 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn a_channel_is_a_place_to_stand_not_a_paste_into_the_transcript() {
+        let mut app = App::new();
+        let story_before = app.sess.story.len();
+        handle_event(
+            &mut app,
+            json!({
+                "ev": "channel_story", "channel": "build",
+                "messages": [
+                    {"author": "01a02d6c078efa33312d4599868e5696", "body": "ship it"},
+                    {"author": "hyperion", "body": "built in 3m11s"}
+                ]
+            }),
+        );
+        // The agent's own history is untouched: reading a channel twice used
+        // to leave two copies of it in the transcript.
+        assert_eq!(app.sess.story.len(), story_before);
+        let view = app.channel_view.as_ref().expect("standing in the channel");
+        assert_eq!(view.name, "build");
+        let said: Vec<_> = view
+            .messages
+            .iter()
+            .map(|m| (m.author.as_str(), m.body.as_str()))
+            .collect();
+        assert_eq!(
+            said,
+            vec![("session:01a02d", "ship it"), ("hyperion", "built in 3m11s")]
+        );
+
+        // A message arriving in the channel you are standing in lands in it,
+        // rather than being announced somewhere else.
+        handle_event(
+            &mut app,
+            json!({
+                "ev": "channel", "channel": "build", "author": "hyperion",
+                "preview": "done", "body": "work w-1 done", "unread": 1
+            }),
+        );
+        assert_eq!(app.channel_view.as_ref().unwrap().messages.len(), 3);
+        assert_eq!(app.sess.story.len(), story_before);
+
+        // What the composer posts comes back as an echo, and a dispatched
+        // mention says so on the composer's edge.
+        handle_event(
+            &mut app,
+            json!({
+                "ev": "posted", "channel": "build", "author": "main",
+                "body": "@hyperion status?", "dispatched": ["remote work w-2 dispatched to hyperion"]
+            }),
+        );
+        let view = app.channel_view.as_ref().unwrap();
+        assert_eq!(view.messages.len(), 4);
+        assert_eq!(view.messages[3].author, "main");
+        assert_eq!(app.sess.story.len(), story_before);
+    }
 
     #[test]
     fn channels_event_populates_channel_rows_and_unread() {

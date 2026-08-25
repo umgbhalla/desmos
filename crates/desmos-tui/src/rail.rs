@@ -150,6 +150,7 @@ pub(crate) fn activate(app: &mut App) {
         Target::Header => {}
         Target::Root => {
             app.viewing = None;
+            app.channel_view = None;
             app.focus = Focus::Story;
         }
         Target::Child(id) => {

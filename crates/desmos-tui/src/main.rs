@@ -1735,6 +1735,18 @@ fn submit_prompt_inner(
         }
         return Ok(false);
     }
+    // Standing in a channel, the composer belongs to the channel: the line
+    // goes to whoever is there, not into this agent's turn. It is also the
+    // only place in the UI where an @bot mention can be typed, which is what
+    // sends work to another machine.
+    let posting_to = app.channel_view.as_ref().map(|view| view.name.clone());
+    if let Some(channel) = posting_to {
+        match bridge.as_mut() {
+            Some(b) => b.send(&json!({"op": "post", "channel": channel, "body": line}))?,
+            None => app.notify("bridge is gone"),
+        }
+        return Ok(false);
+    }
     if app.running && !force_step {
         if let Some(idx) = slot {
             app.queue.insert_at_with(idx, line, images);

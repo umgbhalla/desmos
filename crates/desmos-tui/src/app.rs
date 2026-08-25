@@ -447,6 +447,36 @@ pub(crate) struct AgentRow {
     pub(crate) live: bool,
 }
 
+/// How a channel names whoever wrote a line.
+///
+/// Rows written before the roster carry a raw session id, and a wall of
+/// "01a02d6c078efa33312d4599868e5696:" names nobody. Bots and the chief post
+/// under their roster name; anything else is shortened to something a human
+/// can at least match against another line.
+pub(crate) fn speaker(author: &str) -> String {
+    let opaque = author.len() >= 24 && author.chars().all(|c| c.is_ascii_hexdigit());
+    if opaque {
+        format!("session:{}", &author[..6])
+    } else {
+        author.to_string()
+    }
+}
+
+/// One message as a channel shows it.
+pub(crate) struct ChannelMsg {
+    pub(crate) author: String,
+    pub(crate) body: String,
+}
+
+/// The channel the story pane is currently showing, if any. `None` means the
+/// pane belongs to the agent, which is the only thing it used to mean: a
+/// channel was pasted into the transcript as a block, so reading #build twice
+/// left two copies in the session's own history.
+pub(crate) struct ChannelView {
+    pub(crate) name: String,
+    pub(crate) messages: Vec<ChannelMsg>,
+}
+
 pub(crate) struct App {
     pub(crate) prompt: PromptBuf,
     pub(crate) model: String,
@@ -461,6 +491,7 @@ pub(crate) struct App {
     /// itself when one lands, which is the one thing polling gets wrong.
     pub(crate) background: Vec<String>,
     pub(crate) agents: Vec<AgentRow>,
+    pub(crate) channel_view: Option<ChannelView>,
     pub(crate) channels: Vec<ChannelRow>,
     pub(crate) pending_channel_read: Option<String>,
     /// Bridge-owned decisions waiting for a one-key human answer, oldest first.
@@ -587,6 +618,7 @@ impl App {
             model_pending: None,
             background: Vec::new(),
             agents: Vec::new(),
+            channel_view: None,
             channels: Vec::new(),
             pending_channel_read: None,
             decisions: Vec::new(),

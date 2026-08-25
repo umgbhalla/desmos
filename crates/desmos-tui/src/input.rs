@@ -322,6 +322,13 @@ pub(crate) fn handle_key(
             app.set_focus(app.focus.next_open(&pane_open(app)));
             return Ok(false);
         }
+        KeyCode::Esc if app.channel_view.is_some() => {
+            // Leaving a channel is leaving a place: the agent's own story is
+            // still underneath, unchanged by having been away from it.
+            app.channel_view = None;
+            app.set_focus(Focus::Input);
+            return Ok(false);
+        }
         KeyCode::Esc => {
             // Accumulate, never short-circuit: `||` and `any` stopped at the
             // first pane that had a selection, so with a highlight on both the
