@@ -810,6 +810,28 @@ pub(crate) fn handle_event(app: &mut App, ev: Value) {
                     },
                 )));
             } else {
+                // The rail badge used to wait for the next `channels`
+                // snapshot, so a message that landed while you stood
+                // somewhere else was announced by a toast that faded and
+                // then left no mark on the rail at all.
+                let message_id = ev.get("message_id").and_then(Value::as_u64).unwrap_or(0);
+                if let Some(row) = app.channels.iter_mut().find(|row| row.channel == channel) {
+                    row.unread = unread;
+                    row.max_id = row.max_id.max(message_id);
+                    row.preview = preview.to_string();
+                    row.author = author.to_string();
+                } else {
+                    app.channels.push(crate::ChannelRow {
+                        channel: channel.to_string(),
+                        kind: "adhoc".to_string(),
+                        unread,
+                        last_seen: 0,
+                        max_id: message_id,
+                        preview: preview.to_string(),
+                        author: author.to_string(),
+                        ts: String::new(),
+                    });
+                }
                 app.notify(format!(
                     "IRC #{channel} · {author}: {preview} · {unread} unread"
                 ));
@@ -1079,6 +1101,44 @@ mod tests {
         assert_eq!(view.messages.len(), 4);
         assert_eq!(view.messages[3].author, "main");
         assert_eq!(app.sess.story.len(), story_before);
+    }
+
+    #[test]
+    fn a_message_in_a_channel_you_are_not_in_lights_the_rail() {
+        let mut app = App::new();
+        app.channels = vec![crate::ChannelRow {
+            channel: "build".into(),
+            kind: "topic".into(),
+            unread: 0,
+            last_seen: 4,
+            max_id: 4,
+            preview: "old".into(),
+            author: "main".into(),
+            ts: String::new(),
+        }];
+        handle_event(
+            &mut app,
+            json!({
+                "ev": "channel", "channel": "build", "author": "hyperion",
+                "preview": "built in 3m11s", "unread": 2, "message_id": 9
+            }),
+        );
+        assert!(app.channel_view.is_none());
+        assert_eq!(app.channels[0].unread, 2);
+        assert_eq!(app.channels[0].max_id, 9);
+        assert_eq!(app.channels[0].author, "hyperion");
+
+        // A channel the rail has never heard of shows up rather than being
+        // announced by a toast and then forgotten.
+        handle_event(
+            &mut app,
+            json!({
+                "ev": "channel", "channel": "ops", "author": "hyperion",
+                "preview": "deploy", "unread": 1, "message_id": 3
+            }),
+        );
+        assert_eq!(app.channels.len(), 2);
+        assert_eq!(app.channels[1].channel, "ops");
     }
 
     #[test]
