@@ -130,6 +130,46 @@ def self_check() -> None:
                 raise AssertionError("partial output must not be duplicated by retry")
             assert len(opened) == 1
 
+            # A stream that dies before message_stop is the same transient
+            # failure as an error event inside it, and reopening is safe while
+            # nothing has been said.
+            queue[:] = [
+                Response([{"type": "message_start", "message": {"id": "cut", "usage": {}}}]),
+                Response(success("second try")),
+            ]
+            opened.clear()
+            retry_events.clear()
+            got = complete.complete(
+                "claude-opus-5", "system", [], 100, on_event=retry_events.append
+            )
+            assert got["content"][0]["text"] == "second try", got
+            assert len(opened) == 2, opened
+            cut = [event for event in retry_events if event.get("kind") == "retry"]
+            assert len(cut) == 1 and "incomplete_stream" in cut[0]["reason"], cut
+
+            # A truncated stream that already opened a block has painted
+            # something, so it takes the no-replay path instead.
+            queue[:] = [
+                Response(
+                    [
+                        {"type": "message_start", "message": {"id": "cut2", "usage": {}}},
+                        {
+                            "type": "content_block_start",
+                            "index": 0,
+                            "content_block": {"type": "text", "text": "half"},
+                        },
+                    ]
+                )
+            ]
+            opened.clear()
+            try:
+                complete.complete("claude-opus-5", "system", [], 100)
+            except RuntimeError as exc:
+                assert "partial output was already emitted" in str(exc), exc
+            else:
+                raise AssertionError("a truncated stream with output must not be replayed")
+            assert len(opened) == 1
+
             # Backoff remains cancelable.
             complete._wait_for_retry = old_wait
             try:
@@ -244,6 +284,34 @@ def _openai_stream_retry() -> None:
                 assert "partial output was already emitted" in str(exc), exc
             else:
                 raise AssertionError("partial output must not be duplicated by retry")
+            assert len(opened) == 1
+
+            # A stream that stops before response.completed reopens too.
+            queue[:] = [
+                Response([{"type": "response.created", "response": {"id": "cut"}}]),
+                Response(oa_success("second try")),
+            ]
+            opened.clear()
+            events.clear()
+            got = openai_transport.complete(
+                "gpt-5.6-sol", "system", [], 100, on_event=events.append
+            )
+            assert got["content"][0]["text"] == "second try", got
+            assert len(opened) == 2, opened
+            cut = [event for event in events if event.get("kind") == "retry"]
+            assert len(cut) == 1 and "incomplete_stream" in cut[0]["reason"], cut
+
+            # Deltas already on the reader's screen are never replayed.
+            queue[:] = [
+                Response([{"type": "response.output_text.delta", "delta": "half"}])
+            ]
+            opened.clear()
+            try:
+                openai_transport.complete("gpt-5.6-sol", "system", [], 100)
+            except RuntimeError as exc:
+                assert "partial output was already emitted" in str(exc), exc
+            else:
+                raise AssertionError("a truncated stream with output must not be replayed")
             assert len(opened) == 1
 
             # An unending overload gives up, and says it tried.

@@ -449,7 +449,16 @@ def _usage(raw: dict[str, Any]) -> dict[str, Any]:
 #: HTTP 200 stream became the turn's answer -- and a resident agent posted
 #: "Our servers are currently overloaded" to a channel as its reply.
 RETRY_STREAM_ERROR_CODES = frozenset(
-    {"server_error", "rate_limit_exceeded", "overloaded", "timeout"}
+    # incomplete_stream is not a code any server sends: read_sse raises it when
+    # the stream stops before its terminal event. Same transient failure as an
+    # error event, and safe to reopen while nothing has been said.
+    {
+        "server_error",
+        "rate_limit_exceeded",
+        "overloaded",
+        "timeout",
+        "incomplete_stream",
+    }
 )
 
 
@@ -597,7 +606,11 @@ def read_sse(
     # its half-written syscall has no closing tag, scan() drops it, and the
     # truncated reply is committed as the step's result.
     if not saw_end and not (should_stop is not None and should_stop()):
-        raise RuntimeError("OpenAI stream ended before response.completed")
+        raise OpenAIStreamError(
+            "incomplete_stream",
+            "OpenAI stream ended before response.completed",
+            had_output=bool(state.get("emitted")),
+        )
     return assemble(state, model)
 
 

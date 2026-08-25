@@ -470,7 +470,16 @@ def cached_payload(
 
 
 RETRY_STREAM_ERROR_TYPES = frozenset(
-    {"overloaded_error", "rate_limit_error", "api_error", "timeout_error"}
+    # A stream that dies before message_stop is the same transient failure as
+    # an overload event delivered inside it, and having said nothing yet it is
+    # safe to reopen. Left un-retried, a dropped socket ended the turn.
+    {
+        "overloaded_error",
+        "rate_limit_error",
+        "api_error",
+        "timeout_error",
+        "incomplete_stream",
+    }
 )
 
 
@@ -703,7 +712,11 @@ def read_sse(
         msg["stop_reason"] = "degenerate_repetition"
         return msg
     if not saw_stop and not (should_stop is not None and should_stop()):
-        raise RuntimeError("Anthropic stream ended before message_stop")
+        raise AnthropicStreamError(
+            "incomplete_stream",
+            "Anthropic stream ended before message_stop",
+            had_output=_stream_has_output(state),
+        )
     if not saw_stop:
         # Aborted. A tool_use whose JSON never finished is a call the model
         # never got to ask for: dispatching it answers an empty body, and
