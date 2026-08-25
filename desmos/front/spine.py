@@ -598,12 +598,34 @@ def purge(world: World, channels: list[str], timeout: float = RECV_TIMEOUT) -> d
     holds the rows and hands them back. Junk channels were immortal until the
     DO learned this op.
     """
+    from urllib.request import Request, urlopen
+
+    admin = os.environ.get("DESMOS_SPINE_ADMIN_TOKEN", "").strip() or _dotenv(
+        "DESMOS_SPINE_ADMIN_TOKEN", world
+    )
+    if not admin:
+        raise RuntimeError("spine purge needs DESMOS_SPINE_ADMIN_TOKEN")
+    endpoint = url().replace("wss://", "https://").replace("ws://", "http://")
+    if endpoint.endswith("/ws"):
+        endpoint = endpoint[:-3] + "/purge"
+    else:
+        endpoint = endpoint.rstrip("/") + "/purge"
     purged = []
-    with _connect(world, timeout) as ws:
-        for channel in channels:
-            ws.send(json.dumps({"op": "purge", "channel": channel}))
-            _recv_until(ws, "purged", timeout)
-            purged.append(channel)
+    for channel in channels:
+        req = Request(
+            endpoint,
+            data=json.dumps({"channel": channel}).encode(),
+            headers={
+                "Authorization": f"Bearer {admin}",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        with urlopen(req, timeout=timeout) as response:
+            reply = json.loads(response.read())
+        if reply.get("purged") != channel:
+            raise RuntimeError(f"spine purge refused {channel}: {reply}")
+        purged.append(channel)
     db = _open(state_file(world))
     try:
         with db:

@@ -90,6 +90,51 @@ def _spine_sequence_check() -> None:
         rows = persist.ordered_read(world, "migration-check")
         assert len(rows) == 1 and rows[0]["spine_seq"] == 7
 
+def _check_spine_admin_purge() -> None:
+    """Maintenance purge uses the admin HTTP capability, never a seat socket."""
+    import tempfile
+    from unittest.mock import patch
+
+    from desmos.front import spine
+
+    root = Path(tempfile.mkdtemp())
+    world = new_world(root, state_path=root / "s.sqlite3")
+    seen = {}
+
+    class Reply:
+        def __enter__(self):
+            return self
+        def __exit__(self, *_args):
+            return None
+        def read(self):
+            return json.dumps({"purged": "junk"}).encode()
+
+    def opened(req, timeout):
+        seen.update(url=req.full_url, auth=req.get_header("Authorization"),
+                    body=json.loads(req.data), timeout=timeout)
+        return Reply()
+
+    keep = {k: os.environ.get(k) for k in (
+        "DESMOS_SPINE_ADMIN_TOKEN", "DESMOS_SPINE_URL")}
+    try:
+        os.environ["DESMOS_SPINE_ADMIN_TOKEN"] = "admin-test"
+        os.environ["DESMOS_SPINE_URL"] = "wss://example.invalid/ws"
+        with patch("urllib.request.urlopen", opened):
+            assert spine.purge(world, ["junk"], timeout=3)["channels"] == 1
+    finally:
+        for key, value in keep.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+    assert seen == {
+        "url": "https://example.invalid/purge",
+        "auth": "Bearer admin-test",
+        "body": {"channel": "junk"},
+        "timeout": 3,
+    }, seen
+
+
 def _check_spine_presence() -> None:
     """Presence and cold-session rows ride the spine; peers() sees remote hosts."""
     import tempfile
@@ -650,6 +695,7 @@ def check() -> None:
     import tempfile
 
     _spine_sequence_check()
+    _check_spine_admin_purge()
     _check_spine_presence()
     _check_spine_memory()
     _check_roster()
