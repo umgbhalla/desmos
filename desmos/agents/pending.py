@@ -36,6 +36,13 @@ class Task:
     output: str = ""
     error: str = ""
     delivered: bool = False
+    #: A quiet task lands without waking the step. Its result has already
+    #: reached whoever wanted it -- a resident agent's reply is posted to the
+    #: channel by the task itself -- so a notice would only be accounting the
+    #: chief agent has to spend a turn reading. wait_next takes quiet tasks
+    #: and keeps parking; they get no handoff file because there is no notice
+    #: to replay.
+    quiet: bool = False
     #: Durable handoff file for the root world's tasks: written the moment the
     #: task settles, renamed into delivered/ only after commit() has saved the
     #: transcript that carries its notice. None for a non-persistent world's
@@ -70,13 +77,16 @@ def _handoff_dir(world: Any) -> Path | None:
     return Path(cwd) / ".desmos" / "pending" if cwd else None
 
 
-def submit(world: Any, name: str, fn: Callable[[], Any]) -> Task:
+def submit(world: Any, name: str, fn: Callable[[], Any], quiet: bool = False) -> Task:
     """Run fn on its own thread; the loop resumes the step when it lands."""
     # The uuid suffix keeps two processes on one cwd from colliding on the
     # per-process task counter, and doubles as the durable notice id: it is
     # the handoff file's stem AND appears in the notice text, so replay can
     # tell "already in the transcript" from "never delivered".
-    task = Task(id=f"t{next(_SEQ)}-{uuid.uuid4().hex[:8]}", name=name, started=time.monotonic())
+    task = Task(
+        id=f"t{next(_SEQ)}-{uuid.uuid4().hex[:8]}", name=name,
+        started=time.monotonic(), quiet=quiet,
+    )
     handoff = _handoff_dir(world)
 
     def body() -> None:
@@ -87,7 +97,7 @@ def submit(world: Any, name: str, fn: Callable[[], Any]) -> Task:
             task.output = traceback.format_exc(limit=3)
         finally:
             try:
-                if handoff is not None:
+                if handoff is not None and not quiet:
                     # Durable before visible: the file lands before done is
                     # set, so from the first instant a waiter can see this
                     # task, a kill can no longer lose its result -- load
@@ -256,7 +266,7 @@ def wait_next(
     """
     deadline = None if timeout is None else time.monotonic() + timeout
     while True:
-        ready = take_done(world)
+        ready = [t for t in take_done(world) if not t.quiet]
         if ready:
             return ready
         if not outstanding(world):

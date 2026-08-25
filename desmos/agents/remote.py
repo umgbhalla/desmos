@@ -189,29 +189,34 @@ def request(
             if status == "timeout"
             else f"remote work {work_id} on {from_host} [{status}]\n{output}"
         )
-        if reply_channel and output.strip():
+        if reply_channel:
             # The channel gets the answer, not the accounting. The work id and
             # the status are for whoever dispatched it; the person reading the
             # channel wants the sentence.
             from desmos.state.persist import channel_post
 
             try:
-                channel_post(world, output, channel=reply_channel,
+                said = output.strip() or f"(no answer -- {status})"
+                channel_post(world, said, channel=reply_channel,
                              author=reply_as or from_host)
             except ValueError:
                 pass
         return note
 
-    pending.submit(world, f"remote {work_id} -> {host}", _finish)
-    # Say where the answer will surface. "(general)" is the agent kind, and
-    # read in a channel it looked like the name of the channel the reply was
-    # going to -- which was never true: the bot answers where it was asked.
-    where = (
-        f" the answer lands in #{reply_channel}"
-        if reply_channel
-        else " the result resumes this step as a background task"
+    # A channel reply needs no notice: the answer is posted to the channel by
+    # the task itself, so waking the chief agent to read "[done]" would spend
+    # a turn on somebody else's conversation.
+    pending.submit(world, f"remote {work_id} -> {host}", _finish,
+                   quiet=bool(reply_channel))
+    if reply_channel:
+        # A mention is a conversation. The reply lands in this same channel in
+        # a moment, so the note says who is answering and nothing about work
+        # ids or agent kinds.
+        return f"{reply_as or host} is thinking..."
+    return (
+        f"remote work {work_id} dispatched to {host} ({agent or 'general'});"
+        " the result resumes this step as a background task"
     )
-    return f"remote work {work_id} dispatched to {host} ({agent or 'general'});{where}"
 
 
 def mention_dispatch(world: Any, channel: str, body: str, asker: str = "") -> list[str]:

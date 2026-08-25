@@ -374,7 +374,9 @@ def _check_mention_dispatch() -> None:
             assert remote.mention_dispatch(world, "build", "@hyperion") == []
             notes = remote.mention_dispatch(
                 world, "build", "@hyperion run the suite")
-            assert len(notes) == 1 and "dispatched to hyperion" in notes[0]
+            # A mention is a conversation: the note names who is answering,
+            # not a work id, an agent kind, or where the reply will land.
+            assert notes == ["hyperion is thinking..."], notes
 
             db = persist._open(persist.state_file(world))
             try:
@@ -403,6 +405,11 @@ def _check_mention_dispatch() -> None:
             task = next(t for t in pending._bucket(world) if wid in t.name)
             assert task.done.wait(20), "mention reply never landed"
             assert task.error == "", task.error
+            # The answer goes to the channel, so the task is quiet: no notice
+            # for the step to read, and no handoff file to replay one later.
+            assert task.quiet, "a channel reply must not wake the step"
+            assert task.path is None, task.path
+            assert pending.wait_next(world, timeout=1) == [], "quiet woke the step"
             got = persist.channel_read(world, channel="build", limit=5)
             assert got and got[-1]["author"] == "hyperion", got
             assert "suite green" in got[-1]["body"], got[-1]
