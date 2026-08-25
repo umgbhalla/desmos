@@ -21,7 +21,7 @@ pub(crate) fn draw_input(f: &mut Frame, area: Rect, app: &mut App) {
     let prefix = " ";
     let focused = app.focus == Focus::Input;
     let signal = input_signal(app);
-    let (signal_label, signal_color) = match signal {
+    let (mut signal_label, mut signal_color) = match signal {
         Some(InputSignal::Inference) => (
             Some("enter steer · tab queue".to_string()),
             theme.accent_assistant,
@@ -44,6 +44,12 @@ pub(crate) fn draw_input(f: &mut Frame, area: Rect, app: &mut App) {
             },
         ),
     };
+    // Standing in a channel, Enter posts there: it does not steer the agent
+    // and it does not queue. "tab queue" was a lie about where the text lands.
+    if let Some(view) = app.channel_view.as_ref() {
+        signal_label = Some(format!("enter posts to #{} · esc leaves", view.name));
+        signal_color = theme.accent_user;
+    }
     // The whole composer frame is the activity indicator. Runtime states keep
     // their own hue while the bold pulse makes progress visible without adding
     // another status row.

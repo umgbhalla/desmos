@@ -5519,6 +5519,21 @@ mod tests {
     }
 
     #[test]
+    fn composer_hint_names_the_channel_you_are_standing_in() {
+        let mut app = App::new();
+        app.channel_view = Some(crate::ChannelView {
+            name: "build".into(),
+            messages: vec![crate::ChannelMsg {
+                author: "main".into(),
+                body: "first words".into(),
+            }],
+        });
+        let screen = paint(&mut app, 120, 34);
+        assert!(screen.contains("enter posts to #build"), "{screen}");
+        assert!(!screen.contains("tab queue"), "{screen}");
+    }
+
+    #[test]
     fn done_drains_front_of_queue() {
         let mut app = App::new();
         app.queue.push("first queued".into());
