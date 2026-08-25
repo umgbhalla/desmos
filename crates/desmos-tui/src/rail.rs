@@ -142,6 +142,21 @@ pub(crate) fn rows(app: &App) -> Vec<Row> {
     rows
 }
 
+fn enter_channel(app: &mut App, name: String) {
+    // Paint the destination immediately instead of leaving the old story on
+    // screen during the bridge round trip. Keep an already-open view intact;
+    // the channel_story response replaces it with the fresh durable tail.
+    if app.channel_view.as_ref().is_none_or(|view| view.name != name) {
+        app.channel_view = Some(crate::ChannelView {
+            name: name.clone(),
+            messages: Vec::new(),
+            scroll: 0,
+        });
+    }
+    app.pending_channel_read = Some(name);
+    app.focus = Focus::Input;
+}
+
 pub(crate) fn activate(app: &mut App) {
     let Some(row) = rows(app).get(app.rail_sel).cloned() else {
         return;
@@ -160,22 +175,12 @@ pub(crate) fn activate(app: &mut App) {
             app.focus = Focus::Story;
         }
         Target::Background => {}
-        // Addressing a bot is the only thing you can do with one, and it is
-        // done by mentioning it in a channel. So selecting it writes the
-        // mention and hands you the composer, mid-sentence.
-        Target::Agent(name) => {
-            // A bot's channel is where addressing it happens, so selecting
-            // @hyperion stands you in #hyperion with the mention already
-            // typed. Before this the mention went into a composer still
-            // pointed at the local agent, and Enter sent it to the wrong
-            // reader: a message to another machine ran as a prompt here.
-            app.prompt.insert_str(&format!("@{name} "));
-            app.pending_channel_read = Some(name);
-            app.focus = Focus::Input;
-        }
-        Target::Channel(channel) => {
-            app.pending_channel_read = Some(channel);
-        }
+        // A rail is navigation, not text input. Selecting a person opens their
+        // DM; selecting a channel opens that channel. Neither is allowed to
+        // mutate a draft -- Slack does not type @alice because you clicked
+        // Alice, and repeated clicks must be idempotent.
+        Target::Agent(name) => enter_channel(app, name),
+        Target::Channel(channel) => enter_channel(app, channel),
     }
 }
 
@@ -272,7 +277,7 @@ mod tests {
     use crate::events::handle_event;
 
     #[test]
-    fn roster_agents_paint_bots_and_selecting_one_writes_a_mention() {
+    fn roster_agents_paint_bots_and_selecting_one_opens_its_dm() {
         let mut app = App::new();
         handle_event(
             &mut app,
@@ -301,13 +306,21 @@ mod tests {
             ]
         );
         app.rail_sel = got.iter().position(|r| r.label == "@hyperion").unwrap();
+        app.prompt.insert_str("draft stays mine");
         activate(&mut app);
-        assert!(app.prompt.to_send().starts_with("@hyperion"), "{:?}", app.prompt.to_send());
+        assert_eq!(app.prompt.to_send(), "draft stays mine");
         assert_eq!(app.focus, Focus::Input);
-        // ...and stands you where that mention actually dispatches. Without
-        // this the composer was still pointed at the local agent and Enter
-        // sent a message meant for another machine into this one's turn.
+        assert_eq!(app.channel_view.as_ref().map(|v| v.name.as_str()), Some("hyperion"));
         assert_eq!(app.pending_channel_read.as_deref(), Some("hyperion"));
+
+        // Re-entering the same DM is navigation, not another edit or an empty
+        // repaint while the fresh tail is in flight.
+        app.channel_view.as_mut().unwrap().messages.push(crate::ChannelMsg {
+            author: "peer".into(), body: "still visible".into(), ts: String::new(),
+        });
+        activate(&mut app);
+        assert_eq!(app.prompt.to_send(), "draft stays mine");
+        assert_eq!(app.channel_view.as_ref().unwrap().messages.len(), 1);
     }
 
     #[test]
