@@ -79,6 +79,29 @@ def check_shell_peek_history(cwd: Path) -> None:
         close_all(world)
 
 
+def check_shell_close_is_idempotent(cwd: Path) -> None:
+    """A repeated close must not close a descriptor reused by another owner."""
+    import os
+
+    from desmos.kernel.shell import Shell
+
+    shell = Shell(cwd)
+    master = shell.master
+    shell.close()
+    probe = os.open(os.devnull, os.O_RDONLY)
+    if probe != master:
+        os.dup2(probe, master)
+        os.close(probe)
+    try:
+        shell.close()
+        os.fstat(master)
+    finally:
+        try:
+            os.close(master)
+        except OSError:
+            pass
+
+
 def check() -> None:
     import tempfile
 
@@ -1207,6 +1230,7 @@ def check() -> None:
         _shell_mod.PROMPT_IDLE, _shell_mod.QUIET = 0.05, 0.05
 
         check_shell_peek_history(cwd)
+        check_shell_close_is_idempotent(cwd)
 
         w_sh = new_world(cwd, state_path=None, persist=False, ns={})
         try:

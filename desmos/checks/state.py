@@ -1607,7 +1607,7 @@ def _check_quarantine_manifest() -> None:
     import tempfile
     import warnings
 
-    from desmos.state import persist
+    from desmos.state import cold, persist
 
     root = Path(tempfile.mkdtemp())
     world = new_world(root, persist=True)
@@ -1656,6 +1656,18 @@ def _check_quarantine_manifest() -> None:
         warnings.simplefilter("ignore")
         persist.load(fresh)
     assert len(persist.read_events(fresh, limit=500)) == before, "quarantine notice repeated"
+
+    # Reclaim keeps the bytes in the verified cold store. That resolves the
+    # wake notice without deleting the append-only quarantine account.
+    stowed = cold.stow(path, [Path(item) for item in entry["moved"]])
+    assert stowed["stowed"] == [Path(entry["moved"][0]).name], stowed
+    persist._QUARANTINE_REPORTED.discard(str(path))
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        persist.load(fresh)
+    assert len(persist.read_events(fresh, limit=500)) == before, (
+        "a reclaimed quarantine still emitted a wake notice"
+    )
 
 
 def _check_quarantine_gate() -> None:

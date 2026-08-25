@@ -399,6 +399,16 @@ def quarantines(path: Path) -> list[dict[str, Any]]:
 def quarantine_summary(path: Path) -> str:
     """What wake says. Empty when nothing was ever replaced."""
     entries = quarantines(path)
+    stowed = {item["name"] for item in cold.stowed(path)}
+    entries = [
+        entry
+        for entry in entries
+        if not entry.get("moved")
+        or any(
+            Path(str(item)).exists() or Path(str(item)).name not in stowed
+            for item in entry["moved"]
+        )
+    ]
     if not entries:
         return ""
     last = entries[-1]

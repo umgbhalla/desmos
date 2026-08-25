@@ -413,10 +413,13 @@ class Shell:
             except OSError:
                 pass
             self.proc.wait(timeout=5)
-        try:
-            os.close(self.master)
-        except OSError:
-            pass
+        with self._lock:
+            master, self.master = self.master, -1
+        if master >= 0:
+            try:
+                os.close(master)
+            except OSError:
+                pass
         return "closed"
 
 
