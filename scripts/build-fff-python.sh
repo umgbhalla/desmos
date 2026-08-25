@@ -10,7 +10,7 @@
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-VENV="${DESMOS_VENV:-/Users/zeus/hub/desmos/.venv}"
+VENV="${DESMOS_VENV:-$REPO/.venv}"
 PY="$VENV/bin/python"
 PKG="$REPO/vendor/fff/packages/fff-python"
 
