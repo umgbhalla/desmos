@@ -2053,6 +2053,60 @@ def channel_post(
     }
 
 
+def channel_workspace(world: World, channel: str) -> dict[str, Any]:
+    """One channel's chat, work activity, participants, and delivery state."""
+    messages = channel_tail(world, channel=channel, limit=50)
+    participants = sorted({
+        str(row.get("author") or "") for row in messages if row.get("author")
+    })
+    max_seq = max((int(row.get("spine_seq") or 0) for row in messages), default=0)
+    work_rows = ordered_read(world, "sys.work", limit=200)
+    activity: list[dict[str, Any]] = []
+    for row in work_rows:
+        try:
+            payload = json.loads(str(row.get("body") or ""))
+        except ValueError:
+            continue
+        if not isinstance(payload, dict):
+            continue
+        if str(payload.get("reply_channel") or payload.get("channel") or "") != channel:
+            continue
+        activity.append({
+            "type": str(payload.get("t") or "work"),
+            "work_id": str(payload.get("work_id") or ""),
+            "host": str(payload.get("host") or payload.get("target") or ""),
+            "status": str(payload.get("status") or ""),
+            "text": str(payload.get("task") or payload.get("output") or ""),
+            "seq": int(row.get("spine_seq") or 0),
+        })
+    db = _open(state_file(world))
+    try:
+        pending = 0
+        for row in db.execute(
+            "SELECT payload_json FROM outbox"
+            " WHERE kind = 'channel_post' AND sent_at IS NULL"
+        ):
+            try:
+                payload = json.loads(str(row["payload_json"]))
+            except ValueError:
+                continue
+            pending += int(str(payload.get("channel") or "") == channel)
+    finally:
+        db.close()
+    listed = next(
+        (row for row in channel_list(world) if row.get("channel") == channel),
+        {},
+    )
+    return {
+        "messages": messages,
+        "participants": participants,
+        "activity": activity[-50:],
+        "unread": int(listed.get("unread") or 0),
+        "max_seq": max(max_seq, int(listed.get("max_id") or 0)),
+        "pending_delivery": pending,
+    }
+
+
 def channel_read(
     world: World, channel: str = "general", since: int = 0, limit: int = 50
 ) -> list[dict[str, Any]]:

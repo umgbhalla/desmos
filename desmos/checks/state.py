@@ -90,6 +90,32 @@ def _spine_sequence_check() -> None:
         rows = persist.ordered_read(world, "migration-check")
         assert len(rows) == 1 and rows[0]["spine_seq"] == 7
 
+def _check_channel_workspace() -> None:
+    """A channel snapshot joins chat, work, participants, and delivery."""
+    import tempfile
+
+    from desmos.state import persist
+
+    root = Path(tempfile.mkdtemp())
+    world = new_world(root, state_path=root / "s.sqlite3")
+    persist.channel_post(world, "ship it", channel="build", author="main")
+    persist.channel_post(world, "building", channel="build", author="hyperion")
+    persist.channel_post(
+        world,
+        json.dumps({
+            "t": "request", "work_id": "w-1", "target": "hyperion",
+            "reply_channel": "build", "task": "run suite",
+        }),
+        channel="sys.work",
+        author="main",
+    )
+    got = persist.channel_workspace(world, "build")
+    assert got["participants"] == ["hyperion", "main"], got
+    assert [a["work_id"] for a in got["activity"]] == ["w-1"], got
+    assert got["pending_delivery"] == 2, got
+    assert len(got["messages"]) == 2, got
+
+
 def _check_session_snapshot_outbox() -> None:
     """Saving a resident session publishes one bounded redacted projection."""
     import tempfile
@@ -763,6 +789,7 @@ def check() -> None:
     import tempfile
 
     _spine_sequence_check()
+    _check_channel_workspace()
     _check_session_snapshot_outbox()
     _check_spine_replay_gap()
     _check_spine_admin_purge()

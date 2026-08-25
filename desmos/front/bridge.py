@@ -510,17 +510,25 @@ def _roster_reply(world: "World", op: str, msg: dict[str, Any]) -> dict[str, Any
             return {"ev": "channels", "channels": channel_list(world)}
         except Exception as exc:  # noqa: BLE001 -- name it, don't die
             return {"ev": "error", "text": f"channels failed: {exc}"}
-    from desmos.state.persist import channel_dismiss, channel_tail
+    from desmos.state.persist import channel_dismiss, channel_workspace
 
     channel = str(msg.get("channel") or "general")
     try:
+        workspace = channel_workspace(world, channel)
         messages = [
             dict(item, ts=_local_hhmm(item.get("created_at")))
-            for item in channel_tail(world, channel=channel, limit=50)
+            for item in workspace["messages"]
         ]
         through = max((int(item["id"]) for item in messages), default=0)
         channel_dismiss(world, channel=channel, through=through)
-        return {"ev": "channel_story", "channel": channel, "messages": messages}
+        return {
+            "ev": "channel_story", "channel": channel, "messages": messages,
+            "participants": workspace["participants"],
+            "activity": workspace["activity"],
+            "unread": workspace["unread"],
+            "max_seq": workspace["max_seq"],
+            "pending_delivery": workspace["pending_delivery"],
+        }
     except Exception as exc:  # noqa: BLE001 -- name it, don't die
         return {"ev": "error", "text": f"channel read failed: {exc}"}
 
