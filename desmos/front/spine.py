@@ -333,6 +333,9 @@ def _run_work(world: World, wid: str, payload: dict[str, Any]) -> None:
                 asker=str(payload.get("asker", "") or payload.get("origin", "")),
                 channel=str(payload.get("reply_channel", "")),
             )
+            from desmos.state import persist as _persist
+
+            _persist.publish_session_snapshot(resident.resident_world(world), world)
         except Exception as exc:  # noqa: BLE001 -- name it, don't die
             status, output = "error", f"{type(exc).__name__}: {exc}"
         finally:

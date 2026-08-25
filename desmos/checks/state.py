@@ -110,6 +110,14 @@ def _check_session_snapshot_outbox() -> None:
     rows = [r for r in outbox.pending(world, 50)
             if r["kind"] == "session_snapshot"]
     assert len(rows) == 1, rows
+
+    sink_root = Path(tempfile.mkdtemp())
+    sink = new_world(sink_root, state_path=sink_root / "harness.sqlite3")
+    assert persist.publish_session_snapshot(world, sink)
+    relayed = [r for r in outbox.pending(sink, 50)
+               if r["kind"] == "session_snapshot"]
+    assert len(relayed) == 1, relayed
+    assert json.loads(relayed[0]["payload_json"])["messages"], relayed
     payload = json.loads(rows[0]["payload_json"])
     assert payload["v"] == 1 and payload["messages"][-1]["role"] == "assistant"
     assert "secret" not in rows[0]["payload_json"], rows[0]["payload_json"]

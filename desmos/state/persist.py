@@ -2928,6 +2928,51 @@ def read_events(
         conn.close()
 
 
+def publish_session_snapshot(source: World, sink: World) -> bool:
+    """Publish a resident DB projection through the daemon world's outbox."""
+    if not source.persist or not sink.persist:
+        return False
+    source_db = _open(state_file(source))
+    try:
+        source_workspace = _workspace_id(source_db, source, create=False)
+        if source_workspace is None:
+            return False
+        session = _session_id(source_db, source, source_workspace, create=False)
+        if session is None:
+            return False
+        messages = [
+            {
+                "role": str(row["role"]),
+                "content": json.loads(str(row["content_json"])),
+            }
+            for row in source_db.execute(
+                "SELECT role, content_json FROM messages"
+                " WHERE session_id = ? ORDER BY seq",
+                (session,),
+            )
+        ]
+    finally:
+        source_db.close()
+    if not messages:
+        return False
+    sink_db = _open(state_file(sink))
+    try:
+        with sink_db:
+            workspace = _workspace_id(sink_db, sink)
+            assert workspace is not None
+            from desmos.state import outbox as _outbox
+
+            _outbox.enqueue_conn(
+                sink_db,
+                workspace,
+                "session_snapshot",
+                _session_snapshot_payload(source, session, messages),
+            )
+    finally:
+        sink_db.close()
+    return True
+
+
 def save(world: World) -> None:
     if not world.persist:
         return
