@@ -1091,6 +1091,72 @@ fn write_build_stamp(cwd: &str, pid: u32) -> Option<PathBuf> {
     Some(path)
 }
 
+/// Does the front the user is running match the Rust in the tree?
+///
+/// The stamp says which commit a binary came from, but nothing ever compared
+/// it to HEAD -- so a front two Rust commits behind looked exactly like a
+/// current one and stayed that way for hours, until someone thought to ask.
+/// The comparison is on the `crates` tree, not the commit: most commits in
+/// this repo are Python, and a notice that fired on those would be trained
+/// away within a day.
+fn stale_build_notice(
+    built: &str,
+    head: &str,
+    built_tree: &str,
+    head_tree: &str,
+    behind: usize,
+) -> Option<String> {
+    if built.is_empty() || built == "unknown" || built.ends_with("-dirty") {
+        return None;
+    }
+    if built == head || built_tree.is_empty() || head_tree.is_empty() || built_tree == head_tree {
+        return None;
+    }
+    let since = match behind {
+        0 => String::new(),
+        1 => " (1 rust commit since)".to_string(),
+        n => format!(" ({n} rust commits since)"),
+    };
+    Some(format!(
+        "this front was built from {built}; the tree is at {head} and its crates/ differ{since}. \
+         install a fresh build and restart to run it."
+    ))
+}
+
+/// Read the two trees out of git, then decide.
+///
+/// Silent whenever git cannot answer. A binary built from a dirty tree carries
+/// a commit this checkout has never seen, and treating an unresolvable commit
+/// as stale would nag on every single start.
+fn build_notice(cwd: &str) -> Option<String> {
+    let built = env!("DESMOS_COMMIT");
+    let git = |args: &[&str]| -> Option<String> {
+        let out = std::process::Command::new("git")
+            .current_dir(cwd)
+            .args(args)
+            .output()
+            .ok()?;
+        out.status
+            .success()
+            .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+    };
+    let head = git(&["rev-parse", "--short", "HEAD"])?;
+    let built_tree = git(&["rev-parse", &format!("{built}:crates")]).unwrap_or_default();
+    let head_tree = git(&["rev-parse", "HEAD:crates"]).unwrap_or_default();
+    let behind = git(&["rev-list", "--count", &format!("{built}..HEAD"), "--", "crates"])
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(0);
+    stale_build_notice(built, &head, &built_tree, &head_tree, behind)
+}
+
+/// Say it in the story, under whatever was replayed, where the person who has
+/// to restart is already looking.
+fn announce_build(app: &mut App, notice: Option<String>) {
+    if let Some(text) = notice {
+        app.story_push(RenderBlock::system(text.as_str()));
+    }
+}
+
 fn main() -> io::Result<()> {
     let (python, cwd, demo) = parse_args();
     write_build_stamp(&cwd, std::process::id());
@@ -1128,6 +1194,7 @@ fn main() -> io::Result<()> {
         b.send(&json!({"op": "channels"}))?;
         b.send(&json!({"op": "agents"}))?;
     }
+    announce_build(&mut app, build_notice(&cwd));
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -7433,6 +7500,43 @@ mod tests {
         assert!(
             matches!(last, Some(RenderBlock::System(ref b)) if b.text == BRIDGE_GONE),
             "the story must carry the death under the prompt, not a 4s notice: {last:?}"
+        );
+    }
+
+    #[test]
+    fn a_notice_fires_only_when_the_crates_tree_moved() {
+        // Same commit: nothing to say.
+        assert!(stale_build_notice("aaa", "aaa", "t1", "t1", 0).is_none());
+        // A python-only commit moves HEAD and leaves crates/ alone. That is
+        // most commits here, and nagging on them is how a notice gets ignored.
+        assert!(stale_build_notice("aaa", "bbb", "t1", "t1", 0).is_none());
+        // A dirty-tree build carries a commit this checkout cannot resolve.
+        assert!(stale_build_notice("aaa-dirty", "bbb", "t1", "t2", 1).is_none());
+        assert!(stale_build_notice("aaa", "bbb", "", "t2", 1).is_none());
+        assert!(stale_build_notice("unknown", "bbb", "t1", "t2", 1).is_none());
+
+        let two = stale_build_notice("aaa", "bbb", "t1", "t2", 2).expect("stale");
+        assert!(two.contains("aaa") && two.contains("bbb"), "{two}");
+        assert!(two.contains("2 rust commits since"), "{two}");
+        let one = stale_build_notice("aaa", "bbb", "t1", "t2", 1).expect("stale");
+        assert!(one.contains("1 rust commit since"), "{one}");
+    }
+
+    #[test]
+    fn the_build_notice_lands_in_the_story() {
+        let mut app = App::new();
+        let before = app.sess.story.len();
+        announce_build(&mut app, None);
+        assert_eq!(app.sess.story.len(), before, "silence must push nothing");
+        announce_build(&mut app, Some("built from aaa".to_string()));
+        let last = app
+            .sess
+            .story
+            .entry(app.sess.story.len() - 1)
+            .map(|e| e.block.clone());
+        assert!(
+            matches!(last, Some(RenderBlock::System(ref b)) if b.text == "built from aaa"),
+            "a computed notice nobody paints is the same as no notice: {last:?}"
         );
     }
 
