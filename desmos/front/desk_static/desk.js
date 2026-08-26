@@ -27,6 +27,7 @@
     term: { name: "main", text: "", raw: "", shells: [], draft: "", line: "", seq: 0 },
     help: false,
     pendingImages: [],
+    queue: [],
     active: null,
     model: "",
     effort: "",
@@ -288,6 +289,57 @@
     refreshEnv();
   }
 
+  async function drainQueue() {
+    const id = state.active;
+    if (!id) return;
+    const t = turn(id);
+    while (state.queue.length && !t.running) {
+      const item = state.queue.shift();
+      const prompt = [];
+      if (item.text) prompt.push({ type: "text", text: item.text });
+      for (const img of item.images || []) {
+        prompt.push({ type: "image", mimeType: img.mime, data: img.data });
+      }
+      t.story.push({
+        kind: "user",
+        text: item.text || "(image)",
+        thumbs: (item.images || []).map((img) => ({
+          name: img.name,
+          src: `data:${img.mime};base64,${img.data}`,
+        })),
+      });
+      t.running = true;
+      paint();
+      try {
+        await acp.call("session/prompt", { sessionId: id, prompt });
+      } catch (err) {
+        t.error = err.message || String(err);
+        t.running = false;
+        paint();
+        return;
+      }
+      t.running = false;
+    }
+    paint();
+  }
+
+  async function queueFollowUp() {
+    const id = state.active;
+    if (!id) return;
+    const text = state.draft.trim();
+    const images = (state.pendingImages || []).slice();
+    if (!text && !images.length) return;
+    state.queue.push({ text, images });
+    state.draft = "";
+    state.pendingImages = [];
+    try {
+      await acp.call("_session/typed", { sessionId: id });
+    } catch (_) {
+      /* a missing typed method must not drop the local queue */
+    }
+    paint();
+  }
+
   async function send() {
     const id = state.active;
     if (!id) return;
@@ -333,6 +385,7 @@
     paint();
     scrollStory(true);
     refreshEnv();
+    await drainQueue();
   }
 
   async function sendDecide(decisionId, option) {
@@ -355,6 +408,7 @@
     t.running = false;
     paint();
     refreshEnv();
+    await drainQueue();
   }
 
   async function cancel() {
@@ -715,7 +769,8 @@
 
   function helpHtml() {
     const rows = [
-      ["Enter", "send · Shift+Enter newline"],
+      ["Enter", "send · while running, steer"],
+      ["Tab", "while running, queue a follow-up (unparks pending.wait_next)"],
       ["Esc", "cancel turn · close this"],
       ["N", "new session"],
       ["?", "keys"],
@@ -729,7 +784,7 @@
       <dl>${rows
         .map(([k, v]) => `<div><dt><kbd>${esc(k)}</kbd></dt><dd>${esc(v)}</dd></div>`)
         .join("")}</dl>
-      <p class="hint">Story is speech, thinking, and subagent cards. Activity is the wire — complete() POSTs, syscalls, folds, protocol errors, git, files, channels, and the kernel PTY. Attach images with the paperclip.</p>
+      <p class="hint">Story is speech, thinking, and subagent cards. Activity is the wire — complete() POSTs, syscalls, folds, protocol errors, git, files, channels, and the kernel PTY. Attach images with the paperclip. Assistant markdown is xai-grok-markdown-core via POST /md.</p>
     </div></div>`;
   }
 
@@ -977,7 +1032,8 @@
           <h2>Do anything.</h2>
           <p>Story is speech and thinking. The wire — complete() POSTs, syscalls, git, files, channels, the PTY — stays on Activity.</p>
           <div class="keys">
-            <span><kbd>Enter</kbd> send</span>
+            <span><kbd>Enter</kbd> send · steer</span>
+            <span><kbd>Tab</kbd> queue</span>
             <span><kbd>⇧ Enter</kbd> newline</span>
             <span><kbd>N</kbd> new session</span>
             <span><kbd>Esc</kbd> cancel</span>
@@ -1058,6 +1114,14 @@
           `<button type="button" class="img-chip" data-img="${i}">${esc(img.name)} ×</button>`
       )
       .join("");
+    const queued = (state.queue || [])
+      .map(
+        (row, i) =>
+          `<div class="q-row" data-q="${i}"><span class="q-n">#${i + 1}</span><span class="q-t">${esc(
+            row.text || "(image)"
+          )}</span><button type="button" class="q-x" data-qdrop="${i}" aria-label="Drop">×</button></div>`
+      )
+      .join("");
     $("#composer-wrap").innerHTML = `
       ${state.help ? helpHtml() : ""}
       ${
@@ -1066,6 +1130,7 @@
           : ""
       }
       <div class="composer">
+        ${queued ? `<div class="q-list">${queued}</div>` : ""}
         ${chips ? `<div class="img-row">${chips}</div>` : ""}
         <textarea id="draft" placeholder="Do anything…" rows="1"></textarea>
         <div class="composer-bar">
@@ -1077,7 +1142,15 @@
             .join("")}</select>
           <button class="icon-btn" id="attach" title="Attach image">${icon("clip")}</button>
           <input id="attach-files" type="file" accept="image/png,image/jpeg,image/gif,image/webp" multiple hidden />
-          <div class="grow">${running ? "running — Enter steers" : ""}</div>
+          <div class="grow">${
+            running
+              ? state.queue.length
+                ? "running — Enter steers · Tab queues · " + state.queue.length + " queued"
+                : "running — Enter steers · Tab queues"
+              : state.queue.length
+                ? state.queue.length + " queued"
+                : ""
+          }</div>
           <button class="send${running ? " stop" : ""}" id="go" ${!running && !canSend ? "disabled" : ""} title="${
       running ? "Stop" : "Send"
     }">${running ? icon("stop") : icon("send")}</button>
@@ -1095,6 +1168,11 @@
       draft.style.height = Math.min(180, draft.scrollHeight) + "px";
     };
     draft.onkeydown = (e) => {
+      if (e.key === "Tab" && !e.shiftKey && running) {
+        e.preventDefault();
+        queueFollowUp();
+        return;
+      }
       if (e.key === "Enter" && !e.shiftKey) {
         e.preventDefault();
         send();
@@ -1121,6 +1199,13 @@
       btn.onclick = () => {
         const idx = Number(btn.dataset.img);
         state.pendingImages.splice(idx, 1);
+        paint();
+      };
+    });
+    $("#composer-wrap").querySelectorAll("[data-qdrop]").forEach((btn) => {
+      btn.onclick = () => {
+        const idx = Number(btn.dataset.qdrop);
+        if (!Number.isNaN(idx)) state.queue.splice(idx, 1);
         paint();
       };
     });
@@ -1629,6 +1714,7 @@
       <span>${state.git && state.git.branch ? esc(state.git.branch) : ""}</span>
       <span>${state.term.shells && state.term.shells.length ? "pty " + (state.term.name || "main") : ""}</span>
       <span>${pendingCard ? "pending " + (pendingCard.n != null ? pendingCard.n : "") : ""}</span>
+      <span>${state.queue && state.queue.length ? state.queue.length + " queued" : ""}</span>
       <span>${br.socket ? "bridge.sock" : ""}</span>
       <span class="spin${t && t.running ? " on" : ""}"></span>
       <span style="margin-left:auto">${esc(state.cwd || "")}</span>
@@ -1716,6 +1802,12 @@
       paint();
     })
     .catch(() => {});
+
+  let mdPaint = 0;
+  window.__desmosMdReady = () => {
+    clearTimeout(mdPaint);
+    mdPaint = setTimeout(() => paint(), 16);
+  };
 
   paint();
   acp.connect();

@@ -8,6 +8,7 @@ persona/role/agent definitions, an EffectiveConfig resolved by precedence
 and resume-from-a-completed-peer. Implemented against desmos' own loop.
 """
 
+import contextvars
 import json
 import threading
 import time
@@ -951,7 +952,8 @@ def _launch(run: Run, parent: Any, register_pending: bool) -> None:
             "generation": run.generation,
         }
     )
-    _POOL.submit(_execute, run, parent)
+    ctx = contextvars.copy_context()
+    _POOL.submit(ctx.run, _execute, run, parent)
     # Nothing in the parent turn waits on this. The step ends normally and the
     # loop resumes it when the child settles, so a spawn costs no idle turn and
     # a queued follow-up is never stuck behind a sleeping call.
@@ -1065,7 +1067,18 @@ def rerun(rid: str) -> str:
 
 
 PARENT: Any = None
+_BOUND: contextvars.ContextVar[Any] = contextvars.ContextVar("desmos_parent", default=None)
 _EMIT: Any = None
+
+
+def _bound_parent() -> Any:
+    """The parent this thread bound, falling back to the process global.
+
+    `PARENT` is still assigned so reload_sdk and main-thread programmatic
+    spawn keep working. Two ACP worlds in one process bind on their prompt
+    threads; the ContextVar is what stops them overwriting each other.
+    """
+    return _BOUND.get() or PARENT
 
 
 def set_emitter(fn: Any) -> None:
@@ -1075,7 +1088,7 @@ def set_emitter(fn: Any) -> None:
 
 
 def _emit(ev: dict[str, Any]) -> None:
-    """Prefer the executing world's hook, then PARENT's, then the process global.
+    """Prefer the executing world's hook, then this thread's bound parent, then global.
 
     The bridge still installs ``set_emitter`` for process lifetime. ACP sets
     ``world.on_event`` per prompt so two worlds do not steal each other's cards.
@@ -1084,8 +1097,9 @@ def _emit(ev: dict[str, Any]) -> None:
 
     world = CALLER_WORLD.get()
     fn = getattr(world, "on_event", None) if world is not None else None
-    if fn is None and PARENT is not None:
-        fn = getattr(PARENT, "on_event", None)
+    if fn is None:
+        bound = _bound_parent()
+        fn = getattr(bound, "on_event", None) if bound is not None else None
     if fn is None:
         fn = _EMIT
     if fn is None:
@@ -1100,12 +1114,14 @@ def bind(world: Any) -> str:
     """Point subagents at the live parent world (model, cwd, thinking)."""
     global PARENT
     PARENT = world
+    _BOUND.set(world)
     return f"subagents bound to {world.cwd}"
 
 
 def _parent() -> Any:
-    if PARENT is not None:
-        return PARENT
+    bound = _bound_parent()
+    if bound is not None:
+        return bound
     from desmos.kernel.loop import new_world
 
     # An unbound parent is a fallback, not a session. The persist=True default
@@ -1135,7 +1151,7 @@ def _caller_world() -> Any:
     if world is not None:
         return world
     if threading.current_thread() is threading.main_thread():
-        return PARENT  # may be None: an unbound root; _parent() supplies one
+        return _bound_parent()  # may be None: an unbound root; _parent() supplies one
     return _UNRESOLVED
 
 

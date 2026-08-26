@@ -244,6 +244,34 @@ class DeskHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def do_POST(self) -> None:  # noqa: N802
+        parsed = urlparse(self.path)
+        if parsed.path != "/md":
+            self.send_error(HTTPStatus.NOT_FOUND, "not found")
+            return
+        length = int(self.headers.get("Content-Length") or 0)
+        raw = self.rfile.read(max(0, length)) if length else b""
+        try:
+            from desmos.front.mdhtml import render as _md
+
+            html = _md(raw.decode("utf-8", errors="replace"))
+        except Exception as exc:  # noqa: BLE001 — the UI still has escaped source
+            body = f"markdown renderer failed: {type(exc).__name__}: {exc}".encode("utf-8")
+            self.send_response(HTTPStatus.SERVICE_UNAVAILABLE)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        body = html.encode("utf-8")
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
     def do_HEAD(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
         path = _static_path(parsed.path)
@@ -342,6 +370,12 @@ def serve(
     open_browser: bool = True,
 ) -> int:
     """Block serving the UI until the process is killed."""
+    try:
+        from desmos.front.mdhtml import ensure as _ensure_md
+
+        _ensure_md(release=False)
+    except Exception as exc:  # noqa: BLE001 — Desk still serves; /md will 503
+        print(f"desmos-md-html: {exc}", file=sys.stderr, flush=True)
     hub = DeskHub(Path(cwd or Path.cwd()).resolve())
     httpd = ThreadingHTTPServer((host, int(port)), _handler_for(hub))
     actual = httpd.server_address[1]

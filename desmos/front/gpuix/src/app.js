@@ -358,7 +358,7 @@ export function App({
         },
         React.createElement("textarea", {
           value: draft || "",
-          placeholder: "prompt — Enter sends, Esc cancels",
+          placeholder: "prompt — Enter sends or steers, Esc cancels",
           theme: STORY_THEME,
           minRows: 2,
           maxRows: 6,
@@ -366,7 +366,7 @@ export function App({
           onChange: onDraft
             ? (ev) => onDraft(ev && ev.value != null ? ev.value : "")
             : undefined,
-          onSubmit: onSubmit && !running ? () => onSubmit() : undefined,
+          onSubmit: onSubmit ? () => onSubmit() : undefined,
         }),
         React.createElement(
           "div",

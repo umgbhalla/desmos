@@ -304,6 +304,45 @@ select.chip {
   border-radius: 8px;
   border: 1px solid var(--border);
 }
+.q-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-bottom: 8px;
+  padding: 6px 8px;
+  background: var(--raised);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+.q-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  font-size: 12px;
+}
+.q-n { color: var(--tertiary); font: 11px var(--mono); flex: none; }
+.q-t {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--secondary);
+}
+.q-x {
+  flex: none;
+  color: var(--ghost);
+  padding: 0 4px;
+  line-height: 1;
+}
+.q-x:hover { color: var(--err); }
+.md-plain {
+  margin: 0;
+  white-space: pre-wrap;
+  font: 12.5px/1.5 var(--mono);
+  color: var(--secondary);
+}
 .img-row { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 8px; }
 .img-chip {
   font-size: 11.5px;

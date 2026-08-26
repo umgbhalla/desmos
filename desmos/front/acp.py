@@ -160,6 +160,8 @@ def initialize_result() -> dict[str, Any]:
                     "_session/post",
                     "_session/bridge",
                     "_session/term",
+                    "_session/typed",
+                    "_session/markdown",
                 ],
             },
         },
@@ -545,6 +547,8 @@ class AcpServer:
             "_session/post": self._session_post,
             "_session/bridge": self._session_bridge,
             "_session/term": self._session_term,
+            "_session/typed": self._session_typed,
+            "_session/markdown": self._session_markdown,
         }
         if method in env:
             try:
@@ -970,7 +974,9 @@ class AcpServer:
         prev_parent = S.PARENT
         # Without this, spawn() inside an ACP session gets _parent()'s
         # fallback world -- default model, launcher cwd, no session state.
-        S.bind(world)
+        # ContextVar so two prompt threads do not share one PARENT.
+        bound_token = S._BOUND.set(world)
+        S.PARENT = world
         prev_emit = getattr(S, "_EMIT", None)
         # Swap this session's transcript onto the shared world for the run.
         # _claim_prompt waits until no other session is stepping this world.
@@ -1017,10 +1023,10 @@ class AcpServer:
                 # than trusting the objects we swapped in.
                 self._convo[session_id] = (world.messages, world.prior)
                 self._inflight.pop(session_id, None)
-            # ponytail: restoring the global only stops the leak past this
-            # prompt. Two prompts on different worlds at once still race --
-            # subagent.PARENT has to come off the module global for that.
+            # Restoring the process global AND the ContextVar: two prompts on
+            # different worlds at once each have their own bound parent.
             S.PARENT = prev_parent
+            S._BOUND.reset(bound_token)
 
     def _session_cancel(self, params: dict[str, Any]) -> None:
         session_id = str(params.get("sessionId") or "")
@@ -1092,6 +1098,19 @@ class AcpServer:
             _steer(world, text)
             return {"outcome": "injected"}
         return {"outcome": "promptRequired"}
+
+    def _session_typed(self, params: dict[str, Any]) -> dict[str, Any]:
+        """TUI `op: typed`: a queued follow-up is waiting. Unpark has_input."""
+        world = self._require_world(params)
+        self._wakeup[id(world)] = True
+        return {"ok": True}
+
+    def _session_markdown(self, params: dict[str, Any]) -> dict[str, Any]:
+        """HTML from the grok markdown parser. Same binary Desk POST /md uses."""
+        text = str(params.get("text") or params.get("markdown") or "")
+        from desmos.front.mdhtml import render as _md
+
+        return {"html": _md(text)}
 
     def _push_card(
         self,

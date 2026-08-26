@@ -1352,8 +1352,11 @@ def _check_desk() -> None:
         _check_acp_workspace_claim()
         _check_acp_event_replay()
         _check_acp_has_input()
-        _check_desk_roundtrip()
+        _check_acp_parent_isolation()
+        _check_acp_typed()
+        _check_acp_markdown()
         _check_desk_markdown()
+        _check_desk_roundtrip()
     finally:
         if old_tools is None:
             os.environ.pop("DESMOS_TOOL_SYSCALLS", None)
@@ -2041,13 +2044,158 @@ def _check_acp_has_input() -> None:
             pending.labels = old_labels
 
 
+def _check_acp_parent_isolation() -> None:
+    """Two threads bind two worlds. _emit lands on the bound world's on_event."""
+    import threading
+
+    from desmos.agents import subagent as S
+    from desmos.kernel.dispatch import CALLER_WORLD
+    from desmos.kernel.types import World
+
+    hits: list[tuple[str, str]] = []
+
+    def hook(name: str):
+        def on(ev: dict) -> None:
+            hits.append((name, str(ev.get("id") or "")))
+
+        return on
+
+    a, b = World(), World()
+    a.on_event = hook("a")
+    b.on_event = hook("b")
+    old_parent = S.PARENT
+    caller_tok = CALLER_WORLD.set(None)
+    S.PARENT = None
+    barrier = threading.Barrier(2)
+    try:
+
+        def worker(world: World, ev_id: str) -> None:
+            tok = S._BOUND.set(world)
+            barrier.wait()
+            S._emit({"ev": "notice", "id": ev_id})
+            S._BOUND.reset(tok)
+
+        t1 = threading.Thread(target=worker, args=(a, "1"))
+        t2 = threading.Thread(target=worker, args=(b, "2"))
+        t1.start()
+        t2.start()
+        t1.join(8)
+        t2.join(8)
+        assert not t1.is_alive() and not t2.is_alive()
+        assert set(hits) == {("a", "1"), ("b", "2")}, hits
+    finally:
+        S.PARENT = old_parent
+        CALLER_WORLD.reset(caller_tok)
+
+
+def _check_acp_typed() -> None:
+    """_session/typed sets the has_input wakeup the TUI op: typed pokes."""
+    import tempfile
+
+    from desmos.front.acp import AcpServer
+    from desmos.state import persist
+
+    memo = dict(persist._WORKSPACE_LEASE)
+    persist._WORKSPACE_LEASE.clear()
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            acp = AcpServer(lambda _n: None, default_cwd=cwd)
+            created = acp.handle(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "session/new",
+                    "params": {"cwd": str(cwd)},
+                }
+            )
+            assert created is not None and "result" in created, created
+            sid = created["result"]["sessionId"]
+            world = acp.sessions[sid]
+            typed = acp.handle(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "_session/typed",
+                    "params": {"sessionId": sid},
+                }
+            )
+            assert typed == {"jsonrpc": "2.0", "id": 2, "result": {"ok": True}}
+            assert acp._wakeup.get(id(world)) is True
+    finally:
+        persist._WORKSPACE_LEASE.clear()
+        persist._WORKSPACE_LEASE.update(memo)
+
+
+def _check_acp_markdown() -> None:
+    """_session/markdown returns grok HTML, not a second grammar."""
+    import shutil
+    import tempfile
+
+    from desmos.front.acp import AcpServer
+    from desmos.state import persist
+
+    if shutil.which("cargo") is None:
+        return
+    memo = dict(persist._WORKSPACE_LEASE)
+    persist._WORKSPACE_LEASE.clear()
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            acp = AcpServer(lambda _n: None, default_cwd=cwd)
+            created = acp.handle(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "session/new",
+                    "params": {"cwd": str(cwd)},
+                }
+            )
+            assert created is not None and "result" in created, created
+            sid = created["result"]["sessionId"]
+            struck = acp.handle(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "_session/markdown",
+                    "params": {"sessionId": sid, "text": "keep ~~this~~ ~that~"},
+                }
+            )
+            assert struck is not None and "result" in struck, struck
+            html = struck["result"]["html"]
+            assert "<del>this</del>" in html, html
+            assert "<del>that" not in html, html
+    finally:
+        persist._WORKSPACE_LEASE.clear()
+        persist._WORKSPACE_LEASE.update(memo)
+
+
 def _check_desk_markdown() -> None:
-    """Fences, autolinks, and LCS diffs render through the desk markdown module."""
+    """Grammar is grok via desmos-md-html. md.js highlight/diffHtml stay paint."""
     import json
     import shutil
     import subprocess
 
     from desmos.front.desk import STATIC_DIR
+
+    cargo = shutil.which("cargo")
+    if cargo is not None:
+        from desmos.front import mdhtml
+
+        fenced = mdhtml.render("```python\ndef hi():\n  return 1\n```\n")
+        assert "fence" in fenced and "def" in fenced, fenced[:500]
+        assert "style=\"color:#" in fenced, fenced[:500]
+        linked = mdhtml.render("[x](https://example.com/x)")
+        assert 'href="https://example.com/x"' in linked, linked
+        angle = mdhtml.render("<https://example.com/x>")
+        assert 'href="https://example.com/x"' in angle, angle
+        strike = mdhtml.render("keep ~~this~~ but not ~that~")
+        assert "<del>this</del>" in strike, strike
+        assert "<del>that" not in strike, strike
+        pct = mdhtml.render("only: ~**10%** (~**300**)")
+        assert "<del>" not in pct, pct
+        table = mdhtml.render("| a | b |\n| --- | --- |\n| 1 | 2 |\n")
+        assert "<th>" in table and "<td>" in table, table
 
     node = shutil.which("node")
     if node is None:
@@ -2068,23 +2216,17 @@ vm.createContext(ctx);
 vm.runInContext(fs.readFileSync({json.dumps(str(src))}, "utf8"), ctx);
 const Md = ctx.DesmosMd;
 if (!Md) process.exit(2);
-const fenced = Md.render("```python\\ndef hi():\\n  return 1\\n```");
-if (!fenced.includes("tok-kw") || !fenced.includes("fence")) process.exit(3);
-const indented = Md.render("   ```js\\nconst x = 1;\\n```");
-if (!indented.includes("const")) process.exit(4);
-const linked = Md.render("see https://example.com/x");
-if (!linked.includes('href="https://example.com/x"')) process.exit(5);
+const hi = Md.highlight("return 1", "python");
+if (!hi.includes("tok-kw")) process.exit(3);
 const diff = Md.diffHtml("a\\nb\\n", "a\\nc\\n");
 if (!diff.includes("d-del") || !diff.includes("d-add") || !diff.includes("d-eq")) process.exit(6);
-const strike = Md.render("keep ~~this~~ but not ~that~");
-if (!strike.includes("<del>") || strike.includes("<del>that")) process.exit(7);
-const pct = Md.render("only: ~**10%** (~**300**)");
-if (pct.includes("<del>")) process.exit(8);
+const escaped = Md.render("**x**");
+if (!escaped.includes("md-plain") && !escaped.includes("<strong>")) process.exit(7);
 process.exit(0);
 """
     ran = subprocess.run([node, "-e", script], capture_output=True, text=True)
     assert ran.returncode == 0, (
-        f"md.js renderer failed ({ran.returncode}): {ran.stderr or ran.stdout}"
+        f"md.js paint failed ({ran.returncode}): {ran.stderr or ran.stdout}"
     )
 
 
@@ -2308,6 +2450,18 @@ def _check_desk_roundtrip() -> None:
             assert health["ok"] is True
             assert Path(health["cwd"]) == cwd.resolve()
 
+            md_req = urllib.request.Request(
+                f"http://127.0.0.1:{port}/md",
+                data=b"keep ~~this~~ ~that~",
+                method="POST",
+                headers={"Content-Type": "text/markdown; charset=utf-8"},
+            )
+            md_got = urllib.request.urlopen(md_req, timeout=60)
+            md_html = md_got.read().decode("utf-8")
+            assert md_got.status == 200, md_html
+            assert "<del>this</del>" in md_html, md_html
+            assert "<del>that" not in md_html, md_html
+
             for asset in (
                 "desk.css",
                 "desk.js",
@@ -2327,6 +2481,8 @@ def _check_desk_roundtrip() -> None:
             assert init["result"]["agentCapabilities"]["loadSession"] is True
             assert init["result"]["_meta"]["steering"]["supported"] is True
             assert "_session/steering" in init["result"]["_meta"]["desmos"]["extensions"]
+            assert "_session/typed" in init["result"]["_meta"]["desmos"]["extensions"]
+            assert "_session/markdown" in init["result"]["_meta"]["desmos"]["extensions"]
             auth = client.call("authenticate", {"methodId": "none"}, req_id=2)
             assert auth["result"] == {}
             created = client.call("session/new", {"cwd": str(cwd)}, req_id=3)

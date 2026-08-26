@@ -33,8 +33,9 @@ Every UI is paint of that same `World`:
 
 Python is truth. Rust and JS are paint. Two processes must not both write the
 same sqlite brain: `persist.claim_workspace` is the single-writer lease. The
-bridge takes it. ACP, Desk, and Comet do **not**. Attaching Desk to
-`.desmos/bridge.sock` as a second writer is refused on purpose.
+bridge takes it. ACP `session/new` takes it too (Desk and Comet go through
+that). Headless runs, `persist=False` children, and checks do not. Attaching
+Desk to `.desmos/bridge.sock` as a second writer is refused on purpose.
 
 Story and Activity are disjoint routes, not one feed with a filter. A
 `result` event never reaches Story. Do not flatten everything to `out`.
@@ -167,7 +168,10 @@ Unknown ids are refused, not minted. `loadSession` is advertised true.
 **One World per cwd.** Persist keys rows off the directory. Two `World`
 objects on one cwd overwrite each other's ns, notes, and tools. Sessions on
 the same cwd share the world. Transcript is swapped per prompt
-(`self._convo`). Concurrent `session/prompt` on that world is refused.
+(`self._convo`). A second `session/prompt` on a world that is already
+stepping parks on `_claim_prompt` until the inflight step ends, then runs.
+`_session/typed` sets `_wakeup[id(world)]` so a parked `has_input` (the TUI
+`op: typed` equivalent) unblocks `pending.wait_next`.
 
 **Prompt.** `session/prompt` runs `run_turns`. Images: initialize advertises
 `promptCapabilities.image: True`. `prompt_text` stays text-only (no base64
@@ -186,7 +190,12 @@ the same catalog the TUI picker reads.
 
 `_session/git`, `_session/fs`, `_session/sessions`, `_session/peers`,
 `_session/roster`, `_session/channels`, `_session/channel_read`,
-`_session/post`, `_session/bridge`, `_session/term`.
+`_session/post`, `_session/bridge`, `_session/term`, `_session/typed`,
+`_session/markdown`.
+
+`_session/markdown` returns HTML from the same `desmos-md-html` binary Desk
+`POST /md` uses. Grammar is `xai_grok_markdown_core::offset_events`. Fence
+colors are syntect Tokyo Night.
 
 `_session/term` talks to `desmos.kernel.shell` / `world.shells`. A PTY is
 process memory. It does not survive restart.
@@ -196,13 +205,15 @@ process memory. It does not survive restart.
 the wire into the thread. Clients that honor it can split Story / Activity
 the way the TUI does.
 
-**Subagents.** `S.set_emitter(on_event)` is installed for the duration of
-the prompt and restored in `finally`. Without that, ACP children were
-silent (the bridge held the process-lifetime emitter). Child thinking /
-speech update the subagent card. They do not become parent
-`agent_message_chunk`. Child `result` is an Activity syscall with
-`extra.child`. Empty title is omitted on updates so child speech does not
-overwrite the spawn title with the run id.
+**Subagents.** `world.on_event` is copied onto children. `_emit` prefers
+`CALLER_WORLD.on_event`, then this thread's bound parent (`S._BOUND`
+ContextVar), then the process `_EMIT`. ACP sets `_BOUND` for the prompt so
+two worlds in one process do not share `S.PARENT`. `S.set_emitter` is still
+installed for the duration of the prompt and restored in `finally` for the
+bridge's process-lifetime hook. Child thinking / speech update the subagent
+card. They do not become parent `agent_message_chunk`. Child `result` is an
+Activity syscall with `extra.child`. Empty title is omitted on updates so
+child speech does not overwrite the spawn title with the run id.
 
 ---
 
@@ -229,15 +240,18 @@ root gitlink moves. This checkout does not patch Comet at runtime.
 
 ### Desk (`python -m desmos desk`)
 
-HTML viewport. No cargo. Story / Activity, composer with paperclip +
-drag-drop images, model/effort chips, git / files / channels / agents rail
-(`persist.roster()` is painted), xterm.js on `_session/term` (Tokyo Night),
-cancel, new session, resume. Keys: `?`, `N`, `Ctrl/⌘ K`, `Ctrl/⌘ ``, `1–7`.
+HTML viewport. Hash-gates `desmos-md-html` the same way the TUI hash-gates
+`desmos-tui` (`desmos/front/hashgate.py`). Story / Activity, composer with
+paperclip + drag-drop images, Tab-queue while running (`_session/typed`),
+Enter-steer while running, model/effort chips, git / files / channels /
+agents rail (`persist.roster()` is painted), xterm.js on `_session/term`
+(Tokyo Night), cancel, new session, resume. Keys: `?`, `N`, `Tab` (queue),
+`Ctrl/⌘ K`, `Ctrl/⌘ ``, `1–7`.
 
-Markdown is `desk_static/md.js`: a **second grammar** (regex GFM subset +
-Tokyo Night token colors). A second HTML renderer is allowed. A second
-markdown grammar is the remaining markdown job — WASM or token spans from
-`xai-grok-markdown`, not another homemade walker.
+Markdown grammar is `xai-grok-markdown-core` via `POST /md`. `md.js`
+`highlight` / `diffHtml` are paint for the files tab and edit diffs, not a
+second GFM parser. Until `/md` returns, the composer shows escaped source
+in `<pre class="md-plain">`.
 
 Paint is full `innerHTML` rebuilds. There is no incremental DOM reducer.
 
@@ -247,8 +261,10 @@ First-party host so Desmos loads `@gpuix/react` instead of approximating it.
 Story `<markdown>` in a `virtual-list`. Edits `<diff wordDiff>`. Model /
 effort `Select`. Native is loaded only when `require('@gpuix/native')`
 succeeds — file-only probes used to launch xvfb `--tree` and fail the floor.
-Does not host Comet session registry, alacritty, steering UI, or desk's git /
-files / channel / xterm tabs.
+Does not host Comet session registry, alacritty, or desk's git / files /
+channel / xterm tabs. Enter while a turn is running calls
+`_session/steering` (same idle/running split as Desk). The send button
+still stops when running.
 
 ---
 
@@ -322,6 +338,21 @@ These are done. Do not rebuild them. Do not list them as remaining work.
 12. **notice / model_rejected** Activity cards. Desk/GPUIX decision buttons
     send `decide:<id>: <option>`.
 13. **AGENTS.md** thinking/edit-card sentences match the TUI tests.
+14. **`S._BOUND`.** Per-thread parent. Two ACP prompt threads no longer
+    share one `S.PARENT`. `_POOL.submit(ctx.run, …)` copies the context
+    into child threads.
+15. **Desk markdown** is `desmos-md-html` walking grok `offset_events`.
+    Syntect Tokyo Night colors fences. `POST /md` and `_session/markdown`
+    share that binary. `md.js` is paint (highlight / LCS diffs / escaped
+    fallback).
+16. **Hash-gate** lives in `desmos/front/hashgate.py`. TUI, Comet, and
+    `desmos-md-html` call it. Do not copy the sha256 walk again.
+17. **Tab queue.** Desk Tab while running queues a follow-up and pokes
+    `_session/typed`. TUI Tab already sent `op: typed`. Enter still steers.
+18. **Spill names** are `{time_ns}-{pid}-{token}-{tag}.txt` + `os.replace`.
+19. **`front/trace.py`** reads sqlite `events` (`export_world`). jsonl is
+    the leftover fixture path. `python -m desmos check --only trace` is on
+    the floor.
 
 ---
 
@@ -337,18 +368,11 @@ TUI tests put thinking on **Activity**. ACP tags thinking as **Story**
 muted Story block. That split is written down in AGENTS.md. Do not paint
 thinking on both panes to make the docs agree.
 
-### `PARENT` is still a module global
+### `PARENT` fallback
 
-`world.on_event` is per-world. `S.PARENT` is still process-global. A child
-that emits without `CALLER_WORLD` and without `on_event` copied still
-falls through to whichever parent was bound last.
-
-### Desk markdown grammar
-
-`md.js` reimplements GFM. The real remaining job is the grok markdown
-contract in the browser (WASM of `xai-grok-markdown-core`, or token spans
-the Python side already has). Do not add a third regex. Do not restore a
-pulldown walker.
+`S._BOUND` is per-thread. `S.PARENT` remains for `reload_sdk` and
+main-thread spawn. A child that emits with neither `CALLER_WORLD` nor
+`_BOUND` still falls through to the last `bind()`.
 
 ### Comet chip richness
 
@@ -362,10 +386,7 @@ copy, and similar chrome are Comet product — commit there, pin here.
   not owns. Proposed. Not this checkout's TUI.
 - `state/work.py` CAS graph: production never calls `work.add` / `claim` /
   `finish`. `witness.wake` still injects a catalog line from git commits
-  even when `work_*` is empty.
-- `front/trace.py` still globs `.desmos/events/*.jsonl`; events live in
-  sqlite.
-- `.desmos/out/NNNN-tag.txt` numbering is still `max+1`.
+  even when `work_*` is empty. Deleting the four tables is a schema bump.
 - Spine / herdr remain opt-in. Seats, channels, roster are on the default
   TUI and are not spine extras.
 
@@ -410,6 +431,9 @@ tool titles, body contains `not dispatched`.
 Protocol cards: `_check_acp_protocol_cards`. Images: `_check_acp_images`.
 Emitter: `_check_acp_subagent_emitter`. Claim: `_check_acp_workspace_claim`.
 Resume: `_check_acp_event_replay`. Park: `_check_acp_has_input`.
+Parent bind: `_check_acp_parent_isolation`. Typed: `_check_acp_typed`.
+Markdown: `_check_acp_markdown` / `_check_desk_markdown`.
+Trace: `python -m desmos check --only trace`.
 
 A Comet GUI recording is not a substitute for those checks, and it is not
 possible until `vendor/comet` is initialized and `zeron` is built.

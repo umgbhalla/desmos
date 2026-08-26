@@ -99,7 +99,7 @@ must refuse when `persist` is False. They do.
 
 | Path | Why it exists |
 |---|---|
-| `.desmos/harness.sqlite3` | Schema v16. Transcript tail, notes, grown tools, calls, events, sessions, seats, channels, outbox, unused `work_*` tables. |
+| `.desmos/harness.sqlite3` | Schema v17. Transcript tail, notes, grown tools, calls, events, sessions, seats, channels, outbox, unused `work_*` tables, `acp_sessions`. |
 | `.desmos/memories/records.jsonl` | Durable memory. Separate from notes. Notes are sqlite and rollback-able. Memory records are not. |
 | `.desmos/generations/NNNN.json` | `evolve` snapshots. |
 | `.desmos/plans/plans.jsonl`, `decisions/decisions.jsonl` | Plan rail and TUI choice prompts. |
@@ -144,10 +144,11 @@ a repo with recent commits. Deleting the four tables is a schema bump, not
 just a file delete. Keep the git-commit / spend half of witness, or split it,
 before calling the whole module leftover.
 
-`front/trace.py` globs `.desmos/events/*.jsonl`. Events moved to the sqlite
-`events` table. `kernel/catalog.py runtime_block` still lists `events/` as a
-directory. `docs/identity.md` already says the table. The only importer of
-`trace.py` is `checks/trace.py`.
+`front/trace.py` reads the sqlite `events` table (`export_world` /
+`persist.read_events`). jsonl under `.desmos/events/` is a leftover journal
+the exporter still accepts. `python -m desmos check --only trace` is on the
+floor. `kernel/catalog.py runtime_block` names the events table, not a
+directory.
 
 **Not leftover.** Seats, channels, roster, remote `host=`, and the TUI
 workspace switcher. Recent `main` is that product. Spine-the-Cloudflare-client
@@ -216,8 +217,8 @@ working.
    `witness.commits` / spend so attach still has a git window if you want
    that paragraph.
 
-2. **`front/trace.py` and `checks/trace.py`.** Reader for a directory nothing
-   writes.
+2. **Do not delete `front/trace.py` as a dead jsonl glob.** It exports
+   sqlite `events` now. The leftover jsonl path is the old fixture.
 
 3. **The lying map the model reads.** `kernel/catalog.py runtime_block`
    used to list `events/` as a directory. It names the events table in the
@@ -248,6 +249,6 @@ attempt to resolve that, and it never got a syscall.
 The thing a request does is small: one `World`, one `run_turns`, one POST,
 XML in, `<result>` out, sqlite in `.desmos/`. The self-improving story is
 notes plus live reimport, not reversible SDK generations. If the goal is a
-smaller system that still does today's TUI job, cut the unused graph and the
-dead tracer before you touch the loop, and fix the child plan/decide leak
+smaller system that still does today's TUI job, cut the unused graph
+before you touch the loop, and fix the child plan/decide leak
 before you trust "isolated child" as a store contract.

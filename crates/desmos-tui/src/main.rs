@@ -1880,10 +1880,18 @@ fn submit_prompt_inner(
         if let Some(idx) = slot {
             app.queue.insert_at_with(idx, line, images);
             app.notify(format!("queued #{}", idx + 1));
+            if let Some(b) = bridge.as_mut() {
+                b.send(&json!({"op": "typed"}))?;
+            }
         } else if force_queue {
             let idx = app.queue.len();
             app.queue.push_with(line, images);
             app.notify(format!("queued #{}", idx + 1));
+            if let Some(b) = bridge.as_mut() {
+                // Same contract as the inbox: a queued follow-up must make
+                // has_input true so a step parked on pending.wait_next yields.
+                b.send(&json!({"op": "typed"}))?;
+            }
         } else if let Some(b) = bridge.as_mut() {
             let line = line.trim();
             if !line.is_empty() {

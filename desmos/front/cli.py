@@ -319,27 +319,15 @@ def _comet_watch_roots(comet: Path) -> list[Path]:
 
 
 def _comet_sources(comet: Path) -> list[Path]:
-    files: list[Path] = []
-    for path in _comet_watch_roots(comet):
-        if path.is_file():
-            files.append(path)
-        elif path.is_dir():
-            files.extend(
-                f
-                for f in path.rglob("*")
-                if f.is_file() and ".git" not in f.parts and "target" not in f.parts
-            )
-    return sorted(files)
+    from desmos.front import hashgate
+
+    return hashgate.collect_sources(_comet_watch_roots(comet))
 
 
 def _comet_hash(comet: Path) -> str:
-    import hashlib
+    from desmos.front import hashgate
 
-    h = hashlib.sha256()
-    for f in _comet_sources(comet):
-        h.update(str(f.relative_to(comet)).encode())
-        h.update(f.read_bytes())
-    return h.hexdigest()
+    return hashgate.content_hash(comet, _comet_sources(comet))
 
 
 def _comet_stamp_path(comet: Path, release: bool) -> Path:
@@ -348,23 +336,22 @@ def _comet_stamp_path(comet: Path, release: bool) -> Path:
 
 
 def _comet_write_stamp(comet: Path, release: bool) -> None:
-    stamp = _comet_stamp_path(comet, release)
-    stamp.parent.mkdir(parents=True, exist_ok=True)
-    stamp.write_text(_comet_hash(comet), encoding="utf-8")
+    from desmos.front import hashgate
+
+    hashgate.write_stamp(_comet_stamp_path(comet, release), _comet_hash(comet))
 
 
 def _comet_stale(comet: Path, binary: Path, release: bool = False) -> bool:
     """True when the zeron binary was built from different Comet source bytes."""
-    if not binary.is_file():
-        return True
-    stamp = _comet_stamp_path(comet, release)
-    if not stamp.is_file():
-        newest = max((f.stat().st_mtime for f in _comet_sources(comet)), default=0.0)
-        if newest <= binary.stat().st_mtime:
-            _comet_write_stamp(comet, release)
-            return False
-        return True
-    return stamp.read_text(encoding="utf-8").strip() != _comet_hash(comet)
+    from desmos.front import hashgate
+
+    sources = _comet_sources(comet)
+    return hashgate.stale(
+        binary,
+        _comet_stamp_path(comet, release),
+        sources,
+        hashgate.content_hash(comet, sources),
+    )
 
 
 def _comet_acp_wrapper(root: Path, comet: Path) -> str:
@@ -518,20 +505,15 @@ def _tui_stabilize_fingerprints(root: Path) -> list[Path]:
 def _tui_compile(
     cargo: str, root: Path, env: dict[str, str], release: bool = True
 ) -> int:
-    import subprocess
+    from desmos.front import hashgate
 
     _tui_stabilize_fingerprints(root)
     # Hash what cargo is about to read, not what is on disk when it finishes —
     # an edit landing mid-build must not be stamped as already compiled.
     before = _tui_hash(root)
-    build = _tui_build_cmd(cargo, release)
-    built = subprocess.call(build + ["--offline"], cwd=str(root), env=env)
-    if built != 0:
-        built = subprocess.call(build, cwd=str(root), env=env)
+    built = hashgate.cargo_offline_then(_tui_build_cmd(cargo, release), root, env)
     if built == 0:
-        stamp = _tui_stamp_path(root, release)
-        if stamp.parent.is_dir():
-            stamp.write_text(before, encoding="utf-8")
+        hashgate.write_stamp(_tui_stamp_path(root, release), before)
     return built
 
 
@@ -548,17 +530,9 @@ def _tui_watch_roots(root: Path) -> list[Path]:
 
 def _tui_sources(root: Path) -> list[Path]:
     """Every file whose bytes go into the binary we build."""
-    files: list[Path] = []
-    for path in _tui_watch_roots(root):
-        if path.is_file():
-            files.append(path)
-        elif path.is_dir():
-            files.extend(
-                f
-                for f in path.rglob("*")
-                if f.is_file() and ".git" not in f.parts and "target" not in f.parts
-            )
-    return sorted(files)
+    from desmos.front import hashgate
+
+    return hashgate.collect_sources(_tui_watch_roots(root))
 
 
 def _tui_hash(root: Path) -> str:
@@ -569,13 +543,9 @@ def _tui_hash(root: Path) -> str:
     binary that is already correct. Hash the bytes instead — same bytes, same
     binary, no rebuild.
     """
-    import hashlib
+    from desmos.front import hashgate
 
-    h = hashlib.sha256()
-    for f in _tui_sources(root):
-        h.update(str(f.relative_to(root)).encode())
-        h.update(f.read_bytes())
-    return h.hexdigest()
+    return hashgate.content_hash(root, _tui_sources(root))
 
 
 def _tui_stamp_path(root: Path, release: bool) -> Path:
@@ -584,25 +554,22 @@ def _tui_stamp_path(root: Path, release: bool) -> Path:
 
 
 def _tui_write_stamp(root: Path, release: bool) -> None:
-    stamp = _tui_stamp_path(root, release)
-    if stamp.parent.is_dir():
-        stamp.write_text(_tui_hash(root), encoding="utf-8")
+    from desmos.front import hashgate
+
+    hashgate.write_stamp(_tui_stamp_path(root, release), _tui_hash(root))
 
 
 def _tui_stale(root: Path, binary: Path, release: bool = True) -> bool:
     """True when the binary was built from different source bytes than we have."""
-    stamp = _tui_stamp_path(root, release)
-    if not stamp.is_file():
-        # First launch after an out-of-band `cargo build` — fall back to mtime
-        # so an already-current binary is not rebuilt for want of a stamp.
-        newest = max(
-            (f.stat().st_mtime for f in _tui_sources(root)), default=0.0
-        )
-        if newest <= binary.stat().st_mtime:
-            _tui_write_stamp(root, release)
-            return False
-        return True
-    return stamp.read_text(encoding="utf-8").strip() != _tui_hash(root)
+    from desmos.front import hashgate
+
+    sources = _tui_sources(root)
+    return hashgate.stale(
+        binary,
+        _tui_stamp_path(root, release),
+        sources,
+        hashgate.content_hash(root, sources),
+    )
 
 
 def _tui_binary(root: Path, release: bool = True) -> Path | None:

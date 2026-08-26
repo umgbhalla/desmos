@@ -1,7 +1,6 @@
-/* Desmos desk — GFM subset for streamed assistant markdown.
-   Headings, lists, fences, tables, quotes, emphasis, links, inline code.
-   Fences are lexed before inline, so a ``` block cannot leak. Highlight
-   tokens follow Tokyo Night (the grok-build markdown crate's Syntect theme). */
+/* Desmos desk markdown paint.
+   Grammar is xai-grok-markdown-core via POST /md (desmos-md-html).
+   Highlight and LCS diffs here are paint, not a second markdown parser. */
 
 (function (root) {
   "use strict";
@@ -70,137 +69,42 @@
     return out.join("");
   }
 
-  function inline(text) {
-    let s = esc(text);
-    s = s.replace(/`([^`]+)`/g, (_, c) => `<code>${c}</code>`);
-    s = s.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
-    s = s.replace(/(^|[^\w])\*([^*]+)\*(?!\*)/g, "$1<em>$2</em>");
-    s = s.replace(/~~([^~]+)~~/g, "<del>$1</del>");
-    s = s.replace(
-      /\[([^\]]+)\]\((https?:[^)\s]+)\)/g,
-      '<a href="$2" target="_blank" rel="noreferrer">$1</a>'
-    );
-    s = s.replace(/(^|[\s>(])((https?:\/\/[^\s<]+))/g, (_, pre, url) => {
-      const href = url.replace(/[),.;:!?]+$/, "");
-      const tail = url.slice(href.length);
-      return `${pre}<a href="${esc(href)}" target="_blank" rel="noreferrer">${esc(href)}</a>${tail}`;
-    });
-    return s;
+  const cache = new Map();
+  const pending = new Set();
+
+  function plain(src) {
+    return `<pre class="md-plain">${esc(src)}</pre>`;
+  }
+
+  function fetchCore(key) {
+    if (typeof fetch !== "function") return;
+    pending.add(key);
+    fetch("/md", {
+      method: "POST",
+      headers: { "Content-Type": "text/markdown; charset=utf-8" },
+      body: key,
+    })
+      .then((r) => {
+        if (!r.ok) throw new Error("md " + r.status);
+        return r.text();
+      })
+      .then((html) => {
+        cache.set(key, html);
+        pending.delete(key);
+        if (typeof root.__desmosMdReady === "function") root.__desmosMdReady(key);
+      })
+      .catch(() => {
+        pending.delete(key);
+      });
   }
 
   function render(src) {
-    const lines = String(src || "").replace(/\r\n/g, "\n").split("\n");
-    const html = [];
-    let i = 0;
-    let para = [];
-    function flushPara() {
-      if (!para.length) return;
-      html.push(`<p>${inline(para.join(" "))}</p>`);
-      para = [];
-    }
-    while (i < lines.length) {
-      const line = lines[i];
-      const fence = line.match(/^\s{0,3}```([\w.+-]*)\s*$/);
-      if (fence) {
-        flushPara();
-        const lang = fence[1] || "";
-        const body = [];
-        i += 1;
-        while (i < lines.length && !/^\s{0,3}```\s*$/.test(lines[i])) {
-          body.push(lines[i]);
-          i += 1;
-        }
-        if (i < lines.length) i += 1;
-        const cls = lang ? ` class="lang-${esc(lang)}"` : "";
-        html.push(
-          `<div class="fence"><header><span>${esc(
-            lang || "code"
-          )}</span><button type="button" class="copy">copy</button></header><pre class="code"><code${cls}>${highlight(
-            body.join("\n"),
-            lang
-          )}</code></pre></div>`
-        );
-        continue;
-      }
-      if (/^\s*\|.+\|\s*$/.test(line) && i + 1 < lines.length && /^\s*\|?\s*[-:| ]+\|\s*$/.test(lines[i + 1])) {
-        flushPara();
-        const rows = [];
-        while (i < lines.length && /^\s*\|/.test(lines[i])) {
-          const cells = lines[i]
-            .replace(/^\s*\|/, "")
-            .replace(/\|\s*$/, "")
-            .split("|")
-            .map((c) => c.trim());
-          rows.push(cells);
-          i += 1;
-        }
-        if (rows.length >= 2) {
-          const head = rows[0];
-          const body = rows.slice(2);
-          html.push("<table><thead><tr>");
-          head.forEach((c) => html.push(`<th>${inline(c)}</th>`));
-          html.push("</tr></thead><tbody>");
-          body.forEach((r) => {
-            html.push("<tr>");
-            r.forEach((c) => html.push(`<td>${inline(c)}</td>`));
-            html.push("</tr>");
-          });
-          html.push("</tbody></table>");
-        }
-        continue;
-      }
-      if (/^#{1,6}\s+\S/.test(line)) {
-        flushPara();
-        const n = line.match(/^(#{1,6})/)[1].length;
-        html.push(`<h${n}>${inline(line.replace(/^#{1,6}\s+/, ""))}</h${n}>`);
-        i += 1;
-        continue;
-      }
-      if (/^>\s?/.test(line)) {
-        flushPara();
-        const q = [];
-        while (i < lines.length && /^>\s?/.test(lines[i])) {
-          q.push(lines[i].replace(/^>\s?/, ""));
-          i += 1;
-        }
-        html.push(`<blockquote>${inline(q.join(" "))}</blockquote>`);
-        continue;
-      }
-      if (/^\s*([-*+]|\d+\.)\s+/.test(line)) {
-        flushPara();
-        const ordered = /^\s*\d+\./.test(line);
-        html.push(ordered ? "<ol>" : "<ul>");
-        while (i < lines.length && /^\s*([-*+]|\d+\.)\s+/.test(lines[i])) {
-          const item = lines[i].replace(/^\s*([-*+]|\d+\.)\s+/, "");
-          const task = item.match(/^\[([ xX])\]\s+(.*)$/);
-          if (task) {
-            html.push(
-              `<li class="task"><span class="box">${
-                task[1] !== " " ? "✓" : ""
-              }</span>${inline(task[2])}</li>`
-            );
-          } else html.push(`<li>${inline(item)}</li>`);
-          i += 1;
-        }
-        html.push(ordered ? "</ol>" : "</ul>");
-        continue;
-      }
-      if (/^---+\s*$/.test(line) || /^\*\*\*+\s*$/.test(line)) {
-        flushPara();
-        html.push("<hr/>");
-        i += 1;
-        continue;
-      }
-      if (!line.trim()) {
-        flushPara();
-        i += 1;
-        continue;
-      }
-      para.push(line.trim());
-      i += 1;
-    }
-    flushPara();
-    return html.join("") || "<p></p>";
+    const key = String(src || "");
+    if (!key) return "<p></p>";
+    if (typeof root.DesmosMdCore === "function") return root.DesmosMdCore(key);
+    if (cache.has(key)) return cache.get(key);
+    if (!pending.has(key)) fetchCore(key);
+    return plain(key);
   }
 
   function indexDiff(a, b) {
@@ -285,5 +189,5 @@
     return `<div class="diff">${html.join("")}</div>`;
   }
 
-  root.DesmosMd = { render, highlight, diffHtml, esc };
+  root.DesmosMd = { render, highlight, diffHtml, esc, cache, pending };
 })(typeof window !== "undefined" ? window : globalThis);

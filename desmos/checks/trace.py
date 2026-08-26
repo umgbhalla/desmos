@@ -6,7 +6,16 @@ import json
 import tempfile
 from pathlib import Path
 
-from desmos.front.trace import critical_path_report, export_event_log, ownership_report
+from desmos.front.trace import (
+    _stamp,
+    critical_path_report,
+    export_event_log,
+    export_world,
+    latest_event_source,
+    ownership_report,
+)
+from desmos.kernel.loop import new_world
+from desmos.state import persist
 
 
 def check() -> None:
@@ -77,3 +86,40 @@ def check() -> None:
         guardrails = json.loads(Path(result["output"]).read_text(encoding="utf-8"))["metadata"]["guardrails"]
         assert guardrails["verdict"] == "fail"
         assert guardrails["monotonic_timing"] is False
+
+    stamp_ms, approx_ms = _stamp({"ts": 1_700_000_000_500}, None, 1_700_000_000_000)
+    assert approx_ms is True
+    assert stamp_ms == 500.0, stamp_ms
+    stamp_s, approx_s = _stamp({"ts": 2}, None, 1)
+    assert approx_s is True
+    assert stamp_s == 1000.0, stamp_s
+    stamp_mono, approx_mono = _stamp({"mono_ns": 5_000_000, "ts": 9}, 1_000_000, 0)
+    assert approx_mono is False
+    assert stamp_mono == 4.0, stamp_mono
+
+    with tempfile.TemporaryDirectory() as tmp:
+        cwd = Path(tmp)
+        world = new_world(cwd, state_path=cwd / ".desmos" / "harness.sqlite3")
+        stream = [
+            {"ev": "prompt", "text": "secret prompt"},
+            {"ev": "post", "n": 1, "model": "m", "request": "secret request"},
+            {"ev": "thinking", "text": "secret thinking"},
+            {"ev": "complete", "n": 1, "model": "m", "response": "secret response"},
+            {"ev": "result", "phase": "start", "tag": "bash", "span_idx": 0, "body": "secret body"},
+            {"ev": "result", "phase": "done", "tag": "bash", "span_idx": 0, "text": "secret result"},
+            {"ev": "done"},
+        ]
+        for i, event in enumerate(stream, start=1):
+            persist.record_event(world, event, ts_ms=1_700_000_000_000 + i, mono_ns=i * 1_000)
+        src = latest_event_source(cwd)
+        assert src is not None and src.suffix == ".sqlite3", src
+        out = cwd / "trace.json"
+        result = export_world(world, out)
+        payload = json.loads(Path(result["output"]).read_text(encoding="utf-8"))
+        names = {event["name"] for event in payload["traceEvents"]}
+        assert {"provider.turn", "provider.first_output", "syscall.bash", "harness.complete_to_dispatch"} <= names, names
+        assert payload["metadata"]["approximate_timing"] is False
+        encoded = json.dumps(payload)
+        assert "secret" not in encoded
+        assert all(event["ts"] >= 0 for event in payload["traceEvents"])
+        assert all(event.get("dur", 0) >= 0 for event in payload["traceEvents"])

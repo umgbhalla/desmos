@@ -1,0 +1,16 @@
+[package]
+name = "desmos-md-html"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "HTML from xai-grok-markdown-core offset_events. Desk's markdown grammar."
+
+[[bin]]
+name = "desmos-md-html"
+path = "src/main.rs"
+
+[dependencies]
+pulldown-cmark = { workspace = true }
+syntect = { workspace = true }
+two-face = { workspace = true }
+xai-grok-markdown-core = { workspace = true }

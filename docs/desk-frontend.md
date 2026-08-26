@@ -27,20 +27,24 @@ port, `--host` only if you know you want a non-loopback bind.
 python -m desmos desk --cwd . --port 7734 --no-browser
 ```
 
-No cargo build and no hash gate: the UI is package data under
-`desmos/front/desk_static/`, served by `desmos/front/desk.py`.
+No cargo build for the HTML itself: the UI is package data under
+`desmos/front/desk_static/`, served by `desmos/front/desk.py`. Assistant
+markdown is `crates/desmos-md-html` (grok `offset_events` + syntect Tokyo
+Night), hash-gated like the TUI. First launch of Desk may `cargo build -p
+desmos-md-html`. `POST /md` and ACP `_session/markdown` run that binary.
 
 `vendor/grok-build` and `vendor/comet` are git submodules. A fresh checkout
 must `git submodule update --init vendor/grok-build vendor/comet` before a
-source TUI/Comet build. Desk itself is HTML and does not load those crates
-into the browser.
+source TUI/Comet build. Desk does not load those crates into the browser.
 
 ## Current scope
 
 Supported now:
 
 - create an ACP session for the selected workspace;
-- send a prompt; Enter submits, Shift+Enter is a newline;
+- send a prompt; Enter submits, Shift+Enter is a newline; Tab while running
+  queues a follow-up (`_session/typed`, same wakeup as the TUI `op: typed`);
+  Enter while running steers;
 - stream thinking into the story and assistant markdown into the story;
 - show complete() POSTs, syscalls, edit diffs, folds, protocol errors,
   pending work, decisions, and child results on Activity; subagent cards
@@ -88,17 +92,18 @@ Supported now:
 bound at `session/new`. An unknown id is refused rather than minted.
 
 Keys: `?` overlay, `N` new session, `Ctrl/⌘ K` filter, `Ctrl/⌘ `` terminal,
-`1–7` activity tabs, Enter send, Esc cancel.
+`1–7` activity tabs, Enter send (steer while running), Tab queue while
+running, Esc cancel.
 
 ## What desk cannot host
 
 Desk is HTML. It cannot instantiate grok-build's
-`StreamingMarkdownRenderer` (ratatui + Syntect) or Comet/gpuix GPUI
-`<markdown>` / `<diff>` / alacritty_terminal views in the browser. The
-`crates/xai-grok-markdown` crate emits terminal spans, not HTML. Desk
-raises the HTML renderer to that contract instead: Tokyo Night tokens
-(`#1a1b26` / `#51597d` / `#a9b1d6`), streaming re-render, indented fences,
-autolinks, fence copy, LCS diffs.
+`StreamingMarkdownRenderer` (ratatui + Syntect terminal spans) or Comet/gpuix
+GPUI `<markdown>` / `<diff>` / alacritty_terminal views in the browser.
+`desmos-md-html` walks the same grok `offset_events` stream and emits HTML.
+Fence colors are syntect Tokyo Night. `md.js` `highlight` is the files-tab
+tokenizer. `diffHtml` is the edit-diff LCS. Until `/md` returns, the story
+shows escaped source.
 
 Comet **devices** (`vendor/comet/crates/ui/src/settings/devices.rs`) are a
 Zeron CRDT/RPC workspace device registry (`zeron_rpc`, presence dots,
