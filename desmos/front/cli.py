@@ -102,6 +102,17 @@ def cmd_run(args: argparse.Namespace) -> int:
     return run(args)
 
 
+def cmd_mock(args: argparse.Namespace) -> int:
+    """Local Anthropic Messages SSE mock for e2e / termctrl."""
+    _on_path()
+    from desmos.transport.mock import main as mock_main
+
+    argv: list[str] = ["--host", args.host, "--port", str(args.port)]
+    for reply in args.reply or []:
+        argv.extend(["--reply", reply])
+    return mock_main(argv)
+
+
 def cmd_spine(args: argparse.Namespace) -> int:
     from pathlib import Path
 
@@ -479,6 +490,12 @@ def main() -> int:
     r.add_argument("--cwd", default=".")
     r.add_argument("--out", default="")
     r.set_defaults(func=cmd_run)
+
+    mk = sub.add_parser("mock", help="local Anthropic Messages SSE mock (ANTHROPIC_BASE_URL)")
+    mk.add_argument("--host", default="127.0.0.1")
+    mk.add_argument("--port", type=int, default=0)
+    mk.add_argument("--reply", action="append", default=[], help="scripted assistant text (repeatable)")
+    mk.set_defaults(func=cmd_mock)
 
     sp = sub.add_parser("spine", help="sync daemon: drain outbox, ingest, serve sys.work")
     sp.add_argument("--interval", default="2.0", help="idle poll seconds (default 2)")

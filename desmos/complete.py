@@ -30,6 +30,7 @@ __all__ = [
     "STREAM_RETRY_CAP",
     "TRAJECTORY_DIR",
     "adaptive_model",
+    "anthropic_messages_url",
     "apply_compaction",
     "apply_stream_event",
     "apply_thinking",

@@ -234,6 +234,7 @@ export ANTHROPIC_API_KEY=...      # or: python -m desmos auth login   (OpenAI)
 python -m desmos check            # self-check, no API key needed
 python -m desmos tui              # the full interface (needs cargo)
 python -m desmos tui --demo       # same layout, offline, no key
+python -m desmos mock --reply "hello"   # local Anthropic SSE; set ANTHROPIC_BASE_URL
 python -m desmos console          # IPython with step() and world bound
 python -m desmos run "add a --json flag to desmos check, with a test"
 ```
