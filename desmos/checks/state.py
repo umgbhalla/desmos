@@ -2865,7 +2865,10 @@ def _check_plan_rail(cwd: Path) -> None:
 
     home = cwd / "planrail"
     home.mkdir()
-    world = new_world(home, state_path=home / "harness.sqlite3", persist=False)
+    # The rail reads plans.jsonl. persist=False is a child, and children
+    # do not write that file -- that used to be the leak this group's
+    # later check now guards. A session with an open plan is a root world.
+    world = new_world(home, state_path=home / "harness.sqlite3")
     world.model = "claude-opus-5"
     rec = plan.create(
         world, "ship the rail", steps=["write it", "verify it"], status="active"
