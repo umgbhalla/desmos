@@ -95,9 +95,7 @@ def _absent_module_refusal() -> None:
         sys.modules["fff"] = None  # forces `import fff` to raise ImportError
         try:
             out = _find(world, "anything")
-            assert "find unavailable" in out and "build-fff-python.sh" in out, (
-                f"absent fff must refuse and name the build script, got:\n{out}"
-            )
+            assert "find unavailable" in out, f"absent fff must refuse, got:\n{out}"
         finally:
             if saved is None:
                 sys.modules.pop("fff", None)
@@ -187,15 +185,15 @@ def _content_modes() -> None:
 
 
 def check() -> None:
+    _absent_module_refusal()
     try:
         import fff  # noqa: F401
     except Exception:
-        print("[find] fff extension not built; skipping find checks")
+        print("[find] fff extension not built; refusal path checked")
         return
 
     _typo_round_trip()
     _watcher_liveness()
-    _absent_module_refusal()
     _frecency_ordering()
     _content_modes()
     print("find check ok")

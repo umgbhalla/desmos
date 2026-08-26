@@ -30,7 +30,7 @@ body:
         - TUI (python -m desmos tui)
         - console / IPython
         - headless (desmos run, inverted.py)
-        - ACP frontend (--grok, comet)
+        - ACP frontend (--grok)
         - subagents
         - persistence / generations
         - docs

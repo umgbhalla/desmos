@@ -154,161 +154,6 @@ def _check_release_tui_launcher() -> None:
         ], ran
 
 
-def _check_comet_launcher() -> None:
-    """Hash-gated Comet launch speaks python -m desmos acp; no GPU binary required."""
-    import os
-    import stat
-    import subprocess
-    import sys
-    import tempfile
-
-    from desmos.front.cli import (
-        _comet_acp_wrapper,
-        _comet_hash,
-        _comet_passthrough,
-        _comet_sources,
-        _comet_stale,
-        _comet_watch_roots,
-        _repo_root,
-    )
-
-    root = _repo_root()
-    with tempfile.TemporaryDirectory() as tmp:
-        comet = Path(tmp) / "comet"
-        (comet / "apps").mkdir(parents=True)
-        (comet / "crates").mkdir()
-        (comet / "Cargo.toml").write_text("[workspace]\n", encoding="utf-8")
-        (comet / "Cargo.lock").write_text("# lock\n", encoding="utf-8")
-        (comet / "rust-toolchain.toml").write_text(
-            '[toolchain]\nchannel = "stable"\n', encoding="utf-8"
-        )
-        src = comet / "crates" / "lib.rs"
-        src.write_text("pub fn x() {}\n", encoding="utf-8")
-        (comet / "target" / "noise").mkdir(parents=True)
-        noise = comet / "target" / "noise" / "skip.rs"
-        noise.write_text("should-not-hash\n", encoding="utf-8")
-        roots = _comet_watch_roots(comet)
-        assert any(p.name == "crates" for p in roots)
-        assert not any("target" in p.parts[-2:] and p.name == "noise" for p in roots)
-        before = _comet_hash(comet)
-        noise.write_text("changed-and-still-ignored\n", encoding="utf-8")
-        assert _comet_hash(comet) == before
-        binary = comet / "target" / "debug" / "zeron"
-        assert _comet_stale(comet, binary) is True
-        binary.parent.mkdir(parents=True, exist_ok=True)
-        binary.write_bytes(b"bin")
-        sources = _comet_sources(comet)
-        newest = max(f.stat().st_mtime for f in sources)
-        older = newest - 30
-        os.utime(binary, (older, older))
-        assert _comet_stale(comet, binary) is True
-        for f in sources:
-            os.utime(f, (older - 30, older - 30))
-        assert _comet_stale(comet, binary) is False
-        src.write_text("pub fn x() { let _ = 1; }\n", encoding="utf-8")
-        assert _comet_stale(comet, binary) is True
-        src.write_text("pub fn x() {}\n", encoding="utf-8")
-        assert _comet_stale(comet, binary) is False
-
-        wrapper = Path(_comet_acp_wrapper(root, comet))
-        assert wrapper.is_file()
-        mode = wrapper.stat().st_mode
-        assert mode & stat.S_IXUSR, oct(mode)
-        ran = subprocess.run(
-            [str(wrapper), "--help"],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        assert ran.returncode == 0, ran.stderr
-        import json
-
-        handshake = json.dumps(
-            {
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "initialize",
-                "params": {"protocolVersion": 1},
-            }
-        )
-        listed = subprocess.run(
-            [str(wrapper), "acp"],
-            input=handshake + "\n",
-            capture_output=True,
-            text=True,
-            timeout=8,
-            check=False,
-        )
-        assert listed.returncode == 0, listed.stderr
-        init = json.loads(listed.stdout.splitlines()[0])
-        assert init["result"]["protocolVersion"] == 1
-        assert init["result"]["_meta"]["steering"]["supported"] is True
-
-        fake = Path(tmp) / "zeron"
-        fake.write_text('#!/bin/sh\nprintf "%s\\n" "$@"\n', encoding="utf-8")
-        fake.chmod(0o755)
-        env = dict(os.environ)
-        env["PYTHONPATH"] = str(root)
-        env["DESMOS_COMET_BINARY"] = str(fake)
-        launched = subprocess.run(
-            [sys.executable, "-m", "desmos", "comet", "--cwd", tmp, "--", "status"],
-            env=env,
-            capture_output=True,
-            text=True,
-            check=True,
-        )
-        assert launched.stdout.splitlines() == ["status"], launched
-
-        class _Args:
-            passthrough = ["--", "headless"]
-
-        assert _comet_passthrough(_Args()) == ["headless"]
-
-
-def _check_comet_md_diff_contract() -> None:
-    """Grok strike/math and gpuix wordDiff are the Comet parser/diff, not docs.
-
-    Runs the zeron-ui tests that feed real markdown and patches through
-    parse_full / parse_patch. Skips only when this checkout has not built
-    Comet (no zeron binary) — compiling gpui from a cold cache is not the
-    front floor. A stale binary still reruns the tests; cargo decides.
-    """
-    import shutil
-    import subprocess
-
-    from desmos.front.cli import _repo_root
-
-    root = _repo_root()
-    comet = root / "vendor" / "comet"
-    zeron = comet / "target" / "debug" / "zeron"
-    cargo = shutil.which("cargo")
-    if cargo is None or not zeron.is_file() or not (comet / "Cargo.toml").is_file():
-        return
-    for filt in ("grok_", "word_diff_marks", "desmos_story"):
-        ran = subprocess.run(
-            [
-                cargo,
-                "test",
-                "-p",
-                "zeron-ui",
-                "--manifest-path",
-                str(comet / "Cargo.toml"),
-                "--lib",
-                filt,
-                "--",
-                "--test-threads=1",
-            ],
-            cwd=str(comet),
-            capture_output=True,
-            text=True,
-            timeout=180,
-            check=False,
-        )
-        assert ran.returncode == 0, (
-            f"comet {filt} tests failed:\n{ran.stdout[-4000:]}\n{ran.stderr[-4000:]}"
-        )
-
-
 def _check_lavapipe_headed() -> None:
     """Headed Comet on this VM needs lavapipe; vkCreateInstance used to die.
 
@@ -320,8 +165,6 @@ def _check_lavapipe_headed() -> None:
     import os
     import shutil
     import subprocess
-
-    from desmos.front.cli import _repo_root
 
     icd = "/usr/share/vulkan/icd.d/lvp_icd.json"
     vulkaninfo = shutil.which("vulkaninfo")
@@ -344,26 +187,6 @@ def _check_lavapipe_headed() -> None:
     assert ran.returncode == 0, ran.stderr or ran.stdout
     blob = (ran.stdout + ran.stderr).lower()
     assert "llvmpipe" in blob or "lvp" in blob, ran.stdout[-2000:]
-
-    xvfb = shutil.which("xvfb-run")
-    timeout = shutil.which("timeout")
-    zeron = _repo_root() / "vendor" / "comet" / "target" / "debug" / "zeron"
-    if xvfb is None or timeout is None or not zeron.is_file():
-        return
-    headed = dict(os.environ)
-    headed["VK_ICD_FILENAMES"] = icd
-    launched = subprocess.run(
-        [xvfb, "-a", timeout, "5", str(zeron)],
-        env=headed,
-        capture_output=True,
-        text=True,
-        timeout=20,
-        check=False,
-    )
-    out = launched.stdout + launched.stderr
-    assert "Found no drivers" not in out, out[-3000:]
-    assert "llvmpipe" in out.lower(), out[-3000:]
-    assert "Selected GPU" in out, out[-3000:]
 
 
 # The stubbed gland for the socket checks: the REAL bridge subprocess and the
@@ -3353,8 +3176,6 @@ def check() -> None:
         # moved to an incompatible fork commit -- and that is silent, because
         # the pager compiles either way and runs grok's agent instead of ours.
         _check_desk()
-        _check_comet_launcher()
-        _check_comet_md_diff_contract()
         _check_gpuix_host()
         _check_lavapipe_headed()
         _check_path_deps_tracked()

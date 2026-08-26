@@ -28,8 +28,7 @@ SCAN_WAIT_MS = 5000
 #: name the same path or an edit's touch is invisible to a later <find>.
 FRECENCY_DB = ".desmos/fff"
 REFUSAL = (
-    "find unavailable: fff extension module not built "
-    "(scripts/build-fff-python.sh); use bash/rg for path/content search"
+    "find unavailable: fff extension module not built; use bash/rg for path/content search"
 )
 
 # One FileFinder per resolved cwd. globals().get so reload_sdk (which

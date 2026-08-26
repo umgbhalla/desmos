@@ -14,7 +14,6 @@ __all__ = [
     "cmd_auth",
     "cmd_bridge",
     "cmd_check",
-    "cmd_comet",
     "cmd_console",
     "cmd_desk",
     "cmd_gpuix",

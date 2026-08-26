@@ -3058,12 +3058,6 @@ def record_event(
     mono_ns: int,
 ) -> int:
     """Append one compact wire event and return its session-local sequence."""
-    # Herdr pane seam: every wire event already funnels through here, so the
-    # sidebar reporter subscribes at this one point instead of growing a
-    # second event channel. Late import -- state must not hard-import front.
-    from desmos.front.herdr import observe as _herdr_observe
-
-    _herdr_observe(event)
     if not world.persist:
         return 0
     kind = str(event.get("ev") or "unknown")

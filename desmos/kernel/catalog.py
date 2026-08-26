@@ -243,7 +243,7 @@ def runtime_block(world: World) -> str:
             "harness reload-sdk: reimports desmos.*, reseeds builtins, and rebinds step without wiping state.",
             "workspace edit: op=edit, path=, and body old\\n---\\nnew replaces exactly one occurrence.",
             "python diagnostics: diag.error() returns the automatically recorded last uncaught exception; diag.symbol(obj, source=False) gives bounded location/signature/source metadata; diag.threads(pattern=None) gives bounded file/function/line stacks without locals.",
-            "find: fff search over cwd. mode=path (default, fuzzy/typo-resistant paths + inline glob constraints), glob, grep, symbol (definitions first + usages), or multi (newline-separated patterns; optional constraints=). grep/symbol/multi accept match=plain|regex|fuzzy and context=N; limit=20. Your edits feed frecency. Absent build names scripts/build-fff-python.sh.",
+            "find: fff search over cwd when the extension is importable. Absent fff, the call refuses and you use bash/rg. mode=path (default), glob, grep, symbol, or multi.",
             "knowledge recall: op=recall searches prior-session history; limit and mode are optional.",
             "grow: write a SKILL.md, then use harness op=reload or op=skill; knowledge op=system stores doctrine.",
             "unstick: read the error, fix attrs, retry; use harness op=register only for repeated operations.",
