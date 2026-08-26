@@ -80,6 +80,11 @@
       /\[([^\]]+)\]\((https?:[^)\s]+)\)/g,
       '<a href="$2" target="_blank" rel="noreferrer">$1</a>'
     );
+    s = s.replace(/(^|[\s>(])((https?:\/\/[^\s<]+))/g, (_, pre, url) => {
+      const href = url.replace(/[),.;:!?]+$/, "");
+      const tail = url.slice(href.length);
+      return `${pre}<a href="${esc(href)}" target="_blank" rel="noreferrer">${esc(href)}</a>${tail}`;
+    });
     return s;
   }
 
@@ -95,22 +100,25 @@
     }
     while (i < lines.length) {
       const line = lines[i];
-      const fence = line.match(/^```([\w.+-]*)\s*$/);
+      const fence = line.match(/^\s{0,3}```([\w.+-]*)\s*$/);
       if (fence) {
         flushPara();
         const lang = fence[1] || "";
         const body = [];
         i += 1;
-        while (i < lines.length && !/^```\s*$/.test(lines[i])) {
+        while (i < lines.length && !/^\s{0,3}```\s*$/.test(lines[i])) {
           body.push(lines[i]);
           i += 1;
         }
         if (i < lines.length) i += 1;
+        const cls = lang ? ` class="lang-${esc(lang)}"` : "";
         html.push(
-          `<pre class="code"><header>${esc(lang || "code")}</header><code>${highlight(
+          `<div class="fence"><header><span>${esc(
+            lang || "code"
+          )}</span><button type="button" class="copy">copy</button></header><pre class="code"><code${cls}>${highlight(
             body.join("\n"),
             lang
-          )}</code></pre>`
+          )}</code></pre></div>`
         );
         continue;
       }

@@ -12,6 +12,7 @@ import queue
 import sys
 import threading
 import uuid
+import warnings
 from pathlib import Path
 from typing import Any, Callable, IO, Iterator, TextIO
 
@@ -99,9 +100,8 @@ def initialize_result() -> dict[str, Any]:
     return {
         "protocolVersion": PROTOCOL_VERSION,
         "agentCapabilities": {
-            # Persist session ids from `_session/sessions` / the TUI picker.
-            # An ACP uuid from a previous process is not stored, so Comet
-            # cannot round-trip that id after a restart.
+            # Persist session ids from `_session/sessions` / the TUI picker,
+            # and ACP uuids bound in `acp_sessions` at session/new.
             "loadSession": True,
             # run_turns takes a prompt string, so an image block has nowhere to
             # go; prompt_text used to drop it and the empty prompt answered
@@ -120,7 +120,7 @@ def initialize_result() -> dict[str, Any]:
                 "availableModels": _available_models(),
             },
             "desmos": {
-                "loadSession": "persist",
+                "loadSession": "persist+acp",
                 "extensions": [
                     "_session/steer",
                     "_session/git",
@@ -132,6 +132,7 @@ def initialize_result() -> dict[str, Any]:
                     "_session/channel_read",
                     "_session/post",
                     "_session/bridge",
+                    "_session/term",
                 ],
             },
         },
@@ -413,6 +414,7 @@ class AcpServer:
             "_session/channel_read": self._session_channel_read,
             "_session/post": self._session_post,
             "_session/bridge": self._session_bridge,
+            "_session/term": self._session_term,
         }
         if method in env:
             try:
@@ -528,14 +530,21 @@ class AcpServer:
             self.sessions[session_id] = world
             self._convo[session_id] = (list(entry[1]), list(entry[2]))
             self._tool_ids[session_id] = itertools.count(1)
+        from desmos.state import persist as _persist
+
+        try:
+            _persist.acp_bind(world, session_id)
+        except Exception as exc:  # noqa: BLE001 — a missed bind still issues the uuid
+            warnings.warn(f"acp_bind failed: {exc}", RuntimeWarning, stacklevel=2)
         return self._session_payload(session_id, world)
 
     def _session_load(self, params: dict[str, Any]) -> dict[str, Any]:
-        """Restore a persist session. sessionId is the sqlite sessions.id.
+        """Restore a persist session or a previously bound ACP uuid.
 
-        A live ACP uuid from this process is returned as-is. An unknown id is
-        refused rather than minted: switch_session would otherwise create an
-        empty attach row under that name.
+        Live ACP uuids in this process are returned as-is. After restart,
+        persist.acp_lookup maps the uuid Comet stored. Persist session ids
+        from the TUI picker still work. An unknown id is refused rather than
+        minted: switch_session would otherwise create an empty attach row.
         """
         session_id = str(params.get("sessionId") or "")
         if not session_id:
@@ -553,19 +562,29 @@ class AcpServer:
 
         if not persist.session_id_ok(session_id):
             raise ValueError(f"unknown session {session_id!r}")
+        bound = persist.acp_lookup(world, session_id)
         known = {row["id"] for row in persist.session_list(world)}
-        if session_id not in known:
+        if bound:
+            target = bound["session_id"]
+        elif session_id in known:
+            target = session_id
+        else:
             raise ValueError(f"unknown session {session_id!r}")
-        switch_session(world, session_id)
+        switch_session(world, target)
         with self._lock:
-            entry = self._worlds.get(Path(world.cwd).resolve())
+            resolved = Path(world.cwd).resolve()
+            entry = self._worlds.get(resolved)
             if entry is not None:
-                self._worlds[Path(world.cwd).resolve()] = (
+                self._worlds[resolved] = (
                     world, list(world.messages), list(world.prior),
                 )
             self.sessions[session_id] = world
             self._convo[session_id] = (list(world.messages), list(world.prior))
             self._tool_ids.setdefault(session_id, itertools.count(1))
+        try:
+            persist.acp_bind(world, session_id)
+        except Exception as exc:  # noqa: BLE001
+            warnings.warn(f"acp_bind failed: {exc}", RuntimeWarning, stacklevel=2)
         return self._session_payload(session_id, world, loaded=True)
 
     def _session_git(self, params: dict[str, Any]) -> dict[str, Any]:
@@ -675,6 +694,37 @@ class AcpServer:
         status = bridge_status(Path(world.cwd))
         status["peers"] = peers(world)
         return status
+
+    def _session_term(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Named PTY from world.shells — the same object `<shell>` uses."""
+        from desmos.kernel import shell as sh
+
+        world = self._require_world(params)
+        op = str(params.get("op") or "list")
+        name = str(params.get("name") or "main").strip() or "main"
+        if op == "list":
+            shells = []
+            for key, item in world.shells.items():
+                shells.append({
+                    "name": key,
+                    "alive": bool(item.alive()),
+                    "at_prompt": bool(getattr(item, "at_prompt", False)),
+                    "monitoring": bool(getattr(item, "monitoring", False)),
+                })
+            return {"shells": shells}
+        if op == "peek":
+            live = world.shells.get(name)
+            if live is None:
+                return {"name": name, "text": f"no shell {name!r}"}
+            return {"name": name, "text": live.peek()}
+        if op == "close":
+            return {"name": name, "text": sh.run(world, "", {"id": name, "close": "1"})}
+        if op == "interrupt":
+            return {"name": name, "text": sh.run(world, "", {"id": name, "interrupt": "1"})}
+        if op == "run":
+            body = str(params.get("body") or params.get("text") or "")
+            return {"name": name, "text": sh.run(world, body, {"id": name})}
+        raise ValueError(f"unknown term op {op!r}")
 
     def _session_prompt(self, params: dict[str, Any]) -> dict[str, str]:
         session_id = str(params.get("sessionId") or "")

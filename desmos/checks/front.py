@@ -1123,12 +1123,56 @@ def _check_desk() -> None:
         os.environ.pop(k, None)
     try:
         _check_desk_roundtrip()
+        _check_desk_markdown()
     finally:
         for k, value in old_env.items():
             if value is None:
                 os.environ.pop(k, None)
             else:
                 os.environ[k] = value
+
+
+def _check_desk_markdown() -> None:
+    """Fences, autolinks, and LCS diffs render through the desk markdown module."""
+    import json
+    import shutil
+    import subprocess
+
+    from desmos.front.desk import STATIC_DIR
+
+    node = shutil.which("node")
+    if node is None:
+        return
+    src = STATIC_DIR / "md.js"
+    js = STATIC_DIR / "desk.js"
+    syntax = subprocess.run(
+        [node, "--check", str(js)], capture_output=True, text=True
+    )
+    assert syntax.returncode == 0, syntax.stderr
+    script = f"""
+const fs = require("fs");
+const vm = require("vm");
+const ctx = {{}};
+ctx.window = ctx;
+ctx.globalThis = ctx;
+vm.createContext(ctx);
+vm.runInContext(fs.readFileSync({json.dumps(str(src))}, "utf8"), ctx);
+const Md = ctx.DesmosMd;
+if (!Md) process.exit(2);
+const fenced = Md.render("```python\\ndef hi():\\n  return 1\\n```");
+if (!fenced.includes("tok-kw") || !fenced.includes("fence")) process.exit(3);
+const indented = Md.render("   ```js\\nconst x = 1;\\n```");
+if (!indented.includes("const")) process.exit(4);
+const linked = Md.render("see https://example.com/x");
+if (!linked.includes('href="https://example.com/x"')) process.exit(5);
+const diff = Md.diffHtml("a\\nb\\n", "a\\nc\\n");
+if (!diff.includes("d-del") || !diff.includes("d-add") || !diff.includes("d-eq")) process.exit(6);
+process.exit(0);
+"""
+    ran = subprocess.run([node, "-e", script], capture_output=True, text=True)
+    assert ran.returncode == 0, (
+        f"md.js renderer failed ({ran.returncode}): {ran.stderr or ran.stdout}"
+    )
 
 
 def _check_desk_roundtrip() -> None:
@@ -1142,14 +1186,22 @@ def _check_desk_roundtrip() -> None:
         cwd = Path(tmp)
         port, stop, hub = serve_thread(cwd, port=0)
         client = None
+        world = None
         try:
             page = urllib.request.urlopen(f"http://127.0.0.1:{port}/", timeout=4)
             served = page.read().decode("utf-8")
             assert page.status == 200
             assert 'id="story"' in served and 'id="activity"' in served
+            assert 'id="composer-wrap"' in served and 'id="status"' in served
             health = json.loads(urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=4).read())
             assert health["ok"] is True
             assert Path(health["cwd"]) == cwd.resolve()
+
+            for asset in ("desk.css", "desk.js", "md.js"):
+                got = urllib.request.urlopen(f"http://127.0.0.1:{port}/{asset}", timeout=4)
+                assert got.status == 200, asset
+                payload = got.read()
+                assert len(payload) > 200, asset
 
             client = RpcClient("127.0.0.1", port)
             init = client.call("initialize", {"protocolVersion": 1})
@@ -1355,7 +1407,62 @@ def _check_desk_roundtrip() -> None:
             assert unknown_load.get("error", {}).get("code") == -32602
             bridge = client.call("_session/bridge", {"sessionId": sid}, req_id=18)
             assert bridge["result"]["attached"] is False
+
+            import sqlite3
+
+            from desmos.state.persist import acp_list, state_file
+
+            term_run = client.call(
+                "_session/term",
+                {"sessionId": sid, "op": "run", "body": "echo desk-pty-ok"},
+                req_id=19,
+            )
+            assert "error" not in term_run, term_run
+            term_text = str((term_run.get("result") or {}).get("text") or "")
+            peek = client.call(
+                "_session/term",
+                {"sessionId": sid, "op": "peek", "name": "main"},
+                req_id=20,
+            )
+            peek_text = str((peek.get("result") or {}).get("text") or "")
+            pty_blob = term_text + "\n" + peek_text
+            if "desk-pty-ok" not in pty_blob:
+                raise AssertionError(f"term PTY did not echo: {pty_blob!r}")
+            listed_term = client.call(
+                "_session/term", {"sessionId": sid, "op": "list"}, req_id=21
+            )
+            term_names = [row["name"] for row in listed_term["result"]["shells"]]
+            assert "main" in term_names, listed_term
+
+            db_path = state_file(world)
+            with sqlite3.connect(db_path) as db:
+                cols = [r[1] for r in db.execute("PRAGMA table_info(acp_sessions)")]
+            assert "acp_id" in cols and "session_id" in cols, cols
+            binds = acp_list(world)
+            if not any(row.get("acp_id") == sid for row in binds):
+                raise AssertionError(f"acp_bind missing {sid}: {binds!r}")
+
+            hub.server.sessions.clear()
+            hub.server._convo.clear()
+            uuid_loaded = client.call(
+                "session/load",
+                {"cwd": str(cwd), "sessionId": sid},
+                req_id=22,
+            )
+            assert uuid_loaded.get("error") is None, uuid_loaded
+            assert uuid_loaded["result"]["sessionId"] == sid, uuid_loaded
+            restored = (
+                json.dumps(uuid_loaded["result"].get("story") or [])
+                + json.dumps(uuid_loaded["result"].get("turns") or [])
+                + json.dumps(world.messages)
+            )
+            if "add one" not in restored:
+                raise AssertionError(f"acp uuid load lost transcript: {restored[:800]!r}")
         finally:
+            if world is not None:
+                from desmos.kernel.shell import close_all as _close_shells
+
+                _close_shells(world)
             if client is not None:
                 client.close()
             stop()

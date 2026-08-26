@@ -6,7 +6,7 @@
   const md = (src) => window.DesmosMd.render(src);
   const esc = (s) => window.DesmosMd.esc(s);
 
-  const ACT_TABS = ["wire", "post", "edits", "git", "files", "channel"];
+  const ACT_TABS = ["wire", "post", "edits", "git", "files", "channel", "term"];
 
   const state = {
     connected: false,
@@ -24,6 +24,8 @@
     gitTab: "status",
     files: { dir: ".", entries: [], path: null, lines: [], note: null, binary: false },
     bridge: { socket: null, attached: false, reason: "" },
+    term: { name: "main", text: "", shells: [], draft: "" },
+    help: false,
     active: null,
     model: "",
     effort: "",
@@ -316,12 +318,36 @@
     if (state.actTab === "channel") {
       jobs.push(refreshChannel());
     }
+    if (state.actTab === "term") {
+      jobs.push(refreshTerm());
+    }
     try {
       await Promise.all(jobs);
     } catch (err) {
       state.error = err.message || String(err);
     }
-    paint();
+    const typing =
+      document.activeElement &&
+      (document.activeElement.id === "draft" ||
+        document.activeElement.id === "chan-draft" ||
+        document.activeElement.id === "term-in" ||
+        document.activeElement.id === "filter");
+    if (!typing) paint();
+    else paintStatus(state.active ? turn(state.active) : null);
+  }
+
+  async function refreshTerm() {
+    const id = state.active;
+    if (!id) return;
+    const listed = await acp.call("_session/term", { sessionId: id, op: "list" });
+    state.term.shells = listed.shells || [];
+    const peek = await acp.call("_session/term", {
+      sessionId: id,
+      op: "peek",
+      name: state.term.name || "main",
+    });
+    if (peek.text && !String(peek.text).startsWith("no shell")) state.term.text = peek.text;
+    else if (peek.text && String(peek.text).startsWith("no shell")) state.term.text = "";
   }
 
   async function refreshFiles() {
@@ -468,6 +494,63 @@
     return `<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">${paths[name] || ""}</svg>`;
   }
 
+  function copyText(text) {
+    const value = String(text || "");
+    if (!value) return;
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(value).catch(() => {});
+      return;
+    }
+    const box = document.createElement("textarea");
+    box.value = value;
+    document.body.appendChild(box);
+    box.select();
+    try {
+      document.execCommand("copy");
+    } catch {
+      /* ignore */
+    }
+    box.remove();
+  }
+
+  function bindCopies(root) {
+    if (!root) return;
+    root.querySelectorAll("button.copy").forEach((btn) => {
+      btn.addEventListener("click", (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        const host = btn.closest(".fence") || btn.parentElement;
+        const code = host && host.querySelector("code");
+        copyText((code && code.textContent) || "");
+        const prev = btn.textContent;
+        btn.textContent = "copied";
+        setTimeout(() => {
+          btn.textContent = prev || "copy";
+        }, 1100);
+      });
+    });
+  }
+
+  function helpHtml() {
+    const rows = [
+      ["Enter", "send · Shift+Enter newline"],
+      ["Esc", "cancel turn · close this"],
+      ["N", "new session"],
+      ["?", "keys"],
+      ["Ctrl/⌘ K", "filter sessions"],
+      ["Ctrl/⌘ `", "terminal"],
+      ["1–7", "activity tabs"],
+      ["dblclick", "copy a user prompt"],
+    ];
+    return `<div class="help-scrim" id="help-scrim"><div class="help" role="dialog" aria-label="Keys">
+      <header>Keys</header>
+      <dl>${rows
+        .map(([k, v]) => `<div><dt><kbd>${esc(k)}</kbd></dt><dd>${esc(v)}</dd></div>`)
+        .join("")}</dl>
+      <p class="hint">Story is speech and thinking. Activity is the wire — complete() POSTs, syscalls, git, files, channels, and the kernel PTY.</p>
+    </div></div>`;
+  }
+
   function sessionMeta(id) {
     const row = state.sessions.find((s) => s.id === id);
     const t = turn(id);
@@ -514,6 +597,16 @@
     if (storyNow && (stickStory || (t && t.running))) storyNow.scrollTop = storyNow.scrollHeight;
     const actNow = $("#act-body");
     if (actNow && (stickAct || (t && t.running))) actNow.scrollTop = actNow.scrollHeight;
+    bindCopies($("app"));
+    const scrim = $("#help-scrim");
+    if (scrim) {
+      scrim.onclick = (e) => {
+        if (e.target === scrim) {
+          state.help = false;
+          paint();
+        }
+      };
+    }
     if (focusId) {
       const el = document.getElementById(focusId);
       if (el) {
@@ -657,14 +750,7 @@
     $("#titlebar").innerHTML = `
       <button class="icon-btn" data-act="toggle-side" title="Sessions">${icon("panel")}</button>
       <div class="title">${esc(title)}</div>
-      <div class="pickers">
-        <select class="chip" id="model">${state.models
-          .map((m) => `<option value="${esc(m)}"${m === state.model ? " selected" : ""}>${esc(m)}</option>`)
-          .join("")}</select>
-        <select class="chip" id="effort">${state.efforts
-          .map((e) => `<option value="${esc(e)}"${e === state.effort ? " selected" : ""}>${esc(e)}</option>`)
-          .join("")}</select>
-      </div>
+      <button class="icon-btn" data-act="help" title="Keys">?</button>
       <button class="icon-btn" data-act="toggle-act" title="Activity">${icon("wire")}</button>
     `;
     $("[data-act=toggle-side]").onclick = () => {
@@ -675,8 +761,10 @@
       state.showActivity = !state.showActivity;
       paint();
     };
-    $("#model").onchange = (e) => setConfig("model", e.target.value);
-    $("#effort").onchange = (e) => setConfig("thought_level", e.target.value);
+    $("[data-act=help]").onclick = () => {
+      state.help = !state.help;
+      paint();
+    };
   }
 
   function paintStory(t) {
@@ -684,9 +772,16 @@
     if (!t || (!t.story.length && !t.running)) {
       story.innerHTML = `
         <div class="empty">
-          <h2>Story stays speech.</h2>
-          <p>Prompts, thinking, and markdown land here. Syscalls, complete() POSTs, git, files, and channels stay on Activity — the wire is visible, never restated.</p>
-          <p class="hint">Enter to send · Shift+Enter for a newline · N for a new session · Esc to cancel · 1–6 for Activity tabs</p>
+          <h2>Do anything.</h2>
+          <p>Story is speech and thinking. The wire — complete() POSTs, syscalls, git, files, channels, the PTY — stays on Activity.</p>
+          <div class="keys">
+            <span><kbd>Enter</kbd> send</span>
+            <span><kbd>⇧ Enter</kbd> newline</span>
+            <span><kbd>N</kbd> new session</span>
+            <span><kbd>Esc</kbd> cancel</span>
+            <span><kbd>?</kbd> keys</span>
+            <span><kbd>1–7</kbd> activity</span>
+          </div>
         </div>`;
       return;
     }
@@ -709,6 +804,9 @@
       } else if (item.kind === "assistant") {
         wrap.innerHTML = `<div class="assistant"><div class="md">${md(item.text)}</div></div>`;
       }
+      if (item.kind === "user") {
+        wrap.querySelector(".user").ondblclick = () => copyText(item.text);
+      }
       inner.appendChild(wrap);
     }
     story.innerHTML = "";
@@ -722,11 +820,22 @@
     const selStart = drafting ? document.activeElement.selectionStart : state.draft.length;
     const selEnd = drafting ? document.activeElement.selectionEnd : state.draft.length;
     $("#composer-wrap").innerHTML = `
-      ${state.error || (t && t.error) ? `<div class="banner">${esc(state.error || t.error)}</div>` : ""}
+      ${state.help ? helpHtml() : ""}
+      ${
+        state.error || (t && t.error)
+          ? `<div class="banner" data-dismiss>${esc(state.error || t.error)}<button type="button" class="banner-x" aria-label="Dismiss">×</button></div>`
+          : ""
+      }
       <div class="composer">
-        <textarea id="draft" placeholder="Ask Desmos…" rows="2"></textarea>
+        <textarea id="draft" placeholder="Do anything…" rows="1"></textarea>
         <div class="composer-bar">
-          <div class="grow">${running ? "running — Enter steers the next turn" : "markdown in · syscalls on the right"}</div>
+          <select class="chip" id="model">${state.models
+            .map((m) => `<option value="${esc(m)}"${m === state.model ? " selected" : ""}>${esc(m)}</option>`)
+            .join("")}</select>
+          <select class="chip" id="effort">${state.efforts
+            .map((e) => `<option value="${esc(e)}"${e === state.effort ? " selected" : ""}>${esc(e)}</option>`)
+            .join("")}</select>
+          <div class="grow">${running ? "running — Enter steers" : ""}</div>
           <button class="send${running ? " stop" : ""}" id="go" ${!running && !canSend ? "disabled" : ""} title="${
       running ? "Stop" : "Send"
     }">${running ? icon("stop") : icon("send")}</button>
@@ -749,6 +858,17 @@
       }
     };
     $("#go").onclick = () => (running ? cancel() : send());
+    const model = $("#model");
+    const effort = $("#effort");
+    if (model) model.onchange = (e) => setConfig("model", e.target.value);
+    if (effort) effort.onchange = (e) => setConfig("thought_level", e.target.value);
+    const banner = $("[data-dismiss]");
+    if (banner)
+      banner.onclick = () => {
+        state.error = "";
+        if (t) t.error = "";
+        paint();
+      };
     if (drafting) {
       draft.focus();
       draft.setSelectionRange(selStart, selEnd);
@@ -761,12 +881,20 @@
     $("#activity").innerHTML = `
       <div class="act-head">Activity
         <div class="act-tabs">
-          ${ACT_TABS.map(
-            (tab) =>
-              `<button data-tab="${tab}" class="${state.actTab === tab ? "on" : ""}">${
-                tab === "post" ? "complete" : tab
-              }</button>`
-          ).join("")}
+          ${ACT_TABS.map((tab) => {
+            const labels = {
+              wire: "wire",
+              post: "post",
+              edits: "edits",
+              git: "git",
+              files: "files",
+              channel: "chan",
+              term: "$",
+            };
+            return `<button data-tab="${tab}" class="${state.actTab === tab ? "on" : ""}">${
+              labels[tab] || tab
+            }</button>`;
+          }).join("")}
         </div>
       </div>
       <div class="act-body" id="act-body"></div>
@@ -782,6 +910,7 @@
     if (state.actTab === "git") paintGit(body);
     else if (state.actTab === "files") paintFiles(body);
     else if (state.actTab === "channel") paintChannel(body);
+    else if (state.actTab === "term") paintTerm(body);
     else paintWire(body, t);
   }
 
@@ -965,6 +1094,101 @@
     $("#chan-go").onclick = () => postChannel().catch((err) => ((state.error = err.message), paint()));
   }
 
+  async function runTerm(cmd) {
+    const id = state.active;
+    const text = String(cmd || "").replace(/\n$/, "");
+    if (!id || !text.trim()) return;
+    try {
+      const r = await acp.call("_session/term", {
+        sessionId: id,
+        op: "run",
+        name: state.term.name || "main",
+        body: text,
+      });
+      if (r && r.text) state.term.text = r.text;
+      await refreshTerm();
+    } catch (err) {
+      state.error = err.message || String(err);
+    }
+    paint();
+    const again = document.getElementById("term-in");
+    if (again) again.focus();
+  }
+
+  function paintTerm(body) {
+    body.classList.add("term-body");
+    const shells = state.term.shells.length ? state.term.shells : [];
+    const names = shells.length
+      ? shells
+          .map((s) => {
+            const n = s.name || s;
+            const on = n === (state.term.name || "main") ? " on" : "";
+            return `<button type="button" class="term-name${on}" data-term-name="${esc(n)}">${esc(n)}</button>`;
+          })
+          .join("")
+      : `<span class="term-idle">no pty yet</span>`;
+    const empty = !String(state.term.text || "").trim();
+    body.innerHTML = `
+      <div class="term-bar">
+        <div class="term-names">${names}</div>
+        <span class="grow"></span>
+        <button type="button" data-term-int title="Interrupt the foreground job">int</button>
+        <button type="button" data-term-close title="Close this PTY">close</button>
+      </div>
+      <pre class="term-out" id="term-out">${
+        empty
+          ? `<span class="term-hint">Kernel PTY — world.shells, the same object &lt;shell&gt; uses. Type a command.</span>`
+          : esc(state.term.text)
+      }</pre>
+      <div class="term-in-wrap">
+        <span class="term-prompt">$</span>
+        <input id="term-in" class="term-in" spellcheck="false" autocomplete="off" placeholder="command" />
+      </div>`;
+    const out = body.querySelector("#term-out");
+    if (out) out.scrollTop = out.scrollHeight;
+    body.querySelectorAll("[data-term-name]").forEach((btn) => {
+      btn.onclick = () => {
+        state.term.name = btn.dataset.termName;
+        refreshTerm().then(paint);
+      };
+    });
+    const input = body.querySelector("#term-in");
+    if (input) {
+      input.value = state.term.draft;
+      input.addEventListener("input", () => {
+        state.term.draft = input.value;
+      });
+      input.addEventListener("keydown", (e) => {
+        if (e.key === "Enter") {
+          e.preventDefault();
+          const cmd = input.value;
+          state.term.draft = "";
+          input.value = "";
+          runTerm(cmd);
+        }
+      });
+    }
+    body.querySelector("[data-term-int]").onclick = async () => {
+      await acp.call("_session/term", {
+        sessionId: state.active,
+        op: "interrupt",
+        name: state.term.name || "main",
+      });
+      await refreshTerm();
+      paint();
+    };
+    body.querySelector("[data-term-close]").onclick = async () => {
+      await acp.call("_session/term", {
+        sessionId: state.active,
+        op: "close",
+        name: state.term.name || "main",
+      });
+      state.term.text = "";
+      await refreshTerm();
+      paint();
+    };
+  }
+
   function paintStatus(t) {
     const br = state.bridge || {};
     $("#status").innerHTML = `
@@ -973,6 +1197,7 @@
       <span>${esc(state.model || "—")}</span>
       <span>${esc(state.effort || "—")}</span>
       <span>${state.git && state.git.branch ? esc(state.git.branch) : ""}</span>
+      <span>${state.term.shells && state.term.shells.length ? "pty " + (state.term.name || "main") : ""}</span>
       <span>${br.socket ? "bridge.sock" : ""}</span>
       <span class="spin${t && t.running ? " on" : ""}"></span>
       <span style="margin-left:auto">${esc(state.cwd || "")}</span>
@@ -993,11 +1218,50 @@
   };
 
   document.addEventListener("keydown", (e) => {
-    if (e.target && (e.target.tagName === "TEXTAREA" || e.target.tagName === "SELECT" || e.target.tagName === "INPUT")) {
+    if (e.key === "Escape" && state.help) {
+      e.preventDefault();
+      state.help = false;
+      paint();
+      return;
+    }
+    if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {
+      e.preventDefault();
+      state.showSidebar = true;
+      paint();
+      const f = $("#filter");
+      if (f) f.focus();
+      return;
+    }
+    if ((e.metaKey || e.ctrlKey) && e.key === "`") {
+      e.preventDefault();
+      state.actTab = "term";
+      state.showActivity = true;
+      paint();
+      refreshEnv().then(() => {
+        const box = $("#term-in");
+        if (box) box.focus();
+      });
+      return;
+    }
+    const typing =
+      e.target &&
+      (e.target.tagName === "TEXTAREA" || e.target.tagName === "SELECT" || e.target.tagName === "INPUT");
+    if (typing) {
       if (e.key === "Escape") {
         e.preventDefault();
+        if (e.target.id === "term-in") {
+          state.term.draft = "";
+          e.target.value = "";
+          return;
+        }
         cancel();
       }
+      return;
+    }
+    if (e.key === "?" || (e.key === "/" && e.shiftKey)) {
+      e.preventDefault();
+      state.help = !state.help;
+      paint();
       return;
     }
     if (e.key === "n" || e.key === "N") {
@@ -1005,7 +1269,7 @@
       newSession();
     }
     if (e.key === "Escape") cancel();
-    const num = "123456".indexOf(e.key);
+    const num = "1234567".indexOf(e.key);
     if (num >= 0) {
       state.actTab = ACT_TABS[num];
       state.showActivity = true;

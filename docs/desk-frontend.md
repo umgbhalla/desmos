@@ -8,9 +8,9 @@ the NDJSON stdio shape without the newlines).
 
 gpuix is a GPUI/React toolkit, not an agent UI. Comet is already launched by
 `python -m desmos comet` as a thin exec of `vendor/comet`. Desk copies their
-craft (Waku graphite density, session rail, composer, model/thinking pickers,
-markdown, diffs) while keeping Desmos invariants: story is speech and
-thinking, activity is the wire.
+craft (Waku graphite density, session rail, composer chips, Tokyo Night
+markdown, diffs, a PTY panel) while keeping Desmos invariants: story is speech
+and thinking, activity is the wire.
 
 ## Setup and launch
 
@@ -29,6 +29,11 @@ python -m desmos desk --cwd . --port 7734 --no-browser
 No cargo build and no hash gate: the UI is package data under
 `desmos/front/desk_static/`, served by `desmos/front/desk.py`.
 
+`vendor/grok-build` and `vendor/comet` are git submodules. A fresh checkout
+must `git submodule update --init vendor/grok-build vendor/comet` before a
+source TUI/Comet build. Desk itself is HTML and does not load those crates
+into the browser.
+
 ## Current scope
 
 Supported now:
@@ -41,29 +46,52 @@ Supported now:
 - new session (`session/new`);
 - resume a persist session (`session/load` with the sqlite `sessions.id`
   from `_session/sessions` — the same rows the TUI picker reads);
+- resume a previous ACP uuid (`session/load` of the uuid `session/new`
+  issued; `persist.acp_sessions` is the join, schema 17, same sqlite file);
 - model and thought_level through `session/set_config_option` (the same
-  catalog the TUI picker reads);
+  catalog the TUI picker reads), as chips inside the composer;
 - steer while a turn is running (`_session/steer` → `catalog.steer`);
 - git status / branches / log (`_session/git`, same `--no-optional-locks`
   reader as the TUI);
 - files listing and bounded read (`_session/fs`, jailed to the session cwd);
 - live peers and named roster (`_session/peers`, `_session/roster`);
 - channel list, read, and post (`persist.channel_*`, same as the bridge);
+- kernel PTY (`_session/term` → `desmos.kernel.shell` / `world.shells`,
+  the same object `<shell>` uses);
 - bridge socket presence (`_session/bridge`). Desk does not attach as a
   second writer on a live TUI daemon.
 
-`loadSession` is advertised true for persist session ids. An ACP uuid from a
-previous process is not stored, so Comet cannot round-trip that id after a
-restart.
+`loadSession` is advertised true for persist session ids and for ACP uuids
+bound at `session/new`. An unknown id is refused rather than minted.
+
+Keys: `?` overlay, `N` new session, `Ctrl/⌘ K` filter, `Ctrl/⌘ `` terminal,
+`1–7` activity tabs, Enter send, Esc cancel.
+
+## What desk cannot host
+
+Desk is HTML. It cannot instantiate grok-build's
+`StreamingMarkdownRenderer` (ratatui + Syntect) or Comet/gpuix GPUI
+`<markdown>` / `<diff>` / alacritty_terminal views in the browser. The
+`crates/xai-grok-markdown` crate emits terminal spans, not HTML. Desk
+raises the HTML renderer to that contract instead: Tokyo Night tokens
+(`#1a1b26` / `#51597d` / `#a9b1d6`), streaming re-render, indented fences,
+autolinks, fence copy, LCS diffs.
+
+Comet **devices** (`vendor/comet/crates/ui/src/settings/devices.rs`) are a
+Zeron CRDT/RPC workspace device registry (`zeron_rpc`, presence dots,
+rename). Desmos has no that object. The honest analog is
+`persist.peers()`, already on the rail. There is no devices page.
+
+A PTY is process memory. `World.shells` cannot be reloaded from JSON after
+a restart; the term panel talks to the live kernel only.
 
 Not yet matched with the native TUI / Comet / gpuix:
 
-- native GPUI `<markdown>` / `<diff>` (needs Metal/Vulkan or a vendored
-  gpuix host; `vendor/grok-build` and `vendor/comet` are empty gitlinks
-  in a fresh checkout);
-- attaching the in-process ACP world to `<cwd>/.desmos/bridge.sock` (that
-  would be two writers on one persist brain);
-- Comet CRDT session registry, devices, and terminal panel.
+- native GPUI `<markdown>` / `<diff>` / Metal-Vulkan host;
+- attaching the in-process ACP world to `<cwd>/.desmos/bridge.sock`
+  (that would be two writers on one persist brain);
+- Comet CRDT session registry and devices;
+- xterm.js / alacritty glyph rendering (desk shows the kernel peek text).
 
 The TUI (`python -m desmos tui`) and Comet (`python -m desmos comet`) stay
 as they are. Desk is another viewport onto the same kernel.
