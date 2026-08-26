@@ -162,9 +162,29 @@ def _gpuix_dir() -> Path:
 
 
 def _gpuix_native_ok(gpuix: Path | None = None) -> bool:
+    """True when `@gpuix/native` actually loads, not when index.js merely exists.
+
+    npm can leave index.js in place while the platform `.node` is missing
+    (optional-dependency holes). `require()` is the same failure `--tree`
+    would hit, so a file-only probe would run xvfb and fail the floor.
+    """
+    import shutil
+    import subprocess
+
     root = gpuix or _gpuix_dir()
     native = root / "node_modules" / "@gpuix" / "native" / "index.js"
-    return native.is_file()
+    if not native.is_file():
+        return False
+    node = shutil.which("node")
+    if node is None:
+        return False
+    probe = subprocess.run(
+        [node, "-e", "require('@gpuix/native')"],
+        cwd=str(root),
+        capture_output=True,
+        check=False,
+    )
+    return probe.returncode == 0
 
 
 def _gpuix_install(gpuix: Path | None = None) -> int:
