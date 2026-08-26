@@ -1219,6 +1219,7 @@ def check() -> None:
         _check_fold_keeps_transcript()
         _check_session_asks()
         _check_decisions(cwd)
+        _check_child_plan_decide(cwd)
 
 
 #: The one fixture both languages price. `crates/desmos-tui/src/main.rs`
@@ -3584,3 +3585,47 @@ def _check_decisions(cwd: Path) -> None:
     result3 = _decide("ask Restored? | yes | no")
     assert result3.startswith("```ui-choice"), f"restore failed: {result3!r}"
     print("decision queue check ok")
+
+
+def _check_child_plan_decide(cwd: Path) -> None:
+    """A persist=False world must not append the parent's plan or decide JSONL.
+
+    Subagents share the parent's cwd and resolve `state_file` to the same
+    `.desmos/`. Ungated, `knowledge op=plan` and `op=decide` mkdir'd those
+    sidecars the way `write_generation` used to. Scope is a different rail.
+    This check is the writer: an unscoped child, same path the parent uses.
+    """
+    from desmos.dispatch import dispatch
+    from desmos.loop import new_world, seed_builtins
+    from desmos.state.decisions import pending as pending_decisions
+    from desmos.state.plan import latest as latest_plans, plans_path
+    from desmos.types import Block
+
+    home = cwd / "child-jsonl"
+    home.mkdir()
+    parent = new_world(home)
+    child = new_world(home, state_path=None, persist=False, ns={})
+    seed_builtins(child)
+    assert child.persist is False
+    assert plans_path(child) == plans_path(parent)
+
+    dispatch(child, Block("knowledge", "new leaked\n1. pwn the parent", {"op": "plan"}))
+    dispatch(child, Block("knowledge", "ask leak this? | yes | no", {"op": "decide"}))
+    from desmos.state.plan import create as plan_create
+    from desmos.state.decisions import push as decide_push
+
+    plan_create(child, "direct leak")
+    decide_push(child, "direct leak?", ["yes", "no"])
+
+    plan_file = plans_path(parent)
+    decide_file = plan_file.parent.parent / "decisions" / "decisions.jsonl"
+    assert latest_plans(child) == {}, latest_plans(child)
+    assert pending_decisions(child) == [], pending_decisions(child)
+    assert not plan_file.exists(), plan_file
+    assert not decide_file.exists(), decide_file
+
+    dispatch(parent, Block("knowledge", "new real\n1. do the work", {"op": "plan"}))
+    dispatch(parent, Block("knowledge", "ask real? | yes | no", {"op": "decide"}))
+    assert plan_file.exists(), "the root world must still write plans"
+    assert decide_file.exists(), "the root world must still write decisions"
+    print("child plan/decide persist gate ok")
