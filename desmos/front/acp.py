@@ -1000,10 +1000,11 @@ class AcpServer:
         payload: dict[str, Any] = {
             "sessionUpdate": "tool_call_update" if update else "tool_call",
             "toolCallId": tool_id,
-            "title": title,
             "kind": kind,
             "status": status,
         }
+        if title:
+            payload["title"] = title
         if content is None and text:
             content = [{
                 "type": "content",
@@ -1278,7 +1279,7 @@ class AcpServer:
             family = "thinking" if nested == "thinking" else "speech"
             self._push_card(
                 session_id, prompt_id, state,
-                title=run_id or "subagent", family="subagent",
+                title="", family="subagent",
                 text=text, status="in_progress", tool_id=tool_id, update=True,
                 pane="story", extra={**extra, "chunk": family},
             )

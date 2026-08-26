@@ -1512,6 +1512,7 @@ def _check_acp_protocol_cards() -> None:
     assert child["params"]["update"]["sessionUpdate"] == "tool_call_update"
     assert child["params"]["_meta"]["desmos"]["family"] == "subagent"
     assert child["params"]["_meta"]["desmos"]["pane"] == "story"
+    assert child["params"]["update"].get("title") in {None, "", "look around"}
     body = ""
     for part in child["params"]["update"].get("content") or []:
         if part.get("type") == "content":
