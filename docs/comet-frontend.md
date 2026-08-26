@@ -33,19 +33,19 @@ session id (the same uuid `acp_sessions` binds).
 ## What Comet actually paints
 
 Desmos tags every `session/update` with `_meta.desmos.pane` (`story` |
-`activity`) and `family`. Comet's normalizer maps that wire:
+`activity`) and `family`. Comet's normalizer maps that wire, and the GPUI
+shell splits it into two panes:
 
-- speech → `TextDelta` (transcript markdown)
-- thinking → `ReasoningDelta`
+- speech → `TextDelta` (story markdown)
+- thinking → `ReasoningDelta` (story)
 - `complete()` is kind `other`, so the chip is `ToolCall::Unknown { name: complete }`,
-  not a WebFetch
-- kernel syscalls (`kind: execute`, `rawInput.tag`) → `ToolCall::Exec`
-- edit diffs → the Changes pane (Comet's diff surface)
+  not a WebFetch. Activity pane only.
+- kernel syscalls (`kind: execute`, `rawInput.tag`) → `ToolCall::Exec` (Activity)
+- edit diffs → the Changes pane (Comet's diff surface) and Activity chips
 
-That is Comet craft: one transcript with tool chips, diffs in the right
-pane, sessions in the CRDT registry, terminals as engine alacritty PTYs.
-It is not the TUI's three-pane layout. Story vs activity is preserved on
-the wire; Comet does not grow a second Activity pane.
+Story is the main transcript: user prompts, thinking, assistant markdown.
+Activity is a right-pane surface (auto-opened on the first Desmos chat in a
+run). Other harnesses still chip tools in the thread.
 
 Steering: initialize advertises `_meta.steering.supported` and
 `_session/steering`. The Desmos spec is `SteeringMode::StepBoundary` with
@@ -55,23 +55,33 @@ come from `session/new` `configOptions`. Mid-turn Comet calls
 `outcome: promptRequired` so Comet starts the next prompt instead of
 injecting into a finished turn.
 
+The bottom dock (⌘J) on a Desmos chat opens an alacritty tab over
+`world.shells` (`OpenTerminal` `kind: kernel` → `_session/term` bytes /
+run / interrupt). Extra `+` tabs are still login PTYs. The kernel tab
+needs a live ACP child, so send a prompt once; after that the session
+parks and the mailbox stays warm. Line-oriented, same contract as desk
+xterm, not a raw login PTY.
+
 ## Current scope
 
 Supported now:
 
 - hash-gated `zeron` launch over this checkout's ACP server;
 - create / resume a Desmos ACP session for a workspace;
-- stream assistant text, thought, complete cards, and syscall chips;
+- stream assistant text and thought on **Story**;
+- `complete()` cards and syscall chips on **Activity** (separate GPUI pane);
 - model and thought_level from Desmos `configOptions`;
 - mid-turn steering (`_session/steering`);
 - Comet session registry + `session/load` of the ACP uuid;
-- Comet's own alacritty terminals (engine PTYs, not `world.shells`).
+- kernel PTY in the alacritty dock (`world.shells` / `_session/term`);
+- extra login-shell tabs from the dock `+`.
 
 Not the same object as the TUI / desk:
 
-- TUI Story/Activity/POST split as separate GPUI panes;
-- kernel PTY (`world.shells` / `_session/term`) inside Comet's terminal dock;
-- Zeron CRDT devices page (no Desmos analog — `persist.peers()` is the honest one);
+- gpuix React-on-GPUI markdown host (Comet paints with pulldown-cmark);
+- a headed Vulkan window on machines with no wgpu driver (binary still
+  compiles; this VM dies at `vkCreateInstance`);
+- Zeron CRDT devices page (no Desmos analog. `persist.peers()` is the honest one);
 - attaching Comet and the TUI as two writers on `.desmos/bridge.sock`.
 
 Comet is pinned as a Git submodule of the `umgbhalla/comet` fork. Harness
