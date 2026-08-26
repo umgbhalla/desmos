@@ -166,6 +166,7 @@ def _check_comet_launcher() -> None:
         _comet_acp_wrapper,
         _comet_hash,
         _comet_passthrough,
+        _comet_sources,
         _comet_stale,
         _comet_watch_roots,
         _repo_root,
@@ -196,15 +197,17 @@ def _check_comet_launcher() -> None:
         assert _comet_stale(comet, binary) is True
         binary.parent.mkdir(parents=True, exist_ok=True)
         binary.write_bytes(b"bin")
-        older = src.stat().st_mtime - 30
+        sources = _comet_sources(comet)
+        newest = max(f.stat().st_mtime for f in sources)
+        older = newest - 30
         os.utime(binary, (older, older))
         assert _comet_stale(comet, binary) is True
-        os.utime(src, (older - 30, older - 30))
+        for f in sources:
+            os.utime(f, (older - 30, older - 30))
         assert _comet_stale(comet, binary) is False
         src.write_text("pub fn x() { let _ = 1; }\n", encoding="utf-8")
         assert _comet_stale(comet, binary) is True
         src.write_text("pub fn x() {}\n", encoding="utf-8")
-        os.utime(src, (older - 30, older - 30))
         assert _comet_stale(comet, binary) is False
 
         wrapper = Path(_comet_acp_wrapper(root, comet))
