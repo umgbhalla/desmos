@@ -448,7 +448,9 @@ While a step runs, `Enter` queues a follow-up instead of interrupting; an empty
 `--grok` launches grok-build's pager with `python -m desmos acp` on stdio.
 `python -m desmos comet` launches the vendored Comet desktop frontend with
 desmos registered as an ACP harness — see
-[docs/comet-frontend.md](docs/comet-frontend.md).
+[docs/comet-frontend.md](docs/comet-frontend.md). `python -m desmos gpuix`
+loads published `@gpuix/react` `<markdown>` / `<diff wordDiff>` over the
+same ACP server — see [docs/gpuix-frontend.md](docs/gpuix-frontend.md).
 
 ## Two providers
 
@@ -596,7 +598,9 @@ Vulnerabilities: [SECURITY.md](SECURITY.md) — never a public issue.
 | [identity.md](docs/identity.md) | what state survives which reset |
 | [extensibility.md](docs/extensibility.md) | writing an extension |
 | [subagents.md](docs/subagents.md) | contracts, fan-out, judgment |
-| [comet-frontend.md](docs/comet-frontend.md) | the optional desktop frontend |
+| [comet-frontend.md](docs/comet-frontend.md) | vendored zeron GPUI frontend over ACP |
+| [gpuix-frontend.md](docs/gpuix-frontend.md) | first-party `@gpuix/react` host over ACP |
+| [desk-frontend.md](docs/desk-frontend.md) | HTML viewport over in-process ACP |
 | [openai-prompt-cache-audit.md](docs/openai-prompt-cache-audit.md) | measured cache behaviour |
 
 `AGENTS.md` (symlinked as `CLAUDE.md`) is the instruction file for coding agents

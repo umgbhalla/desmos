@@ -33,19 +33,21 @@ session id (the same uuid `acp_sessions` binds).
 ## What Comet actually paints
 
 Desmos tags every `session/update` with `_meta.desmos.pane` (`story` |
-`activity`) and `family`. Comet's normalizer maps that wire:
+`activity`) and `family`. Comet's normalizer maps that wire, and the GPUI
+shell splits it into two panes:
 
-- speech → `TextDelta` (transcript markdown)
-- thinking → `ReasoningDelta`
+- speech → `TextDelta` (story markdown)
+- thinking → `ReasoningDelta` → `MessagePart::Thought` on **Story** (muted
+  markdown, left rail, "thinking" label on the first block). Empty deltas
+  stay heartbeats. Activity omits thought.
 - `complete()` is kind `other`, so the chip is `ToolCall::Unknown { name: complete }`,
-  not a WebFetch
-- kernel syscalls (`kind: execute`, `rawInput.tag`) → `ToolCall::Exec`
-- edit diffs → the Changes pane (Comet's diff surface)
+  not a WebFetch. Activity pane only.
+- kernel syscalls (`kind: execute`, `rawInput.tag`) → `ToolCall::Exec` (Activity)
+- edit diffs → the Changes pane (Comet's diff surface) and Activity chips
 
-That is Comet craft: one transcript with tool chips, diffs in the right
-pane, sessions in the CRDT registry, terminals as engine alacritty PTYs.
-It is not the TUI's three-pane layout. Story vs activity is preserved on
-the wire; Comet does not grow a second Activity pane.
+Story is the main transcript: user prompts, thinking, assistant markdown.
+Activity is a right-pane surface (auto-opened on the first Desmos chat in a
+run). Other harnesses still chip tools in the thread.
 
 Steering: initialize advertises `_meta.steering.supported` and
 `_session/steering`. The Desmos spec is `SteeringMode::StepBoundary` with
@@ -55,24 +57,49 @@ come from `session/new` `configOptions`. Mid-turn Comet calls
 `outcome: promptRequired` so Comet starts the next prompt instead of
 injecting into a finished turn.
 
+The bottom dock (⌘J) on a Desmos chat opens an alacritty tab over
+`world.shells` (`OpenTerminal` `kind: kernel` → `_session/term` bytes /
+run / interrupt). Opening that tab warms a Desmos ACP child (`session/new`
+with no prompt) so the mailbox is live without sending a chat message
+first. Extra `+` tabs are still login PTYs. Line-oriented, same contract
+as desk xterm, not a raw login PTY.
+
 ## Current scope
 
 Supported now:
 
 - hash-gated `zeron` launch over this checkout's ACP server;
 - create / resume a Desmos ACP session for a workspace;
-- stream assistant text, thought, complete cards, and syscall chips;
+- stream assistant markdown and thinking on **Story** (`MessagePart::Thought`);
+- `complete()` cards and syscall chips on **Activity** (separate GPUI pane);
+- Grok markdown contract on Story: GFM + math + `~~` strike only (single `~`
+  stays literal, matching `xai-grok-markdown-core`);
+- gpuix-style word diffs on the Changes pane and inline edit diffs (`similar`);
 - model and thought_level from Desmos `configOptions`;
 - mid-turn steering (`_session/steering`);
 - Comet session registry + `session/load` of the ACP uuid;
-- Comet's own alacritty terminals (engine PTYs, not `world.shells`).
+- kernel PTY in the alacritty dock (`world.shells` / `_session/term`),
+  warmed on tab open so a prompt is not required first;
+- extra login-shell tabs from the dock `+`.
 
 Not the same object as the TUI / desk:
 
-- TUI Story/Activity/POST split as separate GPUI panes;
-- kernel PTY (`world.shells` / `_session/term`) inside Comet's terminal dock;
-- Zeron CRDT devices page (no Desmos analog — `persist.peers()` is the honest one);
+- Zeron CRDT devices page (no Desmos analog. `persist.peers()` is the honest one);
 - attaching Comet and the TUI as two writers on `.desmos/bridge.sock`.
+
+First-party gpuix `<markdown>` / `<diff>` is `python -m desmos gpuix`
+(`docs/gpuix-frontend.md`): published `@gpuix/react`, same ACP server.
+Comet does not load that package; it keeps its own GPUI parser that
+matches the Grok GFM / wordDiff contract. The TUI / ACP / Comet / desk /
+GPUIX capability map is [docs/design.md](design.md) (Surfaces).
+
+Headed Linux without a GPU: `mesa-vulkan-drivers` (lavapipe).
+`VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json` makes wgpu select
+`llvmpipe`. `python -m desmos check --only front` probes that with
+`vulkaninfo` (DISPLAY unset — this VM's `:1` rejects `X_CreateWindow`) and,
+when `zeron` is built, `xvfb-run timeout 5 zeron` (must log `Selected GPU`
+llvmpipe, not "Found no drivers"). Story vs Activity is the `desmos_story`
+unit tests on that same GPUI crate.
 
 Comet is pinned as a Git submodule of the `umgbhalla/comet` fork. Harness
 changes land in that repository, then the root gitlink moves. The launcher

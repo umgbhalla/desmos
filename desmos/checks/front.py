@@ -265,6 +265,107 @@ def _check_comet_launcher() -> None:
         assert _comet_passthrough(_Args()) == ["headless"]
 
 
+def _check_comet_md_diff_contract() -> None:
+    """Grok strike/math and gpuix wordDiff are the Comet parser/diff, not docs.
+
+    Runs the zeron-ui tests that feed real markdown and patches through
+    parse_full / parse_patch. Skips only when this checkout has not built
+    Comet (no zeron binary) — compiling gpui from a cold cache is not the
+    front floor. A stale binary still reruns the tests; cargo decides.
+    """
+    import shutil
+    import subprocess
+
+    from desmos.front.cli import _repo_root
+
+    root = _repo_root()
+    comet = root / "vendor" / "comet"
+    zeron = comet / "target" / "debug" / "zeron"
+    cargo = shutil.which("cargo")
+    if cargo is None or not zeron.is_file() or not (comet / "Cargo.toml").is_file():
+        return
+    for filt in ("grok_", "word_diff_marks", "desmos_story"):
+        ran = subprocess.run(
+            [
+                cargo,
+                "test",
+                "-p",
+                "zeron-ui",
+                "--manifest-path",
+                str(comet / "Cargo.toml"),
+                "--lib",
+                filt,
+                "--",
+                "--test-threads=1",
+            ],
+            cwd=str(comet),
+            capture_output=True,
+            text=True,
+            timeout=180,
+            check=False,
+        )
+        assert ran.returncode == 0, (
+            f"comet {filt} tests failed:\n{ran.stdout[-4000:]}\n{ran.stderr[-4000:]}"
+        )
+
+
+def _check_lavapipe_headed() -> None:
+    """Headed Comet on this VM needs lavapipe; vkCreateInstance used to die.
+
+    vulkaninfo is probed with DISPLAY unset (this VM's :1 rejects
+    X_CreateWindow). If xvfb and a built zeron exist, the real GPUI binary
+    must select llvmpipe and map a window — Story/Activity paint on that
+    surface; the row split is the desmos_story unit tests.
+    """
+    import os
+    import shutil
+    import subprocess
+
+    from desmos.front.cli import _repo_root
+
+    icd = "/usr/share/vulkan/icd.d/lvp_icd.json"
+    vulkaninfo = shutil.which("vulkaninfo")
+    if vulkaninfo is None or not os.path.isfile(icd):
+        return
+    env = dict(os.environ)
+    env["VK_ICD_FILENAMES"] = icd
+    # DISPLAY=:1 on this VM is an X server vulkaninfo cannot CreateWindow on
+    # (BadMatch). Headless instance + lavapipe is the contract Comet uses
+    # under xvfb; a broken DISPLAY must not fail the probe.
+    env.pop("DISPLAY", None)
+    ran = subprocess.run(
+        [vulkaninfo, "--summary"],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=20,
+        check=False,
+    )
+    assert ran.returncode == 0, ran.stderr or ran.stdout
+    blob = (ran.stdout + ran.stderr).lower()
+    assert "llvmpipe" in blob or "lvp" in blob, ran.stdout[-2000:]
+
+    xvfb = shutil.which("xvfb-run")
+    timeout = shutil.which("timeout")
+    zeron = _repo_root() / "vendor" / "comet" / "target" / "debug" / "zeron"
+    if xvfb is None or timeout is None or not zeron.is_file():
+        return
+    headed = dict(os.environ)
+    headed["VK_ICD_FILENAMES"] = icd
+    launched = subprocess.run(
+        [xvfb, "-a", timeout, "5", str(zeron)],
+        env=headed,
+        capture_output=True,
+        text=True,
+        timeout=20,
+        check=False,
+    )
+    out = launched.stdout + launched.stderr
+    assert "Found no drivers" not in out, out[-3000:]
+    assert "llvmpipe" in out.lower(), out[-3000:]
+    assert "Selected GPU" in out, out[-3000:]
+
+
 # The stubbed gland for the socket checks: the REAL bridge subprocess and the
 # REAL loop, with canned responses -- the record-golden pattern, one code path,
 # never a second engine. Content-addressed so call counts cannot skew it: the
@@ -1287,12 +1388,214 @@ const linked = Md.render("see https://example.com/x");
 if (!linked.includes('href="https://example.com/x"')) process.exit(5);
 const diff = Md.diffHtml("a\\nb\\n", "a\\nc\\n");
 if (!diff.includes("d-del") || !diff.includes("d-add") || !diff.includes("d-eq")) process.exit(6);
+const strike = Md.render("keep ~~this~~ but not ~that~");
+if (!strike.includes("<del>") || strike.includes("<del>that")) process.exit(7);
+const pct = Md.render("only: ~**10%** (~**300**)");
+if (pct.includes("<del>")) process.exit(8);
 process.exit(0);
 """
     ran = subprocess.run([node, "-e", script], capture_output=True, text=True)
     assert ran.returncode == 0, (
         f"md.js renderer failed ({ran.returncode}): {ran.stderr or ran.stdout}"
     )
+
+
+def _check_gpuix_host() -> None:
+    """Desk HTML is not gpuix. This host loads @gpuix/react and speaks ACP.
+
+    --acp always runs: a real `python -m desmos acp` child, initialize,
+    session/new, and the same applyUpdate the window uses. --tree needs the
+    published native binary plus a window (xvfb + lavapipe here); it mounts
+    <markdown> / <diff wordDiff> and asserts the retained tree, not docs.
+    """
+    import json
+    import os
+    import shutil
+    import subprocess
+    import sys
+    import tempfile
+
+    from desmos.front.cli import (
+        _gpuix_dir,
+        _gpuix_install,
+        _gpuix_native_ok,
+        _repo_root,
+    )
+
+    gpuix = _gpuix_dir()
+    assert (gpuix / "package.json").is_file(), gpuix
+    assert (gpuix / "src" / "app.js").is_file()
+    assert (gpuix / "src" / "probe.js").is_file()
+    node = shutil.which("node")
+    if node is None:
+        return
+
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(_repo_root())
+    env["DESMOS_PYTHON"] = sys.executable
+    env["DESMOS_TOOL_SYSCALLS"] = "0"
+
+    with tempfile.TemporaryDirectory() as tmp:
+        acp = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "desmos",
+                "gpuix",
+                "--acp-probe",
+                "--cwd",
+                tmp,
+                "--no-install",
+            ],
+            cwd=str(gpuix),
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=40,
+            check=False,
+        )
+        assert acp.returncode == 0, acp.stderr[-4000:] + acp.stdout[-4000:]
+        lines = [ln for ln in acp.stdout.splitlines() if ln.strip()]
+        assert lines, acp.stderr
+        payload = json.loads(lines[-1])
+        assert payload.get("ok") is True, payload
+        got = payload["acp"]
+        assert got["protocolVersion"] == 1, got
+        assert got["sessionId"], got
+        assert got["loadSession"] is True, got
+        assert got["storyKinds"] == ["thinking", "assistant"], got
+
+    if not _gpuix_native_ok(gpuix):
+        _gpuix_install(gpuix)
+    if not _gpuix_native_ok(gpuix):
+        return
+    xvfb = shutil.which("xvfb-run")
+    icd = "/usr/share/vulkan/icd.d/lvp_icd.json"
+    if xvfb is None:
+        return
+    headed = dict(env)
+    if os.path.isfile(icd):
+        headed["VK_ICD_FILENAMES"] = icd
+    speech = "keep ~~this~~ but not ~that~\n\nonly: ~**10%** (~**300**)\n"
+    headed["DESMOS_GPUIX_TURN"] = json.dumps({
+        "story": [
+            {"kind": "thinking", "text": "will strike ~~scratch~~ then speak"},
+            {"kind": "assistant", "text": speech},
+        ],
+        "activity": [
+            {
+                "id": "t1",
+                "family": "edit",
+                "title": "edit n.txt",
+                "diff": {"path": "n.txt", "oldText": "keep 1\n", "newText": "keep 2\n"},
+            }
+        ],
+    })
+    tree = subprocess.run(
+        [xvfb, "-a", node, str(gpuix / "src" / "probe.js"), "--tree"],
+        cwd=str(gpuix),
+        env=headed,
+        capture_output=True,
+        text=True,
+        timeout=40,
+        check=False,
+    )
+    assert tree.returncode == 0, tree.stderr[-4000:] + tree.stdout[-4000:]
+    lines = [ln for ln in tree.stdout.splitlines() if ln.strip()]
+    payload = json.loads(lines[-1])
+    assert payload.get("ok") is True, payload
+    sources = payload["tree"]["markdown"]
+    assert any(speech in src for src in sources), sources
+    assert any("~~scratch~~" in src for src in sources), sources
+    diffs = payload["tree"]["diffs"]
+    assert diffs, payload["tree"]
+    assert diffs[0].get("wordDiff") is True, diffs
+    patch = diffs[0].get("patch") or ""
+    assert "-keep 1" in patch and "+keep 2" in patch, patch
+    size = payload["tree"]["window"]
+    assert size["width"] > 0 and size["height"] > 0, size
+    types = payload["tree"].get("types") or []
+    for need in ("markdown", "diff", "virtual-list", "textarea"):
+        assert need in types, types
+    _check_gpuix_chat_live(gpuix, node, env, xvfb, icd)
+
+
+def _check_gpuix_chat_live(
+    gpuix: Path,
+    node: str,
+    env: dict[str, str],
+    xvfb: str,
+    icd: str,
+) -> None:
+    """session/prompt through the real ACP child, then paint the gpuix App.
+
+    MockAnthropic is the same gland complete() hits in e2e — not a second
+    loop. Story must keep speech; complete() must stay on activity.
+    """
+    import json
+    import os
+    import subprocess
+    import tempfile
+
+    from desmos.transport.mock import MockAnthropic
+
+    marker = "GPUIX_CHAT_PONG"
+    with tempfile.TemporaryDirectory(prefix="desmos-gpuix-chat-") as raw:
+        tmp = Path(raw)
+        work = tmp / "work"
+        work.mkdir()
+        settings = tmp / "settings.json"
+        settings.write_text(
+            json.dumps({"provider": "anthropic", "model": "claude-opus-5", "effort": "low"}),
+            encoding="utf-8",
+        )
+        with MockAnthropic([marker]) as mock:
+            headed = dict(env)
+            headed.update({
+                "HOME": str(tmp),
+                "DESMOS_SETTINGS": str(settings),
+                "DESMOS_REGISTRY": str(tmp / "registry"),
+                "DESMOS_AUTH": str(tmp / "auth.json"),
+                "DESMOS_TRAJECTORY": str(tmp / "trajectory"),
+                "DESMOS_MODEL": "claude-opus-5",
+                "ANTHROPIC_API_KEY": "mock-key",
+                "ANTHROPIC_BASE_URL": mock.url,
+                "NO_PROXY": "127.0.0.1,localhost",
+                "no_proxy": "127.0.0.1,localhost",
+                "DESMOS_GPUIX_PROMPT": "say the marker",
+                "DESMOS_CWD": str(work),
+            })
+            headed.pop("OPENAI_API_KEY", None)
+            if os.path.isfile(icd):
+                headed["VK_ICD_FILENAMES"] = icd
+            chat = subprocess.run(
+                [xvfb, "-a", node, str(gpuix / "src" / "probe.js"), "--chat", "--cwd", str(work)],
+                cwd=str(gpuix),
+                env=headed,
+                capture_output=True,
+                text=True,
+                timeout=90,
+                check=False,
+            )
+            assert chat.returncode == 0, chat.stderr[-4000:] + chat.stdout[-4000:]
+            lines = [ln for ln in chat.stdout.splitlines() if ln.strip()]
+            payload = json.loads(lines[-1])
+            assert payload.get("ok") is True, payload
+            got = payload["chat"]
+            assert got["stopReason"] == "end_turn", got
+            assert marker in (got.get("speech") or ""), got
+            assert "complete" in (got.get("activityFamilies") or []), got
+            kinds = got.get("storyKinds") or []
+            assert "user" in kinds and "assistant" in kinds, kinds
+            assert "complete" not in kinds, kinds
+            panes = {(p.get("pane"), p.get("kind")) for p in got.get("panes") or []}
+            assert ("story", "agent_message_chunk") in panes, got.get("panes")
+            assert ("activity", "tool_call") in panes or ("activity", "tool_call_update") in panes, got.get("panes")
+            types = got.get("types") or []
+            for need in ("markdown", "virtual-list", "textarea"):
+                assert need in types, types
+            assert got["sessionId"] and got["secondId"] and got["sessionId"] != got["secondId"], got
+            assert mock.hits, "session/prompt never reached MockAnthropic"
 
 
 def _check_desk_roundtrip() -> None:
@@ -2057,6 +2360,9 @@ def check() -> None:
         # the pager compiles either way and runs grok's agent instead of ours.
         _check_desk()
         _check_comet_launcher()
+        _check_comet_md_diff_contract()
+        _check_gpuix_host()
+        _check_lavapipe_headed()
         _check_path_deps_tracked()
         _check_vendor_patch()
         _check_release_tui_launcher()

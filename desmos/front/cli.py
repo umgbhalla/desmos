@@ -157,6 +157,72 @@ def cmd_desk(args: argparse.Namespace) -> int:
     )
 
 
+def _gpuix_dir() -> Path:
+    return _repo_root() / "desmos" / "front" / "gpuix"
+
+
+def _gpuix_native_ok(gpuix: Path | None = None) -> bool:
+    root = gpuix or _gpuix_dir()
+    native = root / "node_modules" / "@gpuix" / "native" / "index.js"
+    return native.is_file()
+
+
+def _gpuix_install(gpuix: Path | None = None) -> int:
+    import shutil
+    import subprocess
+
+    root = gpuix or _gpuix_dir()
+    npm = shutil.which("npm")
+    if npm is None:
+        return 1
+    return subprocess.run(
+        [npm, "install", "--omit=dev"],
+        cwd=str(root),
+        check=False,
+    ).returncode
+
+
+def cmd_gpuix(args: argparse.Namespace) -> int:
+    """Launch the first-party GPUIX host: native <markdown> / <diff> over ACP."""
+    _on_path()
+    import shutil
+
+    gpuix = _gpuix_dir()
+    if not (gpuix / "package.json").is_file():
+        print("desmos gpuix sources missing", file=sys.stderr)
+        return 1
+    if not args.no_install and not _gpuix_native_ok(gpuix):
+        print("installing @gpuix/react + @gpuix/native…", file=sys.stderr)
+        rc = _gpuix_install(gpuix)
+        if rc:
+            return rc
+    node = shutil.which("node")
+    if node is None:
+        print("desmos gpuix needs node", file=sys.stderr)
+        return 1
+    env = os.environ.copy()
+    env.setdefault("DESMOS_CWD", str(Path(args.cwd).resolve()))
+    env["DESMOS_PYTHON"] = sys.executable
+    env["PYTHONPATH"] = str(_repo_root()) + (
+        os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else ""
+    )
+    if args.probe:
+        script = gpuix / "src" / "probe.js"
+        flags = ["--tree"]
+    elif getattr(args, "acp_probe", False):
+        script = gpuix / "src" / "probe.js"
+        flags = ["--acp", "--cwd", str(Path(args.cwd).resolve())]
+    elif getattr(args, "chat_probe", False):
+        script = gpuix / "src" / "probe.js"
+        flags = ["--chat", "--cwd", str(Path(args.cwd).resolve())]
+    else:
+        script = gpuix / "src" / "main.js"
+        flags = []
+    os.chdir(Path(args.cwd).resolve())
+    os.execve(node, [node, str(script), *flags], env)
+    return 1
+
+
 def _comet_passthrough(args: argparse.Namespace) -> list[str]:
     extra = list(getattr(args, "passthrough", []) or [])
     if extra and extra[0] == "--":
@@ -655,6 +721,29 @@ def main() -> int:
     d.add_argument("--port", default="7734")
     d.add_argument("--no-browser", action="store_true", help="do not open a browser")
     d.set_defaults(func=cmd_desk)
+
+    gx = sub.add_parser(
+        "gpuix",
+        help="GPUIX React host: native <markdown> / <diff wordDiff> over ACP",
+    )
+    gx.add_argument("--cwd", default=".")
+    gx.add_argument(
+        "--probe",
+        action="store_true",
+        help="paint a turn through <markdown>/<diff> and print the retained tree",
+    )
+    gx.add_argument(
+        "--acp-probe",
+        action="store_true",
+        help="initialize a real ACP session and exit",
+    )
+    gx.add_argument(
+        "--chat-probe",
+        action="store_true",
+        help="session/prompt through ACP, paint story/activity, print the retained tree",
+    )
+    gx.add_argument("--no-install", action="store_true", help="do not npm install")
+    gx.set_defaults(func=cmd_gpuix)
 
     se = sub.add_parser("seat", help="operator-gated seat lifecycle (docs/seats.md)")
     seat_sub = se.add_subparsers(dest="action", required=True)

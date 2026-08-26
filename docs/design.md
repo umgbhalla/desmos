@@ -255,10 +255,32 @@ Every surface drives the same `run_turns` over the same `World`.
 |---|---|---|
 | console | `python -m desmos console` | IPython with `step` and `world` bound |
 | TUI | `python -m desmos tui` | Rust, panes over a JSONL bridge |
+| Comet | `python -m desmos comet` | vendored zeron GPUI binary over ACP |
+| GPUIX | `python -m desmos gpuix` | `@gpuix/react` `<markdown>` / `<diff>` over ACP |
+| desk | `python -m desmos desk` | HTML viewport over in-process ACP |
 | headless | `python -m desmos run "task"` | one-shot, traces to `runs/` |
 | ACP | `python -m desmos acp` | NDJSON JSON-RPC for external frontends |
 | Jupyter | `python -m desmos kernel` | installs a kernelspec |
 | self-check | `python -m desmos check` | no API key needed |
+
+What each surface actually paints. Same ACP server (`python -m desmos acp`)
+for Comet, GPUIX, desk, and `tui --grok`. Default TUI is the JSONL bridge,
+not ACP.
+
+| capability | TUI | ACP | Comet | desk | GPUIX |
+|---|---|---|---|---|---|
+| transport | JSONL `.desmos/bridge.sock` | NDJSON JSON-RPC 2.0 | ACP child | in-process ACP over WebSocket | ACP child |
+| story | grok `UserPrompt` / `Thinking` / `AgentMessage` | `session/update` `_meta.desmos.pane=story` | `MessagePart::Thought` + Grok GFM | thinking + HTML `md.js` | `@gpuix/react` `<markdown>` in `virtual-list` |
+| wire | grok `ToolCall` pane | `_meta.desmos.pane=activity` | Activity GPUI pane; tools off-story | Activity pane | activity pane; tools off-story |
+| diffs | grok pager-diff | edit `oldText`/`newText` | `similar` word marks | HTML LCS | native `<diff wordDiff>` |
+| sessions | persist picker | `session/new`, `session/load` | Comet registry + `session/load` | `_session/sessions` + ACP uuid | `session/new` sidebar in this process |
+| terminal | `world.shells` | `_session/term` | alacritty kernel PTY, warmed on open | xterm.js + `_session/term` | not this host |
+| config | TUI picker | `session/set_config_option` | Comet model / thought_level | composer chips | gpuix `Select` |
+| devices | n/a | `persist.peers()` | Zeron CRDT registry (no Desmos analog) | `persist.peers()` | not this host |
+
+Not faked: two writers on `.desmos/bridge.sock`, or a Zeron CRDT devices
+page. Per-surface scope: [comet-frontend.md](comet-frontend.md),
+[gpuix-frontend.md](gpuix-frontend.md), [desk-frontend.md](desk-frontend.md).
 
 `bridge.py` speaks JSONL to the Rust TUI: the loop emits events (`post`,
 `thinking`, `speech`, `result`, `complete`, `compacted`, `turn`, `done`,

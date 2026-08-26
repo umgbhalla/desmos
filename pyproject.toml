@@ -24,4 +24,10 @@ py-modules = ["inverted"]
 include = ["desmos*"]
 
 [tool.setuptools.package-data]
-desmos = ["skills/**/*", "front/desk_static/**/*"]
+desmos = [
+    "skills/**/*",
+    "front/desk_static/**/*",
+    "front/gpuix/package.json",
+    "front/gpuix/package-lock.json",
+    "front/gpuix/src/**/*",
+]
