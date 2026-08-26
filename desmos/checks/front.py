@@ -265,6 +265,107 @@ def _check_comet_launcher() -> None:
         assert _comet_passthrough(_Args()) == ["headless"]
 
 
+def _check_comet_md_diff_contract() -> None:
+    """Grok strike/math and gpuix wordDiff are the Comet parser/diff, not docs.
+
+    Runs the zeron-ui tests that feed real markdown and patches through
+    parse_full / parse_patch. Skips only when this checkout has not built
+    Comet (no zeron binary) — compiling gpui from a cold cache is not the
+    front floor. A stale binary still reruns the tests; cargo decides.
+    """
+    import shutil
+    import subprocess
+
+    from desmos.front.cli import _repo_root
+
+    root = _repo_root()
+    comet = root / "vendor" / "comet"
+    zeron = comet / "target" / "debug" / "zeron"
+    cargo = shutil.which("cargo")
+    if cargo is None or not zeron.is_file() or not (comet / "Cargo.toml").is_file():
+        return
+    for filt in ("grok_", "word_diff_marks", "desmos_story"):
+        ran = subprocess.run(
+            [
+                cargo,
+                "test",
+                "-p",
+                "zeron-ui",
+                "--manifest-path",
+                str(comet / "Cargo.toml"),
+                "--lib",
+                filt,
+                "--",
+                "--test-threads=1",
+            ],
+            cwd=str(comet),
+            capture_output=True,
+            text=True,
+            timeout=180,
+            check=False,
+        )
+        assert ran.returncode == 0, (
+            f"comet {filt} tests failed:\n{ran.stdout[-4000:]}\n{ran.stderr[-4000:]}"
+        )
+
+
+def _check_lavapipe_headed() -> None:
+    """Headed Comet on this VM needs lavapipe; vkCreateInstance used to die.
+
+    vulkaninfo is probed with DISPLAY unset (this VM's :1 rejects
+    X_CreateWindow). If xvfb and a built zeron exist, the real GPUI binary
+    must select llvmpipe and map a window — Story/Activity paint on that
+    surface; the row split is the desmos_story unit tests.
+    """
+    import os
+    import shutil
+    import subprocess
+
+    from desmos.front.cli import _repo_root
+
+    icd = "/usr/share/vulkan/icd.d/lvp_icd.json"
+    vulkaninfo = shutil.which("vulkaninfo")
+    if vulkaninfo is None or not os.path.isfile(icd):
+        return
+    env = dict(os.environ)
+    env["VK_ICD_FILENAMES"] = icd
+    # DISPLAY=:1 on this VM is an X server vulkaninfo cannot CreateWindow on
+    # (BadMatch). Headless instance + lavapipe is the contract Comet uses
+    # under xvfb; a broken DISPLAY must not fail the probe.
+    env.pop("DISPLAY", None)
+    ran = subprocess.run(
+        [vulkaninfo, "--summary"],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=20,
+        check=False,
+    )
+    assert ran.returncode == 0, ran.stderr or ran.stdout
+    blob = (ran.stdout + ran.stderr).lower()
+    assert "llvmpipe" in blob or "lvp" in blob, ran.stdout[-2000:]
+
+    xvfb = shutil.which("xvfb-run")
+    timeout = shutil.which("timeout")
+    zeron = _repo_root() / "vendor" / "comet" / "target" / "debug" / "zeron"
+    if xvfb is None or timeout is None or not zeron.is_file():
+        return
+    headed = dict(os.environ)
+    headed["VK_ICD_FILENAMES"] = icd
+    launched = subprocess.run(
+        [xvfb, "-a", timeout, "5", str(zeron)],
+        env=headed,
+        capture_output=True,
+        text=True,
+        timeout=20,
+        check=False,
+    )
+    out = launched.stdout + launched.stderr
+    assert "Found no drivers" not in out, out[-3000:]
+    assert "llvmpipe" in out.lower(), out[-3000:]
+    assert "Selected GPU" in out, out[-3000:]
+
+
 # The stubbed gland for the socket checks: the REAL bridge subprocess and the
 # REAL loop, with canned responses -- the record-golden pattern, one code path,
 # never a second engine. Content-addressed so call counts cannot skew it: the
@@ -1287,6 +1388,10 @@ const linked = Md.render("see https://example.com/x");
 if (!linked.includes('href="https://example.com/x"')) process.exit(5);
 const diff = Md.diffHtml("a\\nb\\n", "a\\nc\\n");
 if (!diff.includes("d-del") || !diff.includes("d-add") || !diff.includes("d-eq")) process.exit(6);
+const strike = Md.render("keep ~~this~~ but not ~that~");
+if (!strike.includes("<del>") || strike.includes("<del>that")) process.exit(7);
+const pct = Md.render("only: ~**10%** (~**300**)");
+if (pct.includes("<del>")) process.exit(8);
 process.exit(0);
 """
     ran = subprocess.run([node, "-e", script], capture_output=True, text=True)
@@ -2057,6 +2162,8 @@ def check() -> None:
         # the pager compiles either way and runs grok's agent instead of ours.
         _check_desk()
         _check_comet_launcher()
+        _check_comet_md_diff_contract()
+        _check_lavapipe_headed()
         _check_path_deps_tracked()
         _check_vendor_patch()
         _check_release_tui_launcher()

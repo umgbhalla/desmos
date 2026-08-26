@@ -72,6 +72,9 @@ Supported now:
 - create / resume a Desmos ACP session for a workspace;
 - stream assistant markdown and thinking on **Story** (`MessagePart::Thought`);
 - `complete()` cards and syscall chips on **Activity** (separate GPUI pane);
+- Grok markdown contract on Story: GFM + math + `~~` strike only (single `~`
+  stays literal, matching `xai-grok-markdown-core`);
+- gpuix-style word diffs on the Changes pane and inline edit diffs (`similar`);
 - model and thought_level from Desmos `configOptions`;
 - mid-turn steering (`_session/steering`);
 - Comet session registry + `session/load` of the ACP uuid;
@@ -81,16 +84,19 @@ Supported now:
 
 Not the same object as the TUI / desk:
 
-- gpuix React-on-GPUI markdown/diff (Comet paints with pulldown-cmark + its
-  own Changes pane; grok `StreamingMarkdownRenderer` is ratatui/Syntect —
-  hosting either in Comet without a grok-build half-copy is still a gap);
+- first-party gpuix React `<markdown>` / `<diff>` host (Comet now parses with
+  Grok's pulldown options + double-tilde-only strike, and paints gpuix-style
+  word diffs on Changes via `similar`; it still does not load `@gpuix/react`);
 - Zeron CRDT devices page (no Desmos analog. `persist.peers()` is the honest one);
 - attaching Comet and the TUI as two writers on `.desmos/bridge.sock`.
 
-Headed Linux without a GPU: `mesa-vulkan-drivers` (lavapipe). This VM's
-`vkCreateInstance` used to die with "Found no drivers"; with
-`VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json` wgpu selects
-`llvmpipe` and `python -m desmos comet` maps a real zeron window.
+Headed Linux without a GPU: `mesa-vulkan-drivers` (lavapipe).
+`VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json` makes wgpu select
+`llvmpipe`. `python -m desmos check --only front` probes that with
+`vulkaninfo` (DISPLAY unset — this VM's `:1` rejects `X_CreateWindow`) and,
+when `zeron` is built, `xvfb-run timeout 5 zeron` (must log `Selected GPU`
+llvmpipe, not "Found no drivers"). Story vs Activity is the `desmos_story`
+unit tests on that same GPUI crate.
 
 Comet is pinned as a Git submodule of the `umgbhalla/comet` fork. Harness
 changes land in that repository, then the root gitlink moves. The launcher
