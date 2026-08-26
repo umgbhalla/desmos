@@ -1,0 +1,16 @@
+{
+  "name": "desmos-gpuix",
+  "private": true,
+  "type": "module",
+  "version": "0.1.0",
+  "description": "First-party Desmos ACP host: gpuix native <markdown> and <diff wordDiff>",
+  "scripts": {
+    "start": "node src/main.js",
+    "probe": "node src/probe.js"
+  },
+  "dependencies": {
+    "@gpuix/native": "0.4.0",
+    "@gpuix/react": "0.4.0",
+    "react": "^19.0.0"
+  }
+}

@@ -255,6 +255,9 @@ Every surface drives the same `run_turns` over the same `World`.
 |---|---|---|
 | console | `python -m desmos console` | IPython with `step` and `world` bound |
 | TUI | `python -m desmos tui` | Rust, panes over a JSONL bridge |
+| Comet | `python -m desmos comet` | vendored zeron GPUI binary over ACP |
+| GPUIX | `python -m desmos gpuix` | `@gpuix/react` `<markdown>` / `<diff>` over ACP |
+| desk | `python -m desmos desk` | HTML viewport over in-process ACP |
 | headless | `python -m desmos run "task"` | one-shot, traces to `runs/` |
 | ACP | `python -m desmos acp` | NDJSON JSON-RPC for external frontends |
 | Jupyter | `python -m desmos kernel` | installs a kernelspec |

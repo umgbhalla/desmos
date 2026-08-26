@@ -75,6 +75,7 @@ __pycache__/
 *.egg-info/
 .venv/
 venv/
+node_modules/
 # Root-anchored. Unanchored `build/` also matched
 # vendor/grok-build/crates/build/, which holds xai-proto-build -- a workspace
 # member and a path dep of our root Cargo.toml. That silently dropped one crate

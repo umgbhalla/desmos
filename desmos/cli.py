@@ -17,6 +17,7 @@ __all__ = [
     "cmd_comet",
     "cmd_console",
     "cmd_desk",
+    "cmd_gpuix",
     "cmd_kernel",
     "cmd_run",
     "cmd_tui",

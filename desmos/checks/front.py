@@ -1400,6 +1400,122 @@ process.exit(0);
     )
 
 
+def _check_gpuix_host() -> None:
+    """Desk HTML is not gpuix. This host loads @gpuix/react and speaks ACP.
+
+    --acp always runs: a real `python -m desmos acp` child, initialize,
+    session/new, and the same applyUpdate the window uses. --tree needs the
+    published native binary plus a window (xvfb + lavapipe here); it mounts
+    <markdown> / <diff wordDiff> and asserts the retained tree, not docs.
+    """
+    import json
+    import os
+    import shutil
+    import subprocess
+    import sys
+    import tempfile
+
+    from desmos.front.cli import (
+        _gpuix_dir,
+        _gpuix_install,
+        _gpuix_native_ok,
+        _repo_root,
+    )
+
+    gpuix = _gpuix_dir()
+    assert (gpuix / "package.json").is_file(), gpuix
+    assert (gpuix / "src" / "app.js").is_file()
+    assert (gpuix / "src" / "probe.js").is_file()
+    node = shutil.which("node")
+    if node is None:
+        return
+
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(_repo_root())
+    env["DESMOS_PYTHON"] = sys.executable
+    env["DESMOS_TOOL_SYSCALLS"] = "0"
+
+    with tempfile.TemporaryDirectory() as tmp:
+        acp = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "desmos",
+                "gpuix",
+                "--acp-probe",
+                "--cwd",
+                tmp,
+                "--no-install",
+            ],
+            cwd=str(gpuix),
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=40,
+            check=False,
+        )
+        assert acp.returncode == 0, acp.stderr[-4000:] + acp.stdout[-4000:]
+        lines = [ln for ln in acp.stdout.splitlines() if ln.strip()]
+        assert lines, acp.stderr
+        payload = json.loads(lines[-1])
+        assert payload.get("ok") is True, payload
+        got = payload["acp"]
+        assert got["protocolVersion"] == 1, got
+        assert got["sessionId"], got
+        assert got["loadSession"] is True, got
+        assert got["storyKinds"] == ["thinking", "assistant"], got
+
+    if not _gpuix_native_ok(gpuix):
+        _gpuix_install(gpuix)
+    if not _gpuix_native_ok(gpuix):
+        return
+    xvfb = shutil.which("xvfb-run")
+    icd = "/usr/share/vulkan/icd.d/lvp_icd.json"
+    if xvfb is None:
+        return
+    headed = dict(env)
+    if os.path.isfile(icd):
+        headed["VK_ICD_FILENAMES"] = icd
+    speech = "keep ~~this~~ but not ~that~\n\nonly: ~**10%** (~**300**)\n"
+    headed["DESMOS_GPUIX_TURN"] = json.dumps({
+        "story": [
+            {"kind": "thinking", "text": "will strike ~~scratch~~ then speak"},
+            {"kind": "assistant", "text": speech},
+        ],
+        "activity": [
+            {
+                "id": "t1",
+                "family": "edit",
+                "title": "edit n.txt",
+                "diff": {"path": "n.txt", "oldText": "keep 1\n", "newText": "keep 2\n"},
+            }
+        ],
+    })
+    tree = subprocess.run(
+        [xvfb, "-a", node, str(gpuix / "src" / "probe.js"), "--tree"],
+        cwd=str(gpuix),
+        env=headed,
+        capture_output=True,
+        text=True,
+        timeout=40,
+        check=False,
+    )
+    assert tree.returncode == 0, tree.stderr[-4000:] + tree.stdout[-4000:]
+    lines = [ln for ln in tree.stdout.splitlines() if ln.strip()]
+    payload = json.loads(lines[-1])
+    assert payload.get("ok") is True, payload
+    sources = payload["tree"]["markdown"]
+    assert any(speech in src for src in sources), sources
+    assert any("~~scratch~~" in src for src in sources), sources
+    diffs = payload["tree"]["diffs"]
+    assert diffs, payload["tree"]
+    assert diffs[0].get("wordDiff") is True, diffs
+    patch = diffs[0].get("patch") or ""
+    assert "-keep 1" in patch and "+keep 2" in patch, patch
+    size = payload["tree"]["window"]
+    assert size["width"] > 0 and size["height"] > 0, size
+
+
 def _check_desk_roundtrip() -> None:
     import json
     import tempfile
@@ -2163,6 +2279,7 @@ def check() -> None:
         _check_desk()
         _check_comet_launcher()
         _check_comet_md_diff_contract()
+        _check_gpuix_host()
         _check_lavapipe_headed()
         _check_path_deps_tracked()
         _check_vendor_patch()

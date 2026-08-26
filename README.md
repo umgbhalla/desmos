@@ -448,7 +448,9 @@ While a step runs, `Enter` queues a follow-up instead of interrupting; an empty
 `--grok` launches grok-build's pager with `python -m desmos acp` on stdio.
 `python -m desmos comet` launches the vendored Comet desktop frontend with
 desmos registered as an ACP harness — see
-[docs/comet-frontend.md](docs/comet-frontend.md).
+[docs/comet-frontend.md](docs/comet-frontend.md). `python -m desmos gpuix`
+loads published `@gpuix/react` `<markdown>` / `<diff wordDiff>` over the
+same ACP server — see [docs/gpuix-frontend.md](docs/gpuix-frontend.md).
 
 ## Two providers
 
