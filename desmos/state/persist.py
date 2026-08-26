@@ -26,7 +26,7 @@ from desmos.kernel.types import Tool, World
 _UMASK = os.umask(0)
 os.umask(_UMASK)
 
-SCHEMA_VERSION = 16  # 16: named agents roster + declared channels
+SCHEMA_VERSION = 17  # 17: ACP session binds (Comet loadSession ids)
 #: Oldest build that can still read this schema. Additive changes leave it
 #: alone; anything an older reader would misread raises it.
 MIN_READER_VERSION = 9
@@ -489,6 +489,14 @@ CREATE TABLE IF NOT EXISTS sessions (
     cache_key TEXT NOT NULL,
     title TEXT NOT NULL DEFAULT ''
 );
+CREATE TABLE IF NOT EXISTS acp_sessions (
+    acp_id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_acp_sessions_session
+    ON acp_sessions(session_id);
 CREATE TABLE IF NOT EXISTS seats (
     id TEXT PRIMARY KEY,
     workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
@@ -2220,6 +2228,180 @@ def channel_list(world: World) -> list[dict[str, Any]]:
             -e["max_id"], e["channel"],
         ))
         return entries
+    finally:
+        db.close()
+
+
+def session_id_ok(session: str) -> bool:
+    """Same gate the TUI picker uses before interpolating an id into SQL."""
+    return bool(session) and all(c.isalnum() or c == "-" for c in session)
+
+
+def session_list(world: World) -> list[dict[str, Any]]:
+    """Resumable persist sessions. Same rows the TUI picker reads.
+
+    One sqlite file is one workspace, so the TUI query does not filter by
+    workspace_id. We still do: a misplaced path must not leak another cwd.
+    """
+    if not world.persist:
+        return []
+    path = state_file(world)
+    if not path.is_file():
+        return []
+    db = _open(path)
+    try:
+        workspace = _workspace_id(db, world, create=False)
+        if workspace is None:
+            return []
+        rows = db.execute(
+            """
+            SELECT id, started_at, messages, preview FROM (
+                SELECT s.id AS id,
+                       s.started_at AS started_at,
+                       (SELECT count(*) FROM messages m
+                         WHERE m.session_id = s.id) AS messages,
+                       coalesce(
+                           (SELECT p.prompt FROM prior_turns p
+                             WHERE p.session_id = s.id
+                             ORDER BY p.seq DESC LIMIT 1),
+                           ''
+                       ) AS preview
+                FROM sessions s
+                WHERE s.workspace_id = ?
+            )
+            WHERE messages > 0
+            ORDER BY started_at DESC
+            LIMIT 12
+            """,
+            (workspace,),
+        ).fetchall()
+        out: list[dict[str, Any]] = []
+        for row in rows:
+            preview = " ".join(str(row["preview"] or "").split())
+            out.append({
+                "id": str(row["id"]),
+                "started_at": str(row["started_at"] or ""),
+                "messages": int(row["messages"] or 0),
+                "preview": (
+                    preview if len(preview) <= 120
+                    else preview[:119].rstrip() + "…"
+                ),
+            })
+        return out
+    finally:
+        db.close()
+
+
+def session_turns(world: World, session: str) -> list[dict[str, str]]:
+    """prior_turns for one persist session, oldest first."""
+    if not world.persist or not session_id_ok(session):
+        return []
+    path = state_file(world)
+    if not path.is_file():
+        return []
+    db = _open(path)
+    try:
+        workspace = _workspace_id(db, world, create=False)
+        if workspace is None:
+            return []
+        owned = db.execute(
+            "SELECT id FROM sessions WHERE id = ? AND workspace_id = ?",
+            (session, workspace),
+        ).fetchone()
+        if owned is None:
+            return []
+        rows = db.execute(
+            "SELECT prompt, speech FROM prior_turns"
+            " WHERE session_id = ? ORDER BY seq",
+            (session,),
+        ).fetchall()
+        return [
+            {"prompt": str(row["prompt"] or ""), "speech": str(row["speech"] or "")}
+            for row in rows
+        ]
+    finally:
+        db.close()
+
+
+def acp_bind(world: World, acp_id: str) -> dict[str, str]:
+    """Record the ACP session uuid against this persist session.
+
+    Comet/desk `session/load` after a process restart needs the uuid
+    `session/new` issued. That id is not the sqlite sessions.id; this row is
+    the join, in the same database, not a second store.
+    """
+    if not world.persist:
+        return {"acp_id": acp_id, "session_id": ""}
+    if not session_id_ok(acp_id):
+        raise ValueError(f"unknown session {acp_id!r}")
+    announce(world)
+    db = _open(state_file(world))
+    now = datetime.now(timezone.utc).isoformat()
+    try:
+        with db:
+            workspace = _workspace_id(db, world)
+            assert workspace is not None
+            session = _session_id(db, world, workspace)
+            assert session is not None
+            db.execute(
+                """
+                INSERT INTO acp_sessions(acp_id, session_id, workspace_id, created_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(acp_id) DO UPDATE SET
+                    session_id = excluded.session_id,
+                    workspace_id = excluded.workspace_id
+                """,
+                (acp_id, session, workspace, now),
+            )
+        return {"acp_id": acp_id, "session_id": session, "workspace_id": workspace}
+    finally:
+        db.close()
+
+
+def acp_lookup(world: World, acp_id: str) -> dict[str, str] | None:
+    """The persist session an ACP uuid was bound to, if any."""
+    if not world.persist or not session_id_ok(acp_id):
+        return None
+    path = state_file(world)
+    if not path.is_file():
+        return None
+    db = _open(path)
+    try:
+        workspace = _workspace_id(db, world, create=False)
+        if workspace is None:
+            return None
+        row = db.execute(
+            "SELECT acp_id, session_id, workspace_id, created_at"
+            " FROM acp_sessions WHERE acp_id = ? AND workspace_id = ?",
+            (acp_id, workspace),
+        ).fetchone()
+        return dict(row) if row is not None else None
+    except sqlite3.OperationalError:
+        return None
+    finally:
+        db.close()
+
+
+def acp_list(world: World) -> list[dict[str, str]]:
+    if not world.persist:
+        return []
+    path = state_file(world)
+    if not path.is_file():
+        return []
+    db = _open(path)
+    try:
+        workspace = _workspace_id(db, world, create=False)
+        if workspace is None:
+            return []
+        rows = db.execute(
+            "SELECT acp_id, session_id, workspace_id, created_at"
+            " FROM acp_sessions WHERE workspace_id = ?"
+            " ORDER BY created_at DESC",
+            (workspace,),
+        ).fetchall()
+        return [dict(row) for row in rows]
+    except sqlite3.OperationalError:
+        return []
     finally:
         db.close()
 

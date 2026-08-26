@@ -154,6 +154,117 @@ def _check_release_tui_launcher() -> None:
         ], ran
 
 
+def _check_comet_launcher() -> None:
+    """Hash-gated Comet launch speaks python -m desmos acp; no GPU binary required."""
+    import os
+    import stat
+    import subprocess
+    import sys
+    import tempfile
+
+    from desmos.front.cli import (
+        _comet_acp_wrapper,
+        _comet_hash,
+        _comet_passthrough,
+        _comet_sources,
+        _comet_stale,
+        _comet_watch_roots,
+        _repo_root,
+    )
+
+    root = _repo_root()
+    with tempfile.TemporaryDirectory() as tmp:
+        comet = Path(tmp) / "comet"
+        (comet / "apps").mkdir(parents=True)
+        (comet / "crates").mkdir()
+        (comet / "Cargo.toml").write_text("[workspace]\n", encoding="utf-8")
+        (comet / "Cargo.lock").write_text("# lock\n", encoding="utf-8")
+        (comet / "rust-toolchain.toml").write_text(
+            '[toolchain]\nchannel = "stable"\n', encoding="utf-8"
+        )
+        src = comet / "crates" / "lib.rs"
+        src.write_text("pub fn x() {}\n", encoding="utf-8")
+        (comet / "target" / "noise").mkdir(parents=True)
+        noise = comet / "target" / "noise" / "skip.rs"
+        noise.write_text("should-not-hash\n", encoding="utf-8")
+        roots = _comet_watch_roots(comet)
+        assert any(p.name == "crates" for p in roots)
+        assert not any("target" in p.parts[-2:] and p.name == "noise" for p in roots)
+        before = _comet_hash(comet)
+        noise.write_text("changed-and-still-ignored\n", encoding="utf-8")
+        assert _comet_hash(comet) == before
+        binary = comet / "target" / "debug" / "zeron"
+        assert _comet_stale(comet, binary) is True
+        binary.parent.mkdir(parents=True, exist_ok=True)
+        binary.write_bytes(b"bin")
+        sources = _comet_sources(comet)
+        newest = max(f.stat().st_mtime for f in sources)
+        older = newest - 30
+        os.utime(binary, (older, older))
+        assert _comet_stale(comet, binary) is True
+        for f in sources:
+            os.utime(f, (older - 30, older - 30))
+        assert _comet_stale(comet, binary) is False
+        src.write_text("pub fn x() { let _ = 1; }\n", encoding="utf-8")
+        assert _comet_stale(comet, binary) is True
+        src.write_text("pub fn x() {}\n", encoding="utf-8")
+        assert _comet_stale(comet, binary) is False
+
+        wrapper = Path(_comet_acp_wrapper(root, comet))
+        assert wrapper.is_file()
+        mode = wrapper.stat().st_mode
+        assert mode & stat.S_IXUSR, oct(mode)
+        ran = subprocess.run(
+            [str(wrapper), "--help"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert ran.returncode == 0, ran.stderr
+        import json
+
+        handshake = json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {"protocolVersion": 1},
+            }
+        )
+        listed = subprocess.run(
+            [str(wrapper), "acp"],
+            input=handshake + "\n",
+            capture_output=True,
+            text=True,
+            timeout=8,
+            check=False,
+        )
+        assert listed.returncode == 0, listed.stderr
+        init = json.loads(listed.stdout.splitlines()[0])
+        assert init["result"]["protocolVersion"] == 1
+        assert init["result"]["_meta"]["steering"]["supported"] is True
+
+        fake = Path(tmp) / "zeron"
+        fake.write_text('#!/bin/sh\nprintf "%s\\n" "$@"\n', encoding="utf-8")
+        fake.chmod(0o755)
+        env = dict(os.environ)
+        env["PYTHONPATH"] = str(root)
+        env["DESMOS_COMET_BINARY"] = str(fake)
+        launched = subprocess.run(
+            [sys.executable, "-m", "desmos", "comet", "--cwd", tmp, "--", "status"],
+            env=env,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        assert launched.stdout.splitlines() == ["status"], launched
+
+        class _Args:
+            passthrough = ["--", "headless"]
+
+        assert _comet_passthrough(_Args()) == ["headless"]
+
+
 # The stubbed gland for the socket checks: the REAL bridge subprocess and the
 # REAL loop, with canned responses -- the record-golden pattern, one code path,
 # never a second engine. Content-addressed so call counts cannot skew it: the
@@ -1096,6 +1207,417 @@ def _check_replay_sid() -> None:
             os.environ["DESMOS_SESSION_ID"] = old_sid
 
 
+def _check_desk() -> None:
+    """The desk UI speaks live ACP over a real websocket, not a lookalike loop."""
+    import os
+
+    from desmos.front.acp import family_of, pane_of
+    from desmos.front.desk import STATIC_DIR
+    from desmos.state.persist import NEW_SESSION_ENV, SESSION_ID_ENV, SESSION_PID_ENV
+
+    assert pane_of({"sessionUpdate": "agent_thought_chunk"}) == "story"
+    assert pane_of({"sessionUpdate": "agent_message_chunk"}) == "story"
+    assert pane_of({"sessionUpdate": "tool_call"}) == "activity"
+    assert pane_of({"sessionUpdate": "tool_call_update"}) == "activity"
+    assert family_of({"title": "complete"}) == "complete"
+    assert family_of({"sessionUpdate": "agent_thought_chunk"}) == "thinking"
+
+    for name in ("index.html", "desk.css", "desk.js", "md.js"):
+        path = STATIC_DIR / name
+        assert path.is_file() and path.stat().st_size > 0, path
+    xterm = STATIC_DIR / "vendor" / "xterm" / "xterm.js"
+    assert xterm.is_file() and xterm.stat().st_size > 50_000, xterm
+    html = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+    assert 'id="story"' in html and 'id="activity"' in html
+    assert "vendor/xterm/xterm.js" in html
+
+    keys = (SESSION_ID_ENV, SESSION_PID_ENV, NEW_SESSION_ENV)
+    old_env = {k: os.environ.get(k) for k in keys}
+    old_tools = os.environ.get("DESMOS_TOOL_SYSCALLS")
+    for k in keys:
+        os.environ.pop(k, None)
+    os.environ["DESMOS_TOOL_SYSCALLS"] = "0"
+    try:
+        _check_desk_roundtrip()
+        _check_desk_markdown()
+    finally:
+        if old_tools is None:
+            os.environ.pop("DESMOS_TOOL_SYSCALLS", None)
+        else:
+            os.environ["DESMOS_TOOL_SYSCALLS"] = old_tools
+        for k, value in old_env.items():
+            if value is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = value
+
+
+def _check_desk_markdown() -> None:
+    """Fences, autolinks, and LCS diffs render through the desk markdown module."""
+    import json
+    import shutil
+    import subprocess
+
+    from desmos.front.desk import STATIC_DIR
+
+    node = shutil.which("node")
+    if node is None:
+        return
+    src = STATIC_DIR / "md.js"
+    js = STATIC_DIR / "desk.js"
+    syntax = subprocess.run(
+        [node, "--check", str(js)], capture_output=True, text=True
+    )
+    assert syntax.returncode == 0, syntax.stderr
+    script = f"""
+const fs = require("fs");
+const vm = require("vm");
+const ctx = {{}};
+ctx.window = ctx;
+ctx.globalThis = ctx;
+vm.createContext(ctx);
+vm.runInContext(fs.readFileSync({json.dumps(str(src))}, "utf8"), ctx);
+const Md = ctx.DesmosMd;
+if (!Md) process.exit(2);
+const fenced = Md.render("```python\\ndef hi():\\n  return 1\\n```");
+if (!fenced.includes("tok-kw") || !fenced.includes("fence")) process.exit(3);
+const indented = Md.render("   ```js\\nconst x = 1;\\n```");
+if (!indented.includes("const")) process.exit(4);
+const linked = Md.render("see https://example.com/x");
+if (!linked.includes('href="https://example.com/x"')) process.exit(5);
+const diff = Md.diffHtml("a\\nb\\n", "a\\nc\\n");
+if (!diff.includes("d-del") || !diff.includes("d-add") || !diff.includes("d-eq")) process.exit(6);
+process.exit(0);
+"""
+    ran = subprocess.run([node, "-e", script], capture_output=True, text=True)
+    assert ran.returncode == 0, (
+        f"md.js renderer failed ({ran.returncode}): {ran.stderr or ran.stdout}"
+    )
+
+
+def _check_desk_roundtrip() -> None:
+    import json
+    import tempfile
+    import urllib.request
+
+    from desmos.front.desk import RpcClient, serve_thread
+
+    with tempfile.TemporaryDirectory() as tmp:
+        cwd = Path(tmp)
+        port, stop, hub = serve_thread(cwd, port=0)
+        client = None
+        world = None
+        try:
+            page = urllib.request.urlopen(f"http://127.0.0.1:{port}/", timeout=4)
+            served = page.read().decode("utf-8")
+            assert page.status == 200
+            assert 'id="story"' in served and 'id="activity"' in served
+            assert 'id="composer-wrap"' in served and 'id="status"' in served
+            health = json.loads(urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=4).read())
+            assert health["ok"] is True
+            assert Path(health["cwd"]) == cwd.resolve()
+
+            for asset in (
+                "desk.css",
+                "desk.js",
+                "md.js",
+                "vendor/xterm/xterm.js",
+                "vendor/xterm/xterm.css",
+                "vendor/xterm/xterm-addon-fit.js",
+            ):
+                got = urllib.request.urlopen(f"http://127.0.0.1:{port}/{asset}", timeout=4)
+                assert got.status == 200, asset
+                payload = got.read()
+                assert len(payload) > 200, asset
+
+            client = RpcClient("127.0.0.1", port)
+            init = client.call("initialize", {"protocolVersion": 1})
+            assert init["result"]["protocolVersion"] == 1
+            assert init["result"]["agentCapabilities"]["loadSession"] is True
+            assert init["result"]["_meta"]["steering"]["supported"] is True
+            assert "_session/steering" in init["result"]["_meta"]["desmos"]["extensions"]
+            auth = client.call("authenticate", {"methodId": "none"}, req_id=2)
+            assert auth["result"] == {}
+            created = client.call("session/new", {"cwd": str(cwd)}, req_id=3)
+            sid = created["result"]["sessionId"]
+            assert sid
+            assert any(o.get("id") == "model" for o in created["result"]["configOptions"])
+            world = hub.server.sessions[sid]
+            world.model = "claude-opus-5"
+
+            def fake(_model, _system, messages, _max_tokens):
+                blob = json.dumps(messages)
+                if "<result" in blob:
+                    return {"content": [{"type": "text", "text": "done"}], "usage": {}}
+                return {
+                    "content": [
+                        {"type": "thinking", "thinking": "plan", "signature": "sig"},
+                        {"type": "text", "text": '<exec op="python">1+1</exec>'},
+                    ],
+                    "usage": {"input_tokens": 3, "output_tokens": 4},
+                }
+
+            world.complete_fn = fake
+            prompted = client.call(
+                "session/prompt",
+                {"sessionId": sid, "prompt": [{"type": "text", "text": "add one"}]},
+                req_id=4,
+                timeout=30,
+            )
+            assert prompted["result"]["stopReason"] == "end_turn", prompted
+            notes = prompted["_notes"]
+            kinds = [
+                n["params"]["update"]["sessionUpdate"]
+                for n in notes
+                if n.get("method") == "session/update"
+            ]
+            assert "agent_thought_chunk" in kinds, kinds
+            assert "agent_message_chunk" in kinds, kinds
+            assert "tool_call" in kinds, kinds
+            thought = next(
+                n for n in notes
+                if n.get("method") == "session/update"
+                and n["params"]["update"]["sessionUpdate"] == "agent_thought_chunk"
+            )
+            exec_call = next(
+                n for n in notes
+                if n.get("method") == "session/update"
+                and n["params"]["update"]["sessionUpdate"] == "tool_call"
+                and n["params"]["update"]["title"] == "exec"
+            )
+            complete = next(
+                n for n in notes
+                if n.get("method") == "session/update"
+                and n["params"]["update"]["sessionUpdate"] == "tool_call"
+                and n["params"]["update"]["title"] == "complete"
+            )
+            assert thought["params"]["_meta"]["desmos"]["pane"] == "story"
+            assert exec_call["params"]["_meta"]["desmos"]["pane"] == "activity"
+            assert exec_call["params"]["_meta"]["desmos"]["family"] == "syscall"
+            assert complete["params"]["_meta"]["desmos"]["pane"] == "activity"
+            assert complete["params"]["_meta"]["desmos"]["family"] == "complete"
+            assert complete["params"]["update"]["kind"] == "other"
+            speech = next(
+                n["params"]["update"]["content"]["text"]
+                for n in notes
+                if n.get("method") == "session/update"
+                and n["params"]["update"]["sessionUpdate"] == "agent_message_chunk"
+            )
+            assert "<result" not in speech
+
+            cancelled = client.call("session/cancel", {"sessionId": sid}, req_id=5)
+            assert cancelled["result"] == {}
+            efforted = client.call(
+                "session/set_config_option",
+                {"sessionId": sid, "configId": "thought_level", "value": "high"},
+                req_id=6,
+            )
+            assert world.thinking == "high", world.thinking
+            assert any(
+                o.get("currentValue") == "high"
+                for o in efforted["result"]["configOptions"]
+                if o.get("id") == "thought_level"
+            )
+            steered = client.call(
+                "_session/steering",
+                {
+                    "sessionId": sid,
+                    "prompt": [{"type": "text", "text": "slow down"}],
+                    "_meta": {"steering": {"idleBehavior": "promptRequired"}},
+                },
+                req_id=6.5,
+            )
+            assert steered["result"]["outcome"] == "promptRequired", steered
+            assert "slow down" in world.steers
+            missing = client.call(
+                "session/prompt",
+                {"sessionId": "no-such", "prompt": [{"type": "text", "text": "x"}]},
+                req_id=7,
+            )
+            assert missing.get("error", {}).get("code") == -32602
+
+            import os
+            import subprocess
+
+            from desmos.front.acp_env import git_snapshot, jail
+
+            try:
+                jail(cwd, "/etc/passwd")
+                raise AssertionError("absolute path outside cwd was allowed")
+            except ValueError:
+                pass
+            try:
+                jail(cwd, "../secret")
+                raise AssertionError("parent path outside cwd was allowed")
+            except ValueError:
+                pass
+            (cwd / "ok.txt").write_text("hello-desk\n", encoding="utf-8")
+            listed = client.call(
+                "_session/fs", {"sessionId": sid, "op": "list", "path": "."}, req_id=8
+            )
+            names = [row["name"] for row in listed["result"]["entries"]]
+            assert "ok.txt" in names, names
+            read = client.call(
+                "_session/fs",
+                {"sessionId": sid, "op": "read", "path": "ok.txt"},
+                req_id=9,
+            )
+            assert "hello-desk" in "\n".join(read["result"]["lines"])
+            escaped = client.call(
+                "_session/fs",
+                {"sessionId": sid, "op": "read", "path": "/etc/passwd"},
+                req_id=10,
+            )
+            assert escaped.get("error", {}).get("code") == -32602, escaped
+            parented = client.call(
+                "_session/fs",
+                {"sessionId": sid, "op": "read", "path": "../ok.txt"},
+                req_id=11,
+            )
+            assert parented.get("error", {}).get("code") == -32602, parented
+
+            git_env = {
+                **os.environ,
+                "GIT_AUTHOR_NAME": "desk-check",
+                "GIT_AUTHOR_EMAIL": "desk@check",
+                "GIT_COMMITTER_NAME": "desk-check",
+                "GIT_COMMITTER_EMAIL": "desk@check",
+            }
+
+            def _git(*args: str) -> None:
+                subprocess.run(
+                    ["git", *args],
+                    cwd=cwd,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                    env=git_env,
+                )
+
+            _git("init")
+            (cwd / "tracked.txt").write_text("a\n", encoding="utf-8")
+            _git("add", "tracked.txt")
+            _git("-c", "user.name=desk-check", "-c", "user.email=desk@check", "commit", "-m", "init")
+            (cwd / "tracked.txt").write_text("b\n", encoding="utf-8")
+            (cwd / "loose.txt").write_text("x\n", encoding="utf-8")
+            snap = git_snapshot(cwd)
+            assert snap["read"] is True and snap["error"] is None, snap
+            assert snap["dirty"] >= 1, snap
+            git_rpc = client.call("_session/git", {"sessionId": sid}, req_id=12)
+            paths = [row["path"] for row in git_rpc["result"]["status"]]
+            assert "tracked.txt" in paths, paths
+            assert git_rpc["result"]["dirty"] >= 1
+
+            posted = client.call(
+                "_session/post",
+                {"sessionId": sid, "channel": "general", "body": "desk-peer-hello"},
+                req_id=13,
+            )
+            assert posted["result"]["id"], posted
+            got = client.call(
+                "_session/channel_read",
+                {"sessionId": sid, "channel": "general"},
+                req_id=14,
+            )
+            bodies = [row["body"] for row in got["result"]["messages"]]
+            assert "desk-peer-hello" in bodies, bodies
+
+            listed_sessions = client.call(
+                "_session/sessions", {"sessionId": sid}, req_id=15
+            )
+            rows = listed_sessions["result"]["sessions"]
+            assert rows and rows[0]["messages"] > 0, listed_sessions
+            persist_id = rows[0]["id"]
+            loaded = client.call(
+                "session/load",
+                {"cwd": str(cwd), "sessionId": persist_id},
+                req_id=16,
+            )
+            assert loaded["result"]["sessionId"] == persist_id, loaded
+            loaded_world = hub.server.sessions[persist_id]
+            blob = json.dumps(loaded_world.messages)
+            assert "add one" in blob, blob[:500]
+            turns = loaded["result"].get("turns") or []
+            assert any("add one" in (row.get("prompt") or "") for row in turns), turns
+            unknown_load = client.call(
+                "session/load",
+                {"cwd": str(cwd), "sessionId": "no-such-session"},
+                req_id=17,
+            )
+            assert unknown_load.get("error", {}).get("code") == -32602
+            bridge = client.call("_session/bridge", {"sessionId": sid}, req_id=18)
+            assert bridge["result"]["attached"] is False
+
+            import sqlite3
+
+            from desmos.state.persist import acp_list, state_file
+
+            term_run = client.call(
+                "_session/term",
+                {"sessionId": sid, "op": "run", "body": "echo desk-pty-ok"},
+                req_id=19,
+            )
+            assert "error" not in term_run, term_run
+            term_text = str((term_run.get("result") or {}).get("text") or "")
+            peek = client.call(
+                "_session/term",
+                {"sessionId": sid, "op": "peek", "name": "main"},
+                req_id=20,
+            )
+            peek_text = str((peek.get("result") or {}).get("text") or "")
+            pty_blob = term_text + "\n" + peek_text
+            if "desk-pty-ok" not in pty_blob:
+                raise AssertionError(f"term PTY did not echo: {pty_blob!r}")
+            listed_term = client.call(
+                "_session/term", {"sessionId": sid, "op": "list"}, req_id=21
+            )
+            term_names = [row["name"] for row in listed_term["result"]["shells"]]
+            assert "main" in term_names, listed_term
+            import base64
+
+            term_bytes = client.call(
+                "_session/term",
+                {"sessionId": sid, "op": "bytes", "name": "main"},
+                req_id=21.5,
+            )
+            raw_pty = base64.b64decode(term_bytes["result"]["data"] or "")
+            if b"desk-pty-ok" not in raw_pty:
+                raise AssertionError(f"term bytes missed echo: {raw_pty!r}")
+
+            db_path = state_file(world)
+            with sqlite3.connect(db_path) as db:
+                cols = [r[1] for r in db.execute("PRAGMA table_info(acp_sessions)")]
+            assert "acp_id" in cols and "session_id" in cols, cols
+            binds = acp_list(world)
+            if not any(row.get("acp_id") == sid for row in binds):
+                raise AssertionError(f"acp_bind missing {sid}: {binds!r}")
+
+            hub.server.sessions.clear()
+            hub.server._convo.clear()
+            uuid_loaded = client.call(
+                "session/load",
+                {"cwd": str(cwd), "sessionId": sid},
+                req_id=22,
+            )
+            assert uuid_loaded.get("error") is None, uuid_loaded
+            assert uuid_loaded["result"]["sessionId"] == sid, uuid_loaded
+            restored = (
+                json.dumps(uuid_loaded["result"].get("story") or [])
+                + json.dumps(uuid_loaded["result"].get("turns") or [])
+                + json.dumps(world.messages)
+            )
+            if "add one" not in restored:
+                raise AssertionError(f"acp uuid load lost transcript: {restored[:800]!r}")
+        finally:
+            if world is not None:
+                from desmos.kernel.shell import close_all as _close_shells
+
+                _close_shells(world)
+            if client is not None:
+                client.close()
+            stop()
+
+
 def check() -> None:
     import tempfile
 
@@ -1202,7 +1724,7 @@ def check() -> None:
         init = acp_replies[0]["result"]
         assert init["protocolVersion"] == 1
         assert init["authMethods"][0]["id"] == "none"
-        assert init["agentCapabilities"]["loadSession"] is False
+        assert init["agentCapabilities"]["loadSession"] is True
         # What we advertise has to be what prompt_text carries. Claiming image
         # support the loop cannot take made the pager send an image block,
         # prompt_text drop it, and the empty prompt answer end_turn with no
@@ -1223,6 +1745,13 @@ def check() -> None:
         created = acp.handle({"jsonrpc": "2.0", "id": 10, "method": "session/new", "params": {"cwd": str(cwd)}})
         assert created is not None
         sid = created["result"]["sessionId"]
+        missed = acp.handle({
+            "jsonrpc": "2.0",
+            "id": 10.4,
+            "method": "session/load",
+            "params": {"sessionId": "nope", "cwd": str(cwd)},
+        })
+        assert missed is not None and missed.get("error", {}).get("code") == -32602
 
         def fake_acp(_model, _system, messages, _max_tokens):
             blob = json.dumps(messages)
@@ -1260,8 +1789,65 @@ def check() -> None:
         assert "tool_call" in kinds
         assert "tool_call_update" in kinds
         assert all(n["params"].get("_meta", {}).get("promptId") == "p-check" for n in notes if n.get("method") == "session/update")
-        tool = next(n["params"]["update"] for n in notes if n.get("method") == "session/update" and n["params"]["update"]["sessionUpdate"] == "tool_call")
-        assert tool["title"] == "exec" and tool["kind"] == "execute"
+        tools = [
+            n["params"]["update"]
+            for n in notes
+            if n.get("method") == "session/update" and n["params"]["update"]["sessionUpdate"] == "tool_call"
+        ]
+        exec_tool = next(u for u in tools if u["title"] == "exec")
+        assert exec_tool["kind"] == "execute", exec_tool
+        complete_tool = next(u for u in tools if u["title"] == "complete")
+        assert complete_tool["kind"] == "other", complete_tool
+        panes = {n["params"]["_meta"]["desmos"]["pane"] for n in notes if n.get("method") == "session/update"}
+        families = [n["params"]["_meta"]["desmos"]["family"] for n in notes if n.get("method") == "session/update"]
+        thought_panes = [
+            n["params"]["_meta"]["desmos"]["pane"]
+            for n in notes
+            if n.get("method") == "session/update"
+            and n["params"]["update"]["sessionUpdate"] == "agent_thought_chunk"
+        ]
+        tool_panes = [
+            n["params"]["_meta"]["desmos"]["pane"]
+            for n in notes
+            if n.get("method") == "session/update"
+            and n["params"]["update"]["sessionUpdate"] in ("tool_call", "tool_call_update")
+        ]
+        assert thought_panes and set(thought_panes) == {"story"}, thought_panes
+        assert tool_panes and set(tool_panes) == {"activity"}, tool_panes
+        assert "complete" in families and "syscall" in families
+        assert "story" in panes and "activity" in panes
+        created_opts = created["result"]["configOptions"]
+        assert any(o.get("category") == "model" for o in created_opts)
+        assert any(o.get("category") == "thought_level" for o in created_opts)
+
+        efforted = acp.handle({
+            "jsonrpc": "2.0",
+            "id": 11.5,
+            "method": "session/set_config_option",
+            "params": {"sessionId": sid, "configId": "thought_level", "value": "high"},
+        })
+        assert efforted["result"]["configOptions"]
+        assert acp.sessions[sid].thinking == "high"
+        steered = acp.handle({
+            "jsonrpc": "2.0",
+            "id": 11.6,
+            "method": "_session/steer",
+            "params": {"sessionId": sid, "text": "slow down"},
+        })
+        assert steered["result"]["outcome"] == "promptRequired", steered
+        assert "slow down" in acp.sessions[sid].steers
+        comet_steer = acp.handle({
+            "jsonrpc": "2.0",
+            "id": 11.7,
+            "method": "_session/steering",
+            "params": {
+                "sessionId": sid,
+                "prompt": [{"type": "text", "text": "keep going"}],
+                "_meta": {"steering": {"idleBehavior": "promptRequired"}},
+            },
+        })
+        assert comet_steer["result"]["outcome"] == "promptRequired", comet_steer
+        assert "keep going" in acp.sessions[sid].steers
 
         # The pager opens a second session on the same cwd for every new
         # thread. Sessions on one workspace share the World -- persist keys its
@@ -1469,6 +2055,8 @@ def check() -> None:
         # What can still go missing is the DESMOS_ACP branch if that gitlink is
         # moved to an incompatible fork commit -- and that is silent, because
         # the pager compiles either way and runs grok's agent instead of ours.
+        _check_desk()
+        _check_comet_launcher()
         _check_path_deps_tracked()
         _check_vendor_patch()
         _check_release_tui_launcher()

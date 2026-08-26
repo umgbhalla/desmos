@@ -143,17 +143,53 @@ def cmd_acp(args: argparse.Namespace) -> int:
     return serve(cwd=cwd)
 
 
+def cmd_desk(args: argparse.Namespace) -> int:
+    """Serve the first-party desk UI and speak ACP to the live kernel."""
+    _on_path()
+    from desmos.front.desk import serve
+
+    cwd = Path(args.cwd or os.environ.get("DESMOS_CWD") or os.environ.get("PWD") or ".").resolve()
+    return serve(
+        cwd,
+        host=args.host,
+        port=int(args.port),
+        open_browser=not args.no_browser,
+    )
+
+
+def _comet_passthrough(args: argparse.Namespace) -> list[str]:
+    extra = list(getattr(args, "passthrough", []) or [])
+    if extra and extra[0] == "--":
+        extra = extra[1:]
+    return extra
+
+
 def cmd_comet(args: argparse.Namespace) -> int:
-    """Build and launch the vendored Comet frontend with Desmos over ACP."""
+    """Build and launch the vendored Comet GPUI frontend with Desmos over ACP."""
     _on_path()
     import shutil
     import subprocess
 
     root = _repo_root()
     comet = root / "vendor" / "comet"
-    manifest = comet / "Cargo.toml"
-    if not manifest.is_file():
-        print("clone Comet into vendor/comet")
+    extra = _comet_passthrough(args)
+    env = os.environ.copy()
+    env.setdefault("DESMOS_CWD", str(Path(args.cwd).resolve()))
+    wrap_parent = comet if (comet / "Cargo.toml").is_file() else root
+    env["DESMOS_ACP_EXECUTABLE"] = _comet_acp_wrapper(root, wrap_parent)
+
+    release_binary = os.environ.get("DESMOS_COMET_BINARY")
+    if release_binary:
+        bin_path = Path(release_binary).expanduser().resolve()
+        if not bin_path.is_file():
+            print(f"comet binary not found: {bin_path}", file=sys.stderr)
+            return 1
+        os.chdir(Path(args.cwd).resolve())
+        os.execve(str(bin_path), [str(bin_path), *extra], env)
+        return 1
+
+    if not (comet / "Cargo.toml").is_file():
+        print("run: git submodule update --init vendor/comet")
         return 1
 
     cargo = shutil.which("cargo")
@@ -161,33 +197,108 @@ def cmd_comet(args: argparse.Namespace) -> int:
         print("desmos comet needs cargo")
         return 1
 
-    desmos_executable = shutil.which("desmos")
-    sibling = Path(sys.executable).with_name("desmos")
-    if desmos_executable is None and sibling.is_file():
-        desmos_executable = str(sibling)
-    if desmos_executable is None:
-        print("install Desmos first (for example: uv pip install -e .)")
-        return 1
-
-    env = os.environ.copy()
-    env["DESMOS_ACP_EXECUTABLE"] = desmos_executable
+    release = bool(getattr(args, "release", False))
+    profile = "release" if release else "debug"
+    binary = comet / "target" / profile / "zeron"
     if not args.no_build:
-        result = subprocess.run(
-            [cargo, "build", "--locked", "-p", "zeron"],
-            cwd=comet,
-            env=env,
-            check=False,
-        )
-        if result.returncode:
-            return result.returncode
+        if _comet_stale(comet, binary, release):
+            print(f"building comet ({profile})…", file=sys.stderr)
+            cmd = [cargo, "build", "--locked", "-p", "zeron"]
+            if release:
+                cmd.append("--release")
+            result = subprocess.run(cmd, cwd=comet, env=env, check=False)
+            if result.returncode:
+                return result.returncode
+            _comet_write_stamp(comet, release)
+        else:
+            print(f"comet {profile} up to date", file=sys.stderr)
 
-    binary = comet / "target" / "debug" / "zeron"
     if not binary.is_file():
         print("Comet is not built; omit --no-build for the first launch")
         return 1
 
     os.chdir(Path(args.cwd).resolve())
-    os.execve(binary, [str(binary)], env)
+    os.execve(str(binary), [str(binary), *extra], env)
+
+
+def _comet_watch_roots(comet: Path) -> list[Path]:
+    """Comet sources the binary is built from. Never walk target/."""
+    return [
+        comet / "apps",
+        comet / "crates",
+        comet / "Cargo.toml",
+        comet / "Cargo.lock",
+        comet / "rust-toolchain.toml",
+    ]
+
+
+def _comet_sources(comet: Path) -> list[Path]:
+    files: list[Path] = []
+    for path in _comet_watch_roots(comet):
+        if path.is_file():
+            files.append(path)
+        elif path.is_dir():
+            files.extend(
+                f
+                for f in path.rglob("*")
+                if f.is_file() and ".git" not in f.parts and "target" not in f.parts
+            )
+    return sorted(files)
+
+
+def _comet_hash(comet: Path) -> str:
+    import hashlib
+
+    h = hashlib.sha256()
+    for f in _comet_sources(comet):
+        h.update(str(f.relative_to(comet)).encode())
+        h.update(f.read_bytes())
+    return h.hexdigest()
+
+
+def _comet_stamp_path(comet: Path, release: bool) -> Path:
+    profile = "release" if release else "debug"
+    return comet / "target" / profile / ".desmos-comet.hash"
+
+
+def _comet_write_stamp(comet: Path, release: bool) -> None:
+    stamp = _comet_stamp_path(comet, release)
+    stamp.parent.mkdir(parents=True, exist_ok=True)
+    stamp.write_text(_comet_hash(comet), encoding="utf-8")
+
+
+def _comet_stale(comet: Path, binary: Path, release: bool = False) -> bool:
+    """True when the zeron binary was built from different Comet source bytes."""
+    if not binary.is_file():
+        return True
+    stamp = _comet_stamp_path(comet, release)
+    if not stamp.is_file():
+        newest = max((f.stat().st_mtime for f in _comet_sources(comet)), default=0.0)
+        if newest <= binary.stat().st_mtime:
+            _comet_write_stamp(comet, release)
+            return False
+        return True
+    return stamp.read_text(encoding="utf-8").strip() != _comet_hash(comet)
+
+
+def _comet_acp_wrapper(root: Path, comet: Path) -> str:
+    """Absolute program Comet spawns as `{wrapper} acp`.
+
+    Comet's Desmos spec is `desmos acp`. A console-script named desmos is
+    optional; this wrapper is `python -m desmos` so the same checkout's ACP
+    server is what the GPUI binary talks to.
+    """
+    path = comet / "target" / "desmos-acp"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    body = (
+        "#!/bin/sh\n"
+        f'export PYTHONPATH="{root}${{PYTHONPATH:+:$PYTHONPATH}}"\n'
+        f'exec "{sys.executable}" -m desmos "$@"\n'
+    )
+    if not path.is_file() or path.read_text(encoding="utf-8") != body:
+        path.write_text(body, encoding="utf-8")
+        path.chmod(0o755)
+    return str(path)
 
 
 def cmd_tui(args: argparse.Namespace) -> int:
@@ -510,9 +621,15 @@ def main() -> int:
     )
     b.set_defaults(func=cmd_bridge)
 
-    co = sub.add_parser("comet", help="launch Comet with Desmos as an ACP agent")
+    co = sub.add_parser("comet", help="launch Comet (GPUI) with Desmos as an ACP agent")
     co.add_argument("--cwd", default=".")
-    co.add_argument("--no-build", action="store_true", help="launch the existing debug binary")
+    co.add_argument("--no-build", action="store_true", help="launch the existing binary")
+    co.add_argument("--release", action="store_true", help="release build (default is debug)")
+    co.add_argument(
+        "passthrough",
+        nargs=argparse.REMAINDER,
+        help="forwarded to zeron (place after --)",
+    )
     co.set_defaults(func=cmd_comet)
 
     t = sub.add_parser("tui", help="three-pane TUI: trajectory | calls | input")
@@ -531,6 +648,13 @@ def main() -> int:
     a = sub.add_parser("acp", help="ACP stdio server for external frontends")
     a.add_argument("--cwd", default="", help="default cwd before session/new selects one")
     a.set_defaults(func=cmd_acp)
+
+    d = sub.add_parser("desk", help="desktop/web UI over ACP (story | activity | composer)")
+    d.add_argument("--cwd", default=".")
+    d.add_argument("--host", default="127.0.0.1")
+    d.add_argument("--port", default="7734")
+    d.add_argument("--no-browser", action="store_true", help="do not open a browser")
+    d.set_defaults(func=cmd_desk)
 
     se = sub.add_parser("seat", help="operator-gated seat lifecycle (docs/seats.md)")
     seat_sub = se.add_subparsers(dest="action", required=True)

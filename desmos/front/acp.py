@@ -12,6 +12,7 @@ import queue
 import sys
 import threading
 import uuid
+import warnings
 from pathlib import Path
 from typing import Any, Callable, IO, Iterator, TextIO
 
@@ -20,9 +21,78 @@ from desmos.kernel.loop import new_world, run_turns
 
 PROTOCOL_VERSION = 1
 
+# Story is speech and thinking. Activity is the wire. The TUI enforces this by
+# never routing a result event into the story pane; ACP tags the same split so
+# a web/desktop client cannot accidentally flatten everything to `out`.
+STORY_UPDATES = frozenset({"agent_thought_chunk", "agent_message_chunk"})
+ACTIVITY_UPDATES = frozenset({"tool_call", "tool_call_update"})
+
 
 class _TurnFailed(Exception):
     """The step ended on an error event. A stopReason would report it as an answer."""
+
+
+def _available_models() -> list[dict[str, str]]:
+    from desmos.transport.settings import CATALOG
+
+    rows: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for entry in CATALOG.values():
+        for model in entry.get("models") or []:
+            if model in seen:
+                continue
+            seen.add(model)
+            rows.append({"modelId": model, "name": model})
+    if not rows:
+        rows.append({"modelId": DEFAULT_MODEL, "name": DEFAULT_MODEL})
+    return rows
+
+
+def _efforts_for(model: str) -> list[str]:
+    from desmos.transport.settings import CATALOG, provider_of
+
+    entry = CATALOG.get(provider_of(model)) or {}
+    return list(entry.get("efforts") or ["low"])
+
+
+def config_options(world: Any | None = None) -> list[dict[str, Any]]:
+    """ACP session config surface: model + thought_level from the live catalog.
+
+    Comet/gpuix-class clients set these through session/set_config_option.
+    The values are the same objects the TUI picker reads — not a second list.
+    """
+    model = str(getattr(world, "model", None) or DEFAULT_MODEL)
+    effort = str(getattr(world, "thinking", None) or "low")
+    models = _available_models()
+    efforts = _efforts_for(model)
+    if effort not in efforts and efforts:
+        effort = efforts[0]
+    return [
+        {
+            "id": "model",
+            "type": "select",
+            "category": "model",
+            "name": "Model",
+            "currentValue": model,
+            "options": [{"value": row["modelId"], "name": row["name"]} for row in models],
+        },
+        {
+            "id": "thought_level",
+            "type": "select",
+            "category": "thought_level",
+            "name": "Thinking",
+            "currentValue": effort,
+            "options": [{"value": item, "name": item} for item in efforts],
+        },
+    ]
+
+
+def session_models(world: Any | None = None) -> dict[str, Any]:
+    model = str(getattr(world, "model", None) or DEFAULT_MODEL)
+    return {
+        "currentModelId": model,
+        "availableModels": _available_models(),
+    }
 
 
 def initialize_result() -> dict[str, Any]:
@@ -30,7 +100,9 @@ def initialize_result() -> dict[str, Any]:
     return {
         "protocolVersion": PROTOCOL_VERSION,
         "agentCapabilities": {
-            "loadSession": False,
+            # Persist session ids from `_session/sessions` / the TUI picker,
+            # and ACP uuids bound in `acp_sessions` at session/new.
+            "loadSession": True,
             # run_turns takes a prompt string, so an image block has nowhere to
             # go; prompt_text used to drop it and the empty prompt answered
             # end_turn with no model call. Advertise what this agent carries.
@@ -42,12 +114,187 @@ def initialize_result() -> dict[str, Any]:
             "cancelRewind": False,
             "sessionRecap": False,
             "availableCommands": [],
+            "steering": {"supported": True},
             "modelState": {
                 "currentModelId": model,
-                "availableModels": [{"modelId": model, "name": model}],
+                "availableModels": _available_models(),
+            },
+            "desmos": {
+                "loadSession": "persist+acp",
+                "extensions": [
+                    "_session/steer",
+                    "_session/steering",
+                    "_session/git",
+                    "_session/fs",
+                    "_session/sessions",
+                    "_session/peers",
+                    "_session/roster",
+                    "_session/channels",
+                    "_session/channel_read",
+                    "_session/post",
+                    "_session/bridge",
+                    "_session/term",
+                ],
             },
         },
     }
+
+
+def pane_of(update: dict[str, Any]) -> str:
+    """Which Desmos pane an ACP sessionUpdate belongs on."""
+    kind = str(update.get("sessionUpdate") or "")
+    if kind in STORY_UPDATES:
+        return "story"
+    return "activity"
+
+
+def family_of(update: dict[str, Any]) -> str:
+    """Syscall family for activity cards. Story chunks are not families."""
+    meta = update.get("_meta")
+    if isinstance(meta, dict):
+        desmos = meta.get("desmos")
+        if isinstance(desmos, dict) and desmos.get("family"):
+            return str(desmos["family"])
+    title = str(update.get("title") or "")
+    if title == "complete":
+        return "complete"
+    if title in {"edit", "workspace"} or title.endswith(" edit"):
+        return "edit"
+    kind = str(update.get("sessionUpdate") or "")
+    if kind in STORY_UPDATES:
+        return "speech" if kind == "agent_message_chunk" else "thinking"
+    return "syscall"
+
+
+def _clip_text(text: str, cap: int = 8000) -> str:
+    if len(text) <= cap:
+        return text
+    return text[: cap - 16] + "\n…[truncated]"
+
+
+def _is_edit(ev: dict[str, Any]) -> bool:
+    tag = str(ev.get("tag") or "")
+    attrs = ev.get("attrs") if isinstance(ev.get("attrs"), dict) else {}
+    return tag == "edit" or (tag == "workspace" and str(attrs.get("op") or "") == "edit")
+
+
+def _result_title(ev: dict[str, Any]) -> str:
+    """ACP toolCall title is the kernel tag. A prettier label rides _meta."""
+    return str(ev.get("tag") or "tool")
+
+
+def _result_label(ev: dict[str, Any]) -> str:
+    tag = str(ev.get("tag") or "tool")
+    attrs = ev.get("attrs") if isinstance(ev.get("attrs"), dict) else {}
+    op = str(attrs.get("op") or "")
+    path = str(attrs.get("path") or "")
+    if _is_edit(ev):
+        name = path.rsplit("/", 1)[-1] if path else ""
+        return f"edit {name}".strip() if name else "edit"
+    if op and op != tag:
+        return f"{tag} {op}"
+    return tag
+
+
+def _result_locations(ev: dict[str, Any]) -> list[dict[str, Any]]:
+    attrs = ev.get("attrs") if isinstance(ev.get("attrs"), dict) else {}
+    path = str(attrs.get("path") or "")
+    if not path:
+        return []
+    loc: dict[str, Any] = {"path": path}
+    line = ev.get("line")
+    if line is not None:
+        try:
+            loc["line"] = int(line)
+        except (TypeError, ValueError):
+            pass
+    return [loc]
+
+
+def _result_content(ev: dict[str, Any], text: str) -> list[dict[str, Any]]:
+    chunks: list[dict[str, Any]] = []
+    if _is_edit(ev):
+        diff = _edit_diff(ev)
+        if diff is not None:
+            chunks.append(diff)
+    if text:
+        chunks.append({
+            "type": "content",
+            "content": {"type": "text", "text": text},
+        })
+    return chunks
+
+
+def _edit_diff(ev: dict[str, Any]) -> dict[str, Any] | None:
+    attrs = ev.get("attrs") if isinstance(ev.get("attrs"), dict) else {}
+    path = str(attrs.get("path") or "")
+    body = str(ev.get("body") or "")
+    old = new = ""
+    try:
+        from desmos.kernel.edit import parse_edit_body
+
+        old, new = parse_edit_body(body, attrs)
+    except Exception:  # noqa: BLE001 — a refused/ambiguous body still has text
+        if "\n---\n" in body:
+            old, _, new = body.partition("\n---\n")
+    if not old and not new:
+        return None
+    return {
+        "type": "diff",
+        "path": path or "edit",
+        "oldText": old,
+        "newText": new,
+    }
+
+
+def _complete_card(ev: dict[str, Any]) -> str:
+    """Activity-pane summary of one complete() POST. Never the raw key."""
+    req = ev.get("request") if isinstance(ev.get("request"), dict) else {}
+    messages = req.get("messages") if isinstance(req.get("messages"), list) else []
+    summary = {
+        "model": ev.get("model"),
+        "thinking": ev.get("thinking"),
+        "origin": ev.get("origin"),
+        "n": ev.get("n"),
+        "messages": len(messages),
+        "thoughts": ev.get("thoughts"),
+        "redacted": ev.get("redacted"),
+        "usage": ev.get("usage") or {},
+        "spans": ev.get("spans") or [],
+        "residue": ev.get("residue") or "",
+    }
+    return json.dumps(summary, default=str, indent=2)
+
+
+def _story_from_messages(messages: Any) -> list[dict[str, str]]:
+    """User/assistant speech from a persist transcript. Results stay off story."""
+    story: list[dict[str, str]] = []
+    for item in messages or []:
+        if not isinstance(item, dict):
+            continue
+        role = str(item.get("role") or "")
+        content = item.get("content")
+        if isinstance(content, list):
+            parts: list[str] = []
+            for part in content:
+                if isinstance(part, str) and part:
+                    parts.append(part)
+                elif isinstance(part, dict) and part.get("type") == "text":
+                    text = part.get("text") or ""
+                    if text:
+                        parts.append(str(text))
+            text = "".join(parts)
+        else:
+            text = str(content or "")
+        if not text.strip():
+            continue
+        if role == "user" and text.lstrip().startswith("<result"):
+            continue
+        if role == "user":
+            story.append({"kind": "user", "text": text})
+        elif role == "assistant":
+            story.append({"kind": "assistant", "text": text})
+    return story
 
 
 def prompt_text(blocks: Any) -> str:
@@ -153,6 +400,38 @@ class AcpServer:
             return rpc_result(req_id, {})
         if method == "session/new":
             return rpc_result(req_id, self._session_new(params))
+        if method == "session/load":
+            try:
+                return rpc_result(req_id, self._session_load(params))
+            except ValueError as exc:
+                return rpc_error(req_id, -32602, str(exc))
+        env = {
+            "_session/git": self._session_git,
+            "_session/fs": self._session_fs,
+            "_session/sessions": self._session_sessions,
+            "_session/peers": self._session_peers,
+            "_session/roster": self._session_roster,
+            "_session/channels": self._session_channels,
+            "_session/channel_read": self._session_channel_read,
+            "_session/post": self._session_post,
+            "_session/bridge": self._session_bridge,
+            "_session/term": self._session_term,
+        }
+        if method in env:
+            try:
+                return rpc_result(req_id, env[method](params))
+            except ValueError as exc:
+                return rpc_error(req_id, -32602, str(exc))
+        if method == "session/set_config_option":
+            try:
+                return rpc_result(req_id, self._set_config_option(params))
+            except ValueError as exc:
+                return rpc_error(req_id, -32602, str(exc))
+        if method == "_session/steer" or method == "_session/steering":
+            try:
+                return rpc_result(req_id, self._session_steer(params))
+            except ValueError as exc:
+                return rpc_error(req_id, -32602, str(exc))
         if method == "session/prompt":
             try:
                 return rpc_result(req_id, self._session_prompt(params))
@@ -181,22 +460,22 @@ class AcpServer:
             return rpc_error(None, -32600, "Invalid Request")
         return self.handle(msg)
 
-    def _session_new(self, params: dict[str, Any]) -> dict[str, str]:
+    def _cwd_of(self, params: dict[str, Any]) -> Path:
         cwd_raw = params.get("cwd") or self.default_cwd
         cwd = Path(str(cwd_raw)).expanduser()
         if not cwd.is_absolute():
             cwd = (self.default_cwd / cwd).resolve()
         else:
             cwd = cwd.resolve()
-        session_id = str(uuid.uuid4())
+        return cwd
+
+    def _world_for_cwd(self, cwd: Path) -> Any:
         with self._lock:
             entry = self._worlds.get(cwd)
         if entry is None:
-            # new_world loads the workspace's saved state. loadSession is
-            # advertised false because we cannot restore a session by id;
-            # the durable brain of a directory is a different thing. It reads
-            # SQLite, so build it outside the lock -- the lock guards the dicts,
-            # and _session_cancel waits on it -- and double-check on insert.
+            # new_world loads the workspace's saved state. It reads SQLite, so
+            # build it outside the lock -- the lock guards the dicts, and
+            # _session_cancel waits on it -- and double-check on insert.
             world = new_world(cwd)
             entry = (world, list(world.messages), list(world.prior))
         from desmos.transport.settings import load as _load_settings
@@ -212,10 +491,254 @@ class AcpServer:
                 # only at creation latched the first session's model and effort
                 # for the life of the process.
                 world.model, world.thinking = saved.model, saved.effort
+        return world
+
+    def _require_world(self, params: dict[str, Any]) -> Any:
+        session_id = str(params.get("sessionId") or "")
+        with self._lock:
+            world = self.sessions.get(session_id)
+        if world is None:
+            raise ValueError(f"unknown session {session_id!r}")
+        return world
+
+    def _session_payload(self, session_id: str, world: Any, *, loaded: bool = False) -> dict[str, Any]:
+        from desmos.state import persist
+
+        persist_id = persist.run_id()
+        meta: dict[str, Any] = {
+            "desmos": {
+                "persistSessionId": persist_id,
+                "cwd": str(world.cwd),
+            }
+        }
+        payload: dict[str, Any] = {
+            "sessionId": session_id,
+            "configOptions": config_options(world),
+            "models": session_models(world),
+            "_meta": meta,
+        }
+        if loaded:
+            payload["turns"] = persist.session_turns(world, persist_id)
+            payload["story"] = _story_from_messages(world.messages)
+        return payload
+
+    def _session_new(self, params: dict[str, Any]) -> dict[str, Any]:
+        cwd = self._cwd_of(params)
+        session_id = str(uuid.uuid4())
+        world = self._world_for_cwd(cwd)
+        with self._lock:
+            entry = self._worlds[cwd]
             self.sessions[session_id] = world
             self._convo[session_id] = (list(entry[1]), list(entry[2]))
             self._tool_ids[session_id] = itertools.count(1)
-        return {"sessionId": session_id}
+        from desmos.state import persist as _persist
+
+        try:
+            _persist.acp_bind(world, session_id)
+        except Exception as exc:  # noqa: BLE001 — a missed bind still issues the uuid
+            warnings.warn(f"acp_bind failed: {exc}", RuntimeWarning, stacklevel=2)
+        return self._session_payload(session_id, world)
+
+    def _session_load(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Restore a persist session or a previously bound ACP uuid.
+
+        Live ACP uuids in this process are returned as-is. After restart,
+        persist.acp_lookup maps the uuid Comet stored. Persist session ids
+        from the TUI picker still work. An unknown id is refused rather than
+        minted: switch_session would otherwise create an empty attach row.
+        """
+        session_id = str(params.get("sessionId") or "")
+        if not session_id:
+            raise ValueError("session/load needs sessionId")
+        with self._lock:
+            live = self.sessions.get(session_id)
+        if live is not None:
+            return self._session_payload(session_id, live)
+        cwd = self._cwd_of(params)
+        world = self._world_for_cwd(cwd)
+        if world.running:
+            raise ValueError("cannot load a session while a prompt is running")
+        from desmos.kernel.loop import switch_session
+        from desmos.state import persist
+
+        if not persist.session_id_ok(session_id):
+            raise ValueError(f"unknown session {session_id!r}")
+        bound = persist.acp_lookup(world, session_id)
+        known = {row["id"] for row in persist.session_list(world)}
+        if bound:
+            target = bound["session_id"]
+        elif session_id in known:
+            target = session_id
+        else:
+            raise ValueError(f"unknown session {session_id!r}")
+        switch_session(world, target)
+        with self._lock:
+            resolved = Path(world.cwd).resolve()
+            entry = self._worlds.get(resolved)
+            if entry is not None:
+                self._worlds[resolved] = (
+                    world, list(world.messages), list(world.prior),
+                )
+            self.sessions[session_id] = world
+            self._convo[session_id] = (list(world.messages), list(world.prior))
+            self._tool_ids.setdefault(session_id, itertools.count(1))
+        try:
+            persist.acp_bind(world, session_id)
+        except Exception as exc:  # noqa: BLE001
+            warnings.warn(f"acp_bind failed: {exc}", RuntimeWarning, stacklevel=2)
+        return self._session_payload(session_id, world, loaded=True)
+
+    def _session_git(self, params: dict[str, Any]) -> dict[str, Any]:
+        from desmos.front.acp_env import git_snapshot
+
+        world = self._require_world(params)
+        return git_snapshot(Path(world.cwd))
+
+    def _session_fs(self, params: dict[str, Any]) -> dict[str, Any]:
+        from desmos.front.acp_env import fs_list, fs_read
+
+        world = self._require_world(params)
+        op = str(params.get("op") or "list")
+        rel = str(params.get("path") or ".")
+        if op == "read":
+            return fs_read(Path(world.cwd), rel)
+        if op in {"list", "ls", ""}:
+            return fs_list(Path(world.cwd), rel)
+        raise ValueError(f"unknown fs op {op!r}")
+
+    def _session_sessions(self, params: dict[str, Any]) -> dict[str, Any]:
+        from desmos.state import persist
+
+        world = self._require_world(params)
+        return {
+            "sessions": persist.session_list(world),
+            "persistSessionId": persist.run_id(),
+        }
+
+    def _session_peers(self, params: dict[str, Any]) -> dict[str, Any]:
+        from desmos.state.persist import peers
+
+        world = self._require_world(params)
+        return {"peers": peers(world)}
+
+    def _session_roster(self, params: dict[str, Any]) -> dict[str, Any]:
+        from desmos.state.persist import channel_list, roster
+
+        world = self._require_world(params)
+        named = roster(world)
+        return {
+            "agents": named["agents"],
+            "channels": channel_list(world),
+        }
+
+    def _session_channels(self, params: dict[str, Any]) -> dict[str, Any]:
+        from desmos.state.persist import channel_list
+
+        world = self._require_world(params)
+        return {"channels": channel_list(world)}
+
+    def _session_channel_read(self, params: dict[str, Any]) -> dict[str, Any]:
+        from desmos.state.persist import channel_dismiss, channel_workspace
+
+        world = self._require_world(params)
+        channel = str(params.get("channel") or "general")
+        workspace = channel_workspace(world, channel)
+        messages = list(workspace["messages"])
+        through = max((int(item["id"]) for item in messages), default=0)
+        channel_dismiss(world, channel=channel, through=through)
+        return {
+            "channel": channel,
+            "messages": messages,
+            "participants": workspace["participants"],
+            "activity": workspace["activity"],
+            "unread": workspace["unread"],
+            "max_seq": workspace["max_seq"],
+            "pending_delivery": workspace["pending_delivery"],
+        }
+
+    def _session_post(self, params: dict[str, Any]) -> dict[str, Any]:
+        from desmos.agents import remote
+        from desmos.state.persist import channel_post
+
+        world = self._require_world(params)
+        channel = str(params.get("channel") or "general")
+        body = str(params.get("body") or params.get("text") or "")
+        target = str(params.get("target") or "").strip()
+        if not body.strip():
+            raise ValueError("post needs a body")
+        row = channel_post(world, body, channel=channel, author="main")
+        dispatch_body = (
+            body if not target or f"@{target}" in body
+            else f"@{target} {body}"
+        )
+        dispatched: list[str] = []
+        try:
+            dispatched = remote.mention_dispatch(
+                world, channel, dispatch_body, asker=remote.asker_name(),
+            )
+        except Exception:  # noqa: BLE001 — the post already landed
+            dispatched = []
+        return {
+            "channel": channel,
+            "author": "main",
+            "body": body,
+            "id": row.get("id", 0),
+            "dispatched": dispatched,
+            "created_at": row.get("created_at"),
+        }
+
+    def _session_bridge(self, params: dict[str, Any]) -> dict[str, Any]:
+        from desmos.front.acp_env import bridge_status
+        from desmos.state.persist import peers
+
+        world = self._require_world(params)
+        status = bridge_status(Path(world.cwd))
+        status["peers"] = peers(world)
+        return status
+
+    def _session_term(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Named PTY from world.shells — the same object `<shell>` uses."""
+        from desmos.kernel import shell as sh
+
+        world = self._require_world(params)
+        op = str(params.get("op") or "list")
+        name = str(params.get("name") or "main").strip() or "main"
+        if op == "list":
+            shells = []
+            for key, item in world.shells.items():
+                shells.append({
+                    "name": key,
+                    "alive": bool(item.alive()),
+                    "at_prompt": bool(getattr(item, "at_prompt", False)),
+                    "monitoring": bool(getattr(item, "monitoring", False)),
+                })
+            return {"shells": shells}
+        if op == "peek":
+            live = world.shells.get(name)
+            if live is None:
+                return {"name": name, "text": f"no shell {name!r}"}
+            return {"name": name, "text": live.peek()}
+        if op in {"bytes", "raw"}:
+            import base64
+
+            live = world.shells.get(name)
+            if live is None:
+                return {"name": name, "data": "", "text": f"no shell {name!r}"}
+            raw = bytes(getattr(live, "_history", b""))
+            return {
+                "name": name,
+                "data": base64.b64encode(raw).decode("ascii"),
+                "seq": len(raw),
+                "text": live.peek(),
+            }
+        if op == "close":
+            return {"name": name, "text": sh.run(world, "", {"id": name, "close": "1"})}
+        if op == "interrupt":
+            return {"name": name, "text": sh.run(world, "", {"id": name, "interrupt": "1"})}
+        if op == "run":
+            body = str(params.get("body") or params.get("text") or "")
+            return {"name": name, "text": sh.run(world, body, {"id": name})}
+        raise ValueError(f"unknown term op {op!r}")
 
     def _session_prompt(self, params: dict[str, Any]) -> dict[str, str]:
         session_id = str(params.get("sessionId") or "")
@@ -295,6 +818,60 @@ class AcpServer:
             if state is not None:
                 state["cancelled"] = True
 
+    def _set_config_option(self, params: dict[str, Any]) -> dict[str, Any]:
+        session_id = str(params.get("sessionId") or "")
+        with self._lock:
+            world = self.sessions.get(session_id)
+        if world is None:
+            raise ValueError(f"unknown session {session_id!r}")
+        config_id = str(params.get("configId") or params.get("id") or "")
+        raw = params.get("value")
+        if isinstance(raw, dict):
+            value = raw.get("value")
+            if value is None and "boolean" in raw:
+                value = raw.get("boolean")
+        else:
+            value = raw
+        if config_id in {"thought_level", "thinking", "effort"}:
+            text = str(value or "").strip()
+            if not text:
+                raise ValueError("thought_level needs a value")
+            from desmos.transport.settings import clamp_effort, provider_of
+
+            world.thinking = clamp_effort(provider_of(str(world.model or "")), text)
+            return {"configOptions": config_options(world), "models": session_models(world)}
+        if config_id in {"model"}:
+            model = str(value or "").strip()
+            if not model:
+                raise ValueError("model needs a value")
+            from desmos.transport.settings import clamp_effort, provider_of, switch
+
+            effort = clamp_effort(provider_of(model), str(world.thinking or "low"))
+            switch(world, model, effort)
+            return {"configOptions": config_options(world), "models": session_models(world)}
+        raise ValueError(f"unknown config option {config_id!r}")
+
+    def _session_steer(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Queue a steer. Comet calls `_session/steering` with ACP prompt blocks."""
+        session_id = str(params.get("sessionId") or "")
+        with self._lock:
+            world = self.sessions.get(session_id)
+        if world is None:
+            raise ValueError(f"unknown session {session_id!r}")
+        text = str(params.get("text") or params.get("content") or "").strip()
+        if not text:
+            text = prompt_text(params.get("prompt")).strip()
+        if not text:
+            raise ValueError("steer needs text")
+        from desmos.kernel.catalog import steer as _steer
+
+        _steer(world, text)
+        # Comet treats missing outcome as "injected". promptRequired means it
+        # should start a fresh session/prompt with this text instead.
+        if world.running:
+            return {"outcome": "injected"}
+        return {"outcome": "promptRequired"}
+
     def _emit_event(
         self,
         session_id: str,
@@ -309,14 +886,14 @@ class AcpServer:
                 self._update(session_id, prompt_id, {
                     "sessionUpdate": "agent_thought_chunk",
                     "content": {"type": "text", "text": text},
-                })
+                }, family="thinking")
         elif kind == "speech":
             text = str(ev.get("text") or "")
             if text:
                 self._update(session_id, prompt_id, {
                     "sessionUpdate": "agent_message_chunk",
                     "content": {"type": "text", "text": text},
-                })
+                }, family="speech")
         elif kind == "turn":
             # A truncated reply ("[reply was cut short]") emits error and then
             # keeps going, so only an error with no turn after it ended the
@@ -325,20 +902,67 @@ class AcpServer:
             state.pop("error", None)
         elif kind == "error":
             state["error"] = str(ev.get("text") or "")
+        elif kind == "post":
+            tool_id = f"c{next(state['tools'])}"
+            state["complete"] = tool_id
+            model = str(ev.get("model") or "")
+            self._update(session_id, prompt_id, {
+                "sessionUpdate": "tool_call",
+                "toolCallId": tool_id,
+                "title": "complete",
+                "kind": "other",
+                "status": "pending",
+                "rawInput": {
+                    "model": model,
+                    "origin": ev.get("origin"),
+                    "n": ev.get("n"),
+                },
+            }, family="complete")
+        elif kind == "complete":
+            tool_id = str(state.get("complete") or "")
+            if not tool_id:
+                tool_id = f"c{next(state['tools'])}"
+                state["complete"] = tool_id
+                self._update(session_id, prompt_id, {
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": tool_id,
+                    "title": "complete",
+                    "kind": "other",
+                    "status": "pending",
+                }, family="complete")
+            self._update(session_id, prompt_id, {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": tool_id,
+                "status": "completed",
+                "title": "complete",
+                "kind": "other",
+                "content": [{
+                    "type": "content",
+                    "content": {"type": "text", "text": _complete_card(ev)},
+                }],
+            }, family="complete")
         elif kind == "result":
             phase = str(ev.get("phase") or "done")
-            title = str(ev.get("tag") or "tool")
+            title = _result_title(ev)
+            family = "edit" if _is_edit(ev) else "syscall"
             tool_id = str(state.get("tool") or "")
             if phase == "start" or not tool_id:
                 tool_id = f"t{next(state['tools'])}"
                 state["tool"] = tool_id
+                raw: dict[str, Any] = {
+                    "tag": ev.get("tag"),
+                    "attrs": ev.get("attrs") or {},
+                    "body": _clip_text(str(ev.get("body") or "")),
+                }
                 self._update(session_id, prompt_id, {
                     "sessionUpdate": "tool_call",
                     "toolCallId": tool_id,
                     "title": title,
-                    "kind": "execute",
+                    "kind": "edit" if family == "edit" else "execute",
                     "status": "pending",
-                })
+                    "locations": _result_locations(ev),
+                    "rawInput": raw,
+                }, family=family, label=_result_label(ev))
                 if phase == "start":
                     return
             text = str(ev.get("text") or "")
@@ -352,22 +976,42 @@ class AcpServer:
                             "type": "content",
                             "content": {"type": "text", "text": text},
                         }],
-                    })
+                    }, family=family, label=_result_label(ev))
                 return
             self._update(session_id, prompt_id, {
                 "sessionUpdate": "tool_call_update",
                 "toolCallId": tool_id,
                 "status": "completed",
-                "content": [{
-                    "type": "content",
-                    "content": {"type": "text", "text": text},
-                }],
-            })
+                "title": title,
+                "kind": "edit" if family == "edit" else "execute",
+                "content": _result_content(ev, text),
+            }, family=family, label=_result_label(ev))
 
-    def _update(self, session_id: str, prompt_id: str | None, update: dict[str, Any]) -> None:
+    def _update(
+        self,
+        session_id: str,
+        prompt_id: str | None,
+        update: dict[str, Any],
+        *,
+        family: str | None = None,
+        label: str | None = None,
+    ) -> None:
+        pane = pane_of(update)
+        desmos_meta: dict[str, Any] = {"pane": pane}
+        if family:
+            desmos_meta["family"] = family
+        if label:
+            desmos_meta["label"] = label
+        nested = update.get("_meta")
+        if not isinstance(nested, dict):
+            nested = {}
+        nested["desmos"] = desmos_meta
+        update["_meta"] = nested
         params: dict[str, Any] = {"sessionId": session_id, "update": update}
+        meta: dict[str, Any] = {"desmos": desmos_meta}
         if prompt_id:
-            params["_meta"] = {"promptId": prompt_id}
+            meta["promptId"] = prompt_id
+        params["_meta"] = meta
         self.write({"jsonrpc": "2.0", "method": "session/update", "params": params})
 
 

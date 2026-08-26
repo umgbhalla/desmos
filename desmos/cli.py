@@ -16,6 +16,7 @@ __all__ = [
     "cmd_check",
     "cmd_comet",
     "cmd_console",
+    "cmd_desk",
     "cmd_kernel",
     "cmd_run",
     "cmd_tui",
