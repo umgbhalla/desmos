@@ -1646,10 +1646,10 @@ def check() -> None:
         # What can still go missing is the DESMOS_ACP branch if that gitlink is
         # moved to an incompatible fork commit -- and that is silent, because
         # the pager compiles either way and runs grok's agent instead of ours.
+        _check_desk()
         _check_path_deps_tracked()
         _check_vendor_patch()
         _check_release_tui_launcher()
-    _check_desk()
     _check_emit_sid()
     _check_replay_sid()
     _check_socket()

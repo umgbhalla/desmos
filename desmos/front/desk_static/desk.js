@@ -118,6 +118,12 @@
     return "syscall";
   }
 
+  function labelOf(update) {
+    const meta = update && update._meta;
+    if (meta && meta.desmos && meta.desmos.label) return meta.desmos.label;
+    return update.title || "tool";
+  }
+
   function applyConfig(result) {
     const opts = (result && result.configOptions) || [];
     for (const opt of opts) {
@@ -136,7 +142,13 @@
   }
 
   async function boot() {
-    await acp.call("initialize", { protocolVersion: 1, clientInfo: { name: "desmos-desk", version: "1" } });
+    const init = await acp.call("initialize", { protocolVersion: 1, clientInfo: { name: "desmos-desk", version: "1" } });
+    const meta = (init && init._meta) || {};
+    const models = meta.modelState || {};
+    if (models.currentModelId) state.model = models.currentModelId;
+    if (models.availableModels && models.availableModels.length) {
+      state.models = models.availableModels.map((row) => row.modelId || row.name).filter(Boolean);
+    }
     await acp.call("authenticate", { methodId: "none" });
     await newSession();
   }
@@ -234,7 +246,7 @@
         t.activity.push({
           id: update.toolCallId,
           family,
-          title: update.title || "tool",
+          title: labelOf(update),
           status: update.status || "pending",
           kind: update.kind || "",
           raw: update.rawInput || {},
@@ -249,7 +261,7 @@
           card = {
             id: update.toolCallId,
             family,
-            title: update.title || "tool",
+            title: labelOf(update),
             status: "pending",
             raw: {},
             body: "",
@@ -259,7 +271,7 @@
           t.activity.push(card);
         }
         if (update.status) card.status = update.status;
-        if (update.title) card.title = update.title;
+        if (update.title) card.title = labelOf(update);
         if (update.kind) card.kind = update.kind;
         const parts = update.content || [];
         for (const part of parts) {
@@ -312,6 +324,15 @@
     app.classList.toggle("no-sidebar", !state.showSidebar);
     app.classList.toggle("no-activity", !state.showActivity);
 
+    const storyEl = $("#story");
+    const actBody = $("#act-body");
+    const stickStory =
+      !storyEl ||
+      storyEl.scrollHeight - storyEl.scrollTop - storyEl.clientHeight < 140;
+    const stickAct =
+      !actBody ||
+      actBody.scrollHeight - actBody.scrollTop - actBody.clientHeight < 140;
+
     const t = state.active ? turn(state.active) : null;
     $("#sidebar").innerHTML = `
       <div class="brand"><div class="mark"></div><div><div class="name">Desmos</div><div class="sub">kernel over ACP</div></div></div>
@@ -323,7 +344,9 @@
     `;
     const convs = $("#convs");
     if (!state.sessions.length) {
-      convs.innerHTML = `<div class="act-empty">No sessions yet.</div>`;
+      convs.innerHTML = `<div class="act-empty">${
+        state.connected ? "Starting session…" : "Connecting…"
+      }</div>`;
     } else {
       for (const row of state.sessions) {
         const meta = sessionMeta(row.id);
@@ -503,6 +526,10 @@
       <span class="spin${t && t.running ? " on" : ""}"></span>
       <span style="margin-left:auto">${esc(state.cwd || "")}</span>
     `;
+    const storyNow = $("#story");
+    if (storyNow && (stickStory || (t && t.running))) storyNow.scrollTop = storyNow.scrollHeight;
+    const actNow = $("#act-body");
+    if (actNow && (stickAct || (t && t.running))) actNow.scrollTop = actNow.scrollHeight;
   }
 
   let booted = false;

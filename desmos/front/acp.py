@@ -159,6 +159,11 @@ def _is_edit(ev: dict[str, Any]) -> bool:
 
 
 def _result_title(ev: dict[str, Any]) -> str:
+    """ACP toolCall title is the kernel tag. A prettier label rides _meta."""
+    return str(ev.get("tag") or "tool")
+
+
+def _result_label(ev: dict[str, Any]) -> str:
     tag = str(ev.get("tag") or "tool")
     attrs = ev.get("attrs") if isinstance(ev.get("attrs"), dict) else {}
     op = str(attrs.get("op") or "")
@@ -637,7 +642,7 @@ class AcpServer:
                     "status": "pending",
                     "locations": _result_locations(ev),
                     "rawInput": raw,
-                }, family=family)
+                }, family=family, label=_result_label(ev))
                 if phase == "start":
                     return
             text = str(ev.get("text") or "")
@@ -651,7 +656,7 @@ class AcpServer:
                             "type": "content",
                             "content": {"type": "text", "text": text},
                         }],
-                    }, family=family)
+                    }, family=family, label=_result_label(ev))
                 return
             self._update(session_id, prompt_id, {
                 "sessionUpdate": "tool_call_update",
@@ -660,7 +665,7 @@ class AcpServer:
                 "title": title,
                 "kind": "edit" if family == "edit" else "execute",
                 "content": _result_content(ev, text),
-            }, family=family)
+            }, family=family, label=_result_label(ev))
 
     def _update(
         self,
@@ -669,11 +674,14 @@ class AcpServer:
         update: dict[str, Any],
         *,
         family: str | None = None,
+        label: str | None = None,
     ) -> None:
         pane = pane_of(update)
-        desmos_meta = {"pane": pane}
+        desmos_meta: dict[str, Any] = {"pane": pane}
         if family:
             desmos_meta["family"] = family
+        if label:
+            desmos_meta["label"] = label
         nested = update.get("_meta")
         if not isinstance(nested, dict):
             nested = {}
