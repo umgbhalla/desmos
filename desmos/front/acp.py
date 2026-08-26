@@ -99,7 +99,10 @@ def initialize_result() -> dict[str, Any]:
     return {
         "protocolVersion": PROTOCOL_VERSION,
         "agentCapabilities": {
-            "loadSession": False,
+            # Persist session ids from `_session/sessions` / the TUI picker.
+            # An ACP uuid from a previous process is not stored, so Comet
+            # cannot round-trip that id after a restart.
+            "loadSession": True,
             # run_turns takes a prompt string, so an image block has nowhere to
             # go; prompt_text used to drop it and the empty prompt answered
             # end_turn with no model call. Advertise what this agent carries.
@@ -115,6 +118,21 @@ def initialize_result() -> dict[str, Any]:
             "modelState": {
                 "currentModelId": model,
                 "availableModels": _available_models(),
+            },
+            "desmos": {
+                "loadSession": "persist",
+                "extensions": [
+                    "_session/steer",
+                    "_session/git",
+                    "_session/fs",
+                    "_session/sessions",
+                    "_session/peers",
+                    "_session/roster",
+                    "_session/channels",
+                    "_session/channel_read",
+                    "_session/post",
+                    "_session/bridge",
+                ],
             },
         },
     }
@@ -246,6 +264,37 @@ def _complete_card(ev: dict[str, Any]) -> str:
     return json.dumps(summary, default=str, indent=2)
 
 
+def _story_from_messages(messages: Any) -> list[dict[str, str]]:
+    """User/assistant speech from a persist transcript. Results stay off story."""
+    story: list[dict[str, str]] = []
+    for item in messages or []:
+        if not isinstance(item, dict):
+            continue
+        role = str(item.get("role") or "")
+        content = item.get("content")
+        if isinstance(content, list):
+            parts: list[str] = []
+            for part in content:
+                if isinstance(part, str) and part:
+                    parts.append(part)
+                elif isinstance(part, dict) and part.get("type") == "text":
+                    text = part.get("text") or ""
+                    if text:
+                        parts.append(str(text))
+            text = "".join(parts)
+        else:
+            text = str(content or "")
+        if not text.strip():
+            continue
+        if role == "user" and text.lstrip().startswith("<result"):
+            continue
+        if role == "user":
+            story.append({"kind": "user", "text": text})
+        elif role == "assistant":
+            story.append({"kind": "assistant", "text": text})
+    return story
+
+
 def prompt_text(blocks: Any) -> str:
     """Concatenate ACP text (and embedded resource text) into one user prompt."""
     if isinstance(blocks, str):
@@ -349,6 +398,27 @@ class AcpServer:
             return rpc_result(req_id, {})
         if method == "session/new":
             return rpc_result(req_id, self._session_new(params))
+        if method == "session/load":
+            try:
+                return rpc_result(req_id, self._session_load(params))
+            except ValueError as exc:
+                return rpc_error(req_id, -32602, str(exc))
+        env = {
+            "_session/git": self._session_git,
+            "_session/fs": self._session_fs,
+            "_session/sessions": self._session_sessions,
+            "_session/peers": self._session_peers,
+            "_session/roster": self._session_roster,
+            "_session/channels": self._session_channels,
+            "_session/channel_read": self._session_channel_read,
+            "_session/post": self._session_post,
+            "_session/bridge": self._session_bridge,
+        }
+        if method in env:
+            try:
+                return rpc_result(req_id, env[method](params))
+            except ValueError as exc:
+                return rpc_error(req_id, -32602, str(exc))
         if method == "session/set_config_option":
             try:
                 return rpc_result(req_id, self._set_config_option(params))
@@ -387,22 +457,22 @@ class AcpServer:
             return rpc_error(None, -32600, "Invalid Request")
         return self.handle(msg)
 
-    def _session_new(self, params: dict[str, Any]) -> dict[str, Any]:
+    def _cwd_of(self, params: dict[str, Any]) -> Path:
         cwd_raw = params.get("cwd") or self.default_cwd
         cwd = Path(str(cwd_raw)).expanduser()
         if not cwd.is_absolute():
             cwd = (self.default_cwd / cwd).resolve()
         else:
             cwd = cwd.resolve()
-        session_id = str(uuid.uuid4())
+        return cwd
+
+    def _world_for_cwd(self, cwd: Path) -> Any:
         with self._lock:
             entry = self._worlds.get(cwd)
         if entry is None:
-            # new_world loads the workspace's saved state. loadSession is
-            # advertised false because we cannot restore a session by id;
-            # the durable brain of a directory is a different thing. It reads
-            # SQLite, so build it outside the lock -- the lock guards the dicts,
-            # and _session_cancel waits on it -- and double-check on insert.
+            # new_world loads the workspace's saved state. It reads SQLite, so
+            # build it outside the lock -- the lock guards the dicts, and
+            # _session_cancel waits on it -- and double-check on insert.
             world = new_world(cwd)
             entry = (world, list(world.messages), list(world.prior))
         from desmos.transport.settings import load as _load_settings
@@ -418,14 +488,193 @@ class AcpServer:
                 # only at creation latched the first session's model and effort
                 # for the life of the process.
                 world.model, world.thinking = saved.model, saved.effort
-            self.sessions[session_id] = world
-            self._convo[session_id] = (list(entry[1]), list(entry[2]))
-            self._tool_ids[session_id] = itertools.count(1)
-        return {
+        return world
+
+    def _require_world(self, params: dict[str, Any]) -> Any:
+        session_id = str(params.get("sessionId") or "")
+        with self._lock:
+            world = self.sessions.get(session_id)
+        if world is None:
+            raise ValueError(f"unknown session {session_id!r}")
+        return world
+
+    def _session_payload(self, session_id: str, world: Any, *, loaded: bool = False) -> dict[str, Any]:
+        from desmos.state import persist
+
+        persist_id = persist.run_id()
+        meta: dict[str, Any] = {
+            "desmos": {
+                "persistSessionId": persist_id,
+                "cwd": str(world.cwd),
+            }
+        }
+        payload: dict[str, Any] = {
             "sessionId": session_id,
             "configOptions": config_options(world),
             "models": session_models(world),
+            "_meta": meta,
         }
+        if loaded:
+            payload["turns"] = persist.session_turns(world, persist_id)
+            payload["story"] = _story_from_messages(world.messages)
+        return payload
+
+    def _session_new(self, params: dict[str, Any]) -> dict[str, Any]:
+        cwd = self._cwd_of(params)
+        session_id = str(uuid.uuid4())
+        world = self._world_for_cwd(cwd)
+        with self._lock:
+            entry = self._worlds[cwd]
+            self.sessions[session_id] = world
+            self._convo[session_id] = (list(entry[1]), list(entry[2]))
+            self._tool_ids[session_id] = itertools.count(1)
+        return self._session_payload(session_id, world)
+
+    def _session_load(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Restore a persist session. sessionId is the sqlite sessions.id.
+
+        A live ACP uuid from this process is returned as-is. An unknown id is
+        refused rather than minted: switch_session would otherwise create an
+        empty attach row under that name.
+        """
+        session_id = str(params.get("sessionId") or "")
+        if not session_id:
+            raise ValueError("session/load needs sessionId")
+        with self._lock:
+            live = self.sessions.get(session_id)
+        if live is not None:
+            return self._session_payload(session_id, live)
+        cwd = self._cwd_of(params)
+        world = self._world_for_cwd(cwd)
+        if world.running:
+            raise ValueError("cannot load a session while a prompt is running")
+        from desmos.kernel.loop import switch_session
+        from desmos.state import persist
+
+        if not persist.session_id_ok(session_id):
+            raise ValueError(f"unknown session {session_id!r}")
+        known = {row["id"] for row in persist.session_list(world)}
+        if session_id not in known:
+            raise ValueError(f"unknown session {session_id!r}")
+        switch_session(world, session_id)
+        with self._lock:
+            entry = self._worlds.get(Path(world.cwd).resolve())
+            if entry is not None:
+                self._worlds[Path(world.cwd).resolve()] = (
+                    world, list(world.messages), list(world.prior),
+                )
+            self.sessions[session_id] = world
+            self._convo[session_id] = (list(world.messages), list(world.prior))
+            self._tool_ids.setdefault(session_id, itertools.count(1))
+        return self._session_payload(session_id, world, loaded=True)
+
+    def _session_git(self, params: dict[str, Any]) -> dict[str, Any]:
+        from desmos.front.acp_env import git_snapshot
+
+        world = self._require_world(params)
+        return git_snapshot(Path(world.cwd))
+
+    def _session_fs(self, params: dict[str, Any]) -> dict[str, Any]:
+        from desmos.front.acp_env import fs_list, fs_read
+
+        world = self._require_world(params)
+        op = str(params.get("op") or "list")
+        rel = str(params.get("path") or ".")
+        if op == "read":
+            return fs_read(Path(world.cwd), rel)
+        if op in {"list", "ls", ""}:
+            return fs_list(Path(world.cwd), rel)
+        raise ValueError(f"unknown fs op {op!r}")
+
+    def _session_sessions(self, params: dict[str, Any]) -> dict[str, Any]:
+        from desmos.state import persist
+
+        world = self._require_world(params)
+        return {
+            "sessions": persist.session_list(world),
+            "persistSessionId": persist.run_id(),
+        }
+
+    def _session_peers(self, params: dict[str, Any]) -> dict[str, Any]:
+        from desmos.state.persist import peers
+
+        world = self._require_world(params)
+        return {"peers": peers(world)}
+
+    def _session_roster(self, params: dict[str, Any]) -> dict[str, Any]:
+        from desmos.state.persist import channel_list, roster
+
+        world = self._require_world(params)
+        named = roster(world)
+        return {
+            "agents": named["agents"],
+            "channels": channel_list(world),
+        }
+
+    def _session_channels(self, params: dict[str, Any]) -> dict[str, Any]:
+        from desmos.state.persist import channel_list
+
+        world = self._require_world(params)
+        return {"channels": channel_list(world)}
+
+    def _session_channel_read(self, params: dict[str, Any]) -> dict[str, Any]:
+        from desmos.state.persist import channel_dismiss, channel_workspace
+
+        world = self._require_world(params)
+        channel = str(params.get("channel") or "general")
+        workspace = channel_workspace(world, channel)
+        messages = list(workspace["messages"])
+        through = max((int(item["id"]) for item in messages), default=0)
+        channel_dismiss(world, channel=channel, through=through)
+        return {
+            "channel": channel,
+            "messages": messages,
+            "participants": workspace["participants"],
+            "activity": workspace["activity"],
+            "unread": workspace["unread"],
+            "max_seq": workspace["max_seq"],
+            "pending_delivery": workspace["pending_delivery"],
+        }
+
+    def _session_post(self, params: dict[str, Any]) -> dict[str, Any]:
+        from desmos.agents import remote
+        from desmos.state.persist import channel_post
+
+        world = self._require_world(params)
+        channel = str(params.get("channel") or "general")
+        body = str(params.get("body") or params.get("text") or "")
+        target = str(params.get("target") or "").strip()
+        if not body.strip():
+            raise ValueError("post needs a body")
+        row = channel_post(world, body, channel=channel, author="main")
+        dispatch_body = (
+            body if not target or f"@{target}" in body
+            else f"@{target} {body}"
+        )
+        dispatched: list[str] = []
+        try:
+            dispatched = remote.mention_dispatch(
+                world, channel, dispatch_body, asker=remote.asker_name(),
+            )
+        except Exception:  # noqa: BLE001 — the post already landed
+            dispatched = []
+        return {
+            "channel": channel,
+            "author": "main",
+            "body": body,
+            "id": row.get("id", 0),
+            "dispatched": dispatched,
+            "created_at": row.get("created_at"),
+        }
+
+    def _session_bridge(self, params: dict[str, Any]) -> dict[str, Any]:
+        from desmos.front.acp_env import bridge_status
+        from desmos.state.persist import peers
+
+        world = self._require_world(params)
+        status = bridge_status(Path(world.cwd))
+        status["peers"] = peers(world)
+        return status
 
     def _session_prompt(self, params: dict[str, Any]) -> dict[str, str]:
         session_id = str(params.get("sessionId") or "")

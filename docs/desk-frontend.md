@@ -36,19 +36,34 @@ Supported now:
 - create an ACP session for the selected workspace;
 - send a prompt; Enter submits, Shift+Enter is a newline;
 - stream thinking into the story and assistant markdown into the story;
-- show complete() POST cards, syscalls, and edit diffs on Activity only;
+- show complete() POSTs, syscalls, and edit diffs on Activity only;
 - cancel the in-flight prompt (Esc, or the stop control);
 - new session (`session/new`);
+- resume a persist session (`session/load` with the sqlite `sessions.id`
+  from `_session/sessions` — the same rows the TUI picker reads);
 - model and thought_level through `session/set_config_option` (the same
   catalog the TUI picker reads);
-- steer while a turn is running (`_session/steer` → `catalog.steer`).
+- steer while a turn is running (`_session/steer` → `catalog.steer`);
+- git status / branches / log (`_session/git`, same `--no-optional-locks`
+  reader as the TUI);
+- files listing and bounded read (`_session/fs`, jailed to the session cwd);
+- live peers and named roster (`_session/peers`, `_session/roster`);
+- channel list, read, and post (`persist.channel_*`, same as the bridge);
+- bridge socket presence (`_session/bridge`). Desk does not attach as a
+  second writer on a live TUI daemon.
 
-Not yet matched with the native TUI:
+`loadSession` is advertised true for persist session ids. An ACP uuid from a
+previous process is not stored, so Comet cannot round-trip that id after a
+restart.
 
-- git/files environment viewers;
-- channel/peer rail;
-- loading a prior transcript by session id (`loadSession` is still false);
-- attaching to a daemon bridge socket.
+Not yet matched with the native TUI / Comet / gpuix:
+
+- native GPUI `<markdown>` / `<diff>` (needs Metal/Vulkan or a vendored
+  gpuix host; `vendor/grok-build` and `vendor/comet` are empty gitlinks
+  in a fresh checkout);
+- attaching the in-process ACP world to `<cwd>/.desmos/bridge.sock` (that
+  would be two writers on one persist brain);
+- Comet CRDT session registry, devices, and terminal panel.
 
 The TUI (`python -m desmos tui`) and Comet (`python -m desmos comet`) stay
 as they are. Desk is another viewport onto the same kernel.

@@ -2224,6 +2224,97 @@ def channel_list(world: World) -> list[dict[str, Any]]:
         db.close()
 
 
+def session_id_ok(session: str) -> bool:
+    """Same gate the TUI picker uses before interpolating an id into SQL."""
+    return bool(session) and all(c.isalnum() or c == "-" for c in session)
+
+
+def session_list(world: World) -> list[dict[str, Any]]:
+    """Resumable persist sessions. Same rows the TUI picker reads.
+
+    One sqlite file is one workspace, so the TUI query does not filter by
+    workspace_id. We still do: a misplaced path must not leak another cwd.
+    """
+    if not world.persist:
+        return []
+    path = state_file(world)
+    if not path.is_file():
+        return []
+    db = _open(path)
+    try:
+        workspace = _workspace_id(db, world, create=False)
+        if workspace is None:
+            return []
+        rows = db.execute(
+            """
+            SELECT id, started_at, messages, preview FROM (
+                SELECT s.id AS id,
+                       s.started_at AS started_at,
+                       (SELECT count(*) FROM messages m
+                         WHERE m.session_id = s.id) AS messages,
+                       coalesce(
+                           (SELECT p.prompt FROM prior_turns p
+                             WHERE p.session_id = s.id
+                             ORDER BY p.seq DESC LIMIT 1),
+                           ''
+                       ) AS preview
+                FROM sessions s
+                WHERE s.workspace_id = ?
+            )
+            WHERE messages > 0
+            ORDER BY started_at DESC
+            LIMIT 12
+            """,
+            (workspace,),
+        ).fetchall()
+        out: list[dict[str, Any]] = []
+        for row in rows:
+            preview = " ".join(str(row["preview"] or "").split())
+            out.append({
+                "id": str(row["id"]),
+                "started_at": str(row["started_at"] or ""),
+                "messages": int(row["messages"] or 0),
+                "preview": (
+                    preview if len(preview) <= 120
+                    else preview[:119].rstrip() + "…"
+                ),
+            })
+        return out
+    finally:
+        db.close()
+
+
+def session_turns(world: World, session: str) -> list[dict[str, str]]:
+    """prior_turns for one persist session, oldest first."""
+    if not world.persist or not session_id_ok(session):
+        return []
+    path = state_file(world)
+    if not path.is_file():
+        return []
+    db = _open(path)
+    try:
+        workspace = _workspace_id(db, world, create=False)
+        if workspace is None:
+            return []
+        owned = db.execute(
+            "SELECT id FROM sessions WHERE id = ? AND workspace_id = ?",
+            (session, workspace),
+        ).fetchone()
+        if owned is None:
+            return []
+        rows = db.execute(
+            "SELECT prompt, speech FROM prior_turns"
+            " WHERE session_id = ? ORDER BY seq",
+            (session,),
+        ).fetchall()
+        return [
+            {"prompt": str(row["prompt"] or ""), "speech": str(row["speech"] or "")}
+            for row in rows
+        ]
+    finally:
+        db.close()
+
+
 def channel_tail(
     world: World, channel: str = "general", limit: int = 50
 ) -> list[dict[str, Any]]:

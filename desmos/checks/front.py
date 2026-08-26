@@ -1098,12 +1098,11 @@ def _check_replay_sid() -> None:
 
 def _check_desk() -> None:
     """The desk UI speaks live ACP over a real websocket, not a lookalike loop."""
-    import json
-    import tempfile
-    import urllib.request
+    import os
 
     from desmos.front.acp import family_of, pane_of
-    from desmos.front.desk import STATIC_DIR, RpcClient, serve_thread
+    from desmos.front.desk import STATIC_DIR
+    from desmos.state.persist import NEW_SESSION_ENV, SESSION_ID_ENV, SESSION_PID_ENV
 
     assert pane_of({"sessionUpdate": "agent_thought_chunk"}) == "story"
     assert pane_of({"sessionUpdate": "agent_message_chunk"}) == "story"
@@ -1117,6 +1116,27 @@ def _check_desk() -> None:
         assert path.is_file() and path.stat().st_size > 0, path
     html = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
     assert 'id="story"' in html and 'id="activity"' in html
+
+    keys = (SESSION_ID_ENV, SESSION_PID_ENV, NEW_SESSION_ENV)
+    old_env = {k: os.environ.get(k) for k in keys}
+    for k in keys:
+        os.environ.pop(k, None)
+    try:
+        _check_desk_roundtrip()
+    finally:
+        for k, value in old_env.items():
+            if value is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = value
+
+
+def _check_desk_roundtrip() -> None:
+    import json
+    import tempfile
+    import urllib.request
+
+    from desmos.front.desk import RpcClient, serve_thread
 
     with tempfile.TemporaryDirectory() as tmp:
         cwd = Path(tmp)
@@ -1134,6 +1154,7 @@ def _check_desk() -> None:
             client = RpcClient("127.0.0.1", port)
             init = client.call("initialize", {"protocolVersion": 1})
             assert init["result"]["protocolVersion"] == 1
+            assert init["result"]["agentCapabilities"]["loadSession"] is True
             assert init["result"]["_meta"]["steering"]["supported"] is True
             auth = client.call("authenticate", {"methodId": "none"}, req_id=2)
             assert auth["result"] == {}
@@ -1222,6 +1243,118 @@ def _check_desk() -> None:
                 req_id=7,
             )
             assert missing.get("error", {}).get("code") == -32602
+
+            import os
+            import subprocess
+
+            from desmos.front.acp_env import git_snapshot, jail
+
+            try:
+                jail(cwd, "/etc/passwd")
+                raise AssertionError("absolute path outside cwd was allowed")
+            except ValueError:
+                pass
+            try:
+                jail(cwd, "../secret")
+                raise AssertionError("parent path outside cwd was allowed")
+            except ValueError:
+                pass
+            (cwd / "ok.txt").write_text("hello-desk\n", encoding="utf-8")
+            listed = client.call(
+                "_session/fs", {"sessionId": sid, "op": "list", "path": "."}, req_id=8
+            )
+            names = [row["name"] for row in listed["result"]["entries"]]
+            assert "ok.txt" in names, names
+            read = client.call(
+                "_session/fs",
+                {"sessionId": sid, "op": "read", "path": "ok.txt"},
+                req_id=9,
+            )
+            assert "hello-desk" in "\n".join(read["result"]["lines"])
+            escaped = client.call(
+                "_session/fs",
+                {"sessionId": sid, "op": "read", "path": "/etc/passwd"},
+                req_id=10,
+            )
+            assert escaped.get("error", {}).get("code") == -32602, escaped
+            parented = client.call(
+                "_session/fs",
+                {"sessionId": sid, "op": "read", "path": "../ok.txt"},
+                req_id=11,
+            )
+            assert parented.get("error", {}).get("code") == -32602, parented
+
+            git_env = {
+                **os.environ,
+                "GIT_AUTHOR_NAME": "desk-check",
+                "GIT_AUTHOR_EMAIL": "desk@check",
+                "GIT_COMMITTER_NAME": "desk-check",
+                "GIT_COMMITTER_EMAIL": "desk@check",
+            }
+
+            def _git(*args: str) -> None:
+                subprocess.run(
+                    ["git", *args],
+                    cwd=cwd,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                    env=git_env,
+                )
+
+            _git("init")
+            (cwd / "tracked.txt").write_text("a\n", encoding="utf-8")
+            _git("add", "tracked.txt")
+            _git("-c", "user.name=desk-check", "-c", "user.email=desk@check", "commit", "-m", "init")
+            (cwd / "tracked.txt").write_text("b\n", encoding="utf-8")
+            (cwd / "loose.txt").write_text("x\n", encoding="utf-8")
+            snap = git_snapshot(cwd)
+            assert snap["read"] is True and snap["error"] is None, snap
+            assert snap["dirty"] >= 1, snap
+            git_rpc = client.call("_session/git", {"sessionId": sid}, req_id=12)
+            paths = [row["path"] for row in git_rpc["result"]["status"]]
+            assert "tracked.txt" in paths, paths
+            assert git_rpc["result"]["dirty"] >= 1
+
+            posted = client.call(
+                "_session/post",
+                {"sessionId": sid, "channel": "general", "body": "desk-peer-hello"},
+                req_id=13,
+            )
+            assert posted["result"]["id"], posted
+            got = client.call(
+                "_session/channel_read",
+                {"sessionId": sid, "channel": "general"},
+                req_id=14,
+            )
+            bodies = [row["body"] for row in got["result"]["messages"]]
+            assert "desk-peer-hello" in bodies, bodies
+
+            listed_sessions = client.call(
+                "_session/sessions", {"sessionId": sid}, req_id=15
+            )
+            rows = listed_sessions["result"]["sessions"]
+            assert rows and rows[0]["messages"] > 0, listed_sessions
+            persist_id = rows[0]["id"]
+            loaded = client.call(
+                "session/load",
+                {"cwd": str(cwd), "sessionId": persist_id},
+                req_id=16,
+            )
+            assert loaded["result"]["sessionId"] == persist_id, loaded
+            loaded_world = hub.server.sessions[persist_id]
+            blob = json.dumps(loaded_world.messages)
+            assert "add one" in blob, blob[:500]
+            turns = loaded["result"].get("turns") or []
+            assert any("add one" in (row.get("prompt") or "") for row in turns), turns
+            unknown_load = client.call(
+                "session/load",
+                {"cwd": str(cwd), "sessionId": "no-such-session"},
+                req_id=17,
+            )
+            assert unknown_load.get("error", {}).get("code") == -32602
+            bridge = client.call("_session/bridge", {"sessionId": sid}, req_id=18)
+            assert bridge["result"]["attached"] is False
         finally:
             if client is not None:
                 client.close()
@@ -1334,7 +1467,7 @@ def check() -> None:
         init = acp_replies[0]["result"]
         assert init["protocolVersion"] == 1
         assert init["authMethods"][0]["id"] == "none"
-        assert init["agentCapabilities"]["loadSession"] is False
+        assert init["agentCapabilities"]["loadSession"] is True
         # What we advertise has to be what prompt_text carries. Claiming image
         # support the loop cannot take made the pager send an image block,
         # prompt_text drop it, and the empty prompt answer end_turn with no
@@ -1355,6 +1488,13 @@ def check() -> None:
         created = acp.handle({"jsonrpc": "2.0", "id": 10, "method": "session/new", "params": {"cwd": str(cwd)}})
         assert created is not None
         sid = created["result"]["sessionId"]
+        missed = acp.handle({
+            "jsonrpc": "2.0",
+            "id": 10.4,
+            "method": "session/load",
+            "params": {"sessionId": "nope", "cwd": str(cwd)},
+        })
+        assert missed is not None and missed.get("error", {}).get("code") == -32602
 
         def fake_acp(_model, _system, messages, _max_tokens):
             blob = json.dumps(messages)

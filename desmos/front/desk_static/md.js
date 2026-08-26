@@ -1,6 +1,7 @@
 /* Desmos desk — GFM subset for streamed assistant markdown.
    Headings, lists, fences, tables, quotes, emphasis, links, inline code.
-   Not a toy: fences are lexed before inline, so a ``` block cannot leak. */
+   Fences are lexed before inline, so a ``` block cannot leak. Highlight
+   tokens follow Tokyo Night (the grok-build markdown crate's Syntect theme). */
 
 (function (root) {
   "use strict";
@@ -10,27 +11,61 @@
     return String(s).replace(/[&<>"]/g, (c) => ESC[c]);
   }
 
-  const LANG = {
-    keyword:
-      "and as assert async await break class continue def del elif else except finally for from global if import in is lambda nonlocal not or pass raise return try while with yield self True False None const let var function return typeof instanceof new this class extends",
+  const KW = {
+    py: new Set(
+      "and as assert async await break class continue def del elif else except finally for from global if import in is lambda nonlocal not or pass raise return try while with yield self True False None match case type".split(
+        /\s+/
+      )
+    ),
+    rs: new Set(
+      "as async await break const continue crate dyn else enum extern false fn for if impl in let loop match mod move mut pub ref return self Self static struct super trait true type unsafe use where while async await".split(
+        /\s+/
+      )
+    ),
+    js: new Set(
+      "async await break case catch class const continue debugger default delete do else export extends false finally for from function if import in instanceof let new null of return static super switch this throw true try typeof var void while with yield of as".split(
+        /\s+/
+      )
+    ),
+    go: new Set(
+      "break case chan const continue default defer else fallthrough for func go goto if import interface map package range return select struct switch type var true false nil".split(
+        /\s+/
+      )
+    ),
   };
+  KW.ts = KW.js;
+  KW.tsx = KW.js;
+  KW.jsx = KW.js;
+  KW.python = KW.py;
+  KW.rust = KW.rs;
+  KW.javascript = KW.js;
+  KW.typescript = KW.js;
+
+  function langKey(lang) {
+    return String(lang || "").toLowerCase().replace(/^\./, "");
+  }
 
   function highlight(code, lang) {
     const src = String(code);
-    if (!lang) return esc(src);
-    const keywords = new Set(LANG.keyword.split(/\s+/));
+    const key = langKey(lang);
+    if (!key) return esc(src);
+    const keywords = KW[key];
     const out = [];
     const re =
-      /(```)|(\/\/[^\n]*|#(?!\{)[^\n]*|\/\*[\s\S]*?\*\/)|("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|`(?:\\.|[^`\\])*`)|(\b\d+(?:\.\d+)?\b)|(\b[A-Za-z_][A-Za-z0-9_]*\b)|(\s+)|(.)/g;
+      /(\/\/[^\n]*|#(?![\{!])[^\n]*|\/\*[\s\S]*?\*\/)|("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|`(?:\\.|[^`\\])*`)|(\b\d+(?:\.\d+)?\b)|(\b[A-Za-z_][A-Za-z0-9_]*\b)|(\s+)|(.)/g;
     let m;
     while ((m = re.exec(src))) {
-      if (m[2]) out.push(`<span class="tok-cmt">${esc(m[2])}</span>`);
-      else if (m[3]) out.push(`<span class="tok-str">${esc(m[3])}</span>`);
-      else if (m[4]) out.push(`<span class="tok-num">${esc(m[4])}</span>`);
-      else if (m[5]) {
-        const w = m[5];
-        out.push(keywords.has(w) ? `<span class="tok-kw">${esc(w)}</span>` : esc(w));
-      } else out.push(esc(m[6] || m[7] || ""));
+      if (m[1]) out.push(`<span class="tok-cmt">${esc(m[1])}</span>`);
+      else if (m[2]) out.push(`<span class="tok-str">${esc(m[2])}</span>`);
+      else if (m[3]) out.push(`<span class="tok-num">${esc(m[3])}</span>`);
+      else if (m[4]) {
+        const w = m[4];
+        const rest = src.slice(m.index + w.length);
+        if (keywords && keywords.has(w)) out.push(`<span class="tok-kw">${esc(w)}</span>`);
+        else if (/^\s*\(/.test(rest)) out.push(`<span class="tok-fn">${esc(w)}</span>`);
+        else if (/^[A-Z]/.test(w)) out.push(`<span class="tok-ty">${esc(w)}</span>`);
+        else out.push(esc(w));
+      } else out.push(esc(m[5] || m[6] || ""));
     }
     return out.join("");
   }
@@ -160,43 +195,86 @@
     return html.join("") || "<p></p>";
   }
 
-  function diffHtml(oldText, newText) {
-    const a = String(oldText || "").split("\n");
-    const b = String(newText || "").split("\n");
+  function indexDiff(a, b) {
     const rows = [];
-    const n = Math.max(a.length, b.length);
-    // Line-oriented LCS is overkill for streamed cards; pair by index then
-    // mark leftovers. A real unified diff from the kernel still wins when
-    // present — this is the fallback for old/new bodies.
     let i = 0;
     let j = 0;
     while (i < a.length || j < b.length) {
       if (i < a.length && j < b.length && a[i] === b[j]) {
-        rows.push(`<div class="d-eq"><span class="g"></span><span class="t">${esc(a[i])}</span></div>`);
+        rows.push(["eq", a[i]]);
         i += 1;
         j += 1;
         continue;
       }
       if (i < a.length && (j >= b.length || !b.includes(a[i], j))) {
-        rows.push(`<div class="d-del"><span class="g">−</span><span class="t">${esc(a[i])}</span></div>`);
+        rows.push(["del", a[i]]);
         i += 1;
         continue;
       }
       if (j < b.length && (i >= a.length || !a.includes(b[j], i))) {
-        rows.push(`<div class="d-add"><span class="g">+</span><span class="t">${esc(b[j])}</span></div>`);
+        rows.push(["add", b[j]]);
         j += 1;
         continue;
       }
-      rows.push(`<div class="d-del"><span class="g">−</span><span class="t">${esc(a[i])}</span></div>`);
-      rows.push(`<div class="d-add"><span class="g">+</span><span class="t">${esc(b[j])}</span></div>`);
+      rows.push(["del", a[i]]);
+      rows.push(["add", b[j]]);
       i += 1;
       j += 1;
     }
-    if (!rows.length) {
-      for (const line of b) rows.push(`<div class="d-add"><span class="g">+</span><span class="t">${esc(line)}</span></div>`);
+    return rows;
+  }
+
+  function lcsOps(a, b) {
+    const n = a.length;
+    const m = b.length;
+    if (n * m > 250000) return indexDiff(a, b);
+    const dp = new Array(n + 1);
+    for (let i = 0; i <= n; i += 1) dp[i] = new Uint16Array(m + 1);
+    for (let i = n - 1; i >= 0; i -= 1) {
+      for (let j = m - 1; j >= 0; j -= 1) {
+        dp[i][j] = a[i] === b[j] ? dp[i + 1][j + 1] + 1 : Math.max(dp[i + 1][j], dp[i][j + 1]);
+      }
     }
-    void n;
-    return `<div class="diff">${rows.join("")}</div>`;
+    const rows = [];
+    let i = 0;
+    let j = 0;
+    while (i < n && j < m) {
+      if (a[i] === b[j]) {
+        rows.push(["eq", a[i]]);
+        i += 1;
+        j += 1;
+      } else if (dp[i + 1][j] >= dp[i][j + 1]) {
+        rows.push(["del", a[i]]);
+        i += 1;
+      } else {
+        rows.push(["add", b[j]]);
+        j += 1;
+      }
+    }
+    while (i < n) {
+      rows.push(["del", a[i]]);
+      i += 1;
+    }
+    while (j < m) {
+      rows.push(["add", b[j]]);
+      j += 1;
+    }
+    return rows;
+  }
+
+  function diffHtml(oldText, newText) {
+    const a = String(oldText || "").split("\n");
+    const b = String(newText || "").split("\n");
+    const ops = lcsOps(a, b);
+    if (!ops.length) {
+      for (const line of b) ops.push(["add", line]);
+    }
+    const html = ops.map(([kind, line]) => {
+      const cls = kind === "eq" ? "d-eq" : kind === "del" ? "d-del" : "d-add";
+      const g = kind === "eq" ? "" : kind === "del" ? "−" : "+";
+      return `<div class="${cls}"><span class="g">${g}</span><span class="t">${esc(line)}</span></div>`;
+    });
+    return `<div class="diff">${html.join("")}</div>`;
   }
 
   root.DesmosMd = { render, highlight, diffHtml, esc };
