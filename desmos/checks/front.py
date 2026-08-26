@@ -1096,6 +1096,138 @@ def _check_replay_sid() -> None:
             os.environ["DESMOS_SESSION_ID"] = old_sid
 
 
+def _check_desk() -> None:
+    """The desk UI speaks live ACP over a real websocket, not a lookalike loop."""
+    import json
+    import tempfile
+    import urllib.request
+
+    from desmos.front.acp import family_of, pane_of
+    from desmos.front.desk import STATIC_DIR, RpcClient, serve_thread
+
+    assert pane_of({"sessionUpdate": "agent_thought_chunk"}) == "story"
+    assert pane_of({"sessionUpdate": "agent_message_chunk"}) == "story"
+    assert pane_of({"sessionUpdate": "tool_call"}) == "activity"
+    assert pane_of({"sessionUpdate": "tool_call_update"}) == "activity"
+    assert family_of({"title": "complete"}) == "complete"
+    assert family_of({"sessionUpdate": "agent_thought_chunk"}) == "thinking"
+
+    for name in ("index.html", "desk.css", "desk.js", "md.js"):
+        path = STATIC_DIR / name
+        assert path.is_file() and path.stat().st_size > 0, path
+    html = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+    assert 'id="story"' in html and 'id="activity"' in html
+
+    with tempfile.TemporaryDirectory() as tmp:
+        cwd = Path(tmp)
+        port, stop, hub = serve_thread(cwd, port=0)
+        client = None
+        try:
+            page = urllib.request.urlopen(f"http://127.0.0.1:{port}/", timeout=4)
+            served = page.read().decode("utf-8")
+            assert page.status == 200
+            assert 'id="story"' in served and 'id="activity"' in served
+            health = json.loads(urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=4).read())
+            assert health["ok"] is True
+            assert Path(health["cwd"]) == cwd.resolve()
+
+            client = RpcClient("127.0.0.1", port)
+            init = client.call("initialize", {"protocolVersion": 1})
+            assert init["result"]["protocolVersion"] == 1
+            assert init["result"]["_meta"]["steering"]["supported"] is True
+            auth = client.call("authenticate", {"methodId": "none"}, req_id=2)
+            assert auth["result"] == {}
+            created = client.call("session/new", {"cwd": str(cwd)}, req_id=3)
+            sid = created["result"]["sessionId"]
+            assert sid
+            assert any(o.get("id") == "model" for o in created["result"]["configOptions"])
+            world = hub.server.sessions[sid]
+            world.model = "claude-opus-5"
+
+            def fake(_model, _system, messages, _max_tokens):
+                blob = json.dumps(messages)
+                if "<result" in blob:
+                    return {"content": [{"type": "text", "text": "done"}], "usage": {}}
+                return {
+                    "content": [
+                        {"type": "thinking", "thinking": "plan", "signature": "sig"},
+                        {"type": "text", "text": '<exec op="python">1+1</exec>'},
+                    ],
+                    "usage": {"input_tokens": 3, "output_tokens": 4},
+                }
+
+            world.complete_fn = fake
+            prompted = client.call(
+                "session/prompt",
+                {"sessionId": sid, "prompt": [{"type": "text", "text": "add one"}]},
+                req_id=4,
+                timeout=30,
+            )
+            assert prompted["result"]["stopReason"] == "end_turn", prompted
+            notes = prompted["_notes"]
+            kinds = [
+                n["params"]["update"]["sessionUpdate"]
+                for n in notes
+                if n.get("method") == "session/update"
+            ]
+            assert "agent_thought_chunk" in kinds, kinds
+            assert "agent_message_chunk" in kinds, kinds
+            assert "tool_call" in kinds, kinds
+            thought = next(
+                n for n in notes
+                if n.get("method") == "session/update"
+                and n["params"]["update"]["sessionUpdate"] == "agent_thought_chunk"
+            )
+            exec_call = next(
+                n for n in notes
+                if n.get("method") == "session/update"
+                and n["params"]["update"]["sessionUpdate"] == "tool_call"
+                and n["params"]["update"]["title"] == "exec"
+            )
+            complete = next(
+                n for n in notes
+                if n.get("method") == "session/update"
+                and n["params"]["update"]["sessionUpdate"] == "tool_call"
+                and n["params"]["update"]["title"] == "complete"
+            )
+            assert thought["params"]["_meta"]["desmos"]["pane"] == "story"
+            assert exec_call["params"]["_meta"]["desmos"]["pane"] == "activity"
+            assert exec_call["params"]["_meta"]["desmos"]["family"] == "syscall"
+            assert complete["params"]["_meta"]["desmos"]["pane"] == "activity"
+            assert complete["params"]["_meta"]["desmos"]["family"] == "complete"
+            speech = next(
+                n["params"]["update"]["content"]["text"]
+                for n in notes
+                if n.get("method") == "session/update"
+                and n["params"]["update"]["sessionUpdate"] == "agent_message_chunk"
+            )
+            assert "<result" not in speech
+
+            cancelled = client.call("session/cancel", {"sessionId": sid}, req_id=5)
+            assert cancelled["result"] == {}
+            efforted = client.call(
+                "session/set_config_option",
+                {"sessionId": sid, "configId": "thought_level", "value": "high"},
+                req_id=6,
+            )
+            assert world.thinking == "high", world.thinking
+            assert any(
+                o.get("currentValue") == "high"
+                for o in efforted["result"]["configOptions"]
+                if o.get("id") == "thought_level"
+            )
+            missing = client.call(
+                "session/prompt",
+                {"sessionId": "no-such", "prompt": [{"type": "text", "text": "x"}]},
+                req_id=7,
+            )
+            assert missing.get("error", {}).get("code") == -32602
+        finally:
+            if client is not None:
+                client.close()
+            stop()
+
+
 def check() -> None:
     import tempfile
 
@@ -1260,8 +1392,53 @@ def check() -> None:
         assert "tool_call" in kinds
         assert "tool_call_update" in kinds
         assert all(n["params"].get("_meta", {}).get("promptId") == "p-check" for n in notes if n.get("method") == "session/update")
-        tool = next(n["params"]["update"] for n in notes if n.get("method") == "session/update" and n["params"]["update"]["sessionUpdate"] == "tool_call")
-        assert tool["title"] == "exec" and tool["kind"] == "execute"
+        tools = [
+            n["params"]["update"]
+            for n in notes
+            if n.get("method") == "session/update" and n["params"]["update"]["sessionUpdate"] == "tool_call"
+        ]
+        exec_tool = next(u for u in tools if u["title"] == "exec")
+        assert exec_tool["kind"] == "execute", exec_tool
+        complete_tool = next(u for u in tools if u["title"] == "complete")
+        assert complete_tool["kind"] == "fetch", complete_tool
+        panes = {n["params"]["_meta"]["desmos"]["pane"] for n in notes if n.get("method") == "session/update"}
+        families = [n["params"]["_meta"]["desmos"]["family"] for n in notes if n.get("method") == "session/update"]
+        thought_panes = [
+            n["params"]["_meta"]["desmos"]["pane"]
+            for n in notes
+            if n.get("method") == "session/update"
+            and n["params"]["update"]["sessionUpdate"] == "agent_thought_chunk"
+        ]
+        tool_panes = [
+            n["params"]["_meta"]["desmos"]["pane"]
+            for n in notes
+            if n.get("method") == "session/update"
+            and n["params"]["update"]["sessionUpdate"] in ("tool_call", "tool_call_update")
+        ]
+        assert thought_panes and set(thought_panes) == {"story"}, thought_panes
+        assert tool_panes and set(tool_panes) == {"activity"}, tool_panes
+        assert "complete" in families and "syscall" in families
+        assert "story" in panes and "activity" in panes
+        created_opts = created["result"]["configOptions"]
+        assert any(o.get("category") == "model" for o in created_opts)
+        assert any(o.get("category") == "thought_level" for o in created_opts)
+
+        efforted = acp.handle({
+            "jsonrpc": "2.0",
+            "id": 11.5,
+            "method": "session/set_config_option",
+            "params": {"sessionId": sid, "configId": "thought_level", "value": "high"},
+        })
+        assert efforted["result"]["configOptions"]
+        assert acp.sessions[sid].thinking == "high"
+        steered = acp.handle({
+            "jsonrpc": "2.0",
+            "id": 11.6,
+            "method": "_session/steer",
+            "params": {"sessionId": sid, "text": "slow down"},
+        })
+        assert steered["result"] == {}
+        assert "slow down" in acp.sessions[sid].steers
 
         # The pager opens a second session on the same cwd for every new
         # thread. Sessions on one workspace share the World -- persist keys its
@@ -1472,6 +1649,7 @@ def check() -> None:
         _check_path_deps_tracked()
         _check_vendor_patch()
         _check_release_tui_launcher()
+    _check_desk()
     _check_emit_sid()
     _check_replay_sid()
     _check_socket()

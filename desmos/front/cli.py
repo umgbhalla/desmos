@@ -132,6 +132,20 @@ def cmd_acp(args: argparse.Namespace) -> int:
     return serve(cwd=cwd)
 
 
+def cmd_desk(args: argparse.Namespace) -> int:
+    """Serve the first-party desk UI and speak ACP to the live kernel."""
+    _on_path()
+    from desmos.front.desk import serve
+
+    cwd = Path(args.cwd or os.environ.get("DESMOS_CWD") or os.environ.get("PWD") or ".").resolve()
+    return serve(
+        cwd,
+        host=args.host,
+        port=int(args.port),
+        open_browser=not args.no_browser,
+    )
+
+
 def cmd_comet(args: argparse.Namespace) -> int:
     """Build and launch the vendored Comet frontend with Desmos over ACP."""
     _on_path()
@@ -514,6 +528,13 @@ def main() -> int:
     a = sub.add_parser("acp", help="ACP stdio server for external frontends")
     a.add_argument("--cwd", default="", help="default cwd before session/new selects one")
     a.set_defaults(func=cmd_acp)
+
+    d = sub.add_parser("desk", help="desktop/web UI over ACP (story | activity | composer)")
+    d.add_argument("--cwd", default=".")
+    d.add_argument("--host", default="127.0.0.1")
+    d.add_argument("--port", default="7734")
+    d.add_argument("--no-browser", action="store_true", help="do not open a browser")
+    d.set_defaults(func=cmd_desk)
 
     se = sub.add_parser("seat", help="operator-gated seat lifecycle (docs/seats.md)")
     seat_sub = se.add_subparsers(dest="action", required=True)

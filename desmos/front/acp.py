@@ -20,9 +20,78 @@ from desmos.kernel.loop import new_world, run_turns
 
 PROTOCOL_VERSION = 1
 
+# Story is speech and thinking. Activity is the wire. The TUI enforces this by
+# never routing a result event into the story pane; ACP tags the same split so
+# a web/desktop client cannot accidentally flatten everything to `out`.
+STORY_UPDATES = frozenset({"agent_thought_chunk", "agent_message_chunk"})
+ACTIVITY_UPDATES = frozenset({"tool_call", "tool_call_update"})
+
 
 class _TurnFailed(Exception):
     """The step ended on an error event. A stopReason would report it as an answer."""
+
+
+def _available_models() -> list[dict[str, str]]:
+    from desmos.transport.settings import CATALOG
+
+    rows: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for entry in CATALOG.values():
+        for model in entry.get("models") or []:
+            if model in seen:
+                continue
+            seen.add(model)
+            rows.append({"modelId": model, "name": model})
+    if not rows:
+        rows.append({"modelId": DEFAULT_MODEL, "name": DEFAULT_MODEL})
+    return rows
+
+
+def _efforts_for(model: str) -> list[str]:
+    from desmos.transport.settings import CATALOG, provider_of
+
+    entry = CATALOG.get(provider_of(model)) or {}
+    return list(entry.get("efforts") or ["low"])
+
+
+def config_options(world: Any | None = None) -> list[dict[str, Any]]:
+    """ACP session config surface: model + thought_level from the live catalog.
+
+    Comet/gpuix-class clients set these through session/set_config_option.
+    The values are the same objects the TUI picker reads — not a second list.
+    """
+    model = str(getattr(world, "model", None) or DEFAULT_MODEL)
+    effort = str(getattr(world, "thinking", None) or "low")
+    models = _available_models()
+    efforts = _efforts_for(model)
+    if effort not in efforts and efforts:
+        effort = efforts[0]
+    return [
+        {
+            "id": "model",
+            "type": "select",
+            "category": "model",
+            "name": "Model",
+            "currentValue": model,
+            "options": [{"value": row["modelId"], "name": row["name"]} for row in models],
+        },
+        {
+            "id": "thought_level",
+            "type": "select",
+            "category": "thought_level",
+            "name": "Thinking",
+            "currentValue": effort,
+            "options": [{"value": item, "name": item} for item in efforts],
+        },
+    ]
+
+
+def session_models(world: Any | None = None) -> dict[str, Any]:
+    model = str(getattr(world, "model", None) or DEFAULT_MODEL)
+    return {
+        "currentModelId": model,
+        "availableModels": _available_models(),
+    }
 
 
 def initialize_result() -> dict[str, Any]:
@@ -42,12 +111,134 @@ def initialize_result() -> dict[str, Any]:
             "cancelRewind": False,
             "sessionRecap": False,
             "availableCommands": [],
+            "steering": {"supported": True},
             "modelState": {
                 "currentModelId": model,
-                "availableModels": [{"modelId": model, "name": model}],
+                "availableModels": _available_models(),
             },
         },
     }
+
+
+def pane_of(update: dict[str, Any]) -> str:
+    """Which Desmos pane an ACP sessionUpdate belongs on."""
+    kind = str(update.get("sessionUpdate") or "")
+    if kind in STORY_UPDATES:
+        return "story"
+    return "activity"
+
+
+def family_of(update: dict[str, Any]) -> str:
+    """Syscall family for activity cards. Story chunks are not families."""
+    meta = update.get("_meta")
+    if isinstance(meta, dict):
+        desmos = meta.get("desmos")
+        if isinstance(desmos, dict) and desmos.get("family"):
+            return str(desmos["family"])
+    title = str(update.get("title") or "")
+    if title == "complete":
+        return "complete"
+    if title in {"edit", "workspace"} or title.endswith(" edit"):
+        return "edit"
+    kind = str(update.get("sessionUpdate") or "")
+    if kind in STORY_UPDATES:
+        return "speech" if kind == "agent_message_chunk" else "thinking"
+    return "syscall"
+
+
+def _clip_text(text: str, cap: int = 8000) -> str:
+    if len(text) <= cap:
+        return text
+    return text[: cap - 16] + "\n…[truncated]"
+
+
+def _is_edit(ev: dict[str, Any]) -> bool:
+    tag = str(ev.get("tag") or "")
+    attrs = ev.get("attrs") if isinstance(ev.get("attrs"), dict) else {}
+    return tag == "edit" or (tag == "workspace" and str(attrs.get("op") or "") == "edit")
+
+
+def _result_title(ev: dict[str, Any]) -> str:
+    tag = str(ev.get("tag") or "tool")
+    attrs = ev.get("attrs") if isinstance(ev.get("attrs"), dict) else {}
+    op = str(attrs.get("op") or "")
+    path = str(attrs.get("path") or "")
+    if _is_edit(ev):
+        name = path.rsplit("/", 1)[-1] if path else ""
+        return f"edit {name}".strip() if name else "edit"
+    if op and op != tag:
+        return f"{tag} {op}"
+    return tag
+
+
+def _result_locations(ev: dict[str, Any]) -> list[dict[str, Any]]:
+    attrs = ev.get("attrs") if isinstance(ev.get("attrs"), dict) else {}
+    path = str(attrs.get("path") or "")
+    if not path:
+        return []
+    loc: dict[str, Any] = {"path": path}
+    line = ev.get("line")
+    if line is not None:
+        try:
+            loc["line"] = int(line)
+        except (TypeError, ValueError):
+            pass
+    return [loc]
+
+
+def _result_content(ev: dict[str, Any], text: str) -> list[dict[str, Any]]:
+    chunks: list[dict[str, Any]] = []
+    if _is_edit(ev):
+        diff = _edit_diff(ev)
+        if diff is not None:
+            chunks.append(diff)
+    if text:
+        chunks.append({
+            "type": "content",
+            "content": {"type": "text", "text": text},
+        })
+    return chunks
+
+
+def _edit_diff(ev: dict[str, Any]) -> dict[str, Any] | None:
+    attrs = ev.get("attrs") if isinstance(ev.get("attrs"), dict) else {}
+    path = str(attrs.get("path") or "")
+    body = str(ev.get("body") or "")
+    old = new = ""
+    try:
+        from desmos.kernel.edit import parse_edit_body
+
+        old, new = parse_edit_body(body, attrs)
+    except Exception:  # noqa: BLE001 — a refused/ambiguous body still has text
+        if "\n---\n" in body:
+            old, _, new = body.partition("\n---\n")
+    if not old and not new:
+        return None
+    return {
+        "type": "diff",
+        "path": path or "edit",
+        "oldText": old,
+        "newText": new,
+    }
+
+
+def _complete_card(ev: dict[str, Any]) -> str:
+    """Activity-pane summary of one complete() POST. Never the raw key."""
+    req = ev.get("request") if isinstance(ev.get("request"), dict) else {}
+    messages = req.get("messages") if isinstance(req.get("messages"), list) else []
+    summary = {
+        "model": ev.get("model"),
+        "thinking": ev.get("thinking"),
+        "origin": ev.get("origin"),
+        "n": ev.get("n"),
+        "messages": len(messages),
+        "thoughts": ev.get("thoughts"),
+        "redacted": ev.get("redacted"),
+        "usage": ev.get("usage") or {},
+        "spans": ev.get("spans") or [],
+        "residue": ev.get("residue") or "",
+    }
+    return json.dumps(summary, default=str, indent=2)
 
 
 def prompt_text(blocks: Any) -> str:
@@ -153,6 +344,16 @@ class AcpServer:
             return rpc_result(req_id, {})
         if method == "session/new":
             return rpc_result(req_id, self._session_new(params))
+        if method == "session/set_config_option":
+            try:
+                return rpc_result(req_id, self._set_config_option(params))
+            except ValueError as exc:
+                return rpc_error(req_id, -32602, str(exc))
+        if method == "_session/steer":
+            try:
+                return rpc_result(req_id, self._session_steer(params))
+            except ValueError as exc:
+                return rpc_error(req_id, -32602, str(exc))
         if method == "session/prompt":
             try:
                 return rpc_result(req_id, self._session_prompt(params))
@@ -181,7 +382,7 @@ class AcpServer:
             return rpc_error(None, -32600, "Invalid Request")
         return self.handle(msg)
 
-    def _session_new(self, params: dict[str, Any]) -> dict[str, str]:
+    def _session_new(self, params: dict[str, Any]) -> dict[str, Any]:
         cwd_raw = params.get("cwd") or self.default_cwd
         cwd = Path(str(cwd_raw)).expanduser()
         if not cwd.is_absolute():
@@ -215,7 +416,11 @@ class AcpServer:
             self.sessions[session_id] = world
             self._convo[session_id] = (list(entry[1]), list(entry[2]))
             self._tool_ids[session_id] = itertools.count(1)
-        return {"sessionId": session_id}
+        return {
+            "sessionId": session_id,
+            "configOptions": config_options(world),
+            "models": session_models(world),
+        }
 
     def _session_prompt(self, params: dict[str, Any]) -> dict[str, str]:
         session_id = str(params.get("sessionId") or "")
@@ -295,6 +500,53 @@ class AcpServer:
             if state is not None:
                 state["cancelled"] = True
 
+    def _set_config_option(self, params: dict[str, Any]) -> dict[str, Any]:
+        session_id = str(params.get("sessionId") or "")
+        with self._lock:
+            world = self.sessions.get(session_id)
+        if world is None:
+            raise ValueError(f"unknown session {session_id!r}")
+        config_id = str(params.get("configId") or params.get("id") or "")
+        raw = params.get("value")
+        if isinstance(raw, dict):
+            value = raw.get("value")
+            if value is None and "boolean" in raw:
+                value = raw.get("boolean")
+        else:
+            value = raw
+        if config_id in {"thought_level", "thinking", "effort"}:
+            text = str(value or "").strip()
+            if not text:
+                raise ValueError("thought_level needs a value")
+            from desmos.transport.settings import clamp_effort, provider_of
+
+            world.thinking = clamp_effort(provider_of(str(world.model or "")), text)
+            return {"configOptions": config_options(world), "models": session_models(world)}
+        if config_id in {"model"}:
+            model = str(value or "").strip()
+            if not model:
+                raise ValueError("model needs a value")
+            from desmos.transport.settings import clamp_effort, provider_of, switch
+
+            effort = clamp_effort(provider_of(model), str(world.thinking or "low"))
+            switch(world, model, effort)
+            return {"configOptions": config_options(world), "models": session_models(world)}
+        raise ValueError(f"unknown config option {config_id!r}")
+
+    def _session_steer(self, params: dict[str, Any]) -> dict[str, Any]:
+        session_id = str(params.get("sessionId") or "")
+        with self._lock:
+            world = self.sessions.get(session_id)
+        if world is None:
+            raise ValueError(f"unknown session {session_id!r}")
+        text = str(params.get("text") or params.get("content") or "").strip()
+        if not text:
+            raise ValueError("steer needs text")
+        from desmos.kernel.catalog import steer as _steer
+
+        _steer(world, text)
+        return {}
+
     def _emit_event(
         self,
         session_id: str,
@@ -309,14 +561,14 @@ class AcpServer:
                 self._update(session_id, prompt_id, {
                     "sessionUpdate": "agent_thought_chunk",
                     "content": {"type": "text", "text": text},
-                })
+                }, family="thinking")
         elif kind == "speech":
             text = str(ev.get("text") or "")
             if text:
                 self._update(session_id, prompt_id, {
                     "sessionUpdate": "agent_message_chunk",
                     "content": {"type": "text", "text": text},
-                })
+                }, family="speech")
         elif kind == "turn":
             # A truncated reply ("[reply was cut short]") emits error and then
             # keeps going, so only an error with no turn after it ended the
@@ -325,20 +577,67 @@ class AcpServer:
             state.pop("error", None)
         elif kind == "error":
             state["error"] = str(ev.get("text") or "")
+        elif kind == "post":
+            tool_id = f"c{next(state['tools'])}"
+            state["complete"] = tool_id
+            model = str(ev.get("model") or "")
+            self._update(session_id, prompt_id, {
+                "sessionUpdate": "tool_call",
+                "toolCallId": tool_id,
+                "title": "complete",
+                "kind": "fetch",
+                "status": "pending",
+                "rawInput": {
+                    "model": model,
+                    "origin": ev.get("origin"),
+                    "n": ev.get("n"),
+                },
+            }, family="complete")
+        elif kind == "complete":
+            tool_id = str(state.get("complete") or "")
+            if not tool_id:
+                tool_id = f"c{next(state['tools'])}"
+                state["complete"] = tool_id
+                self._update(session_id, prompt_id, {
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": tool_id,
+                    "title": "complete",
+                    "kind": "fetch",
+                    "status": "pending",
+                }, family="complete")
+            self._update(session_id, prompt_id, {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": tool_id,
+                "status": "completed",
+                "title": "complete",
+                "kind": "fetch",
+                "content": [{
+                    "type": "content",
+                    "content": {"type": "text", "text": _complete_card(ev)},
+                }],
+            }, family="complete")
         elif kind == "result":
             phase = str(ev.get("phase") or "done")
-            title = str(ev.get("tag") or "tool")
+            title = _result_title(ev)
+            family = "edit" if _is_edit(ev) else "syscall"
             tool_id = str(state.get("tool") or "")
             if phase == "start" or not tool_id:
                 tool_id = f"t{next(state['tools'])}"
                 state["tool"] = tool_id
+                raw: dict[str, Any] = {
+                    "tag": ev.get("tag"),
+                    "attrs": ev.get("attrs") or {},
+                    "body": _clip_text(str(ev.get("body") or "")),
+                }
                 self._update(session_id, prompt_id, {
                     "sessionUpdate": "tool_call",
                     "toolCallId": tool_id,
                     "title": title,
-                    "kind": "execute",
+                    "kind": "edit" if family == "edit" else "execute",
                     "status": "pending",
-                })
+                    "locations": _result_locations(ev),
+                    "rawInput": raw,
+                }, family=family)
                 if phase == "start":
                     return
             text = str(ev.get("text") or "")
@@ -352,22 +651,39 @@ class AcpServer:
                             "type": "content",
                             "content": {"type": "text", "text": text},
                         }],
-                    })
+                    }, family=family)
                 return
             self._update(session_id, prompt_id, {
                 "sessionUpdate": "tool_call_update",
                 "toolCallId": tool_id,
                 "status": "completed",
-                "content": [{
-                    "type": "content",
-                    "content": {"type": "text", "text": text},
-                }],
-            })
+                "title": title,
+                "kind": "edit" if family == "edit" else "execute",
+                "content": _result_content(ev, text),
+            }, family=family)
 
-    def _update(self, session_id: str, prompt_id: str | None, update: dict[str, Any]) -> None:
+    def _update(
+        self,
+        session_id: str,
+        prompt_id: str | None,
+        update: dict[str, Any],
+        *,
+        family: str | None = None,
+    ) -> None:
+        pane = pane_of(update)
+        desmos_meta = {"pane": pane}
+        if family:
+            desmos_meta["family"] = family
+        nested = update.get("_meta")
+        if not isinstance(nested, dict):
+            nested = {}
+        nested["desmos"] = desmos_meta
+        update["_meta"] = nested
         params: dict[str, Any] = {"sessionId": session_id, "update": update}
+        meta: dict[str, Any] = {"desmos": desmos_meta}
         if prompt_id:
-            params["_meta"] = {"promptId": prompt_id}
+            meta["promptId"] = prompt_id
+        params["_meta"] = meta
         self.write({"jsonrpc": "2.0", "method": "session/update", "params": params})
 
 
