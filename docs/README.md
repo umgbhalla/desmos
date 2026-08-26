@@ -3,6 +3,7 @@
 | page | what it covers |
 |---|---|
 | [design.md](design.md) | architecture, the turn loop, dispatch, persistence, providers, invariants |
+| [how-desmos-works.md](how-desmos-works.md) | runtime briefing: one request through the loop, leftover vs current product |
 | [tags.md](tags.md) | every tag, its attributes, and its result shape |
 | [self-growth.md](self-growth.md) | how the agent extends itself: tools, notes, skills, generations |
 | [constitution.md](constitution.md) | the invariants self-improvement is not allowed to break |
