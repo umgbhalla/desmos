@@ -12,6 +12,9 @@
 | [extensibility.md](extensibility.md) | writing an extension that registers tags or hooks dispatch |
 | [subagents.md](subagents.md) | child worlds, contracts, fan-out, judgment |
 | [comet-frontend.md](comet-frontend.md) | the optional Comet desktop frontend over ACP |
+| [desk-frontend.md](desk-frontend.md) | HTML viewport over in-process ACP |
+| [gpuix-frontend.md](gpuix-frontend.md) | `@gpuix/react` host over ACP |
+| [gui-maturity.md](gui-maturity.md) | what each surface actually paints, and what is not built yet |
 | [openai-prompt-cache-audit.md](openai-prompt-cache-audit.md) | measured cache behaviour on the OpenAI path |
 
 Start with [design.md](design.md) if you are reading the code, and

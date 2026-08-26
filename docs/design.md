@@ -281,6 +281,7 @@ not ACP.
 Not faked: two writers on `.desmos/bridge.sock`, or a Zeron CRDT devices
 page. Per-surface scope: [comet-frontend.md](comet-frontend.md),
 [gpuix-frontend.md](gpuix-frontend.md), [desk-frontend.md](desk-frontend.md).
+Built vs remaining, event-by-event: [gui-maturity.md](gui-maturity.md).
 
 `bridge.py` speaks JSONL to the Rust TUI: the loop emits events (`post`,
 `thinking`, `speech`, `result`, `complete`, `compacted`, `turn`, `done`,
