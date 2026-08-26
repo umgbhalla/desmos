@@ -72,6 +72,11 @@ Supported now:
 - create / resume a Desmos ACP session for a workspace;
 - stream assistant markdown and thinking on **Story** (`MessagePart::Thought`);
 - `complete()` cards and syscall chips on **Activity** (separate GPUI pane);
+- protocol errors (xml-as-speech, a fold) as Activity cards — `session/prompt`
+  returns `end_turn`, not JSON-RPC `-32603` ("harness protocol error");
+- image blocks advertised and attached through `run_turns(images=)`;
+- subagent start/progress/done as Story cards; child speech stays inside
+  that card instead of mixing into parent prose;
 - Grok markdown contract on Story: GFM + math + `~~` strike only (single `~`
   stays literal, matching `xai-grok-markdown-core`);
 - gpuix-style word diffs on the Changes pane and inline edit diffs (`similar`);

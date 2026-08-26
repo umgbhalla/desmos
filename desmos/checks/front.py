@@ -1318,10 +1318,16 @@ def _check_desk() -> None:
 
     assert pane_of({"sessionUpdate": "agent_thought_chunk"}) == "story"
     assert pane_of({"sessionUpdate": "agent_message_chunk"}) == "story"
+    assert pane_of({"sessionUpdate": "user_message_chunk"}) == "story"
     assert pane_of({"sessionUpdate": "tool_call"}) == "activity"
     assert pane_of({"sessionUpdate": "tool_call_update"}) == "activity"
     assert family_of({"title": "complete"}) == "complete"
+    assert family_of({"title": "error"}) == "error"
+    assert family_of({"title": "compacted"}) == "compacted"
+    assert family_of({"title": "decision"}) == "decision"
+    assert family_of({"title": "pending"}) == "pending"
     assert family_of({"sessionUpdate": "agent_thought_chunk"}) == "thinking"
+    assert family_of({"sessionUpdate": "user_message_chunk"}) == "prompt"
 
     for name in ("index.html", "desk.css", "desk.js", "md.js"):
         path = STATIC_DIR / name
@@ -1339,6 +1345,10 @@ def _check_desk() -> None:
         os.environ.pop(k, None)
     os.environ["DESMOS_TOOL_SYSCALLS"] = "0"
     try:
+        _check_acp_protocol_cards()
+        _check_acp_xml_as_speech()
+        _check_acp_images()
+        _check_acp_subagent_emitter()
         _check_desk_roundtrip()
         _check_desk_markdown()
     finally:
@@ -1351,6 +1361,413 @@ def _check_desk() -> None:
                 os.environ.pop(k, None)
             else:
                 os.environ[k] = value
+
+
+def _check_acp_protocol_cards() -> None:
+    """ACP maps kernel events to tagged session/update cards, not JSON souvenirs."""
+    import itertools
+    from pathlib import Path
+
+    from desmos.front.acp import AcpServer
+
+    captured: list[dict] = []
+    server = AcpServer(captured.append, default_cwd=Path("."))
+    state: dict = {"tools": itertools.count(1)}
+    sid = "s"
+
+    server._emit_event(
+        sid,
+        None,
+        {
+            "ev": "error",
+            "n": 2,
+            "text": (
+                "[the model emitted XML as speech instead of calling syscall"
+                " (session compact, knowledge todo). Those tags were not dispatched.]"
+            ),
+        },
+        state,
+    )
+    err = captured[-1]
+    assert err["params"]["update"]["title"] == "error"
+    assert err["params"]["_meta"]["desmos"]["family"] == "error"
+    assert err["params"]["_meta"]["desmos"]["pane"] == "activity"
+
+    captured.clear()
+    server._emit_event(
+        sid, None, {"ev": "compacted", "n": 1, "kept": 4, "text": "folded earlier turns"}, state
+    )
+    fold = captured[-1]
+    assert fold["params"]["update"]["title"] == "compacted"
+    assert fold["params"]["_meta"]["desmos"]["family"] == "compacted"
+
+    captured.clear()
+    server._emit_event(sid, None, {"ev": "steer", "n": 1, "text": "slow down"}, state)
+    steer = captured[-1]
+    assert steer["params"]["update"]["sessionUpdate"] == "user_message_chunk"
+    assert steer["params"]["_meta"]["desmos"]["pane"] == "story"
+    assert steer["params"]["_meta"]["desmos"]["family"] == "steer"
+    assert "[steer] slow down" in steer["params"]["update"]["content"]["text"]
+
+    captured.clear()
+    server._emit_event(
+        sid,
+        None,
+        {"ev": "complete", "n": 3, "spans": [[10, 40]], "model": "x", "usage": {}},
+        state,
+    )
+    complete = captured[-1]
+    meta = complete["params"]["_meta"]["desmos"]
+    assert meta["spans"] == [[10, 40]], meta
+    assert meta["group"] == 3, meta
+
+    captured.clear()
+    streamed: dict = {"tools": itertools.count(1)}
+    server._emit_event(
+        sid,
+        None,
+        {"ev": "result", "phase": "start", "tag": "exec", "attrs": {"op": "python"}, "body": "1", "text": ""},
+        streamed,
+    )
+    server._emit_event(
+        sid, None, {"ev": "result", "phase": "delta", "tag": "exec", "text": "line-A\n"}, streamed
+    )
+    server._emit_event(
+        sid, None, {"ev": "result", "phase": "done", "tag": "exec", "text": "line-A\nline-B"}, streamed
+    )
+    finals = [
+        m
+        for m in captured
+        if m.get("method") == "session/update"
+        and m["params"]["update"].get("status") == "completed"
+    ]
+    assert finals, captured
+    done = finals[-1]
+    texts = []
+    for part in done["params"]["update"].get("content") or []:
+        if part.get("type") == "content":
+            texts.append((part.get("content") or {}).get("text") or "")
+    assert "".join(texts) == "", texts
+    assert done["params"]["_meta"]["desmos"]["replace"] is True
+    assert done["params"]["_meta"]["desmos"]["phase"] == "done"
+
+    captured.clear()
+    server._emit_event(
+        sid, None,
+        {
+            "ev": "decision",
+            "id": "d1",
+            "prompt": "Deploy now?",
+            "options": ["yes", "no"],
+            "status": "open",
+            "answer": None,
+        },
+        state,
+    )
+    decision = captured[-1]
+    assert decision["params"]["update"]["title"] == "decision"
+    assert decision["params"]["_meta"]["desmos"]["family"] == "decision"
+    assert decision["params"]["update"]["status"] == "pending"
+
+    captured.clear()
+    server._emit_event(
+        sid, None, {"ev": "pending", "n": 1, "tasks": ["subagent general deadbeef"]}, state
+    )
+    pending = captured[-1]
+    pending_id = pending["params"]["update"]["toolCallId"]
+    assert pending["params"]["_meta"]["desmos"]["family"] == "pending"
+    captured.clear()
+    server._emit_event(sid, None, {"ev": "pending", "n": 0, "tasks": []}, state)
+    cleared = captured[-1]
+    assert cleared["params"]["update"]["toolCallId"] == pending_id
+    assert cleared["params"]["update"]["status"] == "completed"
+    assert cleared["params"]["_meta"]["desmos"]["replace"] is True
+
+    captured.clear()
+    server._emit_event(
+        sid,
+        None,
+        {
+            "ev": "subagent",
+            "phase": "started",
+            "id": "deadbeef",
+            "agent": "general",
+            "task": "look around",
+            "parent": None,
+            "depth": 0,
+        },
+        state,
+    )
+    spawn = captured[-1]
+    assert spawn["params"]["_meta"]["desmos"]["family"] == "subagent"
+    assert spawn["params"]["_meta"]["desmos"]["pane"] == "story"
+    captured.clear()
+    server._emit_event(
+        sid,
+        None,
+        {"ev": "child", "id": "deadbeef", "kind": "speech", "text": "kid said hi"},
+        state,
+    )
+    child = captured[-1]
+    assert child["params"]["update"]["sessionUpdate"] == "tool_call_update"
+    assert child["params"]["_meta"]["desmos"]["family"] == "subagent"
+    assert child["params"]["_meta"]["desmos"]["pane"] == "story"
+    body = ""
+    for part in child["params"]["update"].get("content") or []:
+        if part.get("type") == "content":
+            body += (part.get("content") or {}).get("text") or ""
+    assert "kid said hi" in body
+    assert child["params"]["update"].get("sessionUpdate") != "agent_message_chunk"
+
+    captured.clear()
+    server._emit_event(sid, None, {"ev": "attached", "text": "attached 1 image(s)"}, state)
+    assert captured[-1]["params"]["_meta"]["desmos"]["family"] == "attached"
+    captured.clear()
+    server._emit_event(sid, None, {"ev": "stopped", "text": "stopped, saved"}, state)
+    assert captured[-1]["params"]["_meta"]["desmos"]["family"] == "stopped"
+    captured.clear()
+    server._emit_event(sid, None, {"ev": "guidance", "n": 2, "text": "continue from evidence"}, state)
+    assert captured[-1]["params"]["_meta"]["desmos"]["family"] == "guidance"
+    captured.clear()
+    server._emit_event(sid, None, {"ev": "resumed", "n": 2, "text": "subagent finished"}, state)
+    assert captured[-1]["params"]["_meta"]["desmos"]["family"] == "resumed"
+
+
+def _check_acp_xml_as_speech() -> None:
+    """Tool-channel XML in speech is an error card and a finished prompt, not -32603."""
+    import tempfile
+
+    from desmos.front.acp import AcpServer
+
+    with tempfile.TemporaryDirectory() as tmp:
+        cwd = Path(tmp)
+        notes: list[dict] = []
+        acp = AcpServer(notes.append, default_cwd=cwd)
+        created = acp.handle(
+            {"jsonrpc": "2.0", "id": 1, "method": "session/new", "params": {"cwd": str(cwd)}}
+        )
+        assert created is not None
+        sid = created["result"]["sessionId"]
+        world = acp.sessions[sid]
+        world.model = "gpt-5.6-sol"
+        world.complete_fn = lambda *_: {
+            "content": [
+                {
+                    "type": "text",
+                    "text": (
+                        "recorded my items before moving to commit analysis.\n"
+                        '<session op="compact"></session> '
+                        '<knowledge op="todo">open</knowledge>'
+                    ),
+                }
+            ],
+            "usage": {},
+        }
+        prompted = acp.handle(
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "session/prompt",
+                "params": {"sessionId": sid, "prompt": [{"type": "text", "text": "go"}]},
+            }
+        )
+        assert prompted is not None
+        assert "error" not in prompted, prompted
+        assert prompted.get("result", {}).get("stopReason") == "end_turn", prompted
+        updates = [
+            n["params"]["update"]
+            for n in notes
+            if n.get("method") == "session/update"
+        ]
+        titles = [u.get("title") for u in updates if u.get("sessionUpdate") == "tool_call"]
+        assert "error" in titles, titles
+        assert "session" not in titles, titles
+        assert "knowledge" not in titles, titles
+        error = next(u for u in updates if u.get("title") == "error")
+        body = ""
+        for part in error.get("content") or []:
+            if part.get("type") == "content":
+                body += (part.get("content") or {}).get("text") or ""
+        assert "session compact" in body, body
+        assert "knowledge todo" in body, body
+        assert "not dispatched" in body, body
+
+
+def _tiny_png() -> bytes:
+    return bytes.fromhex(
+        "89504e470d0a1a0a0000000d4948445200000001000000010806000000"
+        "1f15c4890000000a49444154789c6300010000050001"
+        "0d0a2db40000000049454e44ae426082"
+    )
+
+
+def _check_acp_images() -> None:
+    """ACP image blocks reach run_turns(images=), the same path the TUI uses."""
+    import base64
+    import tempfile
+
+    from desmos.front.acp import AcpServer, initialize_result, prompt_images, prompt_text
+
+    init = initialize_result()
+    assert init["agentCapabilities"]["promptCapabilities"]["image"] is True
+    assert not prompt_text([{"type": "image", "data": "aGk=", "mimeType": "image/png"}])
+
+    png = _tiny_png()
+    with tempfile.TemporaryDirectory() as tmp:
+        dest = Path(tmp) / "imgs"
+        paths = prompt_images(
+            [{"type": "image", "mimeType": "image/png", "data": base64.standard_b64encode(png).decode()}],
+            dest,
+        )
+        assert len(paths) == 1 and Path(paths[0]).read_bytes() == png, paths
+
+        cwd = Path(tmp) / "work"
+        cwd.mkdir()
+        notes: list[dict] = []
+        acp = AcpServer(notes.append, default_cwd=cwd)
+        created = acp.handle(
+            {"jsonrpc": "2.0", "id": 1, "method": "session/new", "params": {"cwd": str(cwd)}}
+        )
+        assert created is not None
+        sid = created["result"]["sessionId"]
+        world = acp.sessions[sid]
+        world.complete_fn = lambda *_: {
+            "content": [{"type": "text", "text": "saw it"}],
+            "usage": {},
+        }
+        prompted = acp.handle(
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "session/prompt",
+                "params": {
+                    "sessionId": sid,
+                    "prompt": [
+                        {"type": "text", "text": "look"},
+                        {
+                            "type": "image",
+                            "mimeType": "image/png",
+                            "data": base64.standard_b64encode(png).decode(),
+                        },
+                    ],
+                },
+            }
+        )
+        assert prompted is not None
+        assert "error" not in prompted, prompted
+        kinds = []
+        for block in world.messages[0]["content"]:
+            if isinstance(block, dict):
+                kinds.append(block.get("type"))
+        assert "image" in kinds, world.messages[0]
+        families = [
+            n["params"]["_meta"]["desmos"]["family"]
+            for n in notes
+            if n.get("method") == "session/update" and n.get("params", {}).get("_meta", {}).get("desmos", {}).get("family")
+        ]
+        assert "attached" in families, families
+
+        image_only = acp.handle(
+            {
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "session/prompt",
+                "params": {
+                    "sessionId": sid,
+                    "prompt": [
+                        {
+                            "type": "image",
+                            "mimeType": "image/png",
+                            "data": base64.standard_b64encode(png).decode(),
+                        }
+                    ],
+                },
+            }
+        )
+        assert image_only is not None
+        assert "error" not in image_only, image_only
+
+
+def _check_acp_subagent_emitter() -> None:
+    """A child _emit during session/prompt is an ACP card, not silence."""
+    import tempfile
+
+    from desmos.agents import subagent as S
+    from desmos.front.acp import AcpServer
+
+    with tempfile.TemporaryDirectory() as tmp:
+        cwd = Path(tmp)
+        notes: list[dict] = []
+        acp = AcpServer(notes.append, default_cwd=cwd)
+        created = acp.handle(
+            {"jsonrpc": "2.0", "id": 1, "method": "session/new", "params": {"cwd": str(cwd)}}
+        )
+        assert created is not None
+        sid = created["result"]["sessionId"]
+        world = acp.sessions[sid]
+
+        def fake(_model, _system, _messages, _max_tokens):
+            S._emit(
+                {
+                    "ev": "subagent",
+                    "phase": "started",
+                    "id": "deadbeef",
+                    "agent": "general",
+                    "task": "look around",
+                    "parent": None,
+                    "depth": 0,
+                }
+            )
+            S._emit(
+                {
+                    "ev": "child",
+                    "id": "deadbeef",
+                    "kind": "speech",
+                    "text": "kid said hi",
+                }
+            )
+            S._emit(
+                {
+                    "ev": "subagent",
+                    "phase": "done",
+                    "id": "deadbeef",
+                    "task": "look around",
+                    "secs": 0.1,
+                }
+            )
+            return {"content": [{"type": "text", "text": "parent done"}], "usage": {}}
+
+        world.complete_fn = fake
+        prompted = acp.handle(
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "session/prompt",
+                "params": {"sessionId": sid, "prompt": [{"type": "text", "text": "go"}]},
+            }
+        )
+        assert prompted is not None
+        assert "error" not in prompted, prompted
+        updates = [n["params"]["update"] for n in notes if n.get("method") == "session/update"]
+        families = [
+            n["params"]["_meta"]["desmos"]["family"]
+            for n in notes
+            if n.get("method") == "session/update"
+        ]
+        assert "subagent" in families, families
+        speech = [
+            u for u in updates if u.get("sessionUpdate") == "agent_message_chunk"
+        ]
+        spoken = "".join((u.get("content") or {}).get("text") or "" for u in speech)
+        assert "kid said hi" not in spoken, spoken
+        assert "parent done" in spoken, spoken
+        panes = [
+            n["params"]["_meta"]["desmos"]["pane"]
+            for n in notes
+            if n.get("method") == "session/update"
+            and n["params"]["_meta"]["desmos"].get("family") == "subagent"
+        ]
+        assert panes and all(p == "story" for p in panes), panes
 
 
 def _check_desk_markdown() -> None:
@@ -2028,16 +2445,12 @@ def check() -> None:
         assert init["protocolVersion"] == 1
         assert init["authMethods"][0]["id"] == "none"
         assert init["agentCapabilities"]["loadSession"] is True
-        # What we advertise has to be what prompt_text carries. Claiming image
-        # support the loop cannot take made the pager send an image block,
-        # prompt_text drop it, and the empty prompt answer end_turn with no
-        # model call at all.
+        # Image blocks are files handed to run_turns(images=). prompt_text is
+        # still text-only so a picture is never dumped as prose.
         from desmos.acp import prompt_text as _prompt_text
 
-        carries_image = bool(
-            _prompt_text([{"type": "image", "data": "aGk=", "mimeType": "image/png"}])
-        )
-        assert init["agentCapabilities"]["promptCapabilities"]["image"] is carries_image
+        assert not _prompt_text([{"type": "image", "data": "aGk=", "mimeType": "image/png"}])
+        assert init["agentCapabilities"]["promptCapabilities"]["image"] is True
         assert init["_meta"]["grokShell"] is False
         assert acp_replies[1]["result"] == {}
         assert acp_replies[2]["result"]["sessionId"]

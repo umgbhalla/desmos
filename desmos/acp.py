@@ -21,6 +21,7 @@ __all__ = [
     "initialize_result",
     "new_world",
     "prompt_text",
+    "prompt_images",
     "rpc_error",
     "rpc_result",
     "run_turns",

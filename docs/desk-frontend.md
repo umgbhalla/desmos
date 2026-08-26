@@ -42,7 +42,13 @@ Supported now:
 - create an ACP session for the selected workspace;
 - send a prompt; Enter submits, Shift+Enter is a newline;
 - stream thinking into the story and assistant markdown into the story;
-- show complete() POSTs, syscalls, and edit diffs on Activity only;
+- show complete() POSTs, syscalls, edit diffs, folds, protocol errors,
+  pending work, decisions, and child results on Activity; subagent cards
+  and error/fold/stop notices also land on Story (xml-as-speech is an
+  error card and `end_turn`, not a JSON-RPC crash);
+- attach images through the composer (ACP image blocks → `run_turns(images=)`,
+  the same path the TUI uses);
+- named agents from `persist.roster()` on the rail;
 - cancel the in-flight prompt (Esc, or the stop control);
 - new session (`session/new`);
 - resume a persist session (`session/load` with the sqlite `sessions.id`

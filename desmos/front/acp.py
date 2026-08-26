@@ -6,30 +6,52 @@ Not LSP Content-Length framing.
 
 from __future__ import annotations
 
+import base64
 import itertools
 import json
 import queue
 import sys
+import tempfile
 import threading
 import uuid
 import warnings
 from pathlib import Path
 from typing import Any, Callable, IO, Iterator, TextIO
+from urllib.parse import unquote, urlparse
 
 from desmos.kernel.const import DEFAULT_MODEL
 from desmos.kernel.loop import new_world, run_turns
 
 PROTOCOL_VERSION = 1
 
-# Story is speech and thinking. Activity is the wire. The TUI enforces this by
-# never routing a result event into the story pane; ACP tags the same split so
-# a web/desktop client cannot accidentally flatten everything to `out`.
-STORY_UPDATES = frozenset({"agent_thought_chunk", "agent_message_chunk"})
+# Story is speech, thinking, steer echoes, and subagent cards. Activity is the
+# wire: complete() POSTs, syscalls, folds, protocol errors, pending work,
+# decisions, and child results. The TUI never routes a result into the story
+# pane; ACP tags the same split so a web/desktop client cannot flatten
+# everything to `out`.
+STORY_UPDATES = frozenset(
+    {"agent_thought_chunk", "agent_message_chunk", "user_message_chunk"}
+)
 ACTIVITY_UPDATES = frozenset({"tool_call", "tool_call_update"})
+STORY_FAMILIES = frozenset({"subagent"})
+CARD_FAMILIES = frozenset(
+    {
+        "complete",
+        "error",
+        "compacted",
+        "decision",
+        "pending",
+        "resumed",
+        "guidance",
+        "attached",
+        "stopped",
+        "subagent",
+    }
+)
 
 
 class _TurnFailed(Exception):
-    """The step ended on an error event. A stopReason would report it as an answer."""
+    """run_turns raised. Kernel error events are activity cards, not this."""
 
 
 def _available_models() -> list[dict[str, str]]:
@@ -103,10 +125,11 @@ def initialize_result() -> dict[str, Any]:
             # Persist session ids from `_session/sessions` / the TUI picker,
             # and ACP uuids bound in `acp_sessions` at session/new.
             "loadSession": True,
-            # run_turns takes a prompt string, so an image block has nowhere to
-            # go; prompt_text used to drop it and the empty prompt answered
-            # end_turn with no model call. Advertise what this agent carries.
-            "promptCapabilities": {"image": False, "audio": False, "embeddedContext": True},
+            # Image blocks are written to temp files and handed to
+            # run_turns(images=), the same path the TUI composer uses.
+            # prompt_text stays text-only so a picture is never dumped as
+            # prose. Advertise what that path actually carries.
+            "promptCapabilities": {"image": True, "audio": False, "embeddedContext": True},
         },
         "authMethods": [{"id": "none", "name": "none"}],
         "_meta": {
@@ -142,6 +165,17 @@ def initialize_result() -> dict[str, Any]:
 
 def pane_of(update: dict[str, Any]) -> str:
     """Which Desmos pane an ACP sessionUpdate belongs on."""
+    meta = update.get("_meta")
+    if isinstance(meta, dict):
+        desmos = meta.get("desmos")
+        if isinstance(desmos, dict) and desmos.get("pane"):
+            return str(desmos["pane"])
+    family = ""
+    if isinstance(meta, dict):
+        desmos = meta.get("desmos") if isinstance(meta.get("desmos"), dict) else {}
+        family = str(desmos.get("family") or "")
+    if family in STORY_FAMILIES:
+        return "story"
     kind = str(update.get("sessionUpdate") or "")
     if kind in STORY_UPDATES:
         return "story"
@@ -156,13 +190,17 @@ def family_of(update: dict[str, Any]) -> str:
         if isinstance(desmos, dict) and desmos.get("family"):
             return str(desmos["family"])
     title = str(update.get("title") or "")
-    if title == "complete":
-        return "complete"
+    if title in CARD_FAMILIES:
+        return title
     if title in {"edit", "workspace"} or title.endswith(" edit"):
         return "edit"
     kind = str(update.get("sessionUpdate") or "")
-    if kind in STORY_UPDATES:
-        return "speech" if kind == "agent_message_chunk" else "thinking"
+    if kind == "agent_message_chunk":
+        return "speech"
+    if kind == "agent_thought_chunk":
+        return "thinking"
+    if kind == "user_message_chunk":
+        return "prompt"
     return "syscall"
 
 
@@ -321,6 +359,55 @@ def prompt_text(blocks: Any) -> str:
                 if text:
                     parts.append(str(text))
     return "".join(parts)
+
+
+_IMAGE_EXT = {
+    "image/png": ".png",
+    "image/jpeg": ".jpg",
+    "image/jpg": ".jpg",
+    "image/gif": ".gif",
+    "image/webp": ".webp",
+}
+
+
+def prompt_images(blocks: Any, dest: Path) -> list[str]:
+    """Materialize ACP image blocks as files for run_turns(images=).
+
+    prompt_text never sees these. A file: URI that already exists is used
+    as-is; base64 payloads are decoded into dest. Missing or unreadable
+    blocks are skipped — vision.attach turns a bad path into a note, and a
+    skipped block must not empty the whole prompt.
+    """
+    if isinstance(blocks, str) or not blocks:
+        return []
+    dest.mkdir(parents=True, exist_ok=True)
+    paths: list[str] = []
+    for index, raw in enumerate(blocks):
+        if not isinstance(raw, dict):
+            continue
+        kind = raw.get("type")
+        if kind != "image":
+            continue
+        uri = str(raw.get("uri") or raw.get("url") or "")
+        if uri.startswith("file:"):
+            parsed = urlparse(uri)
+            path = Path(unquote(parsed.path))
+            if path.is_file():
+                paths.append(str(path))
+            continue
+        data = raw.get("data")
+        if not data:
+            continue
+        mime = str(raw.get("mimeType") or raw.get("mime_type") or "image/png")
+        ext = _IMAGE_EXT.get(mime, ".png")
+        path = dest / f"prompt-{index}{ext}"
+        try:
+            path.write_bytes(base64.standard_b64decode(str(data)))
+        except Exception:
+            continue
+        if path.is_file() and path.stat().st_size:
+            paths.append(str(path))
+    return paths
 
 
 def rpc_result(req_id: Any, result: Any) -> dict[str, Any]:
@@ -748,10 +835,13 @@ class AcpServer:
         if world is None or convo is None:
             raise ValueError(f"unknown session {session_id!r}")
         prompt_id = _meta_prompt_id(params)
-        text = prompt_text(params.get("prompt"))
-        if not text.strip():
-            # An image-only or empty prompt used to answer end_turn without
-            # calling the model, which the pager draws as a finished turn.
+        prompt_blocks = params.get("prompt")
+        text = prompt_text(prompt_blocks)
+        img_dir = Path(tempfile.mkdtemp(prefix="desmos-acp-img-"))
+        images = prompt_images(prompt_blocks, img_dir)
+        if not text.strip() and not images:
+            # An empty prompt used to answer end_turn without calling the
+            # model, which the pager draws as a finished turn.
             raise ValueError("prompt had no text this agent can carry")
         state: dict[str, Any] = {"cancelled": False}
         with self._lock:
@@ -774,6 +864,7 @@ class AcpServer:
         # Without this, spawn() inside an ACP session gets _parent()'s
         # fallback world -- default model, launcher cwd, no session state.
         S.bind(world)
+        prev_emit = getattr(S, "_EMIT", None)
         # Swap this session's transcript onto the shared world for the run. The
         # busy check above means no other session is stepping this world. It
         # stays on the world afterwards -- nothing here reads it between
@@ -785,22 +876,34 @@ class AcpServer:
             def on_event(ev: dict[str, Any]) -> None:
                 self._emit_event(session_id, prompt_id, ev, state)
 
+            # The bridge installs this for the process lifetime. ACP only
+            # holds it for the prompt, so a child spawned here is not silent
+            # and a later TUI attach is not still writing ACP cards.
+            S.set_emitter(on_event)
             # An emitter that raises lands in _run_turns' catch-all, which
             # writes "[turn n failed]" over the real reply and skips the
             # commit. The loop's own stop path saves the step; use it.
-            run_turns(
-                world,
-                text,
-                quiet=True,
-                on_event=on_event,
-                should_stop=lambda: bool(state["cancelled"]),
-            )
+            try:
+                run_turns(
+                    world,
+                    text,
+                    quiet=True,
+                    on_event=on_event,
+                    should_stop=lambda: bool(state["cancelled"]),
+                    images=images or None,
+                )
+            except Exception as exc:
+                raise _TurnFailed(f"{type(exc).__name__}: {exc}") from exc
             if state["cancelled"]:
                 return {"stopReason": "cancelled"}
-            if state.get("error"):
-                raise _TurnFailed(str(state["error"]))
+            # Kernel error events are activity cards (xml-as-speech, a cut
+            # reply, max_turns). Raising _TurnFailed turned those into JSON-RPC
+            # -32603, which Comet paints as "harness protocol error" next to
+            # the tags that never ran. An unexpected exception still fails the
+            # RPC because run_turns did not finish.
             return {"stopReason": "end_turn"}
         finally:
+            S.set_emitter(prev_emit)
             with self._lock:
                 # rollback() and reset() rebind these, so read them back rather
                 # than trusting the objects we swapped in.
@@ -872,6 +975,57 @@ class AcpServer:
             return {"outcome": "injected"}
         return {"outcome": "promptRequired"}
 
+    def _push_card(
+        self,
+        session_id: str,
+        prompt_id: str | None,
+        state: dict[str, Any],
+        *,
+        title: str,
+        family: str,
+        text: str = "",
+        status: str = "completed",
+        kind: str = "other",
+        tool_id: str | None = None,
+        raw: dict[str, Any] | None = None,
+        extra: dict[str, Any] | None = None,
+        pane: str | None = None,
+        update: bool = False,
+        locations: list[dict[str, Any]] | None = None,
+        label: str | None = None,
+        content: list[dict[str, Any]] | None = None,
+    ) -> str:
+        if tool_id is None:
+            tool_id = f"{family[:1]}{next(state['tools'])}"
+        payload: dict[str, Any] = {
+            "sessionUpdate": "tool_call_update" if update else "tool_call",
+            "toolCallId": tool_id,
+            "title": title,
+            "kind": kind,
+            "status": status,
+        }
+        if content is None and text:
+            content = [{
+                "type": "content",
+                "content": {"type": "text", "text": text},
+            }]
+        if content:
+            payload["content"] = content
+        if raw is not None and not update:
+            payload["rawInput"] = raw
+        if locations:
+            payload["locations"] = locations
+        self._update(
+            session_id,
+            prompt_id,
+            payload,
+            family=family,
+            label=label,
+            extra=extra,
+            pane=pane,
+        )
+        return tool_id
+
     def _emit_event(
         self,
         session_id: str,
@@ -894,17 +1048,110 @@ class AcpServer:
                     "sessionUpdate": "agent_message_chunk",
                     "content": {"type": "text", "text": text},
                 }, family="speech")
-        elif kind == "turn":
-            # A truncated reply ("[reply was cut short]") emits error and then
-            # keeps going, so only an error with no turn after it ended the
-            # step. Clearing here is what keeps a recovered turn from being
-            # reported as a dead one.
-            state.pop("error", None)
+        elif kind in {"turn", "prompt", "done"}:
+            # prompt: the client already has the user text. done: stopReason.
+            pass
         elif kind == "error":
-            state["error"] = str(ev.get("text") or "")
+            # A handled refusal (xml-as-speech, cut reply) is an Activity card.
+            # Do not latch it into state["error"]: that used to fail
+            # session/prompt as JSON-RPC -32603.
+            text = str(ev.get("text") or "")
+            if text:
+                self._push_card(
+                    session_id, prompt_id, state,
+                    title="error", family="error", text=text,
+                )
+        elif kind == "compacted":
+            self._push_card(
+                session_id, prompt_id, state,
+                title="compacted", family="compacted",
+                text=str(ev.get("text") or ""),
+                extra={"n": ev.get("n"), "kept": ev.get("kept")},
+            )
+        elif kind == "steer":
+            text = str(ev.get("text") or "")
+            if text:
+                self._update(session_id, prompt_id, {
+                    "sessionUpdate": "user_message_chunk",
+                    "content": {"type": "text", "text": f"[steer] {text}"},
+                }, family="steer")
+        elif kind == "decision":
+            status = str(ev.get("status") or "open")
+            options = ev.get("options") or []
+            if isinstance(options, list):
+                option_text = "\n".join(str(item) for item in options)
+            else:
+                option_text = str(options)
+            body = "\n".join(
+                part for part in (
+                    str(ev.get("prompt") or ""),
+                    option_text,
+                    f"answer: {ev.get('answer')}" if ev.get("answer") else "",
+                ) if part
+            )
+            ids: dict[str, str] = state.setdefault("decisions", {})
+            tool_id = ids.get(str(ev.get("id") or ""))
+            acp_status = "completed" if status != "open" else "pending"
+            tool_id = self._push_card(
+                session_id, prompt_id, state,
+                title="decision", family="decision", text=body,
+                status=acp_status, tool_id=tool_id, update=tool_id is not None,
+                extra={"id": ev.get("id"), "status": status},
+            )
+            if ev.get("id"):
+                ids[str(ev.get("id"))] = tool_id
+        elif kind == "pending":
+            tasks = ev.get("tasks") or []
+            n = ev.get("n")
+            if isinstance(tasks, list):
+                text = "\n".join(str(item) for item in tasks)
+            else:
+                text = str(tasks)
+            tool_id = str(state.get("pending") or "") or None
+            empty = not tasks or n == 0
+            tool_id = self._push_card(
+                session_id, prompt_id, state,
+                title="pending", family="pending",
+                text=text or "no background tasks",
+                status="completed" if empty else "in_progress",
+                tool_id=tool_id, update=tool_id is not None,
+                extra={"n": n, "replace": True},
+            )
+            state["pending"] = tool_id
+        elif kind == "resumed":
+            self._push_card(
+                session_id, prompt_id, state,
+                title="resumed", family="resumed",
+                text=str(ev.get("text") or ""),
+            )
+        elif kind == "guidance":
+            self._push_card(
+                session_id, prompt_id, state,
+                title="guidance", family="guidance",
+                text=str(ev.get("text") or ""),
+            )
+        elif kind == "attached":
+            self._push_card(
+                session_id, prompt_id, state,
+                title="attached", family="attached",
+                text=str(ev.get("text") or ""),
+            )
+        elif kind == "stopped":
+            text = str(ev.get("text") or "stopped, saved")
+            self._push_card(
+                session_id, prompt_id, state,
+                title="stopped", family="stopped", text=text,
+            )
+        elif kind == "subagent":
+            self._emit_subagent(session_id, prompt_id, ev, state)
+        elif kind == "child":
+            self._emit_child(session_id, prompt_id, ev, state)
         elif kind == "post":
             tool_id = f"c{next(state['tools'])}"
             state["complete"] = tool_id
+            group = ev.get("n")
+            if group is not None:
+                state["group"] = group
             model = str(ev.get("model") or "")
             self._update(session_id, prompt_id, {
                 "sessionUpdate": "tool_call",
@@ -915,11 +1162,15 @@ class AcpServer:
                 "rawInput": {
                     "model": model,
                     "origin": ev.get("origin"),
-                    "n": ev.get("n"),
+                    "n": group,
                 },
-            }, family="complete")
+            }, family="complete", extra={"group": group})
         elif kind == "complete":
             tool_id = str(state.get("complete") or "")
+            group = ev.get("n")
+            if group is not None:
+                state["group"] = group
+            extra = {"spans": ev.get("spans") or [], "group": group}
             if not tool_id:
                 tool_id = f"c{next(state['tools'])}"
                 state["complete"] = tool_id
@@ -929,7 +1180,7 @@ class AcpServer:
                     "title": "complete",
                     "kind": "other",
                     "status": "pending",
-                }, family="complete")
+                }, family="complete", extra=extra)
             self._update(session_id, prompt_id, {
                 "sessionUpdate": "tool_call_update",
                 "toolCallId": tool_id,
@@ -940,52 +1191,181 @@ class AcpServer:
                     "type": "content",
                     "content": {"type": "text", "text": _complete_card(ev)},
                 }],
-            }, family="complete")
+            }, family="complete", extra=extra)
         elif kind == "result":
-            phase = str(ev.get("phase") or "done")
-            title = _result_title(ev)
-            family = "edit" if _is_edit(ev) else "syscall"
-            tool_id = str(state.get("tool") or "")
-            if phase == "start" or not tool_id:
-                tool_id = f"t{next(state['tools'])}"
-                state["tool"] = tool_id
-                raw: dict[str, Any] = {
-                    "tag": ev.get("tag"),
-                    "attrs": ev.get("attrs") or {},
-                    "body": _clip_text(str(ev.get("body") or "")),
-                }
-                self._update(session_id, prompt_id, {
-                    "sessionUpdate": "tool_call",
-                    "toolCallId": tool_id,
-                    "title": title,
-                    "kind": "edit" if family == "edit" else "execute",
-                    "status": "pending",
-                    "locations": _result_locations(ev),
-                    "rawInput": raw,
-                }, family=family, label=_result_label(ev))
-                if phase == "start":
-                    return
-            text = str(ev.get("text") or "")
-            if phase == "delta":
-                if text:
-                    self._update(session_id, prompt_id, {
-                        "sessionUpdate": "tool_call_update",
-                        "toolCallId": tool_id,
-                        "status": "in_progress",
-                        "content": [{
-                            "type": "content",
-                            "content": {"type": "text", "text": text},
-                        }],
-                    }, family=family, label=_result_label(ev))
+            self._emit_result(session_id, prompt_id, ev, state)
+
+    def _emit_subagent(
+        self,
+        session_id: str,
+        prompt_id: str | None,
+        ev: dict[str, Any],
+        state: dict[str, Any],
+    ) -> None:
+        run_id = str(ev.get("id") or "")
+        phase = str(ev.get("phase") or "")
+        ids: dict[str, str] = state.setdefault("subagents", {})
+        tool_id = ids.get(run_id)
+        task = str(ev.get("task") or ev.get("progress") or run_id or "subagent")
+        extra = {
+            "id": run_id or None,
+            "phase": phase or None,
+            "parent": ev.get("parent"),
+            "depth": ev.get("depth"),
+            "agent": ev.get("agent"),
+        }
+        if phase == "started" or not tool_id:
+            status = "pending" if phase in {"", "started", "progress"} else (
+                "failed" if phase in {"failed", "stopped"} else "completed"
+            )
+            tool_id = self._push_card(
+                session_id, prompt_id, state,
+                title=task, family="subagent", text=task,
+                status=status, kind="other", pane="story",
+                extra=extra, label=str(ev.get("agent") or "subagent"),
+                raw={"id": run_id, "agent": ev.get("agent"), "task": task},
+            )
+            if run_id:
+                ids[run_id] = tool_id
+            if phase in {"", "started"}:
                 return
+        if phase == "progress":
+            text = str(ev.get("progress") or ev.get("stage") or "")
+            self._push_card(
+                session_id, prompt_id, state,
+                title=task, family="subagent", text=text,
+                status="in_progress", tool_id=tool_id, update=True,
+                pane="story", extra=extra,
+                label=str(ev.get("agent") or "subagent"),
+            )
+            return
+        if phase in {"done", "failed", "stopped"}:
+            err = str(ev.get("error") or "")
+            text = err or str(ev.get("progress") or phase)
+            self._push_card(
+                session_id, prompt_id, state,
+                title=task, family="subagent", text=text,
+                status="failed" if phase in {"failed", "stopped"} or err else "completed",
+                tool_id=tool_id, update=True, pane="story", extra=extra,
+                label=str(ev.get("agent") or "subagent"),
+            )
+
+    def _emit_child(
+        self,
+        session_id: str,
+        prompt_id: str | None,
+        ev: dict[str, Any],
+        state: dict[str, Any],
+    ) -> None:
+        run_id = str(ev.get("id") or "")
+        nested = str(ev.get("kind") or "")
+        ids: dict[str, str] = state.setdefault("subagents", {})
+        extra = {"child": run_id or None, "kind": nested or None}
+        if nested in {"thinking", "speech"}:
+            text = str(ev.get("text") or "")
+            if not text:
+                return
+            tool_id = ids.get(run_id)
+            if not tool_id:
+                tool_id = self._push_card(
+                    session_id, prompt_id, state,
+                    title=run_id or "subagent", family="subagent",
+                    text=text, status="in_progress", pane="story", extra=extra,
+                )
+                if run_id:
+                    ids[run_id] = tool_id
+                return
+            family = "thinking" if nested == "thinking" else "speech"
+            self._push_card(
+                session_id, prompt_id, state,
+                title=run_id or "subagent", family="subagent",
+                text=text, status="in_progress", tool_id=tool_id, update=True,
+                pane="story", extra={**extra, "chunk": family},
+            )
+            return
+        if nested == "result":
+            inner = {k: v for k, v in ev.items() if k not in {"ev", "kind", "id", "parent", "depth"}}
+            inner["ev"] = "result"
+            child_state = state.setdefault("child_tools", {}).setdefault(run_id or "_", {"tools": state["tools"]})
+            # Reuse the parent's tool id counter so ids stay unique on the wire.
+            child_state["tools"] = state["tools"]
+            child_state["group"] = state.get("group")
+            self._emit_result(session_id, prompt_id, inner, child_state, extra=extra)
+            return
+        if nested == "error":
+            text = str(ev.get("text") or "")
+            if text:
+                self._push_card(
+                    session_id, prompt_id, state,
+                    title="error", family="error", text=text, extra=extra,
+                )
+
+    def _emit_result(
+        self,
+        session_id: str,
+        prompt_id: str | None,
+        ev: dict[str, Any],
+        state: dict[str, Any],
+        extra: dict[str, Any] | None = None,
+    ) -> None:
+        phase = str(ev.get("phase") or "done")
+        title = _result_title(ev)
+        family = "edit" if _is_edit(ev) else "syscall"
+        tool_id = str(state.get("tool") or "")
+        meta: dict[str, Any] = {
+            "phase": phase,
+            "group": state.get("group"),
+            "replace": phase == "done",
+        }
+        if extra:
+            meta.update(extra)
+        if phase == "start" or not tool_id:
+            tool_id = f"t{next(state['tools'])}"
+            state["tool"] = tool_id
+            raw: dict[str, Any] = {
+                "tag": ev.get("tag"),
+                "attrs": ev.get("attrs") or {},
+                "body": _clip_text(str(ev.get("body") or "")),
+                "group": state.get("group"),
+            }
             self._update(session_id, prompt_id, {
-                "sessionUpdate": "tool_call_update",
+                "sessionUpdate": "tool_call",
                 "toolCallId": tool_id,
-                "status": "completed",
                 "title": title,
                 "kind": "edit" if family == "edit" else "execute",
-                "content": _result_content(ev, text),
-            }, family=family, label=_result_label(ev))
+                "status": "pending",
+                "locations": _result_locations(ev),
+                "rawInput": raw,
+            }, family=family, label=_result_label(ev), extra=meta)
+            if phase == "start":
+                return
+        text = str(ev.get("text") or "")
+        if phase == "delta":
+            streamed = state.setdefault("streamed", set())
+            streamed.add(tool_id)
+            meta["replace"] = False
+            if text:
+                self._update(session_id, prompt_id, {
+                    "sessionUpdate": "tool_call_update",
+                    "toolCallId": tool_id,
+                    "status": "in_progress",
+                    "content": [{
+                        "type": "content",
+                        "content": {"type": "text", "text": text},
+                    }],
+                }, family=family, label=_result_label(ev), extra=meta)
+            return
+        streamed = state.get("streamed") or set()
+        send_text = "" if tool_id in streamed else text
+        meta["replace"] = True
+        self._update(session_id, prompt_id, {
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": tool_id,
+            "status": "completed",
+            "title": title,
+            "kind": "edit" if family == "edit" else "execute",
+            "content": _result_content(ev, send_text),
+        }, family=family, label=_result_label(ev), extra=meta)
 
     def _update(
         self,
@@ -995,13 +1375,22 @@ class AcpServer:
         *,
         family: str | None = None,
         label: str | None = None,
+        extra: dict[str, Any] | None = None,
+        pane: str | None = None,
     ) -> None:
-        pane = pane_of(update)
+        if pane is None and family in STORY_FAMILIES:
+            pane = "story"
+        if pane is None:
+            pane = pane_of(update)
         desmos_meta: dict[str, Any] = {"pane": pane}
         if family:
             desmos_meta["family"] = family
         if label:
             desmos_meta["label"] = label
+        if extra:
+            for key, value in extra.items():
+                if value is not None:
+                    desmos_meta[key] = value
         nested = update.get("_meta")
         if not isinstance(nested, dict):
             nested = {}

@@ -74,6 +74,23 @@ function storyItem(item, i) {
       React.createElement("text", { style: { color: TEXT, fontSize: 13 } }, item.text),
     );
   }
+  if (item.kind === "system") {
+    return React.createElement(
+      "div",
+      { key: `sy${i}`, style: { padding: 8, marginBottom: 8 } },
+      React.createElement("text", { style: { color: MUTED, fontSize: 11 } }, item.family || "notice"),
+      React.createElement("text", { style: { color: TEXT, fontSize: 13 } }, item.text),
+    );
+  }
+  if (item.kind === "subagent") {
+    return React.createElement(
+      "div",
+      { key: `sa${i}`, style: { padding: 8, marginBottom: 8, backgroundColor: RAISED, borderRadius: 6 } },
+      React.createElement("text", { style: { color: MUTED, fontSize: 11 } }, `subagent ${item.status || ""}`),
+      React.createElement("text", { style: { color: TEXT, fontSize: 13 } }, item.title || ""),
+      React.createElement("text", { style: { color: MUTED, fontSize: 12 } }, item.text || ""),
+    );
+  }
   return React.createElement(
     "div",
     { key: `a${i}`, style: { paddingTop: 4, marginBottom: 8 } },
