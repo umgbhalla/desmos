@@ -17,7 +17,7 @@ OpenAI, scans the reply for XML tags, runs the ones that are syscalls, appends
 the outputs as a user-role `<result>` message, and repeats until the model
 stops calling tools, the user stops it, or a token ceiling hits.
 
-Durable state lives in `cwd/.desmos/harness.sqlite3` (schema v16) plus mixed
+Durable state lives in `cwd/.desmos/harness.sqlite3` (schema v17) plus mixed
 sidecars: JSONL for memory, plans, and decisions; JSON for trajectory; SQLite
 for wire events. There is no job object and no local control-plane HTTP API.
 OAuth still binds a one-shot `HTTPServer` on `127.0.0.1` in `transport/auth.py`.

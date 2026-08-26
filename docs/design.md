@@ -270,7 +270,7 @@ not ACP.
 | capability | TUI | ACP | Comet | desk | GPUIX |
 |---|---|---|---|---|---|
 | transport | JSONL `.desmos/bridge.sock` | NDJSON JSON-RPC 2.0 | ACP child | in-process ACP over WebSocket | ACP child |
-| story | grok `UserPrompt` / `Thinking` / `AgentMessage` | `session/update` `_meta.desmos.pane=story` | `MessagePart::Thought` + Grok GFM | thinking + HTML `md.js` | `@gpuix/react` `<markdown>` in `virtual-list` |
+| story | grok `UserPrompt` / `AgentMessage` (thinking is Activity) | `session/update` `_meta.desmos.pane=story` (thinking tagged story for Comet Thought) | `MessagePart::Thought` + Grok GFM | thinking + HTML `md.js` | `@gpuix/react` `<markdown>` in `virtual-list` |
 | wire | grok `ToolCall` pane | `_meta.desmos.pane=activity` | Activity GPUI pane; tools off-story | Activity pane | activity pane; tools off-story |
 | diffs | grok pager-diff | edit `oldText`/`newText` | `similar` word marks | HTML LCS | native `<diff wordDiff>` |
 | sessions | persist picker | `session/new`, `session/load` | Comet registry + `session/load` | `_session/sessions` + ACP uuid | `session/new` sidebar in this process |

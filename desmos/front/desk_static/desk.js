@@ -138,6 +138,8 @@
     if (update.title === "guidance") return "guidance";
     if (update.title === "attached") return "attached";
     if (update.title === "stopped") return "stopped";
+    if (update.title === "notice") return "notice";
+    if (update.title === "model_rejected") return "model_rejected";
     if ((update.title || "").startsWith("edit")) return "edit";
     const kind = update.sessionUpdate;
     if (kind === "agent_thought_chunk") return "thinking";
@@ -246,6 +248,13 @@
 
   function applyLoadedStory(id, result) {
     const t = turn(id);
+    t.persistId = ((result._meta || {}).desmos || {}).persistSessionId || id;
+    const replayed = Number(((result._meta || {}).desmos || {}).replayed || 0);
+    if (replayed > 0 && (t.story.length || t.activity.length)) {
+      const first = t.story.find((s) => s.kind === "user");
+      t.title = first ? first.text.split("\n")[0].slice(0, 72) : "Resumed session";
+      return;
+    }
     t.story = [];
     const story = result.story || [];
     if (story.length) {
@@ -258,7 +267,6 @@
     }
     const first = t.story.find((s) => s.kind === "user");
     t.title = first ? first.text.split("\n")[0].slice(0, 72) : "Resumed session";
-    t.persistId = ((result._meta || {}).desmos || {}).persistSessionId || id;
   }
 
   async function loadPersist(persistId) {
@@ -324,6 +332,28 @@
     }
     paint();
     scrollStory(true);
+    refreshEnv();
+  }
+
+  async function sendDecide(decisionId, option) {
+    const id = state.active;
+    if (!id || !decisionId) return;
+    const text = `decide:${decisionId}: ${option}`;
+    const t = turn(id);
+    t.story.push({ kind: "user", text });
+    t.running = true;
+    t.error = "";
+    paint();
+    try {
+      await acp.call("session/prompt", {
+        sessionId: id,
+        prompt: [{ type: "text", text }],
+      });
+    } catch (err) {
+      t.error = err.message || String(err);
+    }
+    t.running = false;
+    paint();
     refreshEnv();
   }
 
@@ -560,13 +590,18 @@
           diff: null,
           group: meta.group,
           child: meta.child,
+          n: meta.n,
+          decisionId: meta.decisionId || meta.id,
+          options: Array.isArray(meta.options) ? meta.options : [],
           open:
             family === "complete" ||
             family === "edit" ||
             family === "error" ||
             family === "compacted" ||
             family === "decision" ||
-            family === "stopped",
+            family === "stopped" ||
+            family === "notice" ||
+            family === "model_rejected",
         });
         if (family === "error" || family === "compacted" || family === "stopped") {
           if (body) t.story.push({ kind: "system", text: body, family });
@@ -591,6 +626,9 @@
         if (update.title) card.title = labelOf(update);
         if (update.kind) card.kind = update.kind;
         if (meta.group != null) card.group = meta.group;
+        if (meta.n != null) card.n = meta.n;
+        if (meta.decisionId || meta.id) card.decisionId = meta.decisionId || meta.id;
+        if (Array.isArray(meta.options)) card.options = meta.options;
         const parts = update.content || [];
         const replace = meta.replace === true;
         for (const part of parts) {
@@ -1185,6 +1223,11 @@
         inner += window.DesmosMd.diffHtml(card.diff.oldText, card.diff.newText);
       }
       if (card.body) inner += `<div class="txt">${esc(card.body)}</div>`;
+      if (card.family === "decision" && card.status !== "completed" && (card.options || []).length) {
+        inner += `<div class="opts">${card.options
+          .map((opt, i) => `<button type="button" data-decide="${i}">${esc(String(opt))}</button>`)
+          .join("")}</div>`;
+      }
       if (!inner && card.raw && Object.keys(card.raw).length)
         inner = `<div class="txt">${esc(JSON.stringify(card.raw, null, 2))}</div>`;
       el.innerHTML = `<div class="hd"><span class="fam">${esc(card.family)}</span><span class="name">${esc(
@@ -1194,6 +1237,13 @@
         card.open = !card.open;
         paint();
       };
+      el.querySelectorAll("[data-decide]").forEach((btn) => {
+        btn.onclick = (e) => {
+          e.stopPropagation();
+          const opt = card.options[Number(btn.dataset.decide)];
+          if (opt != null && card.decisionId) sendDecide(card.decisionId, String(opt));
+        };
+      });
       body.appendChild(el);
     }
   }
@@ -1568,6 +1618,9 @@
 
   function paintStatus(t) {
     const br = state.bridge || {};
+    const pendingCard =
+      t &&
+      t.activity.find((c) => c.family === "pending" && c.status === "in_progress");
     $("#status").innerHTML = `
       <span class="dot-live${state.connected ? "" : " off"}"></span>
       <span>${state.connected ? "acp" : "offline"}</span>
@@ -1575,6 +1628,7 @@
       <span>${esc(state.effort || "—")}</span>
       <span>${state.git && state.git.branch ? esc(state.git.branch) : ""}</span>
       <span>${state.term.shells && state.term.shells.length ? "pty " + (state.term.name || "main") : ""}</span>
+      <span>${pendingCard ? "pending " + (pendingCard.n != null ? pendingCard.n : "") : ""}</span>
       <span>${br.socket ? "bridge.sock" : ""}</span>
       <span class="spin${t && t.running ? " on" : ""}"></span>
       <span style="margin-left:auto">${esc(state.cwd || "")}</span>

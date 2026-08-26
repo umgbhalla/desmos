@@ -506,6 +506,24 @@ select.chip {
 .card.attached .fam { color: var(--ok); }
 .card.stopped .fam { color: var(--err); }
 .card.guidance .fam { color: var(--think); }
+.card.notice .fam { color: var(--think); }
+.card.model_rejected .fam { color: var(--err); }
+.card .opts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 8px;
+}
+.card .opts button {
+  font: 12px var(--sans);
+  color: var(--accent);
+  background: var(--overlay);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 4px 10px;
+  cursor: pointer;
+}
+.card .opts button:hover { background: var(--raised); }
 .card .hd .name {
   flex: 1; min-width: 0;
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;

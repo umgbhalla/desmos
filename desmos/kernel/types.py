@@ -72,3 +72,7 @@ class World:
     # a pty cannot be reloaded from JSON, and pretending otherwise would hand
     # back a session whose cd and exports silently did not survive.
     shells: dict[str, Any] = field(default_factory=dict)
+    # Per-world wire hook. Subagent children copy this from the parent so two
+    # ACP worlds in one process do not share a module-global emitter.
+    # Not persisted: a callable cannot round-trip through sqlite.
+    on_event: Any = field(default=None, repr=False, compare=False)

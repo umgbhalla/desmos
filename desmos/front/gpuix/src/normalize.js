@@ -27,6 +27,10 @@ export function familyOf(update) {
   if (update.title === "pending") return "pending";
   if (update.title === "attached") return "attached";
   if (update.title === "stopped") return "stopped";
+  if (update.title === "notice") return "notice";
+  if (update.title === "model_rejected") return "model_rejected";
+  if (update.title === "resumed") return "resumed";
+  if (update.title === "guidance") return "guidance";
   if ((update.title || "").startsWith("edit")) return "edit";
   const kind = update.sessionUpdate;
   if (kind === "agent_thought_chunk") return "thinking";
@@ -138,6 +142,9 @@ export function applyUpdate(turn, msg) {
       raw: update.rawInput || {},
       body,
       diff: null,
+      n: meta.n,
+      decisionId: meta.decisionId || meta.id,
+      options: Array.isArray(meta.options) ? meta.options : [],
     });
     if ((family === "error" || family === "compacted" || family === "stopped") && body) {
       turn.story.push({ kind: "system", text: body, family });
@@ -161,6 +168,9 @@ export function applyUpdate(turn, msg) {
     if (update.status) card.status = update.status;
     if (update.title) card.title = labelOf(update);
     if (update.kind) card.kind = update.kind;
+    if (meta.n != null) card.n = meta.n;
+    if (meta.decisionId || meta.id) card.decisionId = meta.decisionId || meta.id;
+    if (Array.isArray(meta.options)) card.options = meta.options;
     const replace = meta.replace === true;
     for (const part of update.content || []) {
       if (part.type === "diff") {

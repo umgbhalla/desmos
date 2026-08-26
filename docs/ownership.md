@@ -48,8 +48,10 @@ or `S.set_emitter(_emit)`, which under one lock writes stdout, fans out to
 every attached socket client, and appends the seq/ts-stamped copy to the
 event log (see "Durable bridge surfaces"). The wire itself never carries
 `seq`/`ts`. Consumer is `handle_event` (`main.rs:2581`) unless said
-otherwise; `front/acp.py:305 _emit_event` is the second consumer and reads
-only `thinking`, `speech`, `turn`, `error`, `result`. The typed mirror is
+otherwise; `front/acp.py` `_emit_event` is the second consumer and maps the
+kernel vocab (thinking, speech, prompt-on-replay, error, result, complete,
+compacted, steer, decision, pending, resumed, guidance, attached, stopped,
+subagent, child, notice, model_rejected). The typed mirror is
 `crates/desmos-events` (`Event` for the wire, `LogLine` for the stamped
 file/replay form), enforced by `desmos/checks/conformance.py`.
 

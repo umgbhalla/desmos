@@ -13,6 +13,7 @@ import queue
 import sys
 import tempfile
 import threading
+import time
 import uuid
 import warnings
 from pathlib import Path
@@ -46,6 +47,8 @@ CARD_FAMILIES = frozenset(
         "attached",
         "stopped",
         "subagent",
+        "notice",
+        "model_rejected",
     }
 )
 
@@ -304,6 +307,32 @@ def _complete_card(ev: dict[str, Any]) -> str:
     return json.dumps(summary, default=str, indent=2)
 
 
+def _story_from_events(rows: list[dict[str, Any]]) -> list[dict[str, str]]:
+    """User/assistant speech from persist events. Header text never belongs here."""
+    story: list[dict[str, str]] = []
+    for row in rows:
+        kind = str(row.get("ev") or "")
+        text = str(row.get("text") or "")
+        if not text.strip():
+            continue
+        if kind == "prompt":
+            story.append({"kind": "user", "text": text})
+        elif kind == "speech":
+            if row.get("delta") and story and story[-1]["kind"] == "assistant":
+                story[-1]["text"] += text
+            else:
+                story.append({"kind": "assistant", "text": text})
+    return story
+
+
+def _kernel_event(row: dict[str, Any]) -> dict[str, Any]:
+    """Strip persist/replay stamps so _emit_event sees a live kernel event."""
+    ev = dict(row)
+    for key in ("seq", "ts", "mono_ns", "payload_bytes", "payload_sha256", "sid"):
+        ev.pop(key, None)
+    return ev
+
+
 def _story_from_messages(messages: Any) -> list[dict[str, str]]:
     """User/assistant speech from a persist transcript. Results stay off story."""
     story: list[dict[str, str]] = []
@@ -328,6 +357,12 @@ def _story_from_messages(messages: Any) -> list[dict[str, str]]:
             continue
         if role == "user" and text.lstrip().startswith("<result"):
             continue
+        if role == "user" and text.lstrip().startswith("ns:"):
+            _, _, rest = text.partition("\n\n")
+            if rest.strip():
+                text = rest
+            else:
+                continue
         if role == "user":
             story.append({"kind": "user", "text": text})
         elif role == "assistant":
@@ -472,6 +507,10 @@ class AcpServer:
         self._tool_ids: dict[str, Iterator[int]] = {}
         self._lock = threading.Lock()
         self._inflight: dict[str, dict[str, Any]] = {}
+        # A follow-up session/prompt on a World that is parked on background
+        # work: same contract as the TUI inbox. has_input becomes true so
+        # pending.wait_next yields, then this prompt takes the inflight slot.
+        self._wakeup: dict[int, bool] = {}
 
     def handle(self, msg: dict[str, Any]) -> dict[str, Any] | None:
         method = msg.get("method")
@@ -486,7 +525,10 @@ class AcpServer:
         if method == "authenticate":
             return rpc_result(req_id, {})
         if method == "session/new":
-            return rpc_result(req_id, self._session_new(params))
+            try:
+                return rpc_result(req_id, self._session_new(params))
+            except ValueError as exc:
+                return rpc_error(req_id, -32602, str(exc))
         if method == "session/load":
             try:
                 return rpc_result(req_id, self._session_load(params))
@@ -564,6 +606,12 @@ class AcpServer:
             # build it outside the lock -- the lock guards the dicts, and
             # _session_cancel waits on it -- and double-check on insert.
             world = new_world(cwd)
+            from desmos.state.persist import WorkspaceBusy, claim_workspace
+
+            try:
+                claim_workspace(world)
+            except WorkspaceBusy as exc:
+                raise ValueError(str(exc)) from exc
             entry = (world, list(world.messages), list(world.prior))
         from desmos.transport.settings import load as _load_settings
 
@@ -588,7 +636,15 @@ class AcpServer:
             raise ValueError(f"unknown session {session_id!r}")
         return world
 
-    def _session_payload(self, session_id: str, world: Any, *, loaded: bool = False) -> dict[str, Any]:
+    def _session_payload(
+        self,
+        session_id: str,
+        world: Any,
+        *,
+        loaded: bool = False,
+        replayed: int = 0,
+        rows: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
         from desmos.state import persist
 
         persist_id = persist.run_id()
@@ -596,6 +652,7 @@ class AcpServer:
             "desmos": {
                 "persistSessionId": persist_id,
                 "cwd": str(world.cwd),
+                "replayed": replayed,
             }
         }
         payload: dict[str, Any] = {
@@ -606,7 +663,10 @@ class AcpServer:
         }
         if loaded:
             payload["turns"] = persist.session_turns(world, persist_id)
-            payload["story"] = _story_from_messages(world.messages)
+            if rows:
+                payload["story"] = _story_from_events(rows)
+            else:
+                payload["story"] = _story_from_messages(world.messages)
         return payload
 
     def _session_new(self, params: dict[str, Any]) -> dict[str, Any]:
@@ -673,7 +733,13 @@ class AcpServer:
             persist.acp_bind(world, session_id)
         except Exception as exc:  # noqa: BLE001
             warnings.warn(f"acp_bind failed: {exc}", RuntimeWarning, stacklevel=2)
-        return self._session_payload(session_id, world, loaded=True)
+        rows = persist.read_events(
+            world, since=0, session=persist.run_id(), limit=20_000,
+        )
+        replayed = self._replay_log(session_id, rows)
+        return self._session_payload(
+            session_id, world, loaded=True, replayed=replayed, rows=rows,
+        )
 
     def _session_git(self, params: dict[str, Any]) -> dict[str, Any]:
         from desmos.front.acp_env import git_snapshot
@@ -827,6 +893,60 @@ class AcpServer:
             return {"name": name, "text": sh.run(world, body, {"id": name})}
         raise ValueError(f"unknown term op {op!r}")
 
+    def _claim_prompt(
+        self, session_id: str, world: Any, state: dict[str, Any]
+    ) -> None:
+        """Take the inflight slot, or wake a parked step and wait.
+
+        Two writers on one World still cannot run_turns at once. A follow-up
+        prompt is the TUI inbox: has_input becomes true so pending.wait_next
+        yields, then this prompt runs.
+        """
+        key = id(world)
+        while True:
+            with self._lock:
+                busy = [
+                    k for k in self._inflight if self.sessions.get(k) is world
+                ]
+                if not busy:
+                    state["tools"] = self._tool_ids.setdefault(
+                        session_id, itertools.count(1)
+                    )
+                    self._inflight[session_id] = state
+                    self._wakeup.pop(key, None)
+                    return
+                self._wakeup[key] = True
+            time.sleep(0.05)
+
+    def _record(self, session_id: str, ev: dict[str, Any]) -> None:
+        """Same persist.record_event the bridge writes. Replay reads this."""
+        world = self.sessions.get(session_id)
+        if world is None or not getattr(world, "persist", False):
+            return
+        from desmos.state.persist import record_event
+
+        record_event(
+            world,
+            ev,
+            ts_ms=int(time.time() * 1000),
+            mono_ns=time.monotonic_ns(),
+        )
+
+    def _replay_log(self, session_id: str, rows: list[dict[str, Any]]) -> int:
+        """Replay persist events through _emit_event. Does not re-record."""
+        state: dict[str, Any] = {
+            "tools": self._tool_ids.setdefault(session_id, itertools.count(1)),
+            "replay": True,
+        }
+        n = 0
+        for row in rows:
+            ev = _kernel_event(row)
+            if not ev.get("ev"):
+                continue
+            self._emit_event(session_id, None, ev, state)
+            n += 1
+        return n
+
     def _session_prompt(self, params: dict[str, Any]) -> dict[str, str]:
         session_id = str(params.get("sessionId") or "")
         with self._lock:
@@ -844,20 +964,7 @@ class AcpServer:
             # model, which the pager draws as a finished turn.
             raise ValueError("prompt had no text this agent can carry")
         state: dict[str, Any] = {"cancelled": False}
-        with self._lock:
-            # The spec says the client awaits the response or cancels first. A
-            # second prompt used to overwrite this entry and its finally popped
-            # the key, so session/cancel became a silent no-op for the prompt
-            # still running. The world is what is exclusive, not the session:
-            # run_turns refuses a concurrent step on the same World with a
-            # RuntimeError that handle() does not catch, and sessions on one cwd
-            # share a world.
-            busy = [k for k in self._inflight if self.sessions.get(k) is world]
-            if busy:
-                who = "this session" if session_id in busy else f"session {busy[0]!r}"
-                raise ValueError(f"{who} is already running a prompt on {world.cwd}")
-            state["tools"] = self._tool_ids.setdefault(session_id, itertools.count(1))
-            self._inflight[session_id] = state
+        self._claim_prompt(session_id, world, state)
         import desmos.agents.subagent as S
 
         prev_parent = S.PARENT
@@ -865,20 +972,18 @@ class AcpServer:
         # fallback world -- default model, launcher cwd, no session state.
         S.bind(world)
         prev_emit = getattr(S, "_EMIT", None)
-        # Swap this session's transcript onto the shared world for the run. The
-        # busy check above means no other session is stepping this world. It
-        # stays on the world afterwards -- nothing here reads it between
-        # prompts, and leaving it is what makes world.messages the last turn
-        # that actually ran.
+        # Swap this session's transcript onto the shared world for the run.
+        # _claim_prompt waits until no other session is stepping this world.
         world.messages, world.prior = convo
         try:
 
             def on_event(ev: dict[str, Any]) -> None:
                 self._emit_event(session_id, prompt_id, ev, state)
 
-            # The bridge installs this for the process lifetime. ACP only
-            # holds it for the prompt, so a child spawned here is not silent
-            # and a later TUI attach is not still writing ACP cards.
+            # The bridge installs this for the process lifetime. ACP holds it
+            # for the prompt on this World so a child spawned here is not
+            # silent and a later TUI attach is not still writing ACP cards.
+            world.on_event = on_event
             S.set_emitter(on_event)
             # An emitter that raises lands in _run_turns' catch-all, which
             # writes "[turn n failed]" over the real reply and skips the
@@ -890,6 +995,7 @@ class AcpServer:
                     quiet=True,
                     on_event=on_event,
                     should_stop=lambda: bool(state["cancelled"]),
+                    has_input=lambda: bool(self._wakeup.get(id(world))),
                     images=images or None,
                 )
             except Exception as exc:
@@ -903,6 +1009,8 @@ class AcpServer:
             # RPC because run_turns did not finish.
             return {"stopReason": "end_turn"}
         finally:
+            if getattr(world, "on_event", None) is on_event:
+                world.on_event = None
             S.set_emitter(prev_emit)
             with self._lock:
                 # rollback() and reset() rebind these, so read them back rather
@@ -950,7 +1058,16 @@ class AcpServer:
             from desmos.transport.settings import clamp_effort, provider_of, switch
 
             effort = clamp_effort(provider_of(model), str(world.thinking or "low"))
-            switch(world, model, effort)
+            try:
+                switch(world, model, effort)
+            except ValueError:
+                state = {
+                    "tools": self._tool_ids.setdefault(session_id, itertools.count(1)),
+                }
+                self._emit_event(
+                    session_id, None, {"ev": "model_rejected", "model": model}, state,
+                )
+                raise
             return {"configOptions": config_options(world), "models": session_models(world)}
         raise ValueError(f"unknown config option {config_id!r}")
 
@@ -966,12 +1083,13 @@ class AcpServer:
             text = prompt_text(params.get("prompt")).strip()
         if not text:
             raise ValueError("steer needs text")
-        from desmos.kernel.catalog import steer as _steer
-
-        _steer(world, text)
-        # Comet treats missing outcome as "injected". promptRequired means it
-        # should start a fresh session/prompt with this text instead.
+        # Running: inject into the live drain. Idle: Comet starts a fresh
+        # session/prompt with this text. Queuing a steer AND returning
+        # promptRequired double-delivered the line.
         if world.running:
+            from desmos.kernel.catalog import steer as _steer
+
+            _steer(world, text)
             return {"outcome": "injected"}
         return {"outcome": "promptRequired"}
 
@@ -1034,6 +1152,8 @@ class AcpServer:
         ev: dict[str, Any],
         state: dict[str, Any],
     ) -> None:
+        if not state.get("replay"):
+            self._record(session_id, ev)
         kind = ev.get("ev")
         if kind == "thinking":
             text = str(ev.get("text") or "")
@@ -1049,8 +1169,18 @@ class AcpServer:
                     "sessionUpdate": "agent_message_chunk",
                     "content": {"type": "text", "text": text},
                 }, family="speech")
-        elif kind in {"turn", "prompt", "done"}:
-            # prompt: the client already has the user text. done: stopReason.
+        elif kind == "prompt":
+            # Live: the client already painted the user text. Replay: that
+            # text exists only as this event — do not reconstruct it from
+            # header(world)+prompt in world.messages.
+            if state.get("replay"):
+                text = str(ev.get("text") or "")
+                if text:
+                    self._update(session_id, prompt_id, {
+                        "sessionUpdate": "user_message_chunk",
+                        "content": {"type": "text", "text": text},
+                    }, family="prompt")
+        elif kind in {"turn", "done"}:
             pass
         elif kind == "error":
             # A handled refusal (xml-as-speech, cut reply) is an Activity card.
@@ -1097,7 +1227,12 @@ class AcpServer:
                 session_id, prompt_id, state,
                 title="decision", family="decision", text=body,
                 status=acp_status, tool_id=tool_id, update=tool_id is not None,
-                extra={"id": ev.get("id"), "status": status},
+                extra={
+                    "id": ev.get("id"),
+                    "status": status,
+                    "decisionId": ev.get("id"),
+                    "options": options if isinstance(options, list) else None,
+                },
             )
             if ev.get("id"):
                 ids[str(ev.get("id"))] = tool_id
@@ -1143,6 +1278,22 @@ class AcpServer:
                 session_id, prompt_id, state,
                 title="stopped", family="stopped", text=text,
             )
+        elif kind == "notice":
+            text = str(ev.get("text") or "")
+            if text:
+                self._push_card(
+                    session_id, prompt_id, state,
+                    title="notice", family="notice", text=text,
+                )
+        elif kind == "model_rejected":
+            model = str(ev.get("model") or "")
+            if model:
+                self._push_card(
+                    session_id, prompt_id, state,
+                    title="model_rejected", family="model_rejected",
+                    text=model,
+                    extra={"model": model},
+                )
         elif kind == "subagent":
             self._emit_subagent(session_id, prompt_id, ev, state)
         elif kind == "child":

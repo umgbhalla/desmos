@@ -489,6 +489,7 @@ def _child_world(
     if cfg.system_append:
         w.system_override = w.system_override.rstrip() + "\n\n" + cfg.system_append.strip()
     w.complete_fn = getattr(parent, "complete_fn", None)
+    w.on_event = getattr(parent, "on_event", None)
     parent_todo = parent.tools.get("todo")
     if todo_actor is not None and parent_todo is not None and parent_todo.handler is not None:
         from desmos.kernel.dispatch import set_child_todo_handler
@@ -1074,7 +1075,19 @@ def set_emitter(fn: Any) -> None:
 
 
 def _emit(ev: dict[str, Any]) -> None:
-    fn = _EMIT
+    """Prefer the executing world's hook, then PARENT's, then the process global.
+
+    The bridge still installs ``set_emitter`` for process lifetime. ACP sets
+    ``world.on_event`` per prompt so two worlds do not steal each other's cards.
+    """
+    from desmos.kernel.dispatch import CALLER_WORLD
+
+    world = CALLER_WORLD.get()
+    fn = getattr(world, "on_event", None) if world is not None else None
+    if fn is None and PARENT is not None:
+        fn = getattr(PARENT, "on_event", None)
+    if fn is None:
+        fn = _EMIT
     if fn is None:
         return
     try:

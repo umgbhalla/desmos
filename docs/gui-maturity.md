@@ -266,18 +266,19 @@ Kernel `ev` → TUI (bridge) → ACP `_emit_event` → Desk / GPUIX paint.
 | `error` | Story `system` + Activity | Activity `tool_call` title `error`. Does **not** latch `state["error"]` | Activity card + Story `system` |
 | `compacted` | Story fold notice + Activity | Activity `compacted` | both |
 | `steer` | Story echo | `user_message_chunk` `"[steer] {text}"` family=prompt | Story; do not duplicate local “steer queued” |
-| `decision` | real option picker | Activity card (options as text) | Activity card |
-| `pending` | badge | reused tool id, `replace: true` | Activity card |
+| `decision` | real option picker | Activity card + `options` / `decisionId` | clickable options → `decide:<id>: <option>` |
+| `pending` | badge | reused tool id, `replace: true` | Activity card + status `pending N` |
 | `resumed` / `guidance` / `attached` / `stopped` | TUI notices / cards | Activity cards | Activity (+ Story system for stopped) |
 | `subagent` | Story card | Story `tool_call` | Story subagent |
 | `child` thinking/speech | update that card | `tool_call_update` on that card | same |
 | `child` result | Activity | Activity syscall + `extra.child` | Activity |
 | `turn` / `done` | stream finish / stop | skipped (`stopReason` is done) | n/a |
+| `prompt` | Story `UserPrompt` | skipped live; `user_message_chunk` on replay | local row on send; replay paints user |
 | `picker` / `login` / `ready` / `snapshot` | TUI chrome | **not emitted** | Desk polls `_session/*` / `configOptions` |
 | `agents` / `channels` / `roster` | TUI rails | **not emitted** | Desk `_session/roster`, `_session/channels` |
 | `workspace_story` / `channel_story` / `posted` | TUI | **not emitted** | Desk polls + `_session/post` |
-| `notice` | TUI toast | **not emitted** | missing |
-| `model_rejected` | TUI | **not emitted** | missing |
+| `notice` | TUI toast | Activity `notice` | Activity card |
+| `model_rejected` | TUI | Activity `model_rejected` | Activity card |
 
 ACP `STORY_UPDATES` = `agent_thought_chunk`, `agent_message_chunk`,
 `user_message_chunk`. `STORY_FAMILIES` = `{subagent}`. Everything else with
@@ -307,6 +308,20 @@ These are done. Do not rebuild them. Do not list them as remaining work.
    agents rail. `bindCopies` targets `$("#app")`. gpuix native probe is
    `require()`, not “index.js exists”.
 6. **Surface docs** `docs/desk-frontend.md`, `docs/comet-frontend.md`.
+7. **ACP `claim_workspace`.** `session/new` takes the same lease as the
+   bridge. A second interactive front is `-32602` naming the holder.
+8. **Event-log resume.** ACP `record_event`s kernel events. `session/load`
+   replays `persist.read_events` through `_emit_event`. User story is
+   `ev prompt`, not `header(world)+prompt`.
+9. **Idle steer.** Running → `injected` + `catalog.steer`. Idle →
+   `promptRequired` only.
+10. **`has_input` park.** A follow-up `session/prompt` wakes
+    `pending.wait_next` the way the TUI inbox does.
+11. **`world.on_event`.** Children copy the parent's hook. `_emit` prefers
+    `CALLER_WORLD.on_event` before the process global.
+12. **notice / model_rejected** Activity cards. Desk/GPUIX decision buttons
+    send `decide:<id>: <option>`.
+13. **AGENTS.md** thinking/edit-card sentences match the TUI tests.
 
 ---
 
@@ -315,71 +330,25 @@ These are done. Do not rebuild them. Do not list them as remaining work.
 Each row names the **real object**. A lookalike is not progress. If wiring
 that object is blocked, say the block. Do not invent an 80-line stand-in.
 
-### Must exist before GUIs can share a workspace with the TUI
-
-**ACP `claim_workspace`.** Only `front/bridge.py` takes
-`persist.claim_workspace`. ACP / Desk / Comet can still overwrite the same
-sqlite if a TUI is attached. The real object is that lease, taken by any
-interactive front that `persist.save`s, with `WorkspaceBusy` named on the
-wire. Headless runs and children stay exempt (the peer rail exists so two
-*sessions* can talk; two *writers* cannot).
-
-### Session resume that is not a speech reconstruction
-
-**`session/load` rebuilds Story from `world.messages` via
-`_story_from_messages`.** That leaks the catalog header into a user row and
-leaves Activity empty. The TUI reattach reads the persist **event log**
-(the same objects `record_event` wrote). ACP resume must replay that log
-through `_emit_event`, not paraphrase the transcript.
-
-### Steer when idle
-
-**`_session_steer` always `catalog.steer`s, then if idle returns
-`promptRequired`.** Comet may inject *and* start a fresh `session/prompt`
-with the same text. Idle should not queue a steer the next prompt will also
-send. The real split: running → `injected` only; idle → `promptRequired`
-only, no `catalog.steer`.
-
-### Park on inbox
-
-**ACP cancel is `should_stop` only.** The bridge passes
-`has_input=lambda: not inbox.empty()` into `run_turns`, so a parked
-background monitor yields when the human types. ACP has no inbox. A Desk /
-Comet prompt typed while monitors are pending waits until they finish or
-cancel. The real object is `has_input` on `session/prompt` (or an ACP
-notification that unparks).
-
-### One emitter per World, not a module global
-
-**`S.set_emitter` and `S.PARENT` are process globals.** ACP restores them
-after the prompt, which stops the leak into a later TUI attach. Two ACP
-prompts on **different worlds** at once still race. The comment in
-`acp.py` already says this: `subagent.PARENT` has to come off the module
-global. Same for the emitter.
-
-### Thinking pane — pick one and write it down
+### Thinking pane — two paints, one event
 
 TUI tests put thinking on **Activity**. ACP tags thinking as **Story**
 (`agent_thought_chunk`), matching Comet `MessagePart::Thought` and Desk's
-muted Story block. AGENTS.md still says Story = UserPrompt / Thinking /
-AgentMessage. Three documents, two behaviours. The remaining work is a
-canonical decision, then AGENTS.md / ACP comments / this file agreeing.
-Do not “fix” it by painting thinking on both panes.
+muted Story block. That split is written down in AGENTS.md. Do not paint
+thinking on both panes to make the docs agree.
 
-### Decision and pending are cards on ACP, UI on the TUI
+### `PARENT` is still a module global
 
-TUI `decision` is an option picker. ACP is a text card. TUI `pending` is a
-badge. ACP is a reused tool_call because ACP has no meta badge. Promoting
-those to real UI is a client change (Comet submodule, Desk JS). The kernel
-event is already on the wire.
+`world.on_event` is per-world. `S.PARENT` is still process-global. A child
+that emits without `CALLER_WORLD` and without `on_event` copied still
+falls through to whichever parent was bound last.
 
 ### Desk markdown grammar
 
 `md.js` reimplements GFM. The real remaining job is the grok markdown
 contract in the browser (WASM of `xai-grok-markdown-core`, or token spans
 the Python side already has). Do not add a third regex. Do not restore a
-pulldown walker. Incremental DOM / a reducer test is the paint job after
-the grammar is one object.
+pulldown walker.
 
 ### Comet chip richness
 
@@ -387,36 +356,16 @@ Lives in `umgbhalla/comet`, then the gitlink. Protocol errors already land
 as Activity cards. Collapsing “Ran N commands”, paperclip, model chip
 copy, and similar chrome are Comet product — commit there, pin here.
 
-### Notices ACP still drops
-
-`notice` and `model_rejected` have no `_emit_event` branch. Roster /
-channels / picker are available over `_session/*` and `configOptions`;
-Desk polls them. GPUIX does not. A client that never polls never sees
-them. That is a client gap, not a missing kernel event.
-
-### Docs that lie
-
-- `AGENTS.md` — thinking-on-Story, `story_edit_card`. Rewrite those
-  sentences to match the TUI tests. Do not restore the old paint to make
-  the doc true.
-- `docs/ownership.md` Part 2 still says ACP reads only
-  `thinking` / `speech` / `turn` / `error` / `result`. `_emit_event` is
-  larger now.
-- `docs/how-desmos-works.md` schema v16; live is 17.
-- `docs/tui-redesign.md` (ARES) — rail / subject-on-events / front-attaches
-  not owns. Proposed. Not this checkout's TUI.
-
 ### Kernel leftovers that are not GUI, but are real
 
-From `docs/how-desmos-works.md`, still true:
-
+- `docs/tui-redesign.md` (ARES) — rail / subject-on-events / front-attaches
+  not owns. Proposed. Not this checkout's TUI.
 - `state/work.py` CAS graph: production never calls `work.add` / `claim` /
   `finish`. `witness.wake` still injects a catalog line from git commits
   even when `work_*` is empty.
 - `front/trace.py` still globs `.desmos/events/*.jsonl`; events live in
-  sqlite. `runtime_block` still lists `events/` as a directory.
+  sqlite.
 - `.desmos/out/NNNN-tag.txt` numbering is still `max+1`.
-- `S.set_emitter` / `PARENT` as above.
 - Spine / herdr remain opt-in. Seats, channels, roster are on the default
   TUI and are not spine extras.
 
@@ -459,7 +408,8 @@ XML-as-speech on ACP: `_check_acp_xml_as_speech` — no JSON-RPC `error`,
 tool titles, body contains `not dispatched`.
 
 Protocol cards: `_check_acp_protocol_cards`. Images: `_check_acp_images`.
-Emitter: `_check_acp_subagent_emitter`.
+Emitter: `_check_acp_subagent_emitter`. Claim: `_check_acp_workspace_claim`.
+Resume: `_check_acp_event_replay`. Park: `_check_acp_has_input`.
 
 A Comet GUI recording is not a substitute for those checks, and it is not
 possible until `vendor/comet` is initialized and `zeron` is built.

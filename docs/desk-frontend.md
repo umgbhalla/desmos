@@ -52,12 +52,24 @@ Supported now:
 - cancel the in-flight prompt (Esc, or the stop control);
 - new session (`session/new`);
 - resume a persist session (`session/load` with the sqlite `sessions.id`
-  from `_session/sessions` — the same rows the TUI picker reads);
+  from `_session/sessions` — the same rows the TUI picker reads). Load
+  replays `persist.read_events` through `_emit_event` so Activity is not
+  empty and user rows are `ev prompt` text, not `header(world)+prompt`;
 - resume a previous ACP uuid (`session/load` of the uuid `session/new`
   issued; `persist.acp_sessions` is the join, schema 17, same sqlite file);
 - model and thought_level through `session/set_config_option` (the same
-  catalog the TUI picker reads), as chips inside the composer;
-- steer while a turn is running (`_session/steer` → `catalog.steer`);
+  catalog the TUI picker reads), as chips inside the composer; a refused
+  model emits `model_rejected`;
+- steer while a turn is running (`_session/steer` → `catalog.steer`,
+  outcome `injected`). Idle returns `promptRequired` and does **not**
+  queue a steer;
+- a follow-up `session/prompt` while parked on background work sets
+  `has_input` so `pending.wait_next` yields, same as the TUI inbox;
+- `persist.claim_workspace` on `session/new`. A live TUI (or another ACP)
+  holding the lease is JSON-RPC `-32602` naming the holder;
+- decision options as buttons that send `decide:<id>: <option>` into
+  `run_turns` (the same ingest the TUI Enter path uses);
+
 - git status / branches / log (`_session/git`, same `--no-optional-locks`
   reader as the TUI);
 - files listing and bounded read (`_session/fs`, jailed to the session cwd);
@@ -99,7 +111,8 @@ a restart; the term panel talks to the live kernel only.
 Not yet matched with the native TUI / Comet / gpuix:
 
 - attaching the in-process ACP world to `<cwd>/.desmos/bridge.sock`
-  (that would be two writers on one persist brain);
+  (forbidden: two writers). `claim_workspace` is the lease; Desk does not
+  speak JSONL on that socket;
 - Comet CRDT session registry and Zeron devices;
 - Comet engine alacritty PTYs (desk xterm paints `world.shells` history,
   which is line-oriented `op=run`, not a byte-for-byte login PTY). Comet

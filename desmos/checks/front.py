@@ -1349,6 +1349,9 @@ def _check_desk() -> None:
         _check_acp_xml_as_speech()
         _check_acp_images()
         _check_acp_subagent_emitter()
+        _check_acp_workspace_claim()
+        _check_acp_event_replay()
+        _check_acp_has_input()
         _check_desk_roundtrip()
         _check_desk_markdown()
     finally:
@@ -1468,6 +1471,8 @@ def _check_acp_protocol_cards() -> None:
     assert decision["params"]["update"]["title"] == "decision"
     assert decision["params"]["_meta"]["desmos"]["family"] == "decision"
     assert decision["params"]["update"]["status"] == "pending"
+    assert decision["params"]["_meta"]["desmos"]["options"] == ["yes", "no"]
+    assert decision["params"]["_meta"]["desmos"]["decisionId"] == "d1"
 
     captured.clear()
     server._emit_event(
@@ -1532,6 +1537,27 @@ def _check_acp_protocol_cards() -> None:
     captured.clear()
     server._emit_event(sid, None, {"ev": "resumed", "n": 2, "text": "subagent finished"}, state)
     assert captured[-1]["params"]["_meta"]["desmos"]["family"] == "resumed"
+
+    captured.clear()
+    server._emit_event(sid, None, {"ev": "notice", "text": "stdio client gone"}, state)
+    assert captured[-1]["params"]["_meta"]["desmos"]["family"] == "notice"
+    captured.clear()
+    server._emit_event(sid, None, {"ev": "model_rejected", "model": "gpt-9-nope"}, state)
+    assert captured[-1]["params"]["_meta"]["desmos"]["family"] == "model_rejected"
+    body = ""
+    for part in captured[-1]["params"]["update"].get("content") or []:
+        if part.get("type") == "content":
+            body += (part.get("content") or {}).get("text") or ""
+    assert "gpt-9-nope" in body
+
+    captured.clear()
+    server._emit_event(sid, None, {"ev": "prompt", "text": "hello human", "n": 1}, state)
+    assert captured == [], "a live prompt must not echo; the client already has it"
+    state["replay"] = True
+    server._emit_event(sid, None, {"ev": "prompt", "text": "hello human", "n": 1}, state)
+    assert captured[-1]["params"]["update"]["sessionUpdate"] == "user_message_chunk"
+    assert captured[-1]["params"]["update"]["content"]["text"] == "hello human"
+    state.pop("replay", None)
 
 
 def _check_acp_xml_as_speech() -> None:
@@ -1769,6 +1795,250 @@ def _check_acp_subagent_emitter() -> None:
             and n["params"]["_meta"]["desmos"].get("family") == "subagent"
         ]
         assert panes and all(p == "story" for p in panes), panes
+
+
+def _check_acp_workspace_claim() -> None:
+    """ACP takes persist.claim_workspace. A second front is refused by name."""
+    import tempfile
+
+    from desmos.front.acp import AcpServer
+    from desmos.kernel.loop import new_world
+    from desmos.state import persist
+
+    with tempfile.TemporaryDirectory() as tmp:
+        cwd = Path(tmp)
+        holder = new_world(cwd)
+        persist.claim_workspace(holder)
+        memo = dict(persist._WORKSPACE_LEASE)
+        persist._WORKSPACE_LEASE.clear()
+        try:
+            notes: list[dict] = []
+            acp = AcpServer(notes.append, default_cwd=cwd)
+            created = acp.handle(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "session/new",
+                    "params": {"cwd": str(cwd)},
+                }
+            )
+            assert created is not None
+            err = created.get("error") or {}
+            assert err.get("code") == -32602, created
+            assert "already has a live session" in str(err.get("message") or ""), err
+        finally:
+            persist._WORKSPACE_LEASE.clear()
+            persist._WORKSPACE_LEASE.update(memo)
+            persist.release_workspace(holder)
+
+
+def _check_acp_event_replay() -> None:
+    """session/load replays persist.record_event, not header(world)+messages."""
+    import os
+    import tempfile
+
+    from desmos.front.acp import AcpServer
+    from desmos.state.persist import (
+        NEW_SESSION_ENV,
+        SESSION_ID_ENV,
+        SESSION_PID_ENV,
+        read_events,
+        run_id,
+    )
+
+    keys = (SESSION_ID_ENV, SESSION_PID_ENV, NEW_SESSION_ENV)
+    old_env = {k: os.environ.get(k) for k in keys}
+    for k in keys:
+        os.environ.pop(k, None)
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            notes: list[dict] = []
+            acp = AcpServer(notes.append, default_cwd=cwd)
+            created = acp.handle(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "session/new",
+                    "params": {"cwd": str(cwd)},
+                }
+            )
+            assert created is not None
+            sid = created["result"]["sessionId"]
+            persist_id = created["result"]["_meta"]["desmos"]["persistSessionId"]
+            world = acp.sessions[sid]
+            world.complete_fn = lambda *_: {
+                "content": [{"type": "text", "text": "the real answer"}],
+                "usage": {},
+            }
+            prompted = acp.handle(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "session/prompt",
+                    "params": {
+                        "sessionId": sid,
+                        "prompt": [{"type": "text", "text": "what happened"}],
+                    },
+                }
+            )
+            assert prompted is not None
+            assert "error" not in prompted, prompted
+            rows = read_events(world, since=0, session=run_id(), limit=20_000)
+            kinds = [row.get("ev") for row in rows]
+            assert "prompt" in kinds, kinds
+            assert "speech" in kinds, kinds
+            prompt_text = next(r["text"] for r in rows if r.get("ev") == "prompt")
+            assert prompt_text == "what happened", prompt_text
+            assert not prompt_text.lstrip().startswith("ns:"), prompt_text
+
+            for k in keys:
+                os.environ.pop(k, None)
+            replayed: list[dict] = []
+            later = AcpServer(replayed.append, default_cwd=cwd)
+            loaded = later.handle(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "session/load",
+                    "params": {"cwd": str(cwd), "sessionId": persist_id},
+                }
+            )
+            assert loaded is not None
+            assert "error" not in loaded, loaded
+            meta = loaded["result"]["_meta"]["desmos"]
+            assert meta["replayed"] > 0, meta
+            story = loaded["result"]["story"]
+            user = [row for row in story if row.get("kind") == "user"]
+            assert user and user[0]["text"] == "what happened", story
+            assert not any(
+                (row.get("text") or "").lstrip().startswith("ns:") for row in story
+            ), story
+            updates = [
+                n for n in replayed if n.get("method") == "session/update"
+            ]
+            families = [
+                n["params"]["_meta"]["desmos"]["family"] for n in updates
+            ]
+            assert "prompt" in families, families
+            spoken = "".join(
+                (n["params"]["update"].get("content") or {}).get("text") or ""
+                for n in updates
+                if n["params"]["update"].get("sessionUpdate") == "agent_message_chunk"
+            )
+            assert "the real answer" in spoken, spoken
+    finally:
+        for k, value in old_env.items():
+            if value is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = value
+
+
+def _check_acp_has_input() -> None:
+    """A follow-up session/prompt unparks pending.wait_next, like the TUI inbox."""
+    import tempfile
+    import threading
+    import time
+
+    import desmos.agents.pending as pending
+    from desmos.front.acp import AcpServer
+
+    with tempfile.TemporaryDirectory() as tmp:
+        cwd = Path(tmp)
+        notes: list[dict] = []
+        acp = AcpServer(notes.append, default_cwd=cwd)
+        created = acp.handle(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "session/new",
+                "params": {"cwd": str(cwd)},
+            }
+        )
+        assert created is not None
+        sid = created["result"]["sessionId"]
+        world = acp.sessions[sid]
+        parked = threading.Event()
+        saw_first = {"n": 0}
+        old_count, old_wait, old_labels = (
+            pending.count, pending.wait_next, pending.labels,
+        )
+
+        def fake_count(w: object) -> int:
+            if w is not world:
+                return old_count(w)
+            return 1 if saw_first["n"] == 0 else 0
+
+        def fake_labels(w: object) -> list[str]:
+            if w is not world:
+                return old_labels(w)
+            return ["subagent general deadbeef"]
+
+        def fake_wait(w: object, stop=None, interrupt=None, **_kw):
+            if w is world:
+                saw_first["n"] = 1
+                parked.set()
+                deadline = time.monotonic() + 8
+                while time.monotonic() < deadline:
+                    if interrupt is not None and interrupt():
+                        return []
+                    if stop is not None and stop():
+                        return []
+                    time.sleep(0.05)
+            return []
+
+        world.complete_fn = lambda *_: {
+            "content": [{"type": "text", "text": "first-done"}],
+            "usage": {},
+        }
+        pending.count = fake_count
+        pending.wait_next = fake_wait
+        pending.labels = fake_labels
+        first: dict = {}
+
+        def run_first() -> None:
+            first["r"] = acp.handle(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "session/prompt",
+                    "params": {
+                        "sessionId": sid,
+                        "prompt": [{"type": "text", "text": "first"}],
+                    },
+                }
+            )
+
+        worker = threading.Thread(target=run_first, daemon=True)
+        try:
+            worker.start()
+            assert parked.wait(8), "the prompt never parked on pending.wait_next"
+            world.complete_fn = lambda *_: {
+                "content": [{"type": "text", "text": "second-done"}],
+                "usage": {},
+            }
+            second = acp.handle(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 3,
+                    "method": "session/prompt",
+                    "params": {
+                        "sessionId": sid,
+                        "prompt": [{"type": "text", "text": "second"}],
+                    },
+                }
+            )
+            worker.join(10)
+            assert not worker.is_alive(), "parked prompt did not yield to the follow-up"
+            assert first.get("r") is not None and "error" not in first["r"], first
+            assert second is not None and "error" not in second, second
+            blob = str(world.messages)
+            assert "second" in blob, blob
+        finally:
+            pending.count = old_count
+            pending.wait_next = old_wait
+            pending.labels = old_labels
 
 
 def _check_desk_markdown() -> None:
@@ -2149,7 +2419,7 @@ def _check_desk_roundtrip() -> None:
                 req_id=6.5,
             )
             assert steered["result"]["outcome"] == "promptRequired", steered
-            assert "slow down" in world.steers
+            assert "slow down" not in world.steers
             missing = client.call(
                 "session/prompt",
                 {"sessionId": "no-such", "prompt": [{"type": "text", "text": "x"}]},
@@ -2552,7 +2822,7 @@ def check() -> None:
             "params": {"sessionId": sid, "text": "slow down"},
         })
         assert steered["result"]["outcome"] == "promptRequired", steered
-        assert "slow down" in acp.sessions[sid].steers
+        assert "slow down" not in acp.sessions[sid].steers
         comet_steer = acp.handle({
             "jsonrpc": "2.0",
             "id": 11.7,
@@ -2564,7 +2834,7 @@ def check() -> None:
             },
         })
         assert comet_steer["result"]["outcome"] == "promptRequired", comet_steer
-        assert "keep going" in acp.sessions[sid].steers
+        assert "keep going" not in acp.sessions[sid].steers
 
         # The pager opens a second session on the same cwd for every new
         # thread. Sessions on one workspace share the World -- persist keys its

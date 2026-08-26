@@ -98,7 +98,7 @@ function storyItem(item, i) {
   );
 }
 
-function activityCard(card, i) {
+function activityCard(card, i, onDecide) {
   const kids = [
     React.createElement(
       "text",
@@ -123,6 +123,21 @@ function activityCard(card, i) {
         String(card.body).slice(0, 400),
       ),
     );
+  }
+  if (card.family === "decision" && card.status !== "completed" && onDecide) {
+    for (const [j, opt] of (card.options || []).entries()) {
+      kids.push(
+        React.createElement(
+          "text",
+          {
+            key: `o${j}`,
+            onClick: () => onDecide(card.decisionId, String(opt)),
+            style: { color: ACCENT, fontSize: 12, cursor: "pointer" },
+          },
+          String(opt),
+        ),
+      );
+    }
   }
   return React.createElement(
     "div",
@@ -180,6 +195,7 @@ export function App({
   onModel,
   onEffort,
   onToggleActivity,
+  onDecide,
 }) {
   const story = (turn && turn.story) || [];
   const activity = (turn && turn.activity) || [];
@@ -318,7 +334,7 @@ export function App({
               },
               React.createElement("text", { style: { color: MUTED, fontSize: 11 } }, "activity"),
               ...(activity.length
-                ? activity.map(activityCard)
+                ? activity.map((card, i) => activityCard(card, i, onDecide))
                 : [
                     React.createElement(
                       "text",
