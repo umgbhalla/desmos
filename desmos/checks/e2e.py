@@ -2,7 +2,9 @@
 
 Not complete_fn. A subprocess runs `desmos run` with ANTHROPIC_BASE_URL
 pointed at MockAnthropic, so a hardcoded api.anthropic.com URL fails this
-group. Optional termctrl PTY wrap when the binary is on PATH.
+group. Optional termctrl PTY wrap when the binary is on PATH. Optional
+default TUI wrap when a desmos-tui binary exists: same mock, same
+`python -m desmos tui` launcher, not `--demo`.
 """
 
 from __future__ import annotations
@@ -131,6 +133,36 @@ def _check_syscall_roundtrip() -> None:
             assert len(mock.hits) >= 2, mock.hits
 
 
+def _tui_bin() -> str | None:
+    """A real desmos-tui binary. The check does not invoke cargo.
+
+    `--demo` seeds canned events and never POSTs. This path needs the
+    hash-gated launcher to execve an already-built binary with
+    DESMOS_TUI_BINARY set, so missing grok-build in CI still leaves the
+    HTTP e2e green.
+    """
+    candidates = [
+        os.environ.get("DESMOS_TUI_BINARY"),
+        shutil.which("desmos-tui"),
+        str(REPO / "target" / "debug" / "desmos-tui"),
+        str(REPO / "target" / "release" / "desmos-tui"),
+    ]
+    for raw in candidates:
+        if raw and Path(raw).is_file() and os.access(raw, os.X_OK):
+            return raw
+    return None
+
+
+def _termctrl_screen(binary: str, name: str) -> str:
+    show = subprocess.run(
+        [binary, "show", name], capture_output=True, text=True, timeout=5
+    )
+    logs = subprocess.run(
+        [binary, "logs", name], capture_output=True, text=True, timeout=5
+    )
+    return (show.stdout or "") + "\n" + (logs.stdout or "")
+
+
 def _termctrl_bin() -> str | None:
     candidates = [
         os.environ.get("TERMCTRL_BINARY"),
@@ -211,8 +243,97 @@ def _check_termctrl_pty() -> None:
                 )
 
 
+def _check_tui_termctrl() -> None:
+    """Default TUI through the real launcher against the mock.
+
+    `desmos tui --demo` is canned events on the same panes. This check
+    types a prompt into the live composer so complete() POSTs /v1/messages.
+    Skips when termctrl or the TUI binary is missing: the HTTP path above
+    still ran.
+    """
+    term = _termctrl_bin()
+    tui = _tui_bin()
+    if term is None or tui is None:
+        print("[check] e2e: TUI/termctrl missing; HTTP path still ran")
+        return
+    name = f"desmos-tui-e2e-{os.getpid()}"
+    with tempfile.TemporaryDirectory(prefix="desmos-e2e-tui-pane-") as raw:
+        tmp = Path(raw)
+        with MockAnthropic([MARKER]) as mock:
+            env = _child_env(tmp, mock.url)
+            env["DESMOS_TUI_BINARY"] = tui
+            env.setdefault("TERM", "xterm-256color")
+            env.setdefault("COLORTERM", "truecolor")
+            started = subprocess.run(
+                [
+                    term,
+                    "start",
+                    name,
+                    "--cols",
+                    "120",
+                    "--rows",
+                    "40",
+                    "--cwd",
+                    str(tmp),
+                    "--",
+                    sys.executable,
+                    "-B",
+                    "-m",
+                    "desmos",
+                    "tui",
+                    "--cwd",
+                    str(tmp),
+                ],
+                cwd=str(tmp),
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=20,
+            )
+            try:
+                assert started.returncode == 0, (started.stdout, started.stderr)
+                screen = ""
+                deadline = time.time() + 25
+                while time.time() < deadline:
+                    screen = _termctrl_screen(term, name)
+                    if "Activity" in screen or "story" in screen:
+                        break
+                    time.sleep(0.2)
+                assert "Activity" in screen or "story" in screen, screen[-4000:]
+                sent = subprocess.run(
+                    [term, "send", name, "text:hi", "enter"],
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                )
+                assert sent.returncode == 0, (sent.stdout, sent.stderr)
+                deadline = time.time() + 25
+                while time.time() < deadline:
+                    if mock.hits:
+                        break
+                    time.sleep(0.2)
+                assert mock.hits, _termctrl_screen(term, name)[-4000:]
+                assert all(h["path"] == "/v1/messages" for h in mock.hits), mock.hits
+                found = ""
+                deadline = time.time() + 10
+                while time.time() < deadline:
+                    found = _termctrl_screen(term, name)
+                    if MARKER in found:
+                        break
+                    time.sleep(0.2)
+                assert MARKER in found, found[-4000:]
+            finally:
+                subprocess.run(
+                    [term, "stop", name],
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                )
+
+
 def check() -> None:
     _check_complete_hits_mock()
     _check_run_cli()
     _check_syscall_roundtrip()
     _check_termctrl_pty()
+    _check_tui_termctrl()
