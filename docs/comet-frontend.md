@@ -37,7 +37,9 @@ Desmos tags every `session/update` with `_meta.desmos.pane` (`story` |
 shell splits it into two panes:
 
 - speech → `TextDelta` (story markdown)
-- thinking → `ReasoningDelta` (story)
+- thinking → `ReasoningDelta` → `MessagePart::Thought` on **Story** (muted
+  markdown, left rail, "thinking" label on the first block). Empty deltas
+  stay heartbeats. Activity omits thought.
 - `complete()` is kind `other`, so the chip is `ToolCall::Unknown { name: complete }`,
   not a WebFetch. Activity pane only.
 - kernel syscalls (`kind: execute`, `rawInput.tag`) → `ToolCall::Exec` (Activity)
@@ -68,7 +70,7 @@ Supported now:
 
 - hash-gated `zeron` launch over this checkout's ACP server;
 - create / resume a Desmos ACP session for a workspace;
-- stream assistant text and thought on **Story**;
+- stream assistant markdown and thinking on **Story** (`MessagePart::Thought`);
 - `complete()` cards and syscall chips on **Activity** (separate GPUI pane);
 - model and thought_level from Desmos `configOptions`;
 - mid-turn steering (`_session/steering`);
@@ -78,11 +80,16 @@ Supported now:
 
 Not the same object as the TUI / desk:
 
-- gpuix React-on-GPUI markdown host (Comet paints with pulldown-cmark);
-- a headed Vulkan window on machines with no wgpu driver (binary still
-  compiles; this VM dies at `vkCreateInstance`);
+- gpuix React-on-GPUI markdown/diff (Comet paints with pulldown-cmark + its
+  own Changes pane; grok `StreamingMarkdownRenderer` is ratatui/Syntect —
+  hosting either in Comet without a grok-build half-copy is still a gap);
 - Zeron CRDT devices page (no Desmos analog. `persist.peers()` is the honest one);
 - attaching Comet and the TUI as two writers on `.desmos/bridge.sock`.
+
+Headed Linux without a GPU: `mesa-vulkan-drivers` (lavapipe). This VM's
+`vkCreateInstance` used to die with "Found no drivers"; with
+`VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json` wgpu selects
+`llvmpipe` and `python -m desmos comet` maps a real zeron window.
 
 Comet is pinned as a Git submodule of the `umgbhalla/comet` fork. Harness
 changes land in that repository, then the root gitlink moves. The launcher
