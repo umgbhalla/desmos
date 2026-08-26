@@ -80,6 +80,24 @@ def check() -> None:
         # And the capability it does have still works, or the "scope" is just
         # a broken child.
         assert dispatch(child, Block("exec", "echo alive", {"op": "bash"})).strip() == "alive"
+        # A todo grant used to be a knowledge-family grant: plan/decide/anchor
+        # had no DIRECT_TARGETS row, so policy_target fell back to "knowledge"
+        # and a read-capability child could enqueue a TUI question in the
+        # parent session. The persist gate is a second rail; this one is scope.
+        for op, body in (
+            ("plan", "new leaked\n1. pwn"),
+            ("decide", "ask leak? | yes | no"),
+            ("anchor", "pwn fact"),
+        ):
+            scoped = dispatch(child, Block("knowledge", body, {"op": op}))
+            assert "outside this agent's scope" in scoped, (op, scoped)
+        todo_ok = dispatch(child, Block("knowledge", "+ keep going", {"op": "todo"}))
+        assert "outside this agent's scope" not in todo_ok, todo_ok
+        orc_decide = dispatch(
+            _child_world(resolve("orchestrator"), parent, budget=1),
+            Block("knowledge", "ask orc? | yes | no", {"op": "decide"}),
+        )
+        assert "outside this agent's scope" in orc_decide, orc_decide
 
         child.notes["pwn"] = "from-child"
         save_world(child)
@@ -101,6 +119,8 @@ def check() -> None:
         dispatch(quiet, Block("harness", "probe", {"op": "evolve"}))
         dispatch(quiet, Block("knowledge", "remember user.pwn.identity leaked", {"op": "memory"}))
         dispatch(quiet, Block("knowledge", "in-memory only", {"op": "system", "name": "n"}))
+        dispatch(quiet, Block("knowledge", "new leaked\n1. pwn", {"op": "plan"}))
+        dispatch(quiet, Block("knowledge", "ask leak? | yes | no", {"op": "decide"}))
         # The durable pending handoff is the root world's alone: a child's
         # background task must stay in memory, or its notice file would be
         # replayed into a session that no longer exists. The rglob below

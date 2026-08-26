@@ -89,8 +89,8 @@ is `canonical.run_op`, not a handler table.
 Children are `new_world(persist=False, state_path=None)` with the parent's
 `cwd` (`agents/subagent.py _child_world`). Scope is a tag rail, not a
 sandbox (`kernel/dispatch.py`). Python and bash can write any file in that
-tree. That is by design. The isolation hole that is *not* by design is
-below.
+tree. That is by design. Syscall writers that share `state_file(world)`
+must refuse when `persist` is False. They do.
 
 ### Disk
 
@@ -106,21 +106,18 @@ below.
 | `~/.desmos/` | Machine-global settings and auth. `rm -rf .desmos` does not touch them. |
 
 `persist.load` / `save` skip when `world.persist` is False. `plan.py` and
-`decisions.py` do not check that flag. A child's `state_file(world)` still
-resolves to the parent's `.desmos/`, so `<knowledge op=plan>` and
-`op=decide` append the parent's JSONL. `generations.py` already gated this
-exact leak. Identity.md still says a fork "writes nothing back." That
-sentence is false for plan and decide.
+`decisions.py` `_append` do the same. A child's `state_file(world)` still
+resolves to the parent's `.desmos/`, so the writers have to refuse. They
+do. `generations.py` was the template. Identity.md's "writes nothing back"
+covers those JSONL files.
 
-`anchor` writes `world.notes` then `save(world)`, which *is* persist-gated, so
+`anchor` writes `world.notes` then `save(world)`, which is persist-gated, so
 a child anchor stays in RAM.
 
-Granting `todo` expands to the `knowledge` family. `plan` / `decide` /
-`anchor` have no `DIRECT_TARGETS` row, so `policy_target` falls back to
-`"knowledge"`. A read-capability child allowed to append a todo can run
-`knowledge op=decide` and enqueue a TUI question in the parent session. The
-fix is a persist check in the JSONL writers (and op-level scope targets).
-It is not a `DIRECT_TARGETS` rewrite.
+Granting `todo` adds the `knowledge` family tag, not every knowledge op.
+`plan` / `decide` / `anchor` have `DIRECT_TARGETS` rows, so `policy_target`
+is the op name. A read-capability child allowed to append a todo cannot
+run `knowledge op=decide`. Driven in `checks/state.py` and `checks/agents.py`.
 
 ## Complexity verdict
 
@@ -219,15 +216,14 @@ working.
 2. **`front/trace.py` and `checks/trace.py`.** Reader for a directory nothing
    writes.
 
-3. **The lying map the model reads.** `kernel/catalog.py runtime_block`:
-   `events/` is not a directory. `docs/identity.md`: a fork can write
-   `plans.jsonl` and `decisions.jsonl`. Do not retarget SDK paths at
-   `kernel/`.
+3. **The lying map the model reads.** `kernel/catalog.py runtime_block`
+   used to list `events/` as a directory. It names the events table in the
+   harness db now. Do not retarget SDK paths at `kernel/`.
 
-4. **One persist gate in the JSONL writers.** `if not world.persist: return`
-   in `plan.py` and `decisions.py`, matching `generations.py`. Add
-   op-level scope targets for `plan` / `decide` / `anchor` so a todo grant
-   is not a knowledge-family grant.
+4. **Child JSONL writers and todo-as-knowledge.** Done. `plan.py` and
+   `decisions.py` `_append` refuse when `persist` is False. `plan` /
+   `decide` / `anchor` have `DIRECT_TARGETS` rows so a todo grant is not a
+   knowledge-family grant.
 
 5. **Do not delete spine/seats/channels/remote as "leftover."** If a future
    cut drops multi-machine sync, that is a product decision, not a cleanup.

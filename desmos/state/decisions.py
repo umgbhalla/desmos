@@ -39,6 +39,11 @@ def _new_id(prompt: str) -> str:
 
 
 def _append(world: World, rec: dict[str, Any]) -> None:
+    # A subagent runs in the parent's cwd with persist=False. Ungated, its
+    # <knowledge op=decide> wrote .desmos/decisions/decisions.jsonl into the
+    # parent's repo -- save() refused, this did not.
+    if not world.persist:
+        return
     path = _decisions_path(world)
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as fh:
@@ -88,6 +93,8 @@ def push(
     urgency: str = "normal",
 ) -> str:
     """Append a new open decision; return its id."""
+    if not world.persist:
+        return ""
     did = _new_id(prompt)
     _append(world, {
         "id": did,
@@ -104,6 +111,8 @@ def push(
 
 def answer(world: World, did: str, choice: str) -> None:
     """Close an open decision by appending an answered record."""
+    if not world.persist:
+        raise KeyError("decide disabled for this non-persistent world")
     records = _latest(world)
     if did not in records:
         raise KeyError(f"no decision {did!r}")

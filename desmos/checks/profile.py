@@ -70,25 +70,29 @@ class Sampler(threading.Thread):
         self.samples: dict[str, int] = defaultdict(int)
         self.wall = 0.0
         self._lock = threading.Lock()
-        self._stop = threading.Event()
+        # Thread.join() calls self._stop() when the thread dies. An Event
+        # stored under that name is not callable, so halt() used to raise
+        # TypeError and take `check --profile` (and the kernel group that
+        # drives it) with it.
+        self._done = threading.Event()
         self._started_at = 0.0
 
     def run(self) -> None:
         target = threading.main_thread().ident
-        while not self._stop.is_set():
+        while not self._done.is_set():
             frame = sys._current_frames().get(target)
             if frame is not None:
                 site = _blame(frame)
                 with self._lock:
                     self.samples[site] += 1
-            self._stop.wait(self.interval)
+            self._done.wait(self.interval)
 
     def start(self) -> None:
         self._started_at = time.monotonic()
         super().start()
 
     def halt(self) -> None:
-        self._stop.set()
+        self._done.set()
         self.join(timeout=1.0)
         self.wall = time.monotonic() - self._started_at
 
