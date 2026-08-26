@@ -850,6 +850,12 @@ def _open_with_retry(
     raise RuntimeError("unreachable")
 
 
+def anthropic_messages_url() -> str:
+    """POST target for Messages. Override with ANTHROPIC_BASE_URL (no path)."""
+    base = (os.environ.get("ANTHROPIC_BASE_URL") or "https://api.anthropic.com").rstrip("/")
+    return f"{base}/v1/messages"
+
+
 def complete(
     model: str,
     system: str,
@@ -895,7 +901,7 @@ def complete(
     if betas:
         headers["anthropic-beta"] = ",".join(betas)
     req = urllib.request.Request(
-        "https://api.anthropic.com/v1/messages",
+        anthropic_messages_url(),
         data=json.dumps(payload).encode(),
         headers=headers,
         method="POST",
