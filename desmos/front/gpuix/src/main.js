@@ -75,6 +75,9 @@ function paint() {
           state.showActivity = !state.showActivity;
           paint();
         },
+        onDecide: (decisionId, option) => {
+          void sendDecide(decisionId, option);
+        },
       }),
     );
   });
@@ -128,6 +131,32 @@ async function send() {
   t.running = true;
   t.error = "";
   state.draft = "";
+  state.status = "prompting";
+  paint();
+  try {
+    const result = await acp.call(
+      "session/prompt",
+      { sessionId: id, prompt: [{ type: "text", text }] },
+      600000,
+    );
+    t.running = false;
+    state.status = (result && result.stopReason) || "idle";
+  } catch (err) {
+    t.running = false;
+    t.error = String(err.message || err);
+    state.status = t.error;
+  }
+  paint();
+}
+
+async function sendDecide(decisionId, option) {
+  const id = state.activeId;
+  if (!id || !decisionId) return;
+  const text = `decide:${decisionId}: ${option}`;
+  const t = turn(id);
+  t.story.push({ kind: "user", text });
+  t.running = true;
+  t.error = "";
   state.status = "prompting";
   paint();
   try {

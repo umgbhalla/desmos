@@ -2874,6 +2874,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "desmos-md-html"
+version = "0.1.0"
+dependencies = [
+ "pulldown-cmark",
+ "syntect",
+ "two-face",
+ "xai-grok-markdown-core",
+]
+
+[[package]]
 name = "desmos-tui"
 version = "0.0.1"
 dependencies = [

@@ -273,6 +273,9 @@ def _check_loop() -> None:
         assert any(
             "emitted XML as speech" in str(m.get("content")) for m in prose.messages
         ), prose.messages
+        assert not any(
+            "RuntimeError" in str(m.get("content")) for m in prose.messages
+        ), prose.messages
 
         # A call whose body is not dispatchable is recoverable: the tool gets a
         # typed answer and the loop asks again.

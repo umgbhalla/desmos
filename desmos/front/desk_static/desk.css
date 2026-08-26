@@ -276,6 +276,82 @@ select.chip {
   font: 12.5px/1.5 var(--font);
   color: var(--think);
 }
+.system, .subagent {
+  margin: 10px 0 12px;
+  border-left: 2px solid var(--err);
+  padding: 2px 0 2px 12px;
+  color: var(--secondary);
+  font-size: 13px;
+}
+.system.compacted, .subagent { border-left-color: var(--think); }
+.system .lab, .subagent .lab {
+  color: var(--tertiary);
+  font-size: 11.5px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+.subagent .name { color: var(--text); font-weight: 500; margin-top: 4px; }
+.system pre, .subagent pre {
+  margin: 6px 0 0;
+  white-space: pre-wrap;
+  font: 12.5px/1.5 var(--font);
+}
+.thumb {
+  display: block;
+  max-width: 240px;
+  max-height: 160px;
+  margin-top: 8px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+}
+.q-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-bottom: 8px;
+  padding: 6px 8px;
+  background: var(--raised);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+.q-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  font-size: 12px;
+}
+.q-n { color: var(--tertiary); font: 11px var(--mono); flex: none; }
+.q-t {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--secondary);
+}
+.q-x {
+  flex: none;
+  color: var(--ghost);
+  padding: 0 4px;
+  line-height: 1;
+}
+.q-x:hover { color: var(--err); }
+.md-plain {
+  margin: 0;
+  white-space: pre-wrap;
+  font: 12.5px/1.5 var(--mono);
+  color: var(--secondary);
+}
+.img-row { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 8px; }
+.img-chip {
+  font-size: 11.5px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: var(--raised);
+  border: 1px solid var(--border);
+  color: var(--secondary);
+}
 .assistant .md { font-size: 14.5px; line-height: 1.6; color: var(--text); }
 .md p { margin: 0 0 12px; }
 .md h1, .md h2, .md h3 { font-weight: 560; margin: 18px 0 8px; letter-spacing: -0.01em; }
@@ -461,6 +537,32 @@ select.chip {
 .card.complete .fam { color: var(--warn); }
 .card.edit .fam { color: var(--ok); }
 .card.syscall .fam { color: #89b4fa; }
+.card.error .fam { color: var(--err); }
+.card.compacted .fam { color: var(--think); }
+.card.decision .fam { color: var(--accent); }
+.card.pending .fam { color: var(--warn); }
+.card.subagent .fam { color: var(--accent); }
+.card.attached .fam { color: var(--ok); }
+.card.stopped .fam { color: var(--err); }
+.card.guidance .fam { color: var(--think); }
+.card.notice .fam { color: var(--think); }
+.card.model_rejected .fam { color: var(--err); }
+.card .opts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 8px;
+}
+.card .opts button {
+  font: 12px var(--sans);
+  color: var(--accent);
+  background: var(--overlay);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 4px 10px;
+  cursor: pointer;
+}
+.card .opts button:hover { background: var(--raised); }
 .card .hd .name {
   flex: 1; min-width: 0;
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;

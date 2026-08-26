@@ -71,7 +71,17 @@ Supported now:
 - hash-gated `zeron` launch over this checkout's ACP server;
 - create / resume a Desmos ACP session for a workspace;
 - stream assistant markdown and thinking on **Story** (`MessagePart::Thought`);
-- `complete()` cards and syscall chips on **Activity** (separate GPUI pane);
+- `complete()` cards and syscall chips on **Activity** (separate GPUI pane):
+  chip label `complete` plus the POST model, bash/python body on `Run`,
+  `<read>` as `ReadFile`, group summary `Posted 1 complete · ran N commands`;
+- the paperclip / drop / paste path sends ACP `type=image` `file:` URI blocks
+  (`acp_prompt_blocks`), which Desmos `prompt_images` already turns into
+  `run_turns(images=)` — not path-names-as-prose;
+- protocol errors (xml-as-speech, a fold) as Activity cards — `session/prompt`
+  returns `end_turn`, not JSON-RPC `-32603` ("harness protocol error");
+- image blocks advertised and attached through `run_turns(images=)`;
+- subagent start/progress/done as Story cards; child speech stays inside
+  that card instead of mixing into parent prose;
 - Grok markdown contract on Story: GFM + math + `~~` strike only (single `~`
   stays literal, matching `xai-grok-markdown-core`);
 - gpuix-style word diffs on the Changes pane and inline edit diffs (`similar`);

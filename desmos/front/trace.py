@@ -42,9 +42,18 @@ _ARG_FIELDS = (
 )
 
 
-def latest_event_log(cwd: Path) -> Path | None:
+def latest_event_source(cwd: Path) -> Path | None:
+    """Sqlite events table first. Leftover jsonl journals are a fallback."""
+    db = cwd / ".desmos" / "harness.sqlite3"
+    if db.is_file():
+        return db
     paths = list((cwd / ".desmos" / "events").glob("*.jsonl"))
     return max(paths, key=lambda p: p.stat().st_mtime_ns, default=None)
+
+
+def latest_event_log(cwd: Path) -> Path | None:
+    """Deprecated name. Prefer latest_event_source."""
+    return latest_event_source(cwd)
 
 
 def _args(row: dict[str, Any], seq: int, **extra: Any) -> dict[str, Any]:
@@ -60,7 +69,12 @@ def _stamp(row: dict[str, Any], mono0: int | None, wall0: int) -> tuple[float, b
         return (mono - mono0) / 1_000_000.0, False
     wall = row.get("ts")
     if isinstance(wall, int):
-        return max(0.0, (wall - wall0) * 1000.0), True
+        delta = wall - wall0
+        # persist.read_events aliases ts_ms AS ts (milliseconds). jsonl
+        # fixtures used small integers as seconds. Epoch-ms is >= 1e12.
+        if abs(wall) >= 1_000_000_000_000 or abs(wall0) >= 1_000_000_000_000:
+            return max(0.0, float(delta)), True
+        return max(0.0, float(delta) * 1000.0), True
     return 0.0, True
 
 
@@ -253,15 +267,25 @@ def ownership_report(rows: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
-def export_event_log(input_path: Path, output_path: Path | None = None) -> dict[str, Any]:
-    rows = [
+def load_event_rows(input_path: Path) -> list[dict[str, Any]]:
+    """Read a jsonl journal. Sqlite sessions use persist.read_events instead."""
+    return [
         json.loads(line)
         for line in input_path.read_text(encoding="utf-8").splitlines()
         if line.strip()
     ]
+
+
+def export_rows(
+    rows: list[dict[str, Any]],
+    output_path: Path,
+    *,
+    source: str = "",
+) -> dict[str, Any]:
+    """Chrome Trace from already-loaded event dicts (jsonl or sqlite)."""
     stamped = [row for row in rows if isinstance(row, dict) and "seq" in row]
     if not stamped:
-        raise ValueError(f"event log has no stamped events: {input_path}")
+        raise ValueError(f"event log has no stamped events: {source or output_path}")
 
     monos = [row["mono_ns"] for row in stamped if isinstance(row.get("mono_ns"), int)]
     mono0 = min(monos) if monos else None
@@ -272,7 +296,6 @@ def export_event_log(input_path: Path, output_path: Path | None = None) -> dict[
     output_wait: deque[tuple[float, int, dict[str, Any]]] = deque()
     dispatch_wait: deque[tuple[float, int, dict[str, Any]]] = deque()
     unmatched = 0
-    explained_unmatched: list[dict[str, Any]] = []
     approximate = mono0 is None
 
     def instant(name: str, stamp: float, args: dict[str, Any]) -> None:
@@ -403,14 +426,12 @@ def export_event_log(input_path: Path, output_path: Path | None = None) -> dict[
 
     # Event order is useful for the viewer and stable enough for equal stamps.
     trace.sort(key=lambda item: (float(item.get("ts", 0)), int(item.get("args", {}).get("source_seq", 0))))
-    if output_path is None:
-        output_path = input_path.parent.parent / "traces" / f"{input_path.stem}.trace.json"
     output_path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "traceEvents": trace,
         "displayTimeUnit": "ms",
         "metadata": {
-            "source": str(input_path),
+            "source": source,
             "approximate_timing": approximate,
             "unmatched_spans": unmatched,
         },
@@ -451,10 +472,25 @@ def export_event_log(input_path: Path, output_path: Path | None = None) -> dict[
     }
     output_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
     return {
-        "input": str(input_path),
+        "input": source,
         "output": str(output_path),
         "events": len(trace),
         "unmatched_spans": unmatched,
         "approximate_timing": approximate,
         "critical_path": critical_path,
     }
+
+
+def export_event_log(input_path: Path, output_path: Path | None = None) -> dict[str, Any]:
+    rows = load_event_rows(input_path)
+    if output_path is None:
+        output_path = input_path.parent.parent / "traces" / f"{input_path.stem}.trace.json"
+    return export_rows(rows, output_path, source=str(input_path))
+
+
+def export_world(world: Any, output_path: Path) -> dict[str, Any]:
+    """Chrome Trace from the sqlite `events` table this world writes."""
+    from desmos.state import persist
+
+    rows = persist.read_events(world)
+    return export_rows(rows, output_path, source=str(persist.state_file(world)))

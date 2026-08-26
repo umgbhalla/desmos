@@ -26,6 +26,8 @@
     bridge: { socket: null, attached: false, reason: "" },
     term: { name: "main", text: "", raw: "", shells: [], draft: "", line: "", seq: 0 },
     help: false,
+    pendingImages: [],
+    queue: [],
     active: null,
     model: "",
     effort: "",
@@ -121,7 +123,7 @@
     const meta = msg.params && msg.params._meta;
     if (meta && meta.desmos && meta.desmos.pane) return meta.desmos.pane;
     const kind = (((msg.params || {}).update) || {}).sessionUpdate;
-    if (kind === "agent_thought_chunk" || kind === "agent_message_chunk") return "story";
+    if (kind === "agent_thought_chunk" || kind === "agent_message_chunk" || kind === "user_message_chunk") return "story";
     return "activity";
   }
 
@@ -129,10 +131,21 @@
     const meta = update && update._meta;
     if (meta && meta.desmos && meta.desmos.family) return meta.desmos.family;
     if (update.title === "complete") return "complete";
+    if (update.title === "error") return "error";
+    if (update.title === "compacted") return "compacted";
+    if (update.title === "decision") return "decision";
+    if (update.title === "pending") return "pending";
+    if (update.title === "resumed") return "resumed";
+    if (update.title === "guidance") return "guidance";
+    if (update.title === "attached") return "attached";
+    if (update.title === "stopped") return "stopped";
+    if (update.title === "notice") return "notice";
+    if (update.title === "model_rejected") return "model_rejected";
     if ((update.title || "").startsWith("edit")) return "edit";
     const kind = update.sessionUpdate;
     if (kind === "agent_thought_chunk") return "thinking";
     if (kind === "agent_message_chunk") return "speech";
+    if (kind === "user_message_chunk") return "prompt";
     return "syscall";
   }
 
@@ -140,6 +153,48 @@
     const meta = update && update._meta;
     if (meta && meta.desmos && meta.desmos.label) return meta.desmos.label;
     return update.title || "tool";
+  }
+
+  function desmosOf(msg, update) {
+    const nested = update && update._meta && update._meta.desmos;
+    if (nested) return nested;
+    const outer = msg && msg.params && msg.params._meta && msg.params._meta.desmos;
+    return outer || {};
+  }
+
+  function cardText(update) {
+    let body = "";
+    for (const part of update.content || []) {
+      if (part.type === "content" && part.content && part.content.text) body += part.content.text;
+      else if (part.text) body += part.text;
+    }
+    return body;
+  }
+
+  function applySpans(text, spans) {
+    if (!text || !spans || !spans.length) return text;
+    const enc = new TextEncoder();
+    const dec = new TextDecoder();
+    const raw = enc.encode(text);
+    const chunks = [];
+    let cursor = 0;
+    for (const pair of spans) {
+      const a = pair[0];
+      const z = pair[1];
+      if (typeof a !== "number" || typeof z !== "number" || z < a) continue;
+      chunks.push(raw.subarray(cursor, a));
+      cursor = z;
+    }
+    chunks.push(raw.subarray(cursor));
+    let total = 0;
+    for (const chunk of chunks) total += chunk.length;
+    const out = new Uint8Array(total);
+    let offset = 0;
+    for (const chunk of chunks) {
+      out.set(chunk, offset);
+      offset += chunk.length;
+    }
+    return dec.decode(out);
   }
 
   function persistMeta(result) {
@@ -194,6 +249,13 @@
 
   function applyLoadedStory(id, result) {
     const t = turn(id);
+    t.persistId = ((result._meta || {}).desmos || {}).persistSessionId || id;
+    const replayed = Number(((result._meta || {}).desmos || {}).replayed || 0);
+    if (replayed > 0 && (t.story.length || t.activity.length)) {
+      const first = t.story.find((s) => s.kind === "user");
+      t.title = first ? first.text.split("\n")[0].slice(0, 72) : "Resumed session";
+      return;
+    }
     t.story = [];
     const story = result.story || [];
     if (story.length) {
@@ -206,7 +268,6 @@
     }
     const first = t.story.find((s) => s.kind === "user");
     t.title = first ? first.text.split("\n")[0].slice(0, 72) : "Resumed session";
-    t.persistId = ((result._meta || {}).desmos || {}).persistSessionId || id;
   }
 
   async function loadPersist(persistId) {
@@ -228,29 +289,92 @@
     refreshEnv();
   }
 
+  async function drainQueue() {
+    const id = state.active;
+    if (!id) return;
+    const t = turn(id);
+    while (state.queue.length && !t.running) {
+      const item = state.queue.shift();
+      const prompt = [];
+      if (item.text) prompt.push({ type: "text", text: item.text });
+      for (const img of item.images || []) {
+        prompt.push({ type: "image", mimeType: img.mime, data: img.data });
+      }
+      t.story.push({
+        kind: "user",
+        text: item.text || "(image)",
+        thumbs: (item.images || []).map((img) => ({
+          name: img.name,
+          src: `data:${img.mime};base64,${img.data}`,
+        })),
+      });
+      t.running = true;
+      paint();
+      try {
+        await acp.call("session/prompt", { sessionId: id, prompt });
+      } catch (err) {
+        t.error = err.message || String(err);
+        t.running = false;
+        paint();
+        return;
+      }
+      t.running = false;
+    }
+    paint();
+  }
+
+  async function queueFollowUp() {
+    const id = state.active;
+    if (!id) return;
+    const text = state.draft.trim();
+    const images = (state.pendingImages || []).slice();
+    if (!text && !images.length) return;
+    state.queue.push({ text, images });
+    state.draft = "";
+    state.pendingImages = [];
+    try {
+      await acp.call("_session/typed", { sessionId: id });
+    } catch (_) {
+      /* a missing typed method must not drop the local queue */
+    }
+    paint();
+  }
+
   async function send() {
     const id = state.active;
     if (!id) return;
     const text = state.draft.trim();
-    if (!text) return;
+    const images = (state.pendingImages || []).slice();
+    if (!text && !images.length) return;
     const t = turn(id);
     if (t.running) {
+      if (!text) return;
       await acp.call("_session/steer", { sessionId: id, text });
       t.story.push({ kind: "steer", text });
       state.draft = "";
       paint();
       return;
     }
-    t.story.push({ kind: "user", text });
-    if (t.title === "New session") t.title = text.split("\n")[0].slice(0, 72);
+    const prompt = [];
+    if (text) prompt.push({ type: "text", text });
+    for (const img of images) {
+      prompt.push({ type: "image", mimeType: img.mime, data: img.data });
+    }
+    t.story.push({
+      kind: "user",
+      text: text || "(image)",
+      thumbs: images.map((img) => ({ name: img.name, src: `data:${img.mime};base64,${img.data}` })),
+    });
+    if (t.title === "New session") t.title = (text || images[0].name || "image").split("\n")[0].slice(0, 72);
     t.running = true;
     t.error = "";
     state.draft = "";
+    state.pendingImages = [];
     paint();
     try {
       const result = await acp.call("session/prompt", {
         sessionId: id,
-        prompt: [{ type: "text", text }],
+        prompt,
       });
       t.running = false;
       if (result && result.stopReason === "cancelled") t.error = "";
@@ -261,6 +385,30 @@
     paint();
     scrollStory(true);
     refreshEnv();
+    await drainQueue();
+  }
+
+  async function sendDecide(decisionId, option) {
+    const id = state.active;
+    if (!id || !decisionId) return;
+    const text = `decide:${decisionId}: ${option}`;
+    const t = turn(id);
+    t.story.push({ kind: "user", text });
+    t.running = true;
+    t.error = "";
+    paint();
+    try {
+      await acp.call("session/prompt", {
+        sessionId: id,
+        prompt: [{ type: "text", text }],
+      });
+    } catch (err) {
+      t.error = err.message || String(err);
+    }
+    t.running = false;
+    paint();
+    refreshEnv();
+    await drainQueue();
   }
 
   async function cancel() {
@@ -438,6 +586,7 @@
     const t = turn(sid);
     const pane = paneOf(msg);
     const family = familyOf(update);
+    const meta = desmosOf(msg, update);
     const kind = update.sessionUpdate;
     if (pane === "story") {
       if (kind === "agent_thought_chunk") {
@@ -450,9 +599,39 @@
         const last = t.story[t.story.length - 1];
         if (last && last.kind === "assistant") last.text += chunk;
         else t.story.push({ kind: "assistant", text: chunk });
+      } else if (kind === "user_message_chunk") {
+        const raw = (update.content && update.content.text) || "";
+        const steered = raw.startsWith("[steer] ") ? raw.slice(8) : raw;
+        const last = t.story[t.story.length - 1];
+        if (last && last.kind === "steer" && last.text === steered) {
+          /* Desk already queued this steer locally. */
+        } else if (family === "steer" || raw.startsWith("[steer] ")) {
+          t.story.push({ kind: "steer", text: steered });
+        } else if (raw) {
+          t.story.push({ kind: "user", text: raw });
+        }
+      } else if (kind === "tool_call" || kind === "tool_call_update") {
+        let card = t.story.find((c) => c.kind === "subagent" && c.id === update.toolCallId);
+        const chunk = cardText(update);
+        if (!card) {
+          card = {
+            kind: "subagent",
+            id: update.toolCallId,
+            family,
+            title: labelOf(update),
+            status: update.status || "pending",
+            text: chunk,
+          };
+          t.story.push(card);
+        } else {
+          if (update.status) card.status = update.status;
+          if (update.title) card.title = labelOf(update);
+          if (chunk) card.text = (card.text || "") + (card.text ? "\n" : "") + chunk;
+        }
       }
     } else {
       if (kind === "tool_call") {
+        const body = cardText(update);
         t.activity.push({
           id: update.toolCallId,
           family,
@@ -461,10 +640,26 @@
           kind: update.kind || "",
           raw: update.rawInput || {},
           locations: update.locations || [],
-          body: "",
+          body: body,
           diff: null,
-          open: family === "complete" || family === "edit" ? true : false,
+          group: meta.group,
+          child: meta.child,
+          n: meta.n,
+          decisionId: meta.decisionId || meta.id,
+          options: Array.isArray(meta.options) ? meta.options : [],
+          open:
+            family === "complete" ||
+            family === "edit" ||
+            family === "error" ||
+            family === "compacted" ||
+            family === "decision" ||
+            family === "stopped" ||
+            family === "notice" ||
+            family === "model_rejected",
         });
+        if (family === "error" || family === "compacted" || family === "stopped") {
+          if (body) t.story.push({ kind: "system", text: body, family });
+        }
       } else if (kind === "tool_call_update") {
         let card = t.activity.find((c) => c.id === update.toolCallId);
         if (!card) {
@@ -476,6 +671,7 @@
             raw: {},
             body: "",
             diff: null,
+            group: meta.group,
             open: true,
           };
           t.activity.push(card);
@@ -483,15 +679,30 @@
         if (update.status) card.status = update.status;
         if (update.title) card.title = labelOf(update);
         if (update.kind) card.kind = update.kind;
+        if (meta.group != null) card.group = meta.group;
+        if (meta.n != null) card.n = meta.n;
+        if (meta.decisionId || meta.id) card.decisionId = meta.decisionId || meta.id;
+        if (Array.isArray(meta.options)) card.options = meta.options;
         const parts = update.content || [];
+        const replace = meta.replace === true;
         for (const part of parts) {
           if (part.type === "diff") {
             card.diff = { path: part.path, oldText: part.oldText, newText: part.newText };
             card.open = true;
           } else if (part.type === "content" && part.content && part.content.text) {
-            card.body = (card.body || "") + part.content.text;
+            if (replace) card.body = part.content.text;
+            else card.body = (card.body || "") + part.content.text;
           } else if (part.text) {
-            card.body = (card.body || "") + part.text;
+            if (replace) card.body = part.text;
+            else card.body = (card.body || "") + part.text;
+          }
+        }
+        if (Array.isArray(meta.spans) && meta.spans.length) {
+          for (let i = t.story.length - 1; i >= 0; i--) {
+            if (t.story[i].kind === "assistant") {
+              t.story[i].text = applySpans(t.story[i].text, meta.spans);
+              break;
+            }
           }
         }
       }
@@ -514,6 +725,7 @@
       wire: '<rect x="4" y="5" width="16" height="14" rx="2"/><path d="M15 5v14"/>',
       send: '<path d="M12 19V5M6 11l6-6 6 6"/>',
       stop: '<rect x="7" y="7" width="10" height="10" rx="1"/>',
+      clip: '<path d="M21.44 11.05l-9.19 9.19a6 6 0 01-8.49-8.49l9.19-9.19a4 4 0 015.66 5.66l-9.2 9.19a2 2 0 01-2.83-2.83l8.49-8.48"/>',
     };
     return `<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">${paths[name] || ""}</svg>`;
   }
@@ -557,7 +769,8 @@
 
   function helpHtml() {
     const rows = [
-      ["Enter", "send · Shift+Enter newline"],
+      ["Enter", "send · while running, steer"],
+      ["Tab", "while running, queue a follow-up (unparks pending.wait_next)"],
       ["Esc", "cancel turn · close this"],
       ["N", "new session"],
       ["?", "keys"],
@@ -571,7 +784,7 @@
       <dl>${rows
         .map(([k, v]) => `<div><dt><kbd>${esc(k)}</kbd></dt><dd>${esc(v)}</dd></div>`)
         .join("")}</dl>
-      <p class="hint">Story is speech and thinking. Activity is the wire — complete() POSTs, syscalls, git, files, channels, and the kernel PTY.</p>
+      <p class="hint">Story is speech, thinking, and subagent cards. Activity is the wire — complete() POSTs, syscalls, folds, protocol errors, git, files, channels, and the kernel PTY. Attach images with the paperclip. Assistant markdown is xai-grok-markdown-core via POST /md.</p>
     </div></div>`;
   }
 
@@ -621,7 +834,7 @@
     if (storyNow && (stickStory || (t && t.running))) storyNow.scrollTop = storyNow.scrollHeight;
     const actNow = $("#act-body");
     if (actNow && (stickAct || (t && t.running))) actNow.scrollTop = actNow.scrollHeight;
-    bindCopies($("app"));
+    bindCopies($("#app"));
     const scrim = $("#help-scrim");
     if (scrim) {
       scrim.onclick = (e) => {
@@ -655,6 +868,7 @@
       </div>
       <div class="rail-tabs">
         <button data-rail="sessions" class="${state.railTab === "sessions" ? "on" : ""}">sessions</button>
+        <button data-rail="agents" class="${state.railTab === "agents" ? "on" : ""}">agents</button>
         <button data-rail="peers" class="${state.railTab === "peers" ? "on" : ""}">peers</button>
         <button data-rail="channels" class="${state.railTab === "channels" ? "on" : ""}">channels</button>
       </div>
@@ -675,6 +889,7 @@
     });
     const convs = $("#convs");
     if (state.railTab === "peers") paintPeers(convs);
+    else if (state.railTab === "agents") paintAgents(convs);
     else if (state.railTab === "channels") paintChannelRail(convs);
     else paintSessionRail(convs);
   }
@@ -744,6 +959,24 @@
     }
   }
 
+  function paintAgents(convs) {
+    const rows = (state.agents || []).filter((a) =>
+      matchesFilter((a.name || "") + " " + (a.kind || "") + " " + (a.host || ""))
+    );
+    if (!rows.length) {
+      convs.innerHTML = `<div class="act-empty">persist.roster() is empty. Named agents land here, not a second process list.</div>`;
+      return;
+    }
+    for (const row of rows) {
+      const el = document.createElement("div");
+      el.className = "conv" + (row.live ? " on" : "");
+      el.innerHTML = `<div class="t">${esc(row.name || "")}</div><div class="m"><span>${esc(
+        row.kind || ""
+      )}</span><span>${esc(row.host || "")}${row.live ? " · live" : ""}</span></div>`;
+      convs.appendChild(el);
+    }
+  }
+
   function paintChannelRail(convs) {
     const rows = state.channels.filter((c) => matchesFilter(c.channel || c.name || ""));
     if (!rows.length) {
@@ -799,7 +1032,8 @@
           <h2>Do anything.</h2>
           <p>Story is speech and thinking. The wire — complete() POSTs, syscalls, git, files, channels, the PTY — stays on Activity.</p>
           <div class="keys">
-            <span><kbd>Enter</kbd> send</span>
+            <span><kbd>Enter</kbd> send · steer</span>
+            <span><kbd>Tab</kbd> queue</span>
             <span><kbd>⇧ Enter</kbd> newline</span>
             <span><kbd>N</kbd> new session</span>
             <span><kbd>Esc</kbd> cancel</span>
@@ -814,9 +1048,24 @@
     for (const item of t.story) {
       const wrap = document.createElement("div");
       wrap.className = "turn " + item.kind;
-      if (item.kind === "user") wrap.innerHTML = `<div class="user">${esc(item.text)}</div>`;
+      if (item.kind === "user") wrap.innerHTML = `<div class="user">${esc(item.text)}</div>${
+        (item.thumbs || [])
+          .map(
+            (img) =>
+              `<img class="thumb" src="${esc(img.src)}" alt="${esc(img.name || "image")}" />`
+          )
+          .join("")
+      }`;
       else if (item.kind === "steer")
         wrap.innerHTML = `<div class="thinking"><div class="lab">steer queued</div><pre>${esc(item.text)}</pre></div>`;
+      else if (item.kind === "system")
+        wrap.innerHTML = `<div class="system ${esc(item.family || "")}"><div class="lab">${esc(
+          item.family || "notice"
+        )}</div><pre>${esc(item.text)}</pre></div>`;
+      else if (item.kind === "subagent")
+        wrap.innerHTML = `<div class="subagent"><div class="lab">subagent ${esc(
+          item.status || ""
+        )}</div><div class="name">${esc(item.title || "")}</div><pre>${esc(item.text || "")}</pre></div>`;
       else if (item.kind === "thinking") {
         wrap.innerHTML = `<div class="thinking"><div class="lab">thinking</div><pre></pre></div>`;
         wrap.querySelector("pre").textContent = item.text;
@@ -837,12 +1086,42 @@
     story.appendChild(inner);
   }
 
+  function queueImages(files) {
+    for (const file of files || []) {
+      if (!file || !String(file.type || "").startsWith("image/")) continue;
+      const reader = new FileReader();
+      reader.onload = () => {
+        const result = String(reader.result || "");
+        const data = result.includes(",") ? result.split(",")[1] : result;
+        if (!data) return;
+        state.pendingImages.push({ name: file.name, mime: file.type, data });
+        paint();
+      };
+      reader.readAsDataURL(file);
+    }
+  }
+
   function paintComposer(t) {
     const running = !!(t && t.running);
-    const canSend = state.connected && !!state.draft.trim();
+    const hasImages = !!(state.pendingImages && state.pendingImages.length);
+    const canSend = state.connected && (!!state.draft.trim() || hasImages);
     const drafting = document.activeElement && document.activeElement.id === "draft";
     const selStart = drafting ? document.activeElement.selectionStart : state.draft.length;
     const selEnd = drafting ? document.activeElement.selectionEnd : state.draft.length;
+    const chips = (state.pendingImages || [])
+      .map(
+        (img, i) =>
+          `<button type="button" class="img-chip" data-img="${i}">${esc(img.name)} ×</button>`
+      )
+      .join("");
+    const queued = (state.queue || [])
+      .map(
+        (row, i) =>
+          `<div class="q-row" data-q="${i}"><span class="q-n">#${i + 1}</span><span class="q-t">${esc(
+            row.text || "(image)"
+          )}</span><button type="button" class="q-x" data-qdrop="${i}" aria-label="Drop">×</button></div>`
+      )
+      .join("");
     $("#composer-wrap").innerHTML = `
       ${state.help ? helpHtml() : ""}
       ${
@@ -851,6 +1130,8 @@
           : ""
       }
       <div class="composer">
+        ${queued ? `<div class="q-list">${queued}</div>` : ""}
+        ${chips ? `<div class="img-row">${chips}</div>` : ""}
         <textarea id="draft" placeholder="Do anything…" rows="1"></textarea>
         <div class="composer-bar">
           <select class="chip" id="model">${state.models
@@ -859,7 +1140,17 @@
           <select class="chip" id="effort">${state.efforts
             .map((e) => `<option value="${esc(e)}"${e === state.effort ? " selected" : ""}>${esc(e)}</option>`)
             .join("")}</select>
-          <div class="grow">${running ? "running — Enter steers" : ""}</div>
+          <button class="icon-btn" id="attach" title="Attach image">${icon("clip")}</button>
+          <input id="attach-files" type="file" accept="image/png,image/jpeg,image/gif,image/webp" multiple hidden />
+          <div class="grow">${
+            running
+              ? state.queue.length
+                ? "running — Enter steers · Tab queues · " + state.queue.length + " queued"
+                : "running — Enter steers · Tab queues"
+              : state.queue.length
+                ? state.queue.length + " queued"
+                : ""
+          }</div>
           <button class="send${running ? " stop" : ""}" id="go" ${!running && !canSend ? "disabled" : ""} title="${
       running ? "Stop" : "Send"
     }">${running ? icon("stop") : icon("send")}</button>
@@ -871,17 +1162,53 @@
     draft.oninput = () => {
       state.draft = draft.value;
       const go = $("#go");
-      if (!turn(state.active).running) go.disabled = !state.draft.trim();
+      if (!turn(state.active).running)
+        go.disabled = !state.draft.trim() && !(state.pendingImages && state.pendingImages.length);
       draft.style.height = "44px";
       draft.style.height = Math.min(180, draft.scrollHeight) + "px";
     };
     draft.onkeydown = (e) => {
+      if (e.key === "Tab" && !e.shiftKey && running) {
+        e.preventDefault();
+        queueFollowUp();
+        return;
+      }
       if (e.key === "Enter" && !e.shiftKey) {
         e.preventDefault();
         send();
       }
     };
+    draft.ondragover = (e) => {
+      e.preventDefault();
+    };
+    draft.ondrop = (e) => {
+      e.preventDefault();
+      queueImages(e.dataTransfer && e.dataTransfer.files);
+    };
     $("#go").onclick = () => (running ? cancel() : send());
+    const attach = $("#attach");
+    const picker = $("#attach-files");
+    if (attach && picker) {
+      attach.onclick = () => picker.click();
+      picker.onchange = () => {
+        queueImages(picker.files);
+        picker.value = "";
+      };
+    }
+    $("#composer-wrap").querySelectorAll("[data-img]").forEach((btn) => {
+      btn.onclick = () => {
+        const idx = Number(btn.dataset.img);
+        state.pendingImages.splice(idx, 1);
+        paint();
+      };
+    });
+    $("#composer-wrap").querySelectorAll("[data-qdrop]").forEach((btn) => {
+      btn.onclick = () => {
+        const idx = Number(btn.dataset.qdrop);
+        if (!Number.isNaN(idx)) state.queue.splice(idx, 1);
+        paint();
+      };
+    });
     const model = $("#model");
     const effort = $("#effort");
     if (model) model.onchange = (e) => setConfig("model", e.target.value);
@@ -960,7 +1287,7 @@
           ? "complete() POSTs land here — model, usage, span count. The request body is redacted."
           : state.actTab === "edits"
             ? "workspace edits stream as diffs, not as story."
-            : "Syscalls, complete cards, and edits. Nothing here is mirrored into the story."
+            : "Syscalls, complete cards, edits, folds, protocol errors, pending work, and decisions. Nothing here is mirrored into the story except error/fold/stop notices."
       }</div>`;
       return;
     }
@@ -968,13 +1295,24 @@
       const el = document.createElement("div");
       el.className = `card ${card.family}${card.open ? "" : " folded"}`;
       const st =
-        card.status === "completed" ? "done" : card.status === "pending" || card.status === "in_progress" ? "run" : "fail";
+        card.family === "error" || card.status === "failed" || card.family === "stopped"
+          ? "fail"
+          : card.status === "completed"
+            ? "done"
+            : card.status === "pending" || card.status === "in_progress"
+              ? "run"
+              : "fail";
       let inner = "";
       if (card.diff) {
         inner += `<div class="path">${esc(card.diff.path || "")}</div>`;
         inner += window.DesmosMd.diffHtml(card.diff.oldText, card.diff.newText);
       }
       if (card.body) inner += `<div class="txt">${esc(card.body)}</div>`;
+      if (card.family === "decision" && card.status !== "completed" && (card.options || []).length) {
+        inner += `<div class="opts">${card.options
+          .map((opt, i) => `<button type="button" data-decide="${i}">${esc(String(opt))}</button>`)
+          .join("")}</div>`;
+      }
       if (!inner && card.raw && Object.keys(card.raw).length)
         inner = `<div class="txt">${esc(JSON.stringify(card.raw, null, 2))}</div>`;
       el.innerHTML = `<div class="hd"><span class="fam">${esc(card.family)}</span><span class="name">${esc(
@@ -984,6 +1322,13 @@
         card.open = !card.open;
         paint();
       };
+      el.querySelectorAll("[data-decide]").forEach((btn) => {
+        btn.onclick = (e) => {
+          e.stopPropagation();
+          const opt = card.options[Number(btn.dataset.decide)];
+          if (opt != null && card.decisionId) sendDecide(card.decisionId, String(opt));
+        };
+      });
       body.appendChild(el);
     }
   }
@@ -1358,6 +1703,9 @@
 
   function paintStatus(t) {
     const br = state.bridge || {};
+    const pendingCard =
+      t &&
+      t.activity.find((c) => c.family === "pending" && c.status === "in_progress");
     $("#status").innerHTML = `
       <span class="dot-live${state.connected ? "" : " off"}"></span>
       <span>${state.connected ? "acp" : "offline"}</span>
@@ -1365,6 +1713,8 @@
       <span>${esc(state.effort || "—")}</span>
       <span>${state.git && state.git.branch ? esc(state.git.branch) : ""}</span>
       <span>${state.term.shells && state.term.shells.length ? "pty " + (state.term.name || "main") : ""}</span>
+      <span>${pendingCard ? "pending " + (pendingCard.n != null ? pendingCard.n : "") : ""}</span>
+      <span>${state.queue && state.queue.length ? state.queue.length + " queued" : ""}</span>
       <span>${br.socket ? "bridge.sock" : ""}</span>
       <span class="spin${t && t.running ? " on" : ""}"></span>
       <span style="margin-left:auto">${esc(state.cwd || "")}</span>
@@ -1452,6 +1802,12 @@
       paint();
     })
     .catch(() => {});
+
+  let mdPaint = 0;
+  window.__desmosMdReady = () => {
+    clearTimeout(mdPaint);
+    mdPaint = setTimeout(() => paint(), 16);
+  };
 
   paint();
   acp.connect();

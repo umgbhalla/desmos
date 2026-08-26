@@ -8,6 +8,7 @@ persona/role/agent definitions, an EffectiveConfig resolved by precedence
 and resume-from-a-completed-peer. Implemented against desmos' own loop.
 """
 
+import contextvars
 import json
 import threading
 import time
@@ -489,6 +490,7 @@ def _child_world(
     if cfg.system_append:
         w.system_override = w.system_override.rstrip() + "\n\n" + cfg.system_append.strip()
     w.complete_fn = getattr(parent, "complete_fn", None)
+    w.on_event = getattr(parent, "on_event", None)
     parent_todo = parent.tools.get("todo")
     if todo_actor is not None and parent_todo is not None and parent_todo.handler is not None:
         from desmos.kernel.dispatch import set_child_todo_handler
@@ -950,7 +952,8 @@ def _launch(run: Run, parent: Any, register_pending: bool) -> None:
             "generation": run.generation,
         }
     )
-    _POOL.submit(_execute, run, parent)
+    ctx = contextvars.copy_context()
+    _POOL.submit(ctx.run, _execute, run, parent)
     # Nothing in the parent turn waits on this. The step ends normally and the
     # loop resumes it when the child settles, so a spawn costs no idle turn and
     # a queued follow-up is never stuck behind a sleeping call.
@@ -1064,7 +1067,24 @@ def rerun(rid: str) -> str:
 
 
 PARENT: Any = None
+_BOUND: contextvars.ContextVar[Any] = contextvars.ContextVar("desmos_parent", default=None)
 _EMIT: Any = None
+
+
+def _bound_parent() -> Any:
+    """The parent this thread bound.
+
+    `PARENT` is the main-thread fallback so `reload_sdk` and programmatic
+    spawn keep working after `bind()`. A worker never sees it: two ACP
+    prompt threads must not inherit the last `bind()` just because `_BOUND`
+    is unset on a pool thread that did not copy context.
+    """
+    bound = _BOUND.get()
+    if bound is not None:
+        return bound
+    if threading.current_thread() is threading.main_thread():
+        return PARENT
+    return None
 
 
 def set_emitter(fn: Any) -> None:
@@ -1074,7 +1094,22 @@ def set_emitter(fn: Any) -> None:
 
 
 def _emit(ev: dict[str, Any]) -> None:
-    fn = _EMIT
+    """Prefer the executing world's hook, then this thread's bound parent, then global.
+
+    The bridge still installs ``set_emitter`` for process lifetime. ACP sets
+    ``world.on_event`` and ``_BOUND`` per prompt and does not touch ``PARENT``
+    or ``_EMIT``, so two worlds cannot steal each other's cards or wipe the
+    bridge hook when their prompts overlap.
+    """
+    from desmos.kernel.dispatch import CALLER_WORLD
+
+    world = CALLER_WORLD.get()
+    fn = getattr(world, "on_event", None) if world is not None else None
+    if fn is None:
+        bound = _bound_parent()
+        fn = getattr(bound, "on_event", None) if bound is not None else None
+    if fn is None:
+        fn = _EMIT
     if fn is None:
         return
     try:
@@ -1087,12 +1122,14 @@ def bind(world: Any) -> str:
     """Point subagents at the live parent world (model, cwd, thinking)."""
     global PARENT
     PARENT = world
+    _BOUND.set(world)
     return f"subagents bound to {world.cwd}"
 
 
 def _parent() -> Any:
-    if PARENT is not None:
-        return PARENT
+    bound = _bound_parent()
+    if bound is not None:
+        return bound
     from desmos.kernel.loop import new_world
 
     # An unbound parent is a fallback, not a session. The persist=True default
@@ -1122,7 +1159,7 @@ def _caller_world() -> Any:
     if world is not None:
         return world
     if threading.current_thread() is threading.main_thread():
-        return PARENT  # may be None: an unbound root; _parent() supplies one
+        return _bound_parent()  # may be None: an unbound root; _parent() supplies one
     return _UNRESOLVED
 
 

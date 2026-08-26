@@ -27,31 +27,53 @@ port, `--host` only if you know you want a non-loopback bind.
 python -m desmos desk --cwd . --port 7734 --no-browser
 ```
 
-No cargo build and no hash gate: the UI is package data under
-`desmos/front/desk_static/`, served by `desmos/front/desk.py`.
+No cargo build for the HTML itself: the UI is package data under
+`desmos/front/desk_static/`, served by `desmos/front/desk.py`. Assistant
+markdown is `crates/desmos-md-html` (grok `offset_events` + syntect Tokyo
+Night), hash-gated like the TUI. First launch of Desk may `cargo build -p
+desmos-md-html`. `POST /md` and ACP `_session/markdown` run that binary.
 
 `vendor/grok-build` and `vendor/comet` are git submodules. A fresh checkout
 must `git submodule update --init vendor/grok-build vendor/comet` before a
-source TUI/Comet build. Desk itself is HTML and does not load those crates
-into the browser.
+source TUI/Comet build. Desk does not load those crates into the browser.
 
 ## Current scope
 
 Supported now:
 
 - create an ACP session for the selected workspace;
-- send a prompt; Enter submits, Shift+Enter is a newline;
+- send a prompt; Enter submits, Shift+Enter is a newline; Tab while running
+  queues a follow-up (`_session/typed`, same wakeup as the TUI `op: typed`);
+  Enter while running steers;
 - stream thinking into the story and assistant markdown into the story;
-- show complete() POSTs, syscalls, and edit diffs on Activity only;
+- show complete() POSTs, syscalls, edit diffs, folds, protocol errors,
+  pending work, decisions, and child results on Activity; subagent cards
+  and error/fold/stop notices also land on Story (xml-as-speech is an
+  error card and `end_turn`, not a JSON-RPC crash);
+- attach images through the composer (ACP image blocks → `run_turns(images=)`,
+  the same path the TUI uses);
+- named agents from `persist.roster()` on the rail;
 - cancel the in-flight prompt (Esc, or the stop control);
 - new session (`session/new`);
 - resume a persist session (`session/load` with the sqlite `sessions.id`
-  from `_session/sessions` — the same rows the TUI picker reads);
+  from `_session/sessions` — the same rows the TUI picker reads). Load
+  replays `persist.read_events` through `_emit_event` so Activity is not
+  empty and user rows are `ev prompt` text, not `header(world)+prompt`;
 - resume a previous ACP uuid (`session/load` of the uuid `session/new`
   issued; `persist.acp_sessions` is the join, schema 17, same sqlite file);
 - model and thought_level through `session/set_config_option` (the same
-  catalog the TUI picker reads), as chips inside the composer;
-- steer while a turn is running (`_session/steer` → `catalog.steer`);
+  catalog the TUI picker reads), as chips inside the composer; a refused
+  model emits `model_rejected`;
+- steer while a turn is running (`_session/steer` → `catalog.steer`,
+  outcome `injected`). Idle returns `promptRequired` and does **not**
+  queue a steer;
+- a follow-up `session/prompt` while parked on background work sets
+  `has_input` so `pending.wait_next` yields, same as the TUI inbox;
+- `persist.claim_workspace` on `session/new`. A live TUI (or another ACP)
+  holding the lease is JSON-RPC `-32602` naming the holder;
+- decision options as buttons that send `decide:<id>: <option>` into
+  `run_turns` (the same ingest the TUI Enter path uses);
+
 - git status / branches / log (`_session/git`, same `--no-optional-locks`
   reader as the TUI);
 - files listing and bounded read (`_session/fs`, jailed to the session cwd);
@@ -70,17 +92,18 @@ Supported now:
 bound at `session/new`. An unknown id is refused rather than minted.
 
 Keys: `?` overlay, `N` new session, `Ctrl/⌘ K` filter, `Ctrl/⌘ `` terminal,
-`1–7` activity tabs, Enter send, Esc cancel.
+`1–7` activity tabs, Enter send (steer while running), Tab queue while
+running, Esc cancel.
 
 ## What desk cannot host
 
 Desk is HTML. It cannot instantiate grok-build's
-`StreamingMarkdownRenderer` (ratatui + Syntect) or Comet/gpuix GPUI
-`<markdown>` / `<diff>` / alacritty_terminal views in the browser. The
-`crates/xai-grok-markdown` crate emits terminal spans, not HTML. Desk
-raises the HTML renderer to that contract instead: Tokyo Night tokens
-(`#1a1b26` / `#51597d` / `#a9b1d6`), streaming re-render, indented fences,
-autolinks, fence copy, LCS diffs.
+`StreamingMarkdownRenderer` (ratatui + Syntect terminal spans) or Comet/gpuix
+GPUI `<markdown>` / `<diff>` / alacritty_terminal views in the browser.
+`desmos-md-html` walks the same grok `offset_events` stream and emits HTML.
+Fence colors are syntect Tokyo Night. `md.js` `highlight` is the files-tab
+tokenizer. `diffHtml` is the edit-diff LCS. Until `/md` returns, the story
+shows escaped source.
 
 Comet **devices** (`vendor/comet/crates/ui/src/settings/devices.rs`) are a
 Zeron CRDT/RPC workspace device registry (`zeron_rpc`, presence dots,
@@ -93,7 +116,8 @@ a restart; the term panel talks to the live kernel only.
 Not yet matched with the native TUI / Comet / gpuix:
 
 - attaching the in-process ACP world to `<cwd>/.desmos/bridge.sock`
-  (that would be two writers on one persist brain);
+  (forbidden: two writers). `claim_workspace` is the lease; Desk does not
+  speak JSONL on that socket;
 - Comet CRDT session registry and Zeron devices;
 - Comet engine alacritty PTYs (desk xterm paints `world.shells` history,
   which is line-oriented `op=run`, not a byte-for-byte login PTY). Comet

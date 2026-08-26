@@ -10,6 +10,9 @@ it. Top, not bottom: anything downstream that trims further trims the tail.
 
 from __future__ import annotations
 
+import os
+import secrets
+import time
 from pathlib import Path
 
 from desmos.kernel.scan import clip
@@ -41,12 +44,10 @@ def _split_pointer(text: str) -> tuple[str, str]:
 
 
 def _next_path(out: Path, tag: str) -> Path:
-    n = 0
-    for old in out.glob("*.txt"):
-        head = old.name.split("-", 1)[0]
-        if head.isdigit():
-            n = max(n, int(head))
-    return out / f"{n + 1:04d}-{tag}.txt"
+    """A unique name. `max(glob)+1` raced when two spills landed together."""
+    stamp = time.time_ns()
+    token = secrets.token_hex(3)
+    return out / f"{stamp}-{os.getpid()}-{token}-{tag}.txt"
 
 
 #: How many spilled outputs to keep. Every oversized syscall writes one, so
@@ -68,7 +69,9 @@ def _write(text: str, tag: str, cwd: Path | None) -> Path | None:
         out.mkdir(parents=True, exist_ok=True)
         safe = "".join(c if c.isalnum() else "_" for c in tag) or "result"
         path = _next_path(out, safe)
-        path.write_text(text, encoding="utf-8", errors="replace")
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(text, encoding="utf-8", errors="replace")
+        os.replace(tmp, path)
         _prune(out)
         return path.relative_to(base)
     except Exception:  # noqa: BLE001 -- a read-only cwd must not fail the call

@@ -74,6 +74,23 @@ function storyItem(item, i) {
       React.createElement("text", { style: { color: TEXT, fontSize: 13 } }, item.text),
     );
   }
+  if (item.kind === "system") {
+    return React.createElement(
+      "div",
+      { key: `sy${i}`, style: { padding: 8, marginBottom: 8 } },
+      React.createElement("text", { style: { color: MUTED, fontSize: 11 } }, item.family || "notice"),
+      React.createElement("text", { style: { color: TEXT, fontSize: 13 } }, item.text),
+    );
+  }
+  if (item.kind === "subagent") {
+    return React.createElement(
+      "div",
+      { key: `sa${i}`, style: { padding: 8, marginBottom: 8, backgroundColor: RAISED, borderRadius: 6 } },
+      React.createElement("text", { style: { color: MUTED, fontSize: 11 } }, `subagent ${item.status || ""}`),
+      React.createElement("text", { style: { color: TEXT, fontSize: 13 } }, item.title || ""),
+      React.createElement("text", { style: { color: MUTED, fontSize: 12 } }, item.text || ""),
+    );
+  }
   return React.createElement(
     "div",
     { key: `a${i}`, style: { paddingTop: 4, marginBottom: 8 } },
@@ -81,7 +98,7 @@ function storyItem(item, i) {
   );
 }
 
-function activityCard(card, i) {
+function activityCard(card, i, onDecide) {
   const kids = [
     React.createElement(
       "text",
@@ -106,6 +123,21 @@ function activityCard(card, i) {
         String(card.body).slice(0, 400),
       ),
     );
+  }
+  if (card.family === "decision" && card.status !== "completed" && onDecide) {
+    for (const [j, opt] of (card.options || []).entries()) {
+      kids.push(
+        React.createElement(
+          "text",
+          {
+            key: `o${j}`,
+            onClick: () => onDecide(card.decisionId, String(opt)),
+            style: { color: ACCENT, fontSize: 12, cursor: "pointer" },
+          },
+          String(opt),
+        ),
+      );
+    }
   }
   return React.createElement(
     "div",
@@ -163,6 +195,7 @@ export function App({
   onModel,
   onEffort,
   onToggleActivity,
+  onDecide,
 }) {
   const story = (turn && turn.story) || [];
   const activity = (turn && turn.activity) || [];
@@ -301,7 +334,7 @@ export function App({
               },
               React.createElement("text", { style: { color: MUTED, fontSize: 11 } }, "activity"),
               ...(activity.length
-                ? activity.map(activityCard)
+                ? activity.map((card, i) => activityCard(card, i, onDecide))
                 : [
                     React.createElement(
                       "text",
@@ -325,7 +358,7 @@ export function App({
         },
         React.createElement("textarea", {
           value: draft || "",
-          placeholder: "prompt — Enter sends, Esc cancels",
+          placeholder: "prompt — Enter sends or steers, Esc cancels",
           theme: STORY_THEME,
           minRows: 2,
           maxRows: 6,
@@ -333,7 +366,7 @@ export function App({
           onChange: onDraft
             ? (ev) => onDraft(ev && ev.value != null ? ev.value : "")
             : undefined,
-          onSubmit: onSubmit && !running ? () => onSubmit() : undefined,
+          onSubmit: onSubmit ? () => onSubmit() : undefined,
         }),
         React.createElement(
           "div",
