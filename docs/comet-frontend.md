@@ -1,51 +1,79 @@
 # Comet frontend
 
-Desmos can run behind the vendored Comet desktop frontend through ACP. This is
-an intentionally small integration: Comet starts `desmos acp`, sends the
-selected workspace in `session/new`, and renders the streamed agent events.
+Desmos's native GPUI frontend is the vendored Comet (`vendor/comet`) binary
+`zeron`, launched over ACP. This is not a second agent: Comet starts
+`python -m desmos acp` (NDJSON JSON-RPC 2.0) and renders the streamed events
+with its own markdown, diff, session registry, and alacritty terminals.
 
 ## Setup and launch
 
-Install Desmos in the active environment and initialize the Comet submodule:
-
 ```text
-git submodule update --init vendor/comet
-```
-
-Then launch the frontend with:
-
-```text
+git submodule update --init vendor/comet vendor/grok-build
 python -m desmos comet --cwd .
 ```
 
-The first launch builds Comet's debug binary. Later launches can use
-`--no-build`. The launcher sets `DESMOS_ACP_EXECUTABLE` to the active Desmos
-console script, so Comet's **Desmos** harness starts the same checkout and
-environment.
+The first launch hash-gates a debug `zeron` build (same idea as
+`python -m desmos tui`): sources under `vendor/comet/{apps,crates}` plus the
+lockfile. Unchanged bytes skip cargo. `--release` builds the release profile.
+`--no-build` launches whatever binary is already there. Extra argv after `--`
+is forwarded to `zeron` (`python -m desmos comet -- status`).
 
-Inside Comet, create a chat and choose **Desmos** as its harness. The chat's
-workspace path becomes the Desmos session working directory.
+The launcher writes `vendor/comet/target/desmos-acp`, a wrapper that execs
+`python -m desmos "$@"`. Comet's Desmos spec is `{executable} acp` with
+`DESMOS_ACP_EXECUTABLE` pointing at that wrapper, so a console script named
+`desmos` is not required. `DESMOS_CWD` is the `--cwd` you passed.
 
-For direct Comet development, build `zeron` in `vendor/comet` and set
-`DESMOS_ACP_EXECUTABLE` to an absolute `desmos` console-script path before
-opening the binary.
+`DESMOS_COMET_BINARY` launches a prebuilt `zeron` and still installs the
+wrapper so the binary's Desmos harness talks to this checkout.
+
+Inside Comet, create a chat and choose **Desmos**. The chat's workspace is
+the ACP `session/new` cwd. Resume uses `session/load` of the stored ACP
+session id (the same uuid `acp_sessions` binds).
+
+## What Comet actually paints
+
+Desmos tags every `session/update` with `_meta.desmos.pane` (`story` |
+`activity`) and `family`. Comet's normalizer maps that wire:
+
+- speech → `TextDelta` (transcript markdown)
+- thinking → `ReasoningDelta`
+- `complete()` is kind `other`, so the chip is `ToolCall::Unknown { name: complete }`,
+  not a WebFetch
+- kernel syscalls (`kind: execute`, `rawInput.tag`) → `ToolCall::Exec`
+- edit diffs → the Changes pane (Comet's diff surface)
+
+That is Comet craft: one transcript with tool chips, diffs in the right
+pane, sessions in the CRDT registry, terminals as engine alacritty PTYs.
+It is not the TUI's three-pane layout. Story vs activity is preserved on
+the wire; Comet does not grow a second Activity pane.
+
+Steering: initialize advertises `_meta.steering.supported` and
+`_session/steering`. The Desmos spec is `SteeringMode::StepBoundary` with
+the thought_level ladder (low / medium / high / xhigh). Live models still
+come from `session/new` `configOptions`. Mid-turn Comet calls
+`_session/steering` with ACP prompt blocks; idle returns
+`outcome: promptRequired` so Comet starts the next prompt instead of
+injecting into a finished turn.
 
 ## Current scope
 
 Supported now:
 
-- create a Desmos ACP session for a selected workspace;
-- send prompts;
-- stream assistant text, thought summaries, and tool activity;
-- use the provider/model configured by Desmos.
+- hash-gated `zeron` launch over this checkout's ACP server;
+- create / resume a Desmos ACP session for a workspace;
+- stream assistant text, thought, complete cards, and syscall chips;
+- model and thought_level from Desmos `configOptions`;
+- mid-turn steering (`_session/steering`);
+- Comet session registry + `session/load` of the ACP uuid;
+- Comet's own alacritty terminals (engine PTYs, not `world.shells`).
 
-Not yet matched with the native Desmos TUI:
+Not the same object as the TUI / desk:
 
-- loading an existing Desmos session into a new Comet chat;
-- Desmos account, provider, model, and effort controls in Comet;
-- exact Desmos Story/Activity/POST/Meta pane semantics;
-- every rich diff, terminal, queue, and subagent interaction.
+- TUI Story/Activity/POST split as separate GPUI panes;
+- kernel PTY (`world.shells` / `_session/term`) inside Comet's terminal dock;
+- Zeron CRDT devices page (no Desmos analog — `persist.peers()` is the honest one);
+- attaching Comet and the TUI as two writers on `.desmos/bridge.sock`.
 
-Comet is pinned as a Git submodule from the `umgbhalla/comet` fork. Its Desmos
-harness integration lives in that repository; the root launcher does not patch
-Comet at runtime.
+Comet is pinned as a Git submodule of the `umgbhalla/comet` fork. Harness
+changes land in that repository, then the root gitlink moves. The launcher
+does not patch Comet at runtime.

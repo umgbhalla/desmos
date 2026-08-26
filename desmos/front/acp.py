@@ -123,6 +123,7 @@ def initialize_result() -> dict[str, Any]:
                 "loadSession": "persist+acp",
                 "extensions": [
                     "_session/steer",
+                    "_session/steering",
                     "_session/git",
                     "_session/fs",
                     "_session/sessions",
@@ -426,7 +427,7 @@ class AcpServer:
                 return rpc_result(req_id, self._set_config_option(params))
             except ValueError as exc:
                 return rpc_error(req_id, -32602, str(exc))
-        if method == "_session/steer":
+        if method == "_session/steer" or method == "_session/steering":
             try:
                 return rpc_result(req_id, self._session_steer(params))
             except ValueError as exc:
@@ -717,6 +718,19 @@ class AcpServer:
             if live is None:
                 return {"name": name, "text": f"no shell {name!r}"}
             return {"name": name, "text": live.peek()}
+        if op in {"bytes", "raw"}:
+            import base64
+
+            live = world.shells.get(name)
+            if live is None:
+                return {"name": name, "data": "", "text": f"no shell {name!r}"}
+            raw = bytes(getattr(live, "_history", b""))
+            return {
+                "name": name,
+                "data": base64.b64encode(raw).decode("ascii"),
+                "seq": len(raw),
+                "text": live.peek(),
+            }
         if op == "close":
             return {"name": name, "text": sh.run(world, "", {"id": name, "close": "1"})}
         if op == "interrupt":
@@ -838,6 +852,7 @@ class AcpServer:
         raise ValueError(f"unknown config option {config_id!r}")
 
     def _session_steer(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Queue a steer. Comet calls `_session/steering` with ACP prompt blocks."""
         session_id = str(params.get("sessionId") or "")
         with self._lock:
             world = self.sessions.get(session_id)
@@ -845,11 +860,17 @@ class AcpServer:
             raise ValueError(f"unknown session {session_id!r}")
         text = str(params.get("text") or params.get("content") or "").strip()
         if not text:
+            text = prompt_text(params.get("prompt")).strip()
+        if not text:
             raise ValueError("steer needs text")
         from desmos.kernel.catalog import steer as _steer
 
         _steer(world, text)
-        return {}
+        # Comet treats missing outcome as "injected". promptRequired means it
+        # should start a fresh session/prompt with this text instead.
+        if world.running:
+            return {"outcome": "injected"}
+        return {"outcome": "promptRequired"}
 
     def _emit_event(
         self,
@@ -889,7 +910,7 @@ class AcpServer:
                 "sessionUpdate": "tool_call",
                 "toolCallId": tool_id,
                 "title": "complete",
-                "kind": "fetch",
+                "kind": "other",
                 "status": "pending",
                 "rawInput": {
                     "model": model,
@@ -906,7 +927,7 @@ class AcpServer:
                     "sessionUpdate": "tool_call",
                     "toolCallId": tool_id,
                     "title": "complete",
-                    "kind": "fetch",
+                    "kind": "other",
                     "status": "pending",
                 }, family="complete")
             self._update(session_id, prompt_id, {
@@ -914,7 +935,7 @@ class AcpServer:
                 "toolCallId": tool_id,
                 "status": "completed",
                 "title": "complete",
-                "kind": "fetch",
+                "kind": "other",
                 "content": [{
                     "type": "content",
                     "content": {"type": "text", "text": _complete_card(ev)},

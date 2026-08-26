@@ -154,6 +154,114 @@ def _check_release_tui_launcher() -> None:
         ], ran
 
 
+def _check_comet_launcher() -> None:
+    """Hash-gated Comet launch speaks python -m desmos acp; no GPU binary required."""
+    import os
+    import stat
+    import subprocess
+    import sys
+    import tempfile
+
+    from desmos.front.cli import (
+        _comet_acp_wrapper,
+        _comet_hash,
+        _comet_passthrough,
+        _comet_stale,
+        _comet_watch_roots,
+        _repo_root,
+    )
+
+    root = _repo_root()
+    with tempfile.TemporaryDirectory() as tmp:
+        comet = Path(tmp) / "comet"
+        (comet / "apps").mkdir(parents=True)
+        (comet / "crates").mkdir()
+        (comet / "Cargo.toml").write_text("[workspace]\n", encoding="utf-8")
+        (comet / "Cargo.lock").write_text("# lock\n", encoding="utf-8")
+        (comet / "rust-toolchain.toml").write_text(
+            '[toolchain]\nchannel = "stable"\n', encoding="utf-8"
+        )
+        src = comet / "crates" / "lib.rs"
+        src.write_text("pub fn x() {}\n", encoding="utf-8")
+        (comet / "target" / "noise").mkdir(parents=True)
+        noise = comet / "target" / "noise" / "skip.rs"
+        noise.write_text("should-not-hash\n", encoding="utf-8")
+        roots = _comet_watch_roots(comet)
+        assert any(p.name == "crates" for p in roots)
+        assert not any("target" in p.parts[-2:] and p.name == "noise" for p in roots)
+        before = _comet_hash(comet)
+        noise.write_text("changed-and-still-ignored\n", encoding="utf-8")
+        assert _comet_hash(comet) == before
+        binary = comet / "target" / "debug" / "zeron"
+        assert _comet_stale(comet, binary) is True
+        binary.parent.mkdir(parents=True, exist_ok=True)
+        binary.write_bytes(b"bin")
+        older = src.stat().st_mtime - 30
+        os.utime(binary, (older, older))
+        assert _comet_stale(comet, binary) is True
+        os.utime(src, (older - 30, older - 30))
+        assert _comet_stale(comet, binary) is False
+        src.write_text("pub fn x() { let _ = 1; }\n", encoding="utf-8")
+        assert _comet_stale(comet, binary) is True
+        src.write_text("pub fn x() {}\n", encoding="utf-8")
+        os.utime(src, (older - 30, older - 30))
+        assert _comet_stale(comet, binary) is False
+
+        wrapper = Path(_comet_acp_wrapper(root, comet))
+        assert wrapper.is_file()
+        mode = wrapper.stat().st_mode
+        assert mode & stat.S_IXUSR, oct(mode)
+        ran = subprocess.run(
+            [str(wrapper), "--help"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert ran.returncode == 0, ran.stderr
+        import json
+
+        handshake = json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {"protocolVersion": 1},
+            }
+        )
+        listed = subprocess.run(
+            [str(wrapper), "acp"],
+            input=handshake + "\n",
+            capture_output=True,
+            text=True,
+            timeout=8,
+            check=False,
+        )
+        assert listed.returncode == 0, listed.stderr
+        init = json.loads(listed.stdout.splitlines()[0])
+        assert init["result"]["protocolVersion"] == 1
+        assert init["result"]["_meta"]["steering"]["supported"] is True
+
+        fake = Path(tmp) / "zeron"
+        fake.write_text('#!/bin/sh\nprintf "%s\\n" "$@"\n', encoding="utf-8")
+        fake.chmod(0o755)
+        env = dict(os.environ)
+        env["PYTHONPATH"] = str(root)
+        env["DESMOS_COMET_BINARY"] = str(fake)
+        launched = subprocess.run(
+            [sys.executable, "-m", "desmos", "comet", "--cwd", tmp, "--", "status"],
+            env=env,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        assert launched.stdout.splitlines() == ["status"], launched
+
+        class _Args:
+            passthrough = ["--", "headless"]
+
+        assert _comet_passthrough(_Args()) == ["headless"]
+
+
 # The stubbed gland for the socket checks: the REAL bridge subprocess and the
 # REAL loop, with canned responses -- the record-golden pattern, one code path,
 # never a second engine. Content-addressed so call counts cannot skew it: the
@@ -1114,8 +1222,11 @@ def _check_desk() -> None:
     for name in ("index.html", "desk.css", "desk.js", "md.js"):
         path = STATIC_DIR / name
         assert path.is_file() and path.stat().st_size > 0, path
+    xterm = STATIC_DIR / "vendor" / "xterm" / "xterm.js"
+    assert xterm.is_file() and xterm.stat().st_size > 50_000, xterm
     html = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
     assert 'id="story"' in html and 'id="activity"' in html
+    assert "vendor/xterm/xterm.js" in html
 
     keys = (SESSION_ID_ENV, SESSION_PID_ENV, NEW_SESSION_ENV)
     old_env = {k: os.environ.get(k) for k in keys}
@@ -1203,7 +1314,14 @@ def _check_desk_roundtrip() -> None:
             assert health["ok"] is True
             assert Path(health["cwd"]) == cwd.resolve()
 
-            for asset in ("desk.css", "desk.js", "md.js"):
+            for asset in (
+                "desk.css",
+                "desk.js",
+                "md.js",
+                "vendor/xterm/xterm.js",
+                "vendor/xterm/xterm.css",
+                "vendor/xterm/xterm-addon-fit.js",
+            ):
                 got = urllib.request.urlopen(f"http://127.0.0.1:{port}/{asset}", timeout=4)
                 assert got.status == 200, asset
                 payload = got.read()
@@ -1214,6 +1332,7 @@ def _check_desk_roundtrip() -> None:
             assert init["result"]["protocolVersion"] == 1
             assert init["result"]["agentCapabilities"]["loadSession"] is True
             assert init["result"]["_meta"]["steering"]["supported"] is True
+            assert "_session/steering" in init["result"]["_meta"]["desmos"]["extensions"]
             auth = client.call("authenticate", {"methodId": "none"}, req_id=2)
             assert auth["result"] == {}
             created = client.call("session/new", {"cwd": str(cwd)}, req_id=3)
@@ -1274,6 +1393,7 @@ def _check_desk_roundtrip() -> None:
             assert exec_call["params"]["_meta"]["desmos"]["family"] == "syscall"
             assert complete["params"]["_meta"]["desmos"]["pane"] == "activity"
             assert complete["params"]["_meta"]["desmos"]["family"] == "complete"
+            assert complete["params"]["update"]["kind"] == "other"
             speech = next(
                 n["params"]["update"]["content"]["text"]
                 for n in notes
@@ -1295,6 +1415,17 @@ def _check_desk_roundtrip() -> None:
                 for o in efforted["result"]["configOptions"]
                 if o.get("id") == "thought_level"
             )
+            steered = client.call(
+                "_session/steering",
+                {
+                    "sessionId": sid,
+                    "prompt": [{"type": "text", "text": "slow down"}],
+                    "_meta": {"steering": {"idleBehavior": "promptRequired"}},
+                },
+                req_id=6.5,
+            )
+            assert steered["result"]["outcome"] == "promptRequired", steered
+            assert "slow down" in world.steers
             missing = client.call(
                 "session/prompt",
                 {"sessionId": "no-such", "prompt": [{"type": "text", "text": "x"}]},
@@ -1439,6 +1570,16 @@ def _check_desk_roundtrip() -> None:
             )
             term_names = [row["name"] for row in listed_term["result"]["shells"]]
             assert "main" in term_names, listed_term
+            import base64
+
+            term_bytes = client.call(
+                "_session/term",
+                {"sessionId": sid, "op": "bytes", "name": "main"},
+                req_id=21.5,
+            )
+            raw_pty = base64.b64decode(term_bytes["result"]["data"] or "")
+            if b"desk-pty-ok" not in raw_pty:
+                raise AssertionError(f"term bytes missed echo: {raw_pty!r}")
 
             db_path = state_file(world)
             with sqlite3.connect(db_path) as db:
@@ -1653,7 +1794,7 @@ def check() -> None:
         exec_tool = next(u for u in tools if u["title"] == "exec")
         assert exec_tool["kind"] == "execute", exec_tool
         complete_tool = next(u for u in tools if u["title"] == "complete")
-        assert complete_tool["kind"] == "fetch", complete_tool
+        assert complete_tool["kind"] == "other", complete_tool
         panes = {n["params"]["_meta"]["desmos"]["pane"] for n in notes if n.get("method") == "session/update"}
         families = [n["params"]["_meta"]["desmos"]["family"] for n in notes if n.get("method") == "session/update"]
         thought_panes = [
@@ -1690,8 +1831,20 @@ def check() -> None:
             "method": "_session/steer",
             "params": {"sessionId": sid, "text": "slow down"},
         })
-        assert steered["result"] == {}
+        assert steered["result"]["outcome"] == "promptRequired", steered
         assert "slow down" in acp.sessions[sid].steers
+        comet_steer = acp.handle({
+            "jsonrpc": "2.0",
+            "id": 11.7,
+            "method": "_session/steering",
+            "params": {
+                "sessionId": sid,
+                "prompt": [{"type": "text", "text": "keep going"}],
+                "_meta": {"steering": {"idleBehavior": "promptRequired"}},
+            },
+        })
+        assert comet_steer["result"]["outcome"] == "promptRequired", comet_steer
+        assert "keep going" in acp.sessions[sid].steers
 
         # The pager opens a second session on the same cwd for every new
         # thread. Sessions on one workspace share the World -- persist keys its
@@ -1900,6 +2053,7 @@ def check() -> None:
         # moved to an incompatible fork commit -- and that is silent, because
         # the pager compiles either way and runs grok's agent instead of ours.
         _check_desk()
+        _check_comet_launcher()
         _check_path_deps_tracked()
         _check_vendor_patch()
         _check_release_tui_launcher()

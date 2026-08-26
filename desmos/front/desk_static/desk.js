@@ -24,7 +24,7 @@
     gitTab: "status",
     files: { dir: ".", entries: [], path: null, lines: [], note: null, binary: false },
     bridge: { socket: null, attached: false, reason: "" },
-    term: { name: "main", text: "", shells: [], draft: "" },
+    term: { name: "main", text: "", raw: "", shells: [], draft: "", line: "", seq: 0 },
     help: false,
     active: null,
     model: "",
@@ -348,6 +348,30 @@
     });
     if (peek.text && !String(peek.text).startsWith("no shell")) state.term.text = peek.text;
     else if (peek.text && String(peek.text).startsWith("no shell")) state.term.text = "";
+    try {
+      const raw = await acp.call("_session/term", {
+        sessionId: id,
+        op: "bytes",
+        name: state.term.name || "main",
+      });
+      if (raw.data) {
+        state.term.raw = b64utf8(raw.data);
+        state.term.seq = Number(raw.seq) || state.term.raw.length;
+      }
+    } catch {
+      /* peek text still stands */
+    }
+  }
+
+  function b64utf8(b64) {
+    try {
+      const bin = atob(b64);
+      const bytes = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i += 1) bytes[i] = bin.charCodeAt(i);
+      return new TextDecoder("utf-8").decode(bytes);
+    } catch {
+      return "";
+    }
   }
 
   async function refreshFiles() {
@@ -878,6 +902,14 @@
   }
 
   function paintActivity(t) {
+    let salvage = null;
+    const existing = document.getElementById("term-host");
+    if (state.actTab === "term" && existing && termLive.term) {
+      salvage = existing;
+      existing.remove();
+    } else if (state.actTab !== "term") {
+      disposeTerm();
+    }
     $("#activity").innerHTML = `
       <div class="act-head">Activity
         <div class="act-tabs">
@@ -910,7 +942,7 @@
     if (state.actTab === "git") paintGit(body);
     else if (state.actTab === "files") paintFiles(body);
     else if (state.actTab === "channel") paintChannel(body);
-    else if (state.actTab === "term") paintTerm(body);
+    else if (state.actTab === "term") paintTerm(body, salvage);
     else paintWire(body, t);
   }
 
@@ -1094,6 +1126,48 @@
     $("#chan-go").onclick = () => postChannel().catch((err) => ((state.error = err.message), paint()));
   }
 
+  const termLive = {
+    term: null,
+    fit: null,
+    written: "",
+    name: "",
+    session: "",
+  };
+
+  function disposeTerm() {
+    if (termLive.term) {
+      try {
+        termLive.term.dispose();
+      } catch {
+        /* already gone */
+      }
+    }
+    termLive.term = null;
+    termLive.fit = null;
+    termLive.written = "";
+    termLive.name = "";
+    termLive.session = "";
+  }
+
+  function toCrlf(text) {
+    return String(text || "")
+      .replace(/\r\n/g, "\n")
+      .replace(/\n/g, "\r\n");
+  }
+
+  function writeTermBlob(blob) {
+    if (!termLive.term) return;
+    const next = String(blob || "");
+    if (next === termLive.written) return;
+    if (termLive.written && next.startsWith(termLive.written)) {
+      termLive.term.write(toCrlf(next.slice(termLive.written.length)));
+    } else {
+      termLive.term.reset();
+      if (next) termLive.term.write(toCrlf(next));
+    }
+    termLive.written = next;
+  }
+
   async function runTerm(cmd) {
     const id = state.active;
     const text = String(cmd || "").replace(/\n$/, "");
@@ -1115,19 +1189,26 @@
     if (again) again.focus();
   }
 
-  function paintTerm(body) {
+  function paintTerm(body, salvage) {
     body.classList.add("term-body");
+    const name = state.term.name || "main";
+    const session = state.active || "";
+    if (termLive.term && (termLive.name !== name || termLive.session !== session)) {
+      disposeTerm();
+      salvage = null;
+    }
     const shells = state.term.shells.length ? state.term.shells : [];
     const names = shells.length
       ? shells
           .map((s) => {
             const n = s.name || s;
-            const on = n === (state.term.name || "main") ? " on" : "";
+            const on = n === name ? " on" : "";
             return `<button type="button" class="term-name${on}" data-term-name="${esc(n)}">${esc(n)}</button>`;
           })
           .join("")
       : `<span class="term-idle">no pty yet</span>`;
-    const empty = !String(state.term.text || "").trim();
+    const blob = state.term.raw || state.term.text || "";
+    const empty = !String(blob).trim();
     body.innerHTML = `
       <div class="term-bar">
         <div class="term-names">${names}</div>
@@ -1135,17 +1216,101 @@
         <button type="button" data-term-int title="Interrupt the foreground job">int</button>
         <button type="button" data-term-close title="Close this PTY">close</button>
       </div>
-      <pre class="term-out" id="term-out">${
-        empty
-          ? `<span class="term-hint">Kernel PTY — world.shells, the same object &lt;shell&gt; uses. Type a command.</span>`
-          : esc(state.term.text)
-      }</pre>
+      <div class="term-host" id="term-host"></div>
       <div class="term-in-wrap">
         <span class="term-prompt">$</span>
         <input id="term-in" class="term-in" spellcheck="false" autocomplete="off" placeholder="command" />
       </div>`;
-    const out = body.querySelector("#term-out");
-    if (out) out.scrollTop = out.scrollHeight;
+    let host = body.querySelector("#term-host");
+    if (salvage && termLive.term && host) {
+      host.replaceWith(salvage);
+      salvage.id = "term-host";
+      host = salvage;
+      writeTermBlob(blob);
+      if (termLive.fit) {
+        try {
+          termLive.fit.fit();
+        } catch {
+          /* host may still be 0×0 */
+        }
+      }
+    } else if (window.Terminal && host) {
+      disposeTerm();
+      const term = new window.Terminal({
+        convertEol: true,
+        cursorBlink: true,
+        fontSize: 12,
+        fontFamily: '"IBM Plex Mono", ui-monospace, Menlo, Consolas, monospace',
+        theme: {
+          background: "#1a1b26",
+          foreground: "#a9b1d6",
+          cursor: "#c0caf5",
+          selectionBackground: "#515c7e4d",
+          black: "#15161e",
+          red: "#f7768e",
+          green: "#9ece6a",
+          yellow: "#e0af68",
+          blue: "#7aa2f7",
+          magenta: "#bb9af7",
+          cyan: "#7dcfff",
+          white: "#a9b1d6",
+        },
+      });
+      term.open(host);
+      const Fit = window.FitAddon && (window.FitAddon.FitAddon || window.FitAddon);
+      if (typeof Fit === "function") {
+        const fit = new Fit();
+        term.loadAddon(fit);
+        termLive.fit = fit;
+        try {
+          fit.fit();
+        } catch {
+          /* host may still be 0×0 on first paint */
+        }
+      }
+      termLive.term = term;
+      termLive.name = name;
+      termLive.session = session;
+      termLive.written = "";
+      writeTermBlob(blob);
+      term.onData((data) => {
+        if (data === "\x03") {
+          acp
+            .call("_session/term", {
+              sessionId: state.active,
+              op: "interrupt",
+              name: state.term.name || "main",
+            })
+            .then(refreshTerm)
+            .then(paint);
+          return;
+        }
+        if (data === "\r" || data === "\n") {
+          const cmd = state.term.line || "";
+          state.term.line = "";
+          term.write("\r\n");
+          runTerm(cmd);
+          return;
+        }
+        if (data === "\u007f") {
+          state.term.line = (state.term.line || "").slice(0, -1);
+          term.write("\b \b");
+          return;
+        }
+        if (data.length === 1 && data >= " ") {
+          state.term.line = (state.term.line || "") + data;
+          term.write(data);
+        }
+      });
+    } else if (host) {
+      host.innerHTML = `<pre class="term-out" id="term-out">${
+        empty
+          ? `<span class="term-hint">Kernel PTY — world.shells. Type a command.</span>`
+          : esc(blob)
+      }</pre>`;
+      const out = host.querySelector("#term-out");
+      if (out) out.scrollTop = out.scrollHeight;
+    }
     body.querySelectorAll("[data-term-name]").forEach((btn) => {
       btn.onclick = () => {
         state.term.name = btn.dataset.termName;
@@ -1184,6 +1349,8 @@
         name: state.term.name || "main",
       });
       state.term.text = "";
+      state.term.raw = "";
+      disposeTerm();
       await refreshTerm();
       paint();
     };

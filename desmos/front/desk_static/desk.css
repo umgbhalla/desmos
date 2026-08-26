@@ -558,6 +558,13 @@ select.chip {
 }
 .term-name.on, .term-bar button:hover { background: var(--item); color: var(--text); }
 .term-idle { color: var(--ghost); font-size: 11px; }
+.term-host {
+  flex: 1;
+  min-height: 0;
+  background: #1a1b26;
+}
+.term-host .xterm { height: 100%; padding: 8px 10px; }
+.term-host .xterm-viewport { overflow-y: auto; }
 .term-out {
   flex: 1;
   margin: 0;
