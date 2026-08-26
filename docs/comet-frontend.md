@@ -59,10 +59,10 @@ injecting into a finished turn.
 
 The bottom dock (⌘J) on a Desmos chat opens an alacritty tab over
 `world.shells` (`OpenTerminal` `kind: kernel` → `_session/term` bytes /
-run / interrupt). Extra `+` tabs are still login PTYs. The kernel tab
-needs a live ACP child, so send a prompt once; after that the session
-parks and the mailbox stays warm. Line-oriented, same contract as desk
-xterm, not a raw login PTY.
+run / interrupt). Opening that tab warms a Desmos ACP child (`session/new`
+with no prompt) so the mailbox is live without sending a chat message
+first. Extra `+` tabs are still login PTYs. Line-oriented, same contract
+as desk xterm, not a raw login PTY.
 
 ## Current scope
 
@@ -75,7 +75,8 @@ Supported now:
 - model and thought_level from Desmos `configOptions`;
 - mid-turn steering (`_session/steering`);
 - Comet session registry + `session/load` of the ACP uuid;
-- kernel PTY in the alacritty dock (`world.shells` / `_session/term`);
+- kernel PTY in the alacritty dock (`world.shells` / `_session/term`),
+  warmed on tab open so a prompt is not required first;
 - extra login-shell tabs from the dock `+`.
 
 Not the same object as the TUI / desk:
