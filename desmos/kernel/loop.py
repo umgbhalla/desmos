@@ -360,6 +360,29 @@ def reload(world: World) -> str:
     return msg
 
 
+def xml_as_speech_note(speech: str) -> str:
+    """Name the tags a tool-channel model wrote as prose, not as a call.
+
+    The phrase ``emitted XML as speech instead of calling syscall`` is the
+    contract the anthropic tool-channel check asserts. The parenthetical is
+    what a GUI card can show instead of a stack-shaped RuntimeError.
+    """
+    names: list[str] = []
+    seen: set[str] = set()
+    for block in scan(speech):
+        op = str((block.attrs or {}).get("op") or "")
+        label = f"{block.tag} {op}".strip() if op else block.tag
+        if label in seen:
+            continue
+        seen.add(label)
+        names.append(label)
+    detail = f" ({', '.join(names)})" if names else ""
+    return (
+        "the model emitted XML as speech instead of calling syscall"
+        f"{detail}. Those tags were not dispatched."
+    )
+
+
 def turn(
     world: World,
     messages: list[dict[str, Any]],
@@ -577,10 +600,9 @@ def turn(
     # every delta has streamed, the assistant message is appended, and
     # dispatch has not begun -- so the TUI can reconcile its conservative
     # mid-stream hold against this verdict before the first result card lands.
-    # OpenAI-family calls arrive on the tool channel, never in speech (XML in
-    # speech raises below), so the list is empty there.
     # Typed-tool-call models carry syscalls on the tool channel; their speech
-    # is never scanned, so complete.spans is empty there by construction.
+    # is never scanned for dispatch, so complete.spans is empty there by
+    # construction. XML written as prose is an error event, not a raise.
     speech_spans = scan_spans(speech) if not tool_syscalls(world.model) else []
     byte_spans: list[list[int]] = []
     tail, tail_bytes = 0, 0  # convert char offsets left to right, once each
@@ -674,8 +696,18 @@ def turn(
             blocks = []
         else:
             blocks = [block for block, _, _ in spans]
-    elif tool_syscalls(world.model) and scan(speech):
-        raise RuntimeError("the model emitted XML as speech instead of calling syscall")
+    elif tool_syscalls(world.model):
+        # Typed-tool models receive syscalls on the tool channel. XML in
+        # speech is not dispatched. Raising here made ACP wrap a handled
+        # refusal as JSON-RPC -32603, which Comet paints as a harness
+        # protocol crash next to the tags that never ran. An error event
+        # plus a user note is the same refusal, as a value.
+        spoken = scan(speech)
+        if spoken:
+            problem = xml_as_speech_note(speech)
+            fire({"ev": "error", "n": n, "text": f"[{problem}]"})
+            deliver(world, f"[{problem}]")
+        blocks = []
     else:
         # The same scan that produced complete.spans, so the dispatched blocks
         # and the advertised spans cannot diverge: spans[i] is the stretch of

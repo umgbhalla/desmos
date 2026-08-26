@@ -958,6 +958,41 @@ def check() -> None:
         assert any(e.get("ev") == "error" and "wire died" in e.get("text", "") for e in fail_evs)
         assert w_fail.running is False
 
+        # gpt-5.6-sol is tool-channel even with DESMOS_TOOL_SYSCALLS=0. XML in
+        # speech is a handled error event, not a RuntimeError that ACP used to
+        # wrap as JSON-RPC -32603. The tags named in the note must not run.
+        w_xml = new_world(cwd, state_path=None, persist=False, ns={})
+        w_xml.model = "gpt-5.6-sol"
+        w_xml.complete_fn = lambda *_: {
+            "content": [
+                {
+                    "type": "text",
+                    "text": (
+                        '<session op="compact"></session> '
+                        '<knowledge op="todo">open</knowledge>'
+                    ),
+                }
+            ],
+            "usage": {},
+        }
+        xml_evs: list[dict] = []
+        _run(w_xml, "go", quiet=True, on_event=xml_evs.append)
+        assert not any(
+            "RuntimeError" in str(m.get("content")) for m in w_xml.messages
+        ), w_xml.messages
+        xml_err = [e for e in xml_evs if e.get("ev") == "error"]
+        assert xml_err, [e.get("ev") for e in xml_evs]
+        note = xml_err[0].get("text") or ""
+        assert "emitted XML as speech" in note, note
+        assert "session compact" in note, note
+        assert "knowledge todo" in note, note
+        assert "not dispatched" in note, note
+        assert not any(
+            e.get("ev") == "result" and e.get("tag") in {"session", "knowledge"}
+            for e in xml_evs
+        ), xml_evs
+        assert any(e.get("ev") == "done" for e in xml_evs), [e.get("ev") for e in xml_evs]
+
         # The assistant turn is durable before its syscalls run, and results
         # come back even when the step stops mid-batch.
         w_ord = new_world(cwd, state_path=None, persist=False, ns={})
