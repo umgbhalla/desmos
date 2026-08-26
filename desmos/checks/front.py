@@ -1119,12 +1119,18 @@ def _check_desk() -> None:
 
     keys = (SESSION_ID_ENV, SESSION_PID_ENV, NEW_SESSION_ENV)
     old_env = {k: os.environ.get(k) for k in keys}
+    old_tools = os.environ.get("DESMOS_TOOL_SYSCALLS")
     for k in keys:
         os.environ.pop(k, None)
+    os.environ["DESMOS_TOOL_SYSCALLS"] = "0"
     try:
         _check_desk_roundtrip()
         _check_desk_markdown()
     finally:
+        if old_tools is None:
+            os.environ.pop("DESMOS_TOOL_SYSCALLS", None)
+        else:
+            os.environ["DESMOS_TOOL_SYSCALLS"] = old_tools
         for k, value in old_env.items():
             if value is None:
                 os.environ.pop(k, None)
