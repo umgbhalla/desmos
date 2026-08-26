@@ -102,4 +102,5 @@ Not yet matched with the native TUI / Comet / gpuix:
 Native `<markdown>` / `<diff>` is `python -m desmos gpuix`, not desk.
 The TUI (`python -m desmos tui`) is the ratatui/grok pager. Comet
 (`python -m desmos comet`) is the native GPUI binary. Desk is the HTML
-viewport onto the same kernel.
+viewport onto the same kernel. Capability map:
+[docs/design.md](design.md) (Surfaces).

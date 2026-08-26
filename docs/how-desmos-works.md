@@ -41,8 +41,10 @@ which is an 8-line star-import of `desmos/front/cli.py`.
 | `desmos run TASK` | 1 Python process | `kernel.loop.run` → `new_world` → `run_turns`. Prints. Writes `summary.json` under `--out` (default: cwd, not `runs/`). |
 | `desmos console` | Replaces itself with IPython | `--ext desmos.ext` → `attach()` binds `step()` in the REPL. Same `run_turns`. |
 | `desmos tui` | Rust paint + Python kernel | Hash-gated `cargo build -p desmos-tui`, then `execve`. The binary attaches to `.desmos/bridge.sock` or spawns `python -m desmos bridge --cwd <cwd>`. |
-| `desmos acp` | 1 Python process, stdio | NDJSON JSON-RPC. Used by `tui --grok`, `desmos comet`, and `desmos gpuix`. Not the default TUI. |
+| `desmos acp` | 1 Python process, stdio | NDJSON JSON-RPC. Used by `tui --grok`, `desmos comet`, `desmos gpuix`, and desk's in-process server. Not the default TUI. |
+| `desmos comet` | hash-gated `zeron` + ACP child | `vendor/comet` GPUI binary. Story/Activity via `_meta.desmos.pane`. Kernel PTY on the alacritty dock. |
 | `desmos gpuix` | Node + `@gpuix/native` | `npm install` in `desmos/front/gpuix`, then `execve` `node src/main.js`. Story is `<markdown>`, edits are `<diff wordDiff>`, ACP child is `python -m desmos acp`. |
+| `desmos desk` | 1 Python process, HTTP + WS | HTML viewport. In-process `AcpServer` (JSON-RPC over WebSocket). Story/Activity, xterm kernel PTY. |
 
 `desmos spine` is a Cloudflare Durable Object client. Off unless `DESMOS_SPINE`
 is set in the environment or a workspace `.env`. Herdr is inert unless

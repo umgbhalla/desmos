@@ -75,3 +75,6 @@ Not this host:
 `vendor/comet` and `vendor/grok-build` are untouched. A change to gpuix
 itself is an npm version bump of `@gpuix/react` / `@gpuix/native`, not a
 half-copy under `crates/`.
+
+The TUI / ACP / Comet / desk / GPUIX capability map is
+[docs/design.md](design.md) (Surfaces).

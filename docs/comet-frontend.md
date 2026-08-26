@@ -90,7 +90,8 @@ Not the same object as the TUI / desk:
 First-party gpuix `<markdown>` / `<diff>` is `python -m desmos gpuix`
 (`docs/gpuix-frontend.md`): published `@gpuix/react`, same ACP server.
 Comet does not load that package; it keeps its own GPUI parser that
-matches the Grok GFM / wordDiff contract.
+matches the Grok GFM / wordDiff contract. The TUI / ACP / Comet / desk /
+GPUIX capability map is [docs/design.md](design.md) (Surfaces).
 
 Headed Linux without a GPU: `mesa-vulkan-drivers` (lavapipe).
 `VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json` makes wgpu select
