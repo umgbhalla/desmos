@@ -7,7 +7,7 @@ row disagrees with the code, the code wins and this file is wrong.
 Last reconciled against `desmos/front/acp.py`, `desmos/kernel/loop.py`,
 `crates/desmos-tui/src/events.rs`, and the surface pages under `docs/`.
 Schema is `persist.SCHEMA_VERSION` **17** (`acp_sessions` binds).
-`docs/how-desmos-works.md` still says v16 in one table; that line is stale.
+`docs/how-desmos-works.md` matches that (v17 in the punchline and the sqlite table).
 
 ---
 
@@ -129,9 +129,9 @@ Live routing (`crates/desmos-tui/src/events.rs`, proved by
 | fold / error as `system` | FOLD notice |
 
 `<edit>` is wire-only. Do not restore story edit cards — that prints
-`edit ×3` above three cards naming the files. AGENTS.md still says thinking
-is on Story and that `<edit>` gets a story card. Those two sentences are
-stale. The tests are the contract.
+`edit ×3` above three cards naming the files. AGENTS.md matches the TUI
+tests: thinking is Activity there; ACP/Comet/Desk tag the same kernel event
+as Story. The tests are the contract.
 
 The frame is a nine-pane cockpit: Story, Activity, Meter, Git, Files, POST
 in, POST out, Queue, Input, plus a rail. Tab walks clockwise. Click select,
@@ -207,13 +207,15 @@ the way the TUI does.
 
 **Subagents.** `world.on_event` is copied onto children. `_emit` prefers
 `CALLER_WORLD.on_event`, then this thread's bound parent (`S._BOUND`
-ContextVar), then the process `_EMIT`. ACP sets `_BOUND` for the prompt so
-two worlds in one process do not share `S.PARENT`. `S.set_emitter` is still
-installed for the duration of the prompt and restored in `finally` for the
-bridge's process-lifetime hook. Child thinking / speech update the subagent
-card. They do not become parent `agent_message_chunk`. Child `result` is an
-Activity syscall with `extra.child`. Empty title is omitted on updates so
-child speech does not overwrite the spawn title with the run id.
+ContextVar), then the process `_EMIT`. ACP sets `_BOUND` and `world.on_event`
+for the prompt. It does not assign `S.PARENT` or `S.set_emitter` — two
+prompts on different cwds overlap, and restoring those process globals from
+the first to finish wipes the second (or the bridge). A worker thread with
+`_BOUND` unset never falls through to the last `bind()`. Child thinking /
+speech update the subagent card. They do not become parent
+`agent_message_chunk`. Child `result` is an Activity syscall with
+`extra.child`. Empty title is omitted on updates so child speech does not
+overwrite the spawn title with the run id.
 
 ---
 
@@ -224,8 +226,14 @@ child speech does not overwrite the spawn title with the run id.
 Vendored `umgbhalla/comet` git submodule. Hash-gated `zeron`. Create a chat,
 choose **Desmos**. Story = user prompts + thinking (`MessagePart::Thought`)
 + assistant GFM. Activity = a right pane (auto-opened on the first Desmos
-chat). `complete()` is `ToolCall::Unknown { name: complete }`, not a
-WebFetch. Edits also land on Comet's Changes pane.
+chat). `complete()` is `ToolCall::Unknown { name: complete }` with chip
+label `complete` and the POST model as the detail, not a WebFetch and not
+generic `Tool`. Syscall chips use the invocation body (`Run` / `ls -la`)
+and `<read>` becomes `ReadFile`. A turn that mixed a POST with two bash
+calls collapses as `Posted 1 complete · ran 2 commands`. Edits also land
+on Comet's Changes pane. The paperclip stages image files and
+`acp_prompt_blocks` sends them as ACP `type=image` `file:` URIs — the same
+blocks Desmos `prompt_images` already hands to `run_turns(images=)`.
 
 Steering: initialize advertises `_meta.steering.supported`. Mid-turn injects.
 Idle returns `promptRequired`. Kernel PTY on the alacritty dock
@@ -353,6 +361,14 @@ These are done. Do not rebuild them. Do not list them as remaining work.
 19. **`front/trace.py`** reads sqlite `events` (`export_world`). jsonl is
     the leftover fixture path. `python -m desmos check --only trace` is on
     the floor.
+20. **ACP does not write `S.PARENT` or `S.set_emitter`.** Prompt threads bind
+    `_BOUND` + `world.on_event`. Workers with `_BOUND` unset use `_EMIT`
+    (the bridge), never the last `bind()`. Checks:
+    `_check_acp_parent_isolation`, `_check_acp_prompt_preserves_globals`.
+21. **Comet chip richness** in `umgbhalla/comet`: complete chip copy, group
+    summary, syscall body/read mapping, paperclip → ACP image blocks. Pin
+    the gitlink after that commit. This checkout does not patch Comet at
+    runtime.
 
 ---
 
@@ -367,18 +383,6 @@ TUI tests put thinking on **Activity**. ACP tags thinking as **Story**
 (`agent_thought_chunk`), matching Comet `MessagePart::Thought` and Desk's
 muted Story block. That split is written down in AGENTS.md. Do not paint
 thinking on both panes to make the docs agree.
-
-### `PARENT` fallback
-
-`S._BOUND` is per-thread. `S.PARENT` remains for `reload_sdk` and
-main-thread spawn. A child that emits with neither `CALLER_WORLD` nor
-`_BOUND` still falls through to the last `bind()`.
-
-### Comet chip richness
-
-Lives in `umgbhalla/comet`, then the gitlink. Protocol errors already land
-as Activity cards. Collapsing “Ran N commands”, paperclip, model chip
-copy, and similar chrome are Comet product — commit there, pin here.
 
 ### Kernel leftovers that are not GUI, but are real
 
@@ -431,7 +435,8 @@ tool titles, body contains `not dispatched`.
 Protocol cards: `_check_acp_protocol_cards`. Images: `_check_acp_images`.
 Emitter: `_check_acp_subagent_emitter`. Claim: `_check_acp_workspace_claim`.
 Resume: `_check_acp_event_replay`. Park: `_check_acp_has_input`.
-Parent bind: `_check_acp_parent_isolation`. Typed: `_check_acp_typed`.
+Parent bind: `_check_acp_parent_isolation`, `_check_acp_prompt_preserves_globals`.
+Typed: `_check_acp_typed`.
 Markdown: `_check_acp_markdown` / `_check_desk_markdown`.
 Trace: `python -m desmos check --only trace`.
 

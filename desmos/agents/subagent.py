@@ -1072,13 +1072,19 @@ _EMIT: Any = None
 
 
 def _bound_parent() -> Any:
-    """The parent this thread bound, falling back to the process global.
+    """The parent this thread bound.
 
-    `PARENT` is still assigned so reload_sdk and main-thread programmatic
-    spawn keep working. Two ACP worlds in one process bind on their prompt
-    threads; the ContextVar is what stops them overwriting each other.
+    `PARENT` is the main-thread fallback so `reload_sdk` and programmatic
+    spawn keep working after `bind()`. A worker never sees it: two ACP
+    prompt threads must not inherit the last `bind()` just because `_BOUND`
+    is unset on a pool thread that did not copy context.
     """
-    return _BOUND.get() or PARENT
+    bound = _BOUND.get()
+    if bound is not None:
+        return bound
+    if threading.current_thread() is threading.main_thread():
+        return PARENT
+    return None
 
 
 def set_emitter(fn: Any) -> None:
@@ -1091,7 +1097,9 @@ def _emit(ev: dict[str, Any]) -> None:
     """Prefer the executing world's hook, then this thread's bound parent, then global.
 
     The bridge still installs ``set_emitter`` for process lifetime. ACP sets
-    ``world.on_event`` per prompt so two worlds do not steal each other's cards.
+    ``world.on_event`` and ``_BOUND`` per prompt and does not touch ``PARENT``
+    or ``_EMIT``, so two worlds cannot steal each other's cards or wipe the
+    bridge hook when their prompts overlap.
     """
     from desmos.kernel.dispatch import CALLER_WORLD
 

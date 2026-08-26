@@ -1353,6 +1353,7 @@ def _check_desk() -> None:
         _check_acp_event_replay()
         _check_acp_has_input()
         _check_acp_parent_isolation()
+        _check_acp_prompt_preserves_globals()
         _check_acp_typed()
         _check_acp_markdown()
         _check_desk_markdown()
@@ -2045,7 +2046,13 @@ def _check_acp_has_input() -> None:
 
 
 def _check_acp_parent_isolation() -> None:
-    """Two threads bind two worlds. _emit lands on the bound world's on_event."""
+    """Workers honor _BOUND, never the process PARENT or _EMIT, when bound.
+
+    A worker with neither binding must use _EMIT (the bridge hook), not the
+    last bind()'s PARENT — that was how one ACP world stole another world's
+    cards, and how restoring PARENT from the first prompt to finish poisoned
+    a still-running second prompt.
+    """
     import threading
 
     from desmos.agents import subagent as S
@@ -2053,6 +2060,8 @@ def _check_acp_parent_isolation() -> None:
     from desmos.kernel.types import World
 
     hits: list[tuple[str, str]] = []
+    stolen_parent: list[dict] = []
+    stolen_emit: list[dict] = []
 
     def hook(name: str):
         def on(ev: dict) -> None:
@@ -2063,29 +2072,174 @@ def _check_acp_parent_isolation() -> None:
     a, b = World(), World()
     a.on_event = hook("a")
     b.on_event = hook("b")
+    poison = World()
+    poison.on_event = lambda ev: stolen_parent.append(ev)
     old_parent = S.PARENT
+    old_emit = S._EMIT
     caller_tok = CALLER_WORLD.set(None)
-    S.PARENT = None
-    barrier = threading.Barrier(2)
+    S.PARENT = poison
+    S.set_emitter(lambda ev: stolen_emit.append(ev))
+    barrier = threading.Barrier(3)
     try:
 
-        def worker(world: World, ev_id: str) -> None:
+        def bound_worker(world: World, ev_id: str) -> None:
             tok = S._BOUND.set(world)
             barrier.wait()
             S._emit({"ev": "notice", "id": ev_id})
             S._BOUND.reset(tok)
 
-        t1 = threading.Thread(target=worker, args=(a, "1"))
-        t2 = threading.Thread(target=worker, args=(b, "2"))
-        t1.start()
-        t2.start()
-        t1.join(8)
-        t2.join(8)
-        assert not t1.is_alive() and not t2.is_alive()
+        def unbound_worker() -> None:
+            barrier.wait()
+            S._emit({"ev": "notice", "id": "unbound"})
+
+        t1 = threading.Thread(target=bound_worker, args=(a, "1"))
+        t2 = threading.Thread(target=bound_worker, args=(b, "2"))
+        t3 = threading.Thread(target=unbound_worker)
+        for thread in (t1, t2, t3):
+            thread.start()
+        for thread in (t1, t2, t3):
+            thread.join(8)
+            assert not thread.is_alive()
         assert set(hits) == {("a", "1"), ("b", "2")}, hits
+        assert not stolen_parent, stolen_parent
+        assert stolen_emit and stolen_emit[0].get("id") == "unbound", stolen_emit
     finally:
         S.PARENT = old_parent
+        S.set_emitter(old_emit)
         CALLER_WORLD.reset(caller_tok)
+
+
+def _notice_texts(notes: list[dict]) -> list[str]:
+    texts: list[str] = []
+    for note in notes:
+        if note.get("method") != "session/update":
+            continue
+        params = note.get("params") or {}
+        family = (params.get("_meta") or {}).get("desmos", {}).get("family")
+        if family != "notice":
+            continue
+        for block in (params.get("update") or {}).get("content") or []:
+            inner = (block.get("content") or {}) if isinstance(block, dict) else {}
+            text = inner.get("text")
+            if text:
+                texts.append(str(text))
+    return texts
+
+
+def _check_acp_prompt_preserves_globals() -> None:
+    """session/prompt must not assign S.PARENT or S.set_emitter.
+
+    Two prompts on different cwds overlap. Swapping those process globals
+    and restoring them from the first to finish wipes the second, or the
+    bridge's lifetime hook.
+    """
+    import tempfile
+    import threading
+
+    from desmos.agents import subagent as S
+    from desmos.front.acp import AcpServer
+    from desmos.kernel.types import World
+    from desmos.state import persist
+
+    stolen_parent: list[dict] = []
+    stolen_emit: list[dict] = []
+    poison = World()
+    poison.on_event = lambda ev: stolen_parent.append(ev)
+
+    def steal(ev: dict) -> None:
+        stolen_emit.append(ev)
+
+    old_parent = S.PARENT
+    old_emit = S._EMIT
+    S.PARENT = poison
+    S.set_emitter(steal)
+    memo = dict(persist._WORKSPACE_LEASE)
+    persist._WORKSPACE_LEASE.clear()
+    try:
+        with tempfile.TemporaryDirectory() as one, tempfile.TemporaryDirectory() as two:
+            notes_a: list[dict] = []
+            notes_b: list[dict] = []
+            acp_a = AcpServer(notes_a.append, default_cwd=Path(one))
+            acp_b = AcpServer(notes_b.append, default_cwd=Path(two))
+            created_a = acp_a.handle(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "session/new",
+                    "params": {"cwd": str(one)},
+                }
+            )
+            created_b = acp_b.handle(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "session/new",
+                    "params": {"cwd": str(two)},
+                }
+            )
+            assert created_a is not None and "result" in created_a, created_a
+            assert created_b is not None and "result" in created_b, created_b
+            sid_a = created_a["result"]["sessionId"]
+            sid_b = created_b["result"]["sessionId"]
+            ready_a, ready_b = threading.Event(), threading.Event()
+            go = threading.Event()
+
+            def complete(mark: str, ready: threading.Event):
+                def fake(*_):
+                    ready.set()
+                    assert go.wait(8)
+                    S._emit({"ev": "notice", "text": mark, "id": mark})
+                    return {
+                        "content": [{"type": "text", "text": mark}],
+                        "usage": {},
+                    }
+
+                return fake
+
+            acp_a.sessions[sid_a].complete_fn = complete("A", ready_a)
+            acp_b.sessions[sid_b].complete_fn = complete("B", ready_b)
+            errors: list[BaseException] = []
+
+            def prompt(server: AcpServer, sid: str) -> None:
+                try:
+                    out = server.handle(
+                        {
+                            "jsonrpc": "2.0",
+                            "id": 2,
+                            "method": "session/prompt",
+                            "params": {
+                                "sessionId": sid,
+                                "prompt": [{"type": "text", "text": "go"}],
+                            },
+                        }
+                    )
+                    assert out is not None and "error" not in out, out
+                except BaseException as exc:  # noqa: BLE001 — collect, then fail
+                    errors.append(exc)
+
+            t_a = threading.Thread(target=prompt, args=(acp_a, sid_a))
+            t_b = threading.Thread(target=prompt, args=(acp_b, sid_b))
+            t_a.start()
+            t_b.start()
+            assert ready_a.wait(8) and ready_b.wait(8)
+            assert S.PARENT is poison
+            assert S._EMIT is steal
+            go.set()
+            t_a.join(8)
+            t_b.join(8)
+            assert not t_a.is_alive() and not t_b.is_alive()
+            assert not errors, errors
+            assert S.PARENT is poison
+            assert S._EMIT is steal
+            assert not stolen_parent, stolen_parent
+            assert not stolen_emit, stolen_emit
+            assert _notice_texts(notes_a) == ["A"], notes_a
+            assert _notice_texts(notes_b) == ["B"], notes_b
+    finally:
+        S.PARENT = old_parent
+        S.set_emitter(old_emit)
+        persist._WORKSPACE_LEASE.clear()
+        persist._WORKSPACE_LEASE.update(memo)
 
 
 def _check_acp_typed() -> None:

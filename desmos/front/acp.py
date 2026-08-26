@@ -971,13 +971,12 @@ class AcpServer:
         self._claim_prompt(session_id, world, state)
         import desmos.agents.subagent as S
 
-        prev_parent = S.PARENT
-        # Without this, spawn() inside an ACP session gets _parent()'s
-        # fallback world -- default model, launcher cwd, no session state.
-        # ContextVar so two prompt threads do not share one PARENT.
+        # Prompt thread only. Do not assign S.PARENT or S.set_emitter: two
+        # sessions on different cwds overlap, and restoring those process
+        # globals from the first to finish wipes the second (or the bridge).
+        # spawn() inside a dispatched syscall already sees CALLER_WORLD;
+        # complete() / child _emit see this ContextVar, then world.on_event.
         bound_token = S._BOUND.set(world)
-        S.PARENT = world
-        prev_emit = getattr(S, "_EMIT", None)
         # Swap this session's transcript onto the shared world for the run.
         # _claim_prompt waits until no other session is stepping this world.
         world.messages, world.prior = convo
@@ -986,11 +985,7 @@ class AcpServer:
             def on_event(ev: dict[str, Any]) -> None:
                 self._emit_event(session_id, prompt_id, ev, state)
 
-            # The bridge installs this for the process lifetime. ACP holds it
-            # for the prompt on this World so a child spawned here is not
-            # silent and a later TUI attach is not still writing ACP cards.
             world.on_event = on_event
-            S.set_emitter(on_event)
             # An emitter that raises lands in _run_turns' catch-all, which
             # writes "[turn n failed]" over the real reply and skips the
             # commit. The loop's own stop path saves the step; use it.
@@ -1017,15 +1012,11 @@ class AcpServer:
         finally:
             if getattr(world, "on_event", None) is on_event:
                 world.on_event = None
-            S.set_emitter(prev_emit)
             with self._lock:
                 # rollback() and reset() rebind these, so read them back rather
                 # than trusting the objects we swapped in.
                 self._convo[session_id] = (world.messages, world.prior)
                 self._inflight.pop(session_id, None)
-            # Restoring the process global AND the ContextVar: two prompts on
-            # different worlds at once each have their own bound parent.
-            S.PARENT = prev_parent
             S._BOUND.reset(bound_token)
 
     def _session_cancel(self, params: dict[str, Any]) -> None:
