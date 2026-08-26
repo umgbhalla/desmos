@@ -1514,6 +1514,88 @@ def _check_gpuix_host() -> None:
     assert "-keep 1" in patch and "+keep 2" in patch, patch
     size = payload["tree"]["window"]
     assert size["width"] > 0 and size["height"] > 0, size
+    types = payload["tree"].get("types") or []
+    for need in ("markdown", "diff", "virtual-list", "textarea"):
+        assert need in types, types
+    _check_gpuix_chat_live(gpuix, node, env, xvfb, icd)
+
+
+def _check_gpuix_chat_live(
+    gpuix: Path,
+    node: str,
+    env: dict[str, str],
+    xvfb: str,
+    icd: str,
+) -> None:
+    """session/prompt through the real ACP child, then paint the gpuix App.
+
+    MockAnthropic is the same gland complete() hits in e2e — not a second
+    loop. Story must keep speech; complete() must stay on activity.
+    """
+    import json
+    import os
+    import subprocess
+    import tempfile
+
+    from desmos.transport.mock import MockAnthropic
+
+    marker = "GPUIX_CHAT_PONG"
+    with tempfile.TemporaryDirectory(prefix="desmos-gpuix-chat-") as raw:
+        tmp = Path(raw)
+        work = tmp / "work"
+        work.mkdir()
+        settings = tmp / "settings.json"
+        settings.write_text(
+            json.dumps({"provider": "anthropic", "model": "claude-opus-5", "effort": "low"}),
+            encoding="utf-8",
+        )
+        with MockAnthropic([marker]) as mock:
+            headed = dict(env)
+            headed.update({
+                "HOME": str(tmp),
+                "DESMOS_SETTINGS": str(settings),
+                "DESMOS_REGISTRY": str(tmp / "registry"),
+                "DESMOS_AUTH": str(tmp / "auth.json"),
+                "DESMOS_TRAJECTORY": str(tmp / "trajectory"),
+                "DESMOS_MODEL": "claude-opus-5",
+                "ANTHROPIC_API_KEY": "mock-key",
+                "ANTHROPIC_BASE_URL": mock.url,
+                "NO_PROXY": "127.0.0.1,localhost",
+                "no_proxy": "127.0.0.1,localhost",
+                "DESMOS_GPUIX_PROMPT": "say the marker",
+                "DESMOS_CWD": str(work),
+            })
+            headed.pop("OPENAI_API_KEY", None)
+            if os.path.isfile(icd):
+                headed["VK_ICD_FILENAMES"] = icd
+            chat = subprocess.run(
+                [xvfb, "-a", node, str(gpuix / "src" / "probe.js"), "--chat", "--cwd", str(work)],
+                cwd=str(gpuix),
+                env=headed,
+                capture_output=True,
+                text=True,
+                timeout=90,
+                check=False,
+            )
+            assert chat.returncode == 0, chat.stderr[-4000:] + chat.stdout[-4000:]
+            lines = [ln for ln in chat.stdout.splitlines() if ln.strip()]
+            payload = json.loads(lines[-1])
+            assert payload.get("ok") is True, payload
+            got = payload["chat"]
+            assert got["stopReason"] == "end_turn", got
+            assert marker in (got.get("speech") or ""), got
+            assert "complete" in (got.get("activityFamilies") or []), got
+            kinds = got.get("storyKinds") or []
+            assert "user" in kinds and "assistant" in kinds, kinds
+            assert "complete" not in kinds, kinds
+            panes = {(p.get("pane"), p.get("kind")) for p in got.get("panes") or []}
+            assert ("story", "agent_message_chunk") in panes, got.get("panes")
+            assert ("activity", "tool_call") in panes or ("activity", "tool_call_update") in panes, got.get("panes")
+            types = got.get("types") or []
+            for need in ("markdown", "virtual-list", "textarea"):
+                assert need in types, types
+            assert got["sessionId"] and got["secondId"] and got["sessionId"] != got["secondId"], got
+            assert mock.hits, "session/prompt never reached MockAnthropic"
 
 
 def _check_desk_roundtrip() -> None:

@@ -30,6 +30,7 @@ Headed Linux without a GPU: the same lavapipe ICD Comet uses
 ```text
 python -m desmos gpuix --probe      # retained tree of <markdown> / <diff>
 python -m desmos gpuix --acp-probe  # initialize + session/new, then exit
+python -m desmos gpuix --chat-probe # session/prompt + paint (needs a mock or key)
 ```
 
 ## What it actually paints
@@ -43,17 +44,26 @@ ACP tags every `session/update` with `_meta.desmos.pane` (`story` |
 - `complete()` and syscalls → activity text
 - edit `oldText`/`newText` → `unifiedPatch` → `<diff wordDiff>`
 
-The composer is gpuix `<textarea>`; Enter is `session/prompt`.
+The composer is gpuix `<textarea>`; Enter is `session/prompt`. Esc / Stop is
+`session/cancel`. New session is `session/new`. Model and thought_level
+are gpuix `Select` wired to `session/set_config_option`. Story rows live
+in a gpuix `virtual-list` (`followTail`). Activity is the right pane;
+tools never enter the story list.
 
 ## Current scope
 
 Supported now:
 
-- live ACP initialize / authenticate / session/new / session/prompt;
-- story markdown and thinking through `@gpuix/react` `<markdown>`;
-- activity edit cards through `<diff wordDiff>`;
-- probe that asserts the GPUI retained tree (custom props on those
-  elements) and an ACP session id from a real child.
+- live ACP initialize / authenticate / session/new / session/prompt /
+  session/cancel / session/set_config_option;
+- session sidebar (New + ACP uuids from this process);
+- story markdown and thinking through `@gpuix/react` markdown in a
+  `virtual-list`;
+- activity edit cards through gpuix diff `wordDiff`; complete/syscall chips
+  off-story;
+- model / thought_level `Select` from the same `configOptions` desk uses;
+- `--chat-probe` runs a real `session/prompt` (point `ANTHROPIC_BASE_URL`
+  at `python -m desmos mock`) and asserts the retained tree.
 
 Not this host:
 

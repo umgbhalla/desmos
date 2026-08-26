@@ -91,7 +91,36 @@ export function applyUpdate(turn, msg) {
   return turn;
 }
 
-/** One turn whose story/activity must paint through gpuix <markdown> / <diff>. */
+export function parseConfig(result) {
+  const models = [];
+  const efforts = [];
+  let model = "";
+  let effort = "";
+  for (const opt of result.configOptions || []) {
+    const values = (opt.options || []).map((o) => o.value).filter(Boolean);
+    if (opt.id === "model" || opt.category === "model") {
+      models.push(...values);
+      if (opt.currentValue) model = opt.currentValue;
+    }
+    if (opt.id === "thought_level" || opt.category === "thought_level") {
+      efforts.push(...values);
+      if (opt.currentValue) effort = opt.currentValue;
+    }
+  }
+  const modelsBlock = result.models || {};
+  if (modelsBlock.currentModelId) model = modelsBlock.currentModelId;
+  return { models, efforts, model, effort };
+}
+
+export function titleOf(turn) {
+  if (!turn) return "New session";
+  if (turn.title && turn.title !== "New session") return turn.title;
+  const user = (turn.story || []).find((s) => s.kind === "user");
+  if (user && user.text) return String(user.text).split("\n")[0].slice(0, 72);
+  return "New session";
+}
+
+/** One turn whose story/activity must paint through gpuix markdown / diff. */
 export function fixtureTurn() {
   return {
     story: [

@@ -209,9 +209,12 @@ def cmd_gpuix(args: argparse.Namespace) -> int:
     if args.probe:
         script = gpuix / "src" / "probe.js"
         flags = ["--tree"]
-    elif args.acp_probe:
+    elif getattr(args, "acp_probe", False):
         script = gpuix / "src" / "probe.js"
         flags = ["--acp", "--cwd", str(Path(args.cwd).resolve())]
+    elif getattr(args, "chat_probe", False):
+        script = gpuix / "src" / "probe.js"
+        flags = ["--chat", "--cwd", str(Path(args.cwd).resolve())]
     else:
         script = gpuix / "src" / "main.js"
         flags = []
@@ -733,6 +736,11 @@ def main() -> int:
         "--acp-probe",
         action="store_true",
         help="initialize a real ACP session and exit",
+    )
+    gx.add_argument(
+        "--chat-probe",
+        action="store_true",
+        help="session/prompt through ACP, paint story/activity, print the retained tree",
     )
     gx.add_argument("--no-install", action="store_true", help="do not npm install")
     gx.set_defaults(func=cmd_gpuix)
