@@ -23,6 +23,9 @@ DIRECT_TARGETS = {
     ("workspace", "see"): "see",
     ("workspace", "commit"): "commit",
     ("knowledge", "todo"): "todo",
+    ("knowledge", "plan"): "plan",
+    ("knowledge", "decide"): "decide",
+    ("knowledge", "anchor"): "anchor",
     ("observe", "usage"): "usage",
     ("observe", "trajectory"): "traj",
     ("session", "compact"): "compact",
@@ -386,6 +389,11 @@ def _decide(world, body: str) -> str:
 
     stripped = body.strip()
     low = stripped.lower()
+
+    # Writes enqueue a TUI question in the session that owns the JSONL.
+    # A persist=False child shares the parent's cwd; list is a read.
+    if not world.persist and stripped and low != "list":
+        return "decide disabled for this non-persistent world"
 
     # "list" or bare body
     if not stripped or low == "list":

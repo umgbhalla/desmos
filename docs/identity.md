@@ -27,6 +27,8 @@ Columns: survives `<reload_sdk/>` / process restart / `<rollback>` /
 | harness db: workspaces, attach sessions and lineage, per-session messages/calls/events, prior turns, notes, grown tools, generation, thinking, presence and channels | `world.state_path` or `<cwd>/.desmos/harness.sqlite3` (`state/persist.py state_file`) | `state/persist.py` — one `DESMOS_SESSION_ID` per attach; workspace rows own state that survives restart, session rows own what happened during one attach; retention keeps 24 sessions and cascades their dependent rows | yes | **24-session lineage** — the load tail is `turn_aligned` and keeps the newest compaction checkpoint; message ownership is never copied across sessions | transcript yes; notes/tools/prior **replaced** from the snapshot (that is the point); generation never rewinds (`max(world.generation, n)`) | no | no |
 | memory records + derived handbook | `.desmos/memories/records.jsonl`, `MEMORY.md`, `memory_summary.md` beside the db (`state/memory.py memory_root`) | `state/memory.py _save` via `remember`/`forget`/`verify`/`consolidate` — atomic, secret-scrubbed (`_redact`); refuses on `persist=False` | yes | yes | **yes** — `apply_snapshot` touches notes/tools/prior only (driven in `checks/kernel.py`) | no | no |
 | generation snapshots (notes/tools/docs/prior — not messages, not memory) | `.desmos/generations/NNNN.json` | `state/generations.py write_generation` (persist-gated; `ensure_gen1` at world birth) | yes | yes | rollback reads them, never deletes; ids only go up | no | no |
+| plans | `.desmos/plans/plans.jsonl` beside the db (`state/plan.py plans_path`) | `state/plan.py _append` via `knowledge op=plan` — refuses on `persist=False` | yes | yes | **yes** — snapshots do not carry plans | no | no |
+| decisions | `.desmos/decisions/decisions.jsonl` (`state/decisions.py`) | `state/decisions.py _append` via `knowledge op=decide` — refuses on `persist=False` | yes | yes | **yes** | no | no |
 | trajectory (exact outgoing POST per `complete()`) | `.desmos/trajectory/*.json` (`DESMOS_TRAJECTORY`; **process**-cwd-relative) | `transport/complete.py log_payload` — unique name + `os.replace`; `prune_trajectory` strips payloads past the newest 12, deletes past 400 | yes | yes | yes | no | no |
 | pending handoff records (Track 1.1, landing this phase) | `.desmos/pending/` | contract: when a child settles, a notice file carrying the **whole notice text** is written; renamed to delivered in the same step that appends it to the transcript; replayed at load — a crash between settle and delivery cannot lose it | yes | yes — its purpose | yes | no | no |
 | event replay | `events` table in the harness db, keyed by attach session | `state/persist.py record_event`, called by `front/bridge.py`; bridge-writer seq/time stamps, provider ciphertext stripped, giant post/complete bodies represented by byte count + SHA-256, animation/timing events stay live-only | yes | yes, bounded by 24-session retention | yes | no | no |
@@ -51,9 +53,14 @@ Planned (Phase 6 — built but not yet wired on this branch; contract, not inven
 - **What a fork inherits.** A child is `new_world(persist=False,
   state_path=None)` (`agents/subagent.py _child_world`): it loads nothing
   from the db, writes nothing back, cannot `remember()` ("memory disabled"),
-  cannot snapshot a generation. It does inherit code, settings, auth, and the
-  skills/extensions roots. Its only durable traces are its run record, its
-  trajectory files, its child-enveloped events, and the files it edits.
+  cannot snapshot a generation, and cannot append `plans.jsonl` or
+  `decisions.jsonl` (`state/plan.py` / `state/decisions.py` persist-gated,
+  driven in `checks/state.py`). A `todo` grant is not a knowledge-family
+  grant: `plan` / `decide` / `anchor` have their own dispatch targets
+  (`kernel/canonical.py DIRECT_TARGETS`). It does inherit code, settings,
+  auth, and the skills/extensions roots. Its only durable traces are its
+  run record, its trajectory files, its child-enveloped events, and the
+  files it edits.
 - **Speech is not memory, and neither is `ns`.** The transcript is a tail
   and `ns` dies with the process. If future-you needs it: a memory record
   (survives everything but `rm -rf .desmos`), a note (survives restart, is

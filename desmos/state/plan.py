@@ -102,6 +102,11 @@ def revisions(world: World) -> list[dict[str, Any]]:
 
 
 def _append(world: World, rec: dict[str, Any]) -> dict[str, Any]:
+    # A subagent runs in the parent's cwd with persist=False. Ungated, its
+    # <knowledge op=plan> wrote .desmos/plans/plans.jsonl into the parent's
+    # repo -- save() refused, this did not.
+    if not world.persist:
+        return rec
     path = plans_path(world)
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as fh:
@@ -359,6 +364,9 @@ USAGE = (
 )
 
 
+_WRITE_CMDS = frozenset({"new", "from", "step", "status", "block", "unblock"})
+
+
 def handle_plan(world: World, body: str = "", **attrs: Any) -> str:
     body = (body or "").strip()
     if not body:
@@ -366,6 +374,9 @@ def handle_plan(world: World, body: str = "", **attrs: Any) -> str:
     head, _, rest = body.partition("\n")
     cmd, _, arg = head.strip().partition(" ")
     cmd, arg, rest = cmd.lower(), arg.strip(), rest.strip("\n")
+
+    if cmd in _WRITE_CMDS and not world.persist:
+        return "plan disabled for this non-persistent world"
 
     if cmd in ("help", "?"):
         return USAGE
